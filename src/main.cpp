@@ -60,7 +60,7 @@ YourClassName::YourClassName(QWidget *parent)
     fftComboBox->addItem("131072");
     fftComboBox->addItem("262144");
     fftComboBox->addItem("524288");
-    fftComboBox->setCurrentIndex(3);
+    fftComboBox->setCurrentIndex(5);
     
     lnaGainSlider = new QSlider(Qt::Horizontal, this);
     lnaGainSlider->setRange(1, 3);
@@ -751,6 +751,10 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     YourClassName window;
     window.show(); 
-    return app.exec();
+
     qDebug() << "App started";
+        SetConsoleOutputCP(CP_UTF8);  // Устанавливаем UTF-8 для вывода
+        SetConsoleCP(CP_UTF8);        // Устанавливаем UTF-8 для ввода
+        std::cout << "Теперь текст будет выводиться правильно!\n";
+        return app.exec();
 }

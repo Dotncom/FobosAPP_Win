@@ -11,7 +11,7 @@ include_directories(${CMAKE_SOURCE_DIR}/fobos/x64)
 include_directories(${CMAKE_SOURCE_DIR}/fobos)
 include_directories(${CMAKE_SOURCE_DIR}/fftw-3.3.5-dll64)
 include_directories(${CMAKE_SOURCE_DIR}/src)
-include_directories(${CMAKE_SOURCE_DIR}/libusb-1.0.27/libusb-1.0.27/libusb/)
+#include_directories(${CMAKE_SOURCE_DIR}/libusb-1.0.27/libusb-1.0.27/libusb/)
 
 find_package(Qt5 REQUIRED COMPONENTS Core Widgets OpenGL Multimedia)
 
@@ -22,7 +22,7 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 # Подключение заголовков и исходников
 set(SOURCES
-    libusb-1.0.27/libusb-1.0.27/libusb/libusb.h
+    #libusb-1.0.27/libusb-1.0.27/libusb/libusb.h
     fobos/fobos.h
     fftw-3.3.5-dll64/fftw3.h
     src/main.cpp
@@ -45,5 +45,5 @@ set(SOURCES
 add_executable(FobosAPP ${SOURCES})
 
 # Подключение библиотек Qt
-target_link_libraries(FobosAPP PRIVATE fobos libfftw3f-3 libusb-1.0 Qt5::Core Qt5::Widgets Qt5::OpenGL Qt5::Multimedia winmm opengl32.lib)
+target_link_libraries(FobosAPP PRIVATE fobos libfftw3f-3  Qt5::Core Qt5::Widgets Qt5::OpenGL Qt5::Multimedia winmm opengl32.lib)
 

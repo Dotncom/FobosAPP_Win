@@ -25,6 +25,8 @@
 //#include "decim/plans.h"
 #include <windows.h>
 #include <mmsystem.h>
+#include <algorithm>
+#include <condition_variable>  // Добавляем для синхронизации
 
 extern double listeningFrequency;
 extern float* iqData;
@@ -54,15 +56,13 @@ private:
     void SDRThread();
     void AudioThread();
     void playAudio(const std::vector<short> &audioData);
-    //void processAudioData(std::vector<short>& output);
-    void processAudioData();
-    //void resampleToAudioRate(std::vector<float>& demodulatedData, double sourceRate, double targetRate);
-    void resampleToAudioRate(std::vector<float>& lowPassFilteredData, std::vector<float>& resampledData, double sourceRate, double targetRate);
     void filterIQData(float* iqData, double centerFrequency, double globalSampleRate, double listeningFrequency, double globalBandwidth, std::vector<float>& filteredData);
     void applyLowPassFilter(const std::vector<float>& demodulatedData, std::vector<float>& lowPassFilteredData, float cutoffFreq, float sampleRate);
     void applyDeemphasisFilter(std::vector<float>& lowPassFilteredData, float sampleRate);
-    std::vector<float> demodulateAM(const std::vector<short>& filteredData);
-	std::vector<float> demodulateFM(const std::vector<float>& filteredData, float& lastPhase);
+    void normalizeAudio(std::vector<float>& audioData);
+    void resampleAudio(const std::vector<float>& input, std::vector<short>& output);
+    void demodulateAM(const std::vector<float>& filteredData, std::vector<float>& demodulatedData);
+    std::vector<float> demodulateFM(const std::vector<float>& localBuffer, float& lastPhase);
 	std::vector<float> demodulateSSB(const std::vector<float>& lowPassFilteredData, double frequency, double globalBandwidth, double sampleRate);
 	std::vector<float> demodulateFSK(const std::vector<float>& lowPassFilteredData, double frequency, double globalBandwidth, double sampleRate);
 	//QUdpSocket *udpSocket;  

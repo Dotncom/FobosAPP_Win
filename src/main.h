@@ -1,7 +1,7 @@
 #ifndef MAIN_H
 #define MAIN_H
 
-
+#include <Windows.h>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -45,7 +45,7 @@
 #include "MyWaterfallWidget.h"
 #include <fobos.h>
 #include <fftw3.h>
-#include <libusb.h>
+//#include <libusb.h>
 
 extern fobos_dev_t *device;
 extern float* dataq;
