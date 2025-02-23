@@ -1,16 +1,13 @@
 #include "fft.h"
 
-extern int DEFAULT_BUF_LEN;
 extern float* iqData;
 extern int globalMode;
 
 extern int fftLength;
-extern int currentScale;
 extern std::vector<float> fftMagnitudes;
 extern std::vector<float> fftFrequencies;
 extern double minFrequency;
 extern double maxFrequency;
-extern int iqDataSize;
 
 FFTResult::FFTResult(QObject *parent)
 	: QObject(parent) {

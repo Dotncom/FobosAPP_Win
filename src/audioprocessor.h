@@ -27,6 +27,7 @@
 #include <mmsystem.h>
 #include <algorithm>
 #include <condition_variable>  // Добавляем для синхронизации
+#include <string>
 
 extern double listeningFrequency;
 extern float* iqData;
@@ -37,6 +38,12 @@ extern int globalModulationType;
 extern int DEFAULT_BUF_LEN;
 extern int globalMode;
 extern double globalFrequency;
+
+struct WAVData {
+    std::vector<short> leftChannel;
+    std::vector<short> rightChannel;
+    int sampleRate;
+};
 
 class AudioProcessor : public QObject {
     Q_OBJECT
@@ -49,20 +56,25 @@ public:
     WAVEFORMATEX format;
     HWAVEOUT hWaveOut; // assuming you're working with Windows audio API
     //AudioProcessor() : hWaveOut(nullptr) {} // Initialize it correctly
+
+        bool loadWAV(const std::string& filename, int& sampleRate, int& numChannels);
+
+
 public slots:
     void startDemodulation();
     void stopDemodulation();
 private:
     void SDRThread();
     void AudioThread();
-    void playAudio(const std::vector<short> &audioData);
+    void playAudio(const std::vector<short>& leftChannel, const std::vector<short>& rightChannel);
+    void demodulateAM(const std::vector<float>& testIQ_AM, std::vector<float>& demodulatedData);
     void filterIQData(float* iqData, double centerFrequency, double globalSampleRate, double listeningFrequency, double globalBandwidth, std::vector<float>& filteredData);
     void applyLowPassFilter(const std::vector<float>& demodulatedData, std::vector<float>& lowPassFilteredData, float cutoffFreq, float sampleRate);
     void applyDeemphasisFilter(std::vector<float>& lowPassFilteredData, float sampleRate);
     void normalizeAudio(std::vector<float>& audioData);
     void resampleAudio(const std::vector<float>& input, std::vector<short>& output);
-    void demodulateAM(const std::vector<float>& filteredData, std::vector<float>& demodulatedData);
-    std::vector<float> demodulateFM(const std::vector<float>& localBuffer, float& lastPhase);
+    std::vector<short> loadWAV(const std::string& filename, int& sampleRate);
+    std::vector<float> demodulateFM(const std::vector<float>& testIQ_FM, float& lastPhase);
 	std::vector<float> demodulateSSB(const std::vector<float>& lowPassFilteredData, double frequency, double globalBandwidth, double sampleRate);
 	std::vector<float> demodulateFSK(const std::vector<float>& lowPassFilteredData, double frequency, double globalBandwidth, double sampleRate);
 	//QUdpSocket *udpSocket;  

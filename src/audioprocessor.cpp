@@ -15,7 +15,7 @@ extern int DEFAULT_BUF_LEN;
 extern double globalFrequency;
 extern float* iqData;
 extern double listeningFrequency;
-double audioSamplerate = 48000;
+double audioSamplerate = 44100;
 extern double globalBandwidth;
 extern double globalSampleRate;
 extern int globalModulationType;
@@ -33,7 +33,7 @@ std::mutex cvMutex;
 std::vector<float> filteredData;
 std::vector<float> demodulatedData;
 std::vector<float> lowPassFilteredData;
-std::vector<float> resampledData(96, 0);
+std::vector<float> resampledData(480, 0);
 std::vector<short> audioData;
 std::vector<short> audioBuffer;  // Общий буфер для аудиоданных
 std::vector<short> localBuffer;
@@ -41,9 +41,10 @@ std::vector<short> localBuffer;
 std::mutex audioMutex;           // Защита от одновременного доступа
 std::mutex audio1Mutex;
 
+
 AudioProcessor::AudioProcessor(QObject *parent) : QObject(parent), running(false), workerThread(nullptr), hWaveOut(nullptr) {
     format.wFormatTag = WAVE_FORMAT_PCM;
-    format.nChannels = 1;
+    format.nChannels = 2;
     format.nSamplesPerSec = 48000;
     format.wBitsPerSample = 16;
     format.nBlockAlign = (format.nChannels * format.wBitsPerSample) / 8;
@@ -74,7 +75,7 @@ void AudioProcessor::setAudioDevice(int deviceID) {
 
     WAVEFORMATEX waveFormat;
     waveFormat.wFormatTag = WAVE_FORMAT_PCM;
-    waveFormat.nChannels = 1;
+    waveFormat.nChannels = 2;
     waveFormat.nSamplesPerSec = 48000;
     waveFormat.wBitsPerSample = 16;
     waveFormat.nBlockAlign = (waveFormat.wBitsPerSample / 8) * waveFormat.nChannels;
@@ -100,17 +101,72 @@ void AudioProcessor::stopDemodulation() {
     running = false;
 }
 
+void AudioProcessor::demodulateAM(const std::vector<float>& testIQ_AM, std::vector<float>& demodulatedData) {
+    size_t numSamples = testIQ_AM.size() / 2; // Количество пар I/Q
+    demodulatedData.resize(numSamples);
+
+    for (size_t i = 0; i < numSamples; ++i) {
+        float I = testIQ_AM[2 * i];
+        float Q = testIQ_AM[2 * i + 1];
+        demodulatedData[i] = std::sqrt(I * I + Q * Q);
+    }
+
+}
+
+
+bool AudioProcessor::loadWAV(const std::string& filename, int& sampleRate, int& numChannels) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Ошибка: не удалось открыть файл " << filename << std::endl;
+        return false;
+    }
+
+    char riffHeader[4];
+    file.read(riffHeader, 4);
+    if (std::string(riffHeader, 4) != "RIFF") {
+        std::cerr << "Ошибка: Файл не является WAV" << std::endl;
+        return false;
+    }
+
+    file.seekg(22, std::ios::beg);
+    file.read(reinterpret_cast<char*>(&numChannels), sizeof(numChannels));
+
+    file.seekg(24, std::ios::beg);
+    file.read(reinterpret_cast<char*>(&sampleRate), sizeof(sampleRate));
+
+    file.seekg(34, std::ios::beg);
+    uint16_t bitsPerSample;
+    file.read(reinterpret_cast<char*>(&bitsPerSample), sizeof(bitsPerSample));
+    if (bitsPerSample != 16) {
+        std::cerr << "Ошибка: Только 16-битные WAV поддерживаются" << std::endl;
+        return false;
+    }
+
+    file.seekg(0, std::ios::beg);
+    char chunkId[4];
+    uint32_t chunkSize;
+    while (file.read(chunkId, 4)) {
+        file.read(reinterpret_cast<char*>(&chunkSize), sizeof(chunkSize));
+        if (std::string(chunkId, 4) == "data") {
+            break;
+        }
+        file.seekg(chunkSize, std::ios::cur);
+    }
+
+    return true;  // WAV-файл загружен успешно
+}
+
+
 void AudioProcessor::SDRThread() {
     qDebug() << "SDRThread started";
     auto nextTimePoint = std::chrono::steady_clock::now();
 
     while (running) {
-       // auto start = std::chrono::high_resolution_clock::now(); // Старт таймера
         std::vector<float> tempFilteredData;
         std::vector<float> tempDemodulatedData;
-        std::vector<short> tempAudioData(96);
+        std::vector<short> tempAudioData(480);
 
-        // 1. Извлекаем данные из IQ-буфера
+        // **1. Фильтруем IQ-данные**
         filterIQData(iqData, globalFrequency, globalSampleRate, listeningFrequency, globalBandwidth, tempFilteredData);
         if (tempFilteredData.empty()) {
             qDebug() << "[SDRThread] Warning: tempFilteredData is empty!";
@@ -118,55 +174,77 @@ void AudioProcessor::SDRThread() {
             continue;
         }
 
-        // 2. Демодуляция в зависимости от типа модуляции
+        // **2. Выбираем метод демодуляции**
         switch (globalModulationType) {
-        case 0: demodulateAM(tempFilteredData, tempDemodulatedData); break;
-        case 1: tempDemodulatedData = demodulateFM(tempFilteredData, lastPhase); break;
-        case 2: tempDemodulatedData = demodulateSSB(tempFilteredData, listeningFrequency, globalBandwidth, audioSamplerate); break;
-        case 9: tempDemodulatedData = demodulateFSK(tempFilteredData, listeningFrequency, globalBandwidth, audioSamplerate); break;
-        default: qWarning() << "Unknown modulation type."; continue;
+        case 0:  // AM
+            demodulateAM(tempFilteredData, tempDemodulatedData);
+            break;
+        case 1:  // FM
+            tempDemodulatedData = demodulateFM(tempFilteredData, lastPhase);
+            break;
+        case 2:  // SSB
+            tempDemodulatedData = demodulateSSB(tempFilteredData, listeningFrequency, globalBandwidth, audioSamplerate);
+            break;
+        case 9:  // FSK
+            tempDemodulatedData = demodulateFSK(tempFilteredData, listeningFrequency, globalBandwidth, audioSamplerate);
+            break;
+        default:
+            qWarning() << "Unknown modulation type.";
+            continue;
         }
-        // 3. Нормализация данных
+
+        // **3. Применяем нормализацию и низкочастотный фильтр**
         normalizeAudio(tempDemodulatedData);
-        // 4. Приведение к 480 сэмплам
-        resampleAudio(tempDemodulatedData, tempAudioData);
-        // 5. Запись в аудиобуфер
+        applyLowPassFilter(tempDemodulatedData, lowPassFilteredData, 3000, audioSamplerate);  // Фильтр 3 кГц
+
+        // **4. Пересэмплируем под аудиовывод**
+        resampleAudio(lowPassFilteredData, tempAudioData);
+
+        // **5. Записываем в общий буфер**
         {
             std::lock_guard<std::mutex> lock(audioMutex);
-            if (audioBuffer.size() >= 48000) {
-                audioBuffer.erase(audioBuffer.begin(), audioBuffer.begin() + 48000);
+            if (audioBuffer.size() >= 4800) {
+                audioBuffer.erase(audioBuffer.begin(), audioBuffer.begin() + 4800);
             }
             audioBuffer.insert(audioBuffer.end(), tempAudioData.begin(), tempAudioData.end());
         }
         cv.notify_one();
-        //auto end = std::chrono::high_resolution_clock::now(); // Конец таймера
-        //std::cout << "[filterIQData] Выполнено за: "
-                 // << std::chrono::duration<double, std::micro>(end - start).count()
-                  //<< " мкс" << std::endl; // Выводим в микросекундах (мкс)
-        nextTimePoint += std::chrono::milliseconds(2);
+
+        nextTimePoint += std::chrono::milliseconds(10);
         std::this_thread::sleep_until(nextTimePoint);
     }
 }
+
+
+
+
 
 
 void AudioProcessor::AudioThread() {
     qDebug() << "AudioThread started";
     auto nextTimePoint = std::chrono::steady_clock::now();
+
     while (running) {
-        std::vector<short> tempBuffer;
+        std::vector<short> leftBuffer(480);
+        std::vector<short> rightBuffer(480);
+
         {
             std::unique_lock<std::mutex> lock(audioMutex);
-            cv.wait(lock, [this] { return audioBuffer.size() >= 4800 || !running; });
+            cv.wait(lock, [this] { return audioBuffer.size() >= 960 || !running; });
             if (!running) break;
 
-            tempBuffer.assign(audioBuffer.begin(), audioBuffer.begin() + 4800);
-            audioBuffer.erase(audioBuffer.begin(), audioBuffer.begin() + 4800);
+            std::copy(audioBuffer.begin(), audioBuffer.begin() + 480, leftBuffer.begin());
+            std::copy(audioBuffer.begin(), audioBuffer.begin() + 480, rightBuffer.begin());
+            audioBuffer.erase(audioBuffer.begin(), audioBuffer.begin() + 480);
         }
-        playAudio(tempBuffer);
-        nextTimePoint += std::chrono::milliseconds(100);
+
+        playAudio(leftBuffer, rightBuffer);
+
+        nextTimePoint += std::chrono::milliseconds(10);
         std::this_thread::sleep_until(nextTimePoint);
     }
 }
+
 
 void AudioProcessor::normalizeAudio(std::vector<float>& audioData) {
     if (audioData.empty()) return;
@@ -188,10 +266,10 @@ void AudioProcessor::normalizeAudio(std::vector<float>& audioData) {
 void AudioProcessor::resampleAudio(const std::vector<float>& input, std::vector<short>& output) {
     if (input.empty()) return;
 
-    std::vector<float> resampledData(96);
-    double step = static_cast<double>(input.size()) / 96.0;
+    std::vector<float> resampledData(480);
+    double step = static_cast<double>(input.size()) / 480.0;
 
-    for (size_t i = 0; i < 96; i++) {
+    for (size_t i = 0; i < 480; i++) {
         double srcIndex = i * step;
         size_t index1 = static_cast<size_t>(srcIndex);
         size_t index2 = (index1 + 1 < input.size()) ? (index1 + 1) : (input.size() - 1);
@@ -199,34 +277,45 @@ void AudioProcessor::resampleAudio(const std::vector<float>& input, std::vector<
         resampledData[i] = sample;
     }
 
-    output.resize(96);
-    for (size_t i = 0; i < 96; i++) {
+    output.resize(480);
+    for (size_t i = 0; i < 480; i++) {
         output[i] = static_cast<short>(resampledData[i] * 32767);
     }
 }
 
 
-void AudioProcessor::playAudio(const std::vector<short>& audioData) {
+void AudioProcessor::playAudio(const std::vector<short>& leftChannel, const std::vector<short>& rightChannel) {
     if (!hWaveOut) return;
-    while (!waveHeaders.empty()) {
-        WAVEHDR& hdr = waveHeaders.front();
-        if ((hdr.dwFlags & WHDR_DONE) == 0) break;  // Если еще проигрывается, не трогаем
-        waveOutUnprepareHeader(hWaveOut, &hdr, sizeof(WAVEHDR));
-        waveHeaders.erase(waveHeaders.begin());
+    if (leftChannel.size() != rightChannel.size()) return;
+
+    std::vector<short> stereoBuffer(leftChannel.size() * 2);
+    for (size_t i = 0; i < leftChannel.size(); i++) {
+        stereoBuffer[2 * i] = leftChannel[i];
+        stereoBuffer[2 * i + 1] = rightChannel[i];
     }
+
     WAVEHDR waveHeader = {};
-    waveHeaders.push_back(waveHeader);
-    WAVEHDR &hdr = waveHeaders.back();
-    hdr.lpData = (LPSTR)audioData.data();
-    hdr.dwBufferLength = static_cast<DWORD>(audioData.size() * sizeof(short));
-    hdr.dwFlags = 0;
-    while (waveOutUnprepareHeader(hWaveOut, &hdr, sizeof(WAVEHDR)) == WAVERR_STILLPLAYING) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    waveHeader.lpData = reinterpret_cast<LPSTR>(stereoBuffer.data());
+    waveHeader.dwBufferLength = static_cast<DWORD>(stereoBuffer.size() * sizeof(short));
+    waveHeader.dwFlags = 0;
+
+    MMRESULT result = waveOutPrepareHeader(hWaveOut, &waveHeader, sizeof(WAVEHDR));
+    if (result != MMSYSERR_NOERROR) {
+        std::cerr << "Ошибка подготовки аудиобуфера" << std::endl;
+        return;
     }
-    if (waveOutPrepareHeader(hWaveOut, &hdr, sizeof(WAVEHDR)) == MMSYSERR_NOERROR) {
-        waveOutWrite(hWaveOut, &hdr, sizeof(WAVEHDR));
+
+    result = waveOutWrite(hWaveOut, &waveHeader, sizeof(WAVEHDR));
+    if (result != MMSYSERR_NOERROR) {
+        std::cerr << "Ошибка воспроизведения аудио" << std::endl;
+        return;
     }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
+
+
+
 
 void AudioProcessor::filterIQData(float* iqData, double centerFrequency, double globalSampleRate,
                                   double listeningFrequency, double globalBandwidth,
@@ -252,19 +341,6 @@ void AudioProcessor::filterIQData(float* iqData, double centerFrequency, double 
         qDebug() << "[filterIQData] Warning: No data selected! Check min/max frequency and center frequency.";
     }
 }
-
-
-void AudioProcessor::demodulateAM(const std::vector<float>& filteredData, std::vector<float>& demodulatedData) {
-    size_t numSamples = filteredData.size() / 2; // Количество пар I/Q
-    demodulatedData.resize(numSamples);         // Устанавливаем правильный размер
-
-    for (size_t i = 0; i < numSamples; ++i) {
-        float I = filteredData[2 * i];     // Реальная часть
-        float Q = filteredData[2 * i + 1]; // Мнимая часть
-        demodulatedData[i] = std::sqrt(I * I + Q * Q);
-    }
-}
-
 
 
 void AudioProcessor::applyLowPassFilter(const std::vector<float>& demodulatedData, std::vector<float>& lowPassFilteredData, float cutoffFreq, float sampleRate) {
