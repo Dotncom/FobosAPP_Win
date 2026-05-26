@@ -1,0 +1,87 @@
+# Build folders
+build/
+release/
+debug/
+x64/
+x86/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+
+# Qt
+moc_*
+ui_*.h
+qrc_*.cpp
+*.pro.user
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Binaries
+*.exe
+*.dll
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.a
+*.exp
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# Temp
+*.tmp
+*.cache
+
+# Your local/private files
+token.txt
+FobosAPP_diagnostic.log
+CMakeLists.txt.user
+CMakeSettings.json
+FobosAPP.desktop
+fobos-sdr.rules
+resources.qrc
+toolchain.cmake
+
+# Backups and drafts
+_stable_backups/
+git/
+fork winapi/
+shaders/
+fobos/
+
+# Build/output
+build/
+out/
+release/
+release.zip
+
+# Bundled binary deps / SDKs
+fftw-3.3.5-dll64/
+libusb-1.0.27/
+
+# local repos
+.codex_libfobos/
+.codex_sdrpp/
+
+# unused source
+src/udp_sender.cpp
+src/udp_sender.h
+src/ringbuffer.cpp
+src/ringbuffer.h
+
+# unused folders
+fobos/
+shaders/
+
