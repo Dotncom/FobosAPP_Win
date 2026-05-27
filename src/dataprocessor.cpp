@@ -263,6 +263,7 @@ void DataProcessor::startProcessing(fobos_dev_t *device,
 }
 
 void DataProcessor::run() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] run enter";
     }

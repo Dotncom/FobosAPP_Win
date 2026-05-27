@@ -1630,16 +1630,16 @@ void YourClassName::updateUiForRunState() {
     if (comboBox) comboBox->setEnabled(idle);
     if (refreshButton) refreshButton->setEnabled(idle);
     if (fobosButton) fobosButton->setEnabled(idle);
-    if (modeBox) modeBox->setEnabled(idle);
-    if (sampleBox) sampleBox->setEnabled(idle);
+    if (modeBox) modeBox->setEnabled(true);
+    if (sampleBox) sampleBox->setEnabled(true);
     if (clkBox) clkBox->setEnabled(idle);
     if (fftComboBox) fftComboBox->setEnabled(idle);
     if (audioDeviceComboBox) audioDeviceComboBox->setEnabled(idle);
     if (audioCheckbox) audioCheckbox->setEnabled(idle);
     if (syncCheckbox) syncCheckbox->setEnabled(false);
     if (bandwidthLineEdit) bandwidthLineEdit->setEnabled(idle);
-    if (lnaGainSlider) lnaGainSlider->setEnabled(idle);
-    if (vgaGainSlider) vgaGainSlider->setEnabled(idle);
+    if (lnaGainSlider) lnaGainSlider->setEnabled(true);
+    if (vgaGainSlider) vgaGainSlider->setEnabled(true);
     for (int i = 0; i < 8; ++i) {
         if (checkBoxes[i]) {
             checkBoxes[i]->setEnabled(idle);
@@ -2814,7 +2814,16 @@ void YourClassName::onCheckboxStateChanged(int state) {
 void YourClassName::onLnaGainChanged(int value) {
     pendingSettings.lnaGain = value;
     lnaGainLabel->setText(QString("LNA Gain: %1").arg(value));
-    qDebug() << "LNA gain will be applied on the next start.";
+
+    if (device && !isIdle() && hardwareSettingsApplied) {
+        const int result = setFobosLnaGainSafely(device, static_cast<unsigned int>(value));
+        qDebug() << "[Live] LNA gain apply result" << result;
+
+        if (result == FOBOS_ERR_OK) {
+            appliedHardwareSettings.lnaGain = value;
+        }
+    }
+
     if (isNetworkClientMode()) {
         sendRemoteControlCommand("settings");
     }
@@ -2823,7 +2832,16 @@ void YourClassName::onLnaGainChanged(int value) {
 void YourClassName::onVgaGainChanged(int value) {
     pendingSettings.vgaGain = value;
     vgaGainLabel->setText(QString("VGA Gain: %1").arg(value));
-    qDebug() << "VGA gain will be applied on the next start.";
+
+    if (device && !isIdle() && hardwareSettingsApplied) {
+        const int result = setFobosVgaGainSafely(device, static_cast<unsigned int>(value));
+        qDebug() << "[Live] VGA gain apply result" << result;
+
+        if (result == FOBOS_ERR_OK) {
+            appliedHardwareSettings.vgaGain = value;
+        }
+    }
+
     if (isNetworkClientMode()) {
         sendRemoteControlCommand("settings");
     }

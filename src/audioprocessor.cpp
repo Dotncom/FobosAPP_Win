@@ -629,6 +629,7 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
 }
 
 void AudioProcessor::SDRThread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "SDRThread started (Real IQ processing)";
     }
@@ -716,6 +717,7 @@ void CALLBACK AudioProcessor::WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR
 
 
 void AudioProcessor::startAudioOutput() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     while (running.load()) {
         std::unique_lock<std::mutex> lock(audioMutex);
         cv.wait(lock, [this] {
@@ -737,6 +739,7 @@ void AudioProcessor::startAudioOutput() {
 
             if (queuedAudioSamples() < static_cast<size_t>(BUFFER_SIZE)) continue;
 
+            QByteArray pcmFrame;
             const size_t samplesToCopy = (std::min)(queuedAudioSamples(), static_cast<size_t>(BUFFER_SIZE));
             if (samplesToCopy > 0) {
                 std::copy(audioBuffer.begin() + static_cast<std::ptrdiff_t>(audioBufferReadOffset),
@@ -749,17 +752,21 @@ void AudioProcessor::startAudioOutput() {
                 std::fill(waveBuffers[i].begin() + samplesToCopy, waveBuffers[i].end(), 0);
             }
 
-            const QByteArray pcmFrame(reinterpret_cast<const char *>(waveBuffers[i].data()),
-                                      static_cast<int>(waveBuffers[i].size() * sizeof(short)));
-            emit audioFrameReady(pcmFrame);
+            pcmFrame = QByteArray(reinterpret_cast<const char *>(waveBuffers[i].data()),
+                                  static_cast<int>(waveBuffers[i].size() * sizeof(short)));
 
             // Заполняем буфер
             bufferReady[i] = false;
+            lock.unlock();
+
+            emit audioFrameReady(pcmFrame);
+
             MMRESULT result = MMSYSERR_NOERROR;
             {
                 std::lock_guard<std::mutex> waveLock(waveOutMutex);
                 if (!hWaveOut || audioDeviceClosing.load()) {
                     bufferReady[i] = true;
+                    lock.lock();
                     continue;
                 }
                 result = waveOutWrite(hWaveOut, &waveHdrs[i], sizeof(WAVEHDR));
@@ -767,6 +774,7 @@ void AudioProcessor::startAudioOutput() {
             if (result != MMSYSERR_NOERROR) {
                 qDebug() << "waveOutWrite failed!";
             }
+            lock.lock();
 
         }
     }

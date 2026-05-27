@@ -6,8 +6,8 @@
 
 namespace {
 
-constexpr std::size_t MAX_QUEUED_BLOCKS = 96;
-constexpr std::size_t MAX_QUEUED_FLOATS = 4 * 1024 * 1024;
+constexpr std::size_t MAX_QUEUED_BLOCKS = 256;
+constexpr std::size_t MAX_QUEUED_FLOATS = 16 * 1024 * 1024;
 constexpr std::size_t MAX_SNAPSHOT_FLOATS = 524288 * 2;
 
 std::mutex g_iqMutex;
