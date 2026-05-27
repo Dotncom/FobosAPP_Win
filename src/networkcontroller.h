@@ -7,6 +7,10 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QElapsedTimer>
+#include <QHash>
+#include <QSet>
+#include <QVector>
 
 enum class NetworkMode {
     Disabled,
@@ -31,11 +35,18 @@ public:
     QString statusText() const;
     bool isControlReady() const;
     qint64 pendingBytes() const;
+    bool clientHasControl() const;
+    QString controllerPeerId() const;
 
     void stop();
     void startServer(const QString &bindAddress, quint16 port);
     void testClientConnection(const QString &serverAddress, quint16 port);
     bool sendControlCommand(const QJsonObject &command);
+    bool sendControlCommandToPeer(const QString &peerId, const QJsonObject &command);
+    bool sendControlCommandToController(const QJsonObject &command);
+    bool setControllerPeer(const QString &peerId);
+    bool blockPriorityRequestsFromPeer(const QString &peerId);
+    bool isPriorityRequestBlocked(const QString &peerId) const;
 
 signals:
     void statusChanged(const QString &status);
@@ -46,20 +57,45 @@ signals:
 private:
     void setStatus(const QString &status);
     void closeClientSocket();
-    void closePeerSocket();
+    void closePeerSocket(QTcpSocket *socket = nullptr);
     void sendHello();
+    void startHeartbeat();
+    void stopHeartbeat();
+    void sendProtocolLine(QTcpSocket *socket, const QByteArray &line);
+    QTcpSocket *activeSocket() const;
+    bool sendJsonToSocket(QTcpSocket *socket, const QJsonObject &command);
+    QTcpSocket *peerForId(const QString &peerId) const;
+    QString peerId(QTcpSocket *socket) const;
+    QString peerLabel(QTcpSocket *socket) const;
+    QString peerPriorityKey(QTcpSocket *socket) const;
+    bool isReadyPeer(QTcpSocket *socket) const;
+    void promoteControllerIfNeeded();
+    void sendRoleUpdate(QTcpSocket *socket);
+    void broadcastRoleUpdates();
+    void handleConnectionLost(const QString &message);
     void processSocketData(QTcpSocket *socket, QByteArray &buffer);
     void processLine(QTcpSocket *socket, const QByteArray &line);
 
     QTcpServer *server = nullptr;
     QTcpSocket *clientSocket = nullptr;
     QTcpSocket *peerSocket = nullptr;
+    QVector<QTcpSocket*> peerSockets;
+    QSet<QTcpSocket*> readyPeerSockets;
+    QHash<QTcpSocket*, QByteArray> peerReadBuffers;
+    QHash<QTcpSocket*, QString> peerIds;
+    QHash<QTcpSocket*, QString> peerLabels;
+    QHash<QTcpSocket*, QString> peerPriorityKeys;
+    QSet<QString> blockedPriorityRequesterKeys;
     QTimer *handshakeTimer = nullptr;
+    QTimer *heartbeatTimer = nullptr;
+    QElapsedTimer lastMessageTimer;
+    QHash<QTcpSocket*, QElapsedTimer> peerLastMessageTimers;
     QByteArray clientReadBuffer;
-    QByteArray peerReadBuffer;
     NetworkMode currentMode = NetworkMode::Disabled;
     QString currentStatus = "Network disabled";
     bool controlReady = false;
+    bool localClientHasControl = true;
+    quint64 nextPeerId = 1;
 };
 
 #endif // NETWORKCONTROLLER_H

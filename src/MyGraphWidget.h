@@ -8,6 +8,8 @@
 #include <vector>
 #include <QWheelEvent>
 #include <QPainter>
+#include <QMouseEvent>
+#include <QPoint>
 
 class MyGraphWidget : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
@@ -22,16 +24,19 @@ public:
 
 signals:
     void scaleChanged(int direction);
+    void tuneContextRequested(double frequency, const QPoint &globalPos);
 
 protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
     void wheelEvent(QWheelEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
 
 private:
     void drawYAxis(QPainter &painter) const;
     float normalizedLevel(float value) const;
+    double frequencyAtX(int x) const;
 
     double xMin, xMax, yMin, yMax;
     int fftLength;

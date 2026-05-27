@@ -12,6 +12,8 @@
 #include <QMutex>
 #include <QWheelEvent>
 #include <QPainter>
+#include <QMouseEvent>
+#include <QPoint>
 #include <cmath>
 
 class MyWaterfallWidget : public QOpenGLWidget, protected QOpenGLFunctions {
@@ -26,14 +28,17 @@ public:
     void computeLineData();
 signals:
     void scaleChanged(int delta);
+    void tuneContextRequested(double frequency, const QPoint &globalPos);
 protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
 	void wheelEvent(QWheelEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
 private:
     void ensureLineBuffer();
     void resetWaterfallTexture(int w, int h);
+    double frequencyAtX(int x) const;
     QMutex mutex;
 	QOpenGLBuffer waterfallVbo;
     GLuint waterfallTexture;
@@ -52,6 +57,7 @@ private:
     bool secondGraph;
     bool changebit;
     bool pendingTextureLine = false;
+    bool textureClearRequested = false;
 };
 
 #endif // MYWATERFALLWIDGET_H

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 bool changebit=false;
 
@@ -25,6 +26,23 @@ MyWaterfallWidget::~MyWaterfallWidget() {
 void MyWaterfallWidget::wheelEvent(QWheelEvent *event) {
     emit scaleChanged(event->angleDelta().y() > 0 ? 1 : -1);
     event->accept();
+}
+
+void MyWaterfallWidget::mousePressEvent(QMouseEvent *event) {
+    if (event->button() == Qt::RightButton) {
+        emit tuneContextRequested(frequencyAtX(event->x()), event->globalPos());
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::mousePressEvent(event);
+}
+
+double MyWaterfallWidget::frequencyAtX(int x) const {
+    if (width() <= 0 || qFuzzyCompare(xMin, xMax)) {
+        return xMin;
+    }
+    const double normalized = std::clamp(static_cast<double>(x) / (std::max)(1, width()), 0.0, 1.0);
+    return xMin + normalized * (xMax - xMin);
 }
 
 void MyWaterfallWidget::ensureLineBuffer() {
@@ -126,7 +144,8 @@ void MyWaterfallWidget::clearData() {
         yData.clear();
         fftLength = 0;
         std::fill(lineData.begin(), lineData.end(), 0);
-        pendingTextureLine = true;
+        pendingTextureLine = false;
+        textureClearRequested = true;
     }
     update();
 }
@@ -144,7 +163,8 @@ void MyWaterfallWidget::computeLineData() {
 	float sensitivityFactor = sensitivity/10;
     const int lineWidth = std::max(1, width());
     const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
-    std::vector<float> pixelMax(static_cast<size_t>(lineWidth), levelMin);
+    std::vector<float> pixelMax(static_cast<size_t>(lineWidth),
+                                std::numeric_limits<float>::quiet_NaN());
     for (int id = 0; id < dataCount; ++id) {
         if (!std::isfinite(xData[id])) {
             continue;
@@ -156,7 +176,40 @@ void MyWaterfallWidget::computeLineData() {
         const int shiftedIndex = (id + dataCount / 2) % dataCount;
         const float value = yData[shiftedIndex];
         if (std::isfinite(value)) {
-            pixelMax[static_cast<size_t>(x1)] = (std::max)(pixelMax[static_cast<size_t>(x1)], value);
+            float &pixelValue = pixelMax[static_cast<size_t>(x1)];
+            pixelValue = std::isfinite(pixelValue) ? (std::max)(pixelValue, value) : value;
+        }
+    }
+
+    int previousFilled = -1;
+    float previousValue = levelMin;
+    for (int x = 0; x < lineWidth; ++x) {
+        const float value = pixelMax[static_cast<size_t>(x)];
+        if (!std::isfinite(value)) {
+            continue;
+        }
+
+        if (previousFilled < 0) {
+            for (int fill = 0; fill < x; ++fill) {
+                pixelMax[static_cast<size_t>(fill)] = value;
+            }
+        } else if (x - previousFilled > 1) {
+            const int gap = x - previousFilled;
+            for (int fill = previousFilled + 1; fill < x; ++fill) {
+                const float t = static_cast<float>(fill - previousFilled) / static_cast<float>(gap);
+                pixelMax[static_cast<size_t>(fill)] = previousValue + (value - previousValue) * t;
+            }
+        }
+
+        previousFilled = x;
+        previousValue = value;
+    }
+
+    if (previousFilled < 0) {
+        std::fill(pixelMax.begin(), pixelMax.end(), levelMin);
+    } else {
+        for (int fill = previousFilled + 1; fill < lineWidth; ++fill) {
+            pixelMax[static_cast<size_t>(fill)] = previousValue;
         }
     }
 
@@ -175,6 +228,14 @@ void MyWaterfallWidget::paintGL() {
     QMutexLocker locker(&mutex);
     if (width() <= 0 || height() <= 0) {
         return;
+    }
+
+    if (textureClearRequested) {
+        ensureLineBuffer();
+        std::fill(lineData.begin(), lineData.end(), 0);
+        resetWaterfallTexture(width(), height());
+        pendingTextureLine = false;
+        textureClearRequested = false;
     }
 
 	if (secondGraph == true) {

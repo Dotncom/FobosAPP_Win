@@ -74,6 +74,9 @@ libusb-1.0.27/
 # local repos
 .codex_libfobos/
 .codex_sdrpp/
+.codex_upstream/
+fobos_agile/
+old/
 
 # unused source
 src/udp_sender.cpp

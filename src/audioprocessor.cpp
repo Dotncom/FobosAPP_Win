@@ -41,12 +41,12 @@ double channelCutoffForMode(int modulationType, double bandwidth) {
         return (std::min)(140000.0, (std::max)(80000.0, bandwidth * 0.55));
     case MOD_NFM:
         return (std::min)(25000.0, (std::max)(6000.0, bandwidth * 0.55));
-    case MOD_RTTY:
     case MOD_FSK:
         return (std::min)(12000.0, (std::max)(2500.0, bandwidth * 0.55));
     case MOD_USB:
     case MOD_LSB:
     case MOD_FT8:
+    case MOD_RTTY:
     case MOD_PSK:
         return (std::min)(SSB_MAX_AUDIO_HZ, (std::max)(700.0, bandwidth * 0.95));
     case MOD_CW:
@@ -66,12 +66,12 @@ double demodAudioCutoffForMode(int modulationType, double bandwidth) {
         return 15000.0;
     case MOD_NFM:
         return 3500.0;
-    case MOD_RTTY:
     case MOD_FSK:
         return 5000.0;
     case MOD_USB:
     case MOD_LSB:
     case MOD_FT8:
+    case MOD_RTTY:
     case MOD_PSK:
         return (std::min)(SSB_MAX_AUDIO_HZ, (std::max)(700.0, bandwidth * 0.95));
     case MOD_CW:
@@ -89,7 +89,7 @@ double targetChannelRate(int modulationType, double bandwidth) {
     if (modulationType == MOD_WFM) {
         return clampDouble((std::max)(384000.0, bandwidth * 3.0), 384000.0, FM_MAX_CHANNEL_RATE);
     }
-    if (modulationType == MOD_NFM || modulationType == MOD_RTTY || modulationType == MOD_FSK) {
+    if (modulationType == MOD_NFM || modulationType == MOD_FSK) {
         return clampDouble((std::max)(FM_MIN_CHANNEL_RATE, bandwidth * 4.0),
                            FM_MIN_CHANNEL_RATE,
                            384000.0);
@@ -528,7 +528,6 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         switch (modulationType) {
         case MOD_NFM:
         case MOD_WFM:
-        case MOD_RTTY:
         case MOD_FSK: {
             float limitedI = lowPassI;
             float limitedQ = lowPassQ;
@@ -546,12 +545,17 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
             fmPrevI = limitedI;
             fmPrevQ = limitedQ;
             fmPreviousValid = true;
-            fmDeemphasisState += fmDeemphasisAlpha * (demodulatedSample - fmDeemphasisState);
-            demodulatedSample = fmDeemphasisState * (modulationType == MOD_WFM ? 2.5f : 8.0f);
+            if (modulationType == MOD_FSK) {
+                demodulatedSample *= 10.0f;
+            } else {
+                fmDeemphasisState += fmDeemphasisAlpha * (demodulatedSample - fmDeemphasisState);
+                demodulatedSample = fmDeemphasisState * (modulationType == MOD_WFM ? 2.5f : 8.0f);
+            }
             break;
         }
         case MOD_USB:
         case MOD_FT8:
+        case MOD_RTTY:
         case MOD_PSK:
         case MOD_LSB: {
             const float oscI = static_cast<float>(std::cos(sidebandPhase));

@@ -10,6 +10,11 @@ enum class RadioRunState {
     Stopping
 };
 
+enum class FobosApiKind {
+    Standard = 0,
+    Agile = 1
+};
+
 enum ModulationMode {
     MOD_AM = 0,
     MOD_NFM = 1,
@@ -28,6 +33,7 @@ enum ModulationMode {
 inline bool isUpperSidebandMode(int modulationType) {
     return modulationType == MOD_USB ||
            modulationType == MOD_FT8 ||
+           modulationType == MOD_RTTY ||
            modulationType == MOD_PSK;
 }
 
@@ -38,7 +44,6 @@ inline bool isLowerSidebandMode(int modulationType) {
 inline bool isFrequencyDiscriminatorMode(int modulationType) {
     return modulationType == MOD_NFM ||
            modulationType == MOD_WFM ||
-           modulationType == MOD_RTTY ||
            modulationType == MOD_FSK;
 }
 

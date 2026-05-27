@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP)
+project(FobosAPP VERSION 2.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(Qt5_DIR "C:/Qt/5.15.2/msvc2019_64/")
@@ -9,11 +9,12 @@ set(Qt5_DIR "C:/Qt/5.15.2/msvc2019_64/lib")
 
 include_directories(${CMAKE_SOURCE_DIR}/fobos/x64)
 include_directories(${CMAKE_SOURCE_DIR}/fobos)
+include_directories(${CMAKE_SOURCE_DIR}/fobos_agile)
 include_directories(${CMAKE_SOURCE_DIR}/fftw-3.3.5-dll64)
 include_directories(${CMAKE_SOURCE_DIR}/src)
 #include_directories(${CMAKE_SOURCE_DIR}/libusb-1.0.27/libusb-1.0.27/libusb/)
 
-find_package(Qt5 REQUIRED COMPONENTS Core Widgets OpenGL Multimedia Network)
+find_package(Qt5 REQUIRED COMPONENTS Core Widgets Network)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -30,6 +31,8 @@ set(SOURCES
     src/dataprocessor.cpp
     src/dataprocessor.h
     src/diagnosticlogging.h
+    src/frequencycontrol.cpp
+    src/frequencycontrol.h
     src/iqbuffer.cpp
     src/iqbuffer.h
     src/networkcontroller.cpp
@@ -53,4 +56,9 @@ set(SOURCES
 add_executable(FobosAPP ${SOURCES})
 
 # Подключение библиотек Qt
-target_link_libraries(FobosAPP PRIVATE fobos libfftw3f-3 Qt5::Core Qt5::Widgets Qt5::OpenGL Qt5::Multimedia Qt5::Network winmm opengl32.lib)
+target_link_directories(FobosAPP PRIVATE
+    ${CMAKE_SOURCE_DIR}/fobos
+    ${CMAKE_SOURCE_DIR}/fobos_agile
+    ${CMAKE_BINARY_DIR}
+)
+target_link_libraries(FobosAPP PRIVATE fobos fobos_sdr libfftw3f-3 Qt5::Core Qt5::Widgets Qt5::Network winmm opengl32.lib)

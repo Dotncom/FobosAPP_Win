@@ -31,7 +31,8 @@ public:
     //void runit();
     void run() override;
     //void stopit();
-    void startProcessing(fobos_dev_t *device,
+    void startProcessing(void *device,
+                         FobosApiKind apiKind,
                          bool syncEnabled,
                          double sampleRate,
                          bool queueAudioBlocks,
@@ -42,6 +43,7 @@ public:
     bool stop(int timeoutMs = 5000);
     uint64_t callbackCount() const;
     void updateNetworkIqSettings(const RadioSettings &settings, bool channelizeFrames);
+    void configureNetworkIqStreaming(const RadioSettings &settings, bool emitFrames, bool channelizeFrames);
 signals:
     void iqFrameReady(const QByteArray &iqData, double sampleRate, int sampleCount);
 
@@ -62,7 +64,8 @@ private:
     std::atomic<bool> requestedChannelizeIqFrames;
     std::atomic<bool> networkIqResetRequested;
     std::atomic<double> requestedSampleRate;
-    std::atomic<fobos_dev_t*> activeDevice;
+    std::atomic<void*> activeDevice;
+    std::atomic<FobosApiKind> activeApiKind;
     std::mutex networkIqSettingsMutex;
     RadioSettings networkIqSettings;
     double networkIqNcoPhase = 0.0;

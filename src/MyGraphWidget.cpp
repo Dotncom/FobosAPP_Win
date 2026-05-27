@@ -112,6 +112,25 @@ void MyGraphWidget::wheelEvent(QWheelEvent *event) {
     event->accept();
 }
 
+void MyGraphWidget::mousePressEvent(QMouseEvent *event) {
+    if (event->button() == Qt::RightButton) {
+        emit tuneContextRequested(frequencyAtX(event->x()), event->globalPos());
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::mousePressEvent(event);
+}
+
+double MyGraphWidget::frequencyAtX(int x) const {
+    if (width() <= 0 || qFuzzyCompare(xMin, xMax)) {
+        return xMin;
+    }
+    const double plotLeft = GRAPH_LEFT_MARGIN;
+    const double plotWidth = (std::max)(1, width() - GRAPH_LEFT_MARGIN - GRAPH_RIGHT_MARGIN);
+    const double normalized = std::clamp((static_cast<double>(x) - plotLeft) / plotWidth, 0.0, 1.0);
+    return xMin + normalized * (xMax - xMin);
+}
+
 QColor MyGraphWidget::valueToColor(float value) {
     if (!std::isfinite(value)) {
         value = 0.0f;

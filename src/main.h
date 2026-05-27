@@ -16,6 +16,7 @@
 #include <QScrollArea>
 #include <QCheckBox>
 #include <QMainWindow>
+#include <QDockWidget>
 //#include <QAudioOutput>
 //#include <QAudioDeviceInfo>
 //#include <QAudio>
@@ -46,6 +47,7 @@
 #include "networkcontroller.h"
 #include "remoteaudioplayer.h"
 #include "radiosettings.h"
+#include "frequencycontrol.h"
 #include "scalewidget.h"
 #include "MyGraphWidget.h"
 #include "MyWaterfallWidget.h"
@@ -131,8 +133,22 @@ protected:
 		//};
 
 private:
+    struct FobosDeviceInfo {
+        FobosApiKind apiKind = FobosApiKind::Standard;
+        int nativeIndex = 0;
+        QString label;
+        QString serial;
+        QString hardwareRevision;
+        QString firmwareVersion;
+        QString product;
+        QString manufacturer;
+    };
+
     QWidget *centralWidget;
     QStringList getFobosDevices();
+    void refreshFobosDeviceList();
+    QString formatFobosDeviceLabel(const FobosDeviceInfo &info) const;
+    FobosDeviceInfo selectedFobosDeviceInfo() const;
     bool restartStreamForHardwareChange();
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
@@ -151,14 +167,19 @@ private:
     bool isClientIqProcessingMode() const;
     bool isChannelIqProcessingMode() const;
     bool isFullIqProcessingMode() const;
+    bool isClientIqProcessingMode(NetworkProcessingMode mode) const;
     void appendNetworkState(QJsonObject &command) const;
     void applyNetworkStateFromCommand(const QJsonObject &command);
-    bool sendRemoteControlCommand(const QString &action);
+    bool sendRemoteControlCommand(const QString &action, const QJsonObject &extra = QJsonObject());
     QJsonObject settingsToJson() const;
     void applySettingsFromJson(const QJsonObject &settingsJson);
     void updateUiFromPendingSettings();
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
     void connectDataProcessorSignals();
+    void applyServerLocalOutputPolicy();
+    void resetNetworkIqReceptionState(bool clearGraph, bool clearWaterfall, bool restartAudioPrebuffer);
+    void loadPersistentSettings();
+    void savePersistentSettings();
     void startNetworkClientProcessing();
     void stopNetworkClientProcessing();
     void sendNetworkSpectrumFrame(const std::vector<float> &frequencies, const std::vector<float> &magnitudes);
@@ -167,67 +188,75 @@ private:
     void playNetworkAudioFrame(const QJsonObject &frame);
     void sendNetworkIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     void receiveNetworkIqFrame(const QJsonObject &frame);
+    void showTuneContextMenu(double frequency, const QPoint &globalPos);
+    void tuneSignalCenterAt(double frequency);
+    void tuneSidebandEdgeAt(double frequency, int modulationType);
+    void centerReceiverAt(double frequency);
+    bool applyFftLengthChange(int newFftLength, bool notifyRemote);
     
-    QComboBox *clkBox;
-    QComboBox *comboBox;
-    QComboBox *modeBox;
-    QComboBox *sampleBox;
-    QComboBox *fftComboBox;
-    QComboBox *audioDeviceComboBox;
-    QButtonGroup *modulationButtonGroup;
+    QComboBox *clkBox = nullptr;
+    QComboBox *comboBox = nullptr;
+    QComboBox *modeBox = nullptr;
+    QComboBox *sampleBox = nullptr;
+    QComboBox *fftComboBox = nullptr;
+    QComboBox *audioDeviceComboBox = nullptr;
+    QButtonGroup *modulationButtonGroup = nullptr;
     
-    QPushButton *refreshButton;
-    QPushButton *fobosButton;
-    QPushButton *networkButton;
-    QPushButton *startButton;
-    QPushButton *stopButton;
+    QPushButton *refreshButton = nullptr;
+    QPushButton *fobosButton = nullptr;
+    QPushButton *networkButton = nullptr;
+    QPushButton *startButton = nullptr;
+    QPushButton *stopButton = nullptr;
     
-    QCheckBox *spectrumCheckbox;
-    QCheckBox *audioCheckbox;
-    QCheckBox *syncCheckbox;
-    QCheckBox *graphCheckbox;
-    QCheckBox *colorCheckbox;
-    QCheckBox *checkBoxes[8]; 
+    QCheckBox *spectrumCheckbox = nullptr;
+    QCheckBox *audioCheckbox = nullptr;
+    QCheckBox *syncCheckbox = nullptr;
+    QCheckBox *graphCheckbox = nullptr;
+    QCheckBox *colorCheckbox = nullptr;
+    QCheckBox *checkBoxes[8] = {};
     
-    QSlider *scaleSlider;
-    QSlider *lnaGainSlider;
-    QSlider *vgaGainSlider;
-    QSlider *contrastSlider;
-    QSlider *sensitivitySlider;
-    QSlider *levelMinSlider;
-    QSlider *levelMaxSlider;
-    QSlider *volumeSlider;
+    QSlider *scaleSlider = nullptr;
+    QSlider *lnaGainSlider = nullptr;
+    QSlider *vgaGainSlider = nullptr;
+    QSlider *contrastSlider = nullptr;
+    QSlider *sensitivitySlider = nullptr;
+    QSlider *levelMinSlider = nullptr;
+    QSlider *levelMaxSlider = nullptr;
+    QSlider *volumeSlider = nullptr;
 
-    QLabel *volumeLabel;
-    QLabel *lnaGainLabel;
-    QLabel *centralFrequencyLabel;
-    QLabel *listeningFrequencyLabel;
-    QLabel *fftLabel;
-    QLabel *contrastLabel;
-    QLabel *sensitivityLabel;
-    QLabel *levelMinLabel;
-    QLabel *levelMaxLabel;
-    QLabel *vgaGainLabel;
-    QLabel *scaleLabel;
+    QLabel *volumeLabel = nullptr;
+    QLabel *lnaGainLabel = nullptr;
+    QLabel *centralFrequencyLabel = nullptr;
+    QLabel *listeningFrequencyLabel = nullptr;
+    QLabel *fftLabel = nullptr;
+    QLabel *contrastLabel = nullptr;
+    QLabel *sensitivityLabel = nullptr;
+    QLabel *levelMinLabel = nullptr;
+    QLabel *levelMaxLabel = nullptr;
+    QLabel *vgaGainLabel = nullptr;
+    QLabel *scaleLabel = nullptr;
        
-    QLineEdit *frequencyLineEdit;
-    QLineEdit *listeningFrequencyLineEdit;
-    QLineEdit *bandwidthLineEdit;
+    FrequencyControl *frequencyControl = nullptr;
+    FrequencyControl *listeningFrequencyControl = nullptr;
+    FrequencyControl *bandwidthControl = nullptr;
     
-    QTimer *updateTimer;
-    QTimer *stopPollTimer;
-    QTimer *streamWatchdogTimer;
+    QTimer *updateTimer = nullptr;
+    QTimer *stopPollTimer = nullptr;
+    QTimer *streamWatchdogTimer = nullptr;
 
-    DataProcessor *processor;
-    AudioProcessor *audioProcessor;
-    NetworkController *networkController;
-    RemoteAudioPlayer *remoteAudioPlayer;
-    MyGraphWidget *graphWidget;
-    MyWaterfallWidget *waterfallWidget;
-    ScaleWidget *scaleWidget;
+    DataProcessor *processor = nullptr;
+    AudioProcessor *audioProcessor = nullptr;
+    NetworkController *networkController = nullptr;
+    RemoteAudioPlayer *remoteAudioPlayer = nullptr;
+    MyGraphWidget *graphWidget = nullptr;
+    MyWaterfallWidget *waterfallWidget = nullptr;
+    ScaleWidget *scaleWidget = nullptr;
+    QDockWidget *controlsDock = nullptr;
     
     bool deviceOpened;
     int openedDeviceIndex = -1;
+    FobosApiKind openedDeviceApiKind = FobosApiKind::Standard;
+    int openedNativeDeviceIndex = -1;
     double appliedSampleRate = 0.0;
     QElapsedTimer stopElapsedTimer;
     QElapsedTimer streamStartElapsedTimer;
@@ -240,6 +269,20 @@ private:
     bool pendingNetworkAudioStartAfterIqPrebuffer = false;
     bool sampleRateReopenRequired = false;
     bool fobosCloseKnownUnsafe = false;
+    bool networkClientIqProcessingActive = false;
+    bool networkClientReconnectPending = false;
+    NetworkProcessingMode activeNetworkClientProcessingMode = NetworkProcessingMode::ServerSide;
+    bool networkIqStreamMetadataValid = false;
+    bool networkIqStreamWasChannelized = false;
+    double networkIqStreamSampleRate = 0.0;
+    double networkIqStreamCenterFrequency = 0.0;
+    double networkIqStreamListeningFrequency = 0.0;
+    int networkIqStreamInputMode = 0;
+    bool networkSpectrumFrameMetadataValid = false;
+    double networkSpectrumFrameMinFrequency = 0.0;
+    double networkSpectrumFrameMaxFrequency = 0.0;
+    int networkSpectrumFrameFftLength = 0;
+    QVector<FobosDeviceInfo> availableFobosDevices;
     RadioSettings pendingSettings;
     RadioSettings appliedHardwareSettings;
     bool hardwareSettingsApplied = false;
@@ -251,6 +294,7 @@ private:
     QString networkBindAddress = "0.0.0.0";
     quint16 networkControlPort = 21090;
     bool serverDisableLocalVisualAudio = true;
+    int volumePercent = 100;
     QElapsedTimer networkSpectrumFrameTimer;
     uint64_t networkSpectrumFrameSequence = 0;
     uint64_t networkIqFrameSequence = 0;

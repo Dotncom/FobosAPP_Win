@@ -1,0 +1,70 @@
+FobosAPP third-party components
+Version: 2.0.0
+
+This file lists third-party runtime and build components used by FobosAPP.
+The release package contains redistributable binaries from several upstream
+projects/vendors. Their licenses remain owned by their respective authors.
+
+1. Qt 5.15.2 runtime libraries
+   Files used in the Windows package:
+   - Qt5Core.dll
+   - Qt5Gui.dll
+   - Qt5Widgets.dll
+   - Qt5Network.dll
+   - platforms/qwindows.dll
+
+   Upstream: https://www.qt.io/
+   License: Qt Open Source licensing terms or commercial Qt license, depending
+   on how Qt is obtained and used. For open-source Qt 5.15 builds, consult the
+   Qt LGPL/GPL license files distributed with your Qt installation.
+
+2. FFTW 3.3.5 single-precision runtime
+   File used in the Windows package:
+   - libfftw3f-3.dll
+
+   Upstream: https://www.fftw.org/
+   Copyright: Matteo Frigo and Massachusetts Institute of Technology
+   License: GNU General Public License version 2 or later, or a separate
+   commercial FFTW license.
+   Local license texts:
+   - licenses/FFTW-COPYING.txt
+   - licenses/FFTW-COPYRIGHT.txt
+
+3. libusb 1.0.27 runtime
+   File used in the Windows package:
+   - libusb-1.0.dll
+
+   Upstream: https://github.com/libusb/libusb
+   License: GNU Lesser General Public License version 2.1 or later.
+   Local license text:
+   - licenses/libusb-COPYING.txt
+
+4. RigExpert Fobos SDR standard API library
+   Files used for build/runtime:
+   - fobos.h
+   - fobos.dll
+   - fobos.lib
+
+   Upstream/vendor: RigExpert / Fobos SDR SDK
+   License: vendor SDK terms. No explicit open-source license was found in the
+   local bundled header or readme at the time this file was written.
+
+5. RigExpert Fobos SDR agile API library
+   Files used for build/runtime:
+   - fobos_sdr.h
+   - fobos_sdr.dll
+   - fobos_sdr.lib
+
+   Upstream/vendor: RigExpert / Fobos SDR agile SDK
+   License: vendor SDK terms. No explicit open-source license was found in the
+   local bundled header at the time this file was written.
+
+6. Microsoft Visual C++ runtime
+   Files used in the Windows package:
+   - MSVCP140.dll
+   - MSVCP140_1.dll
+   - VCRUNTIME140.dll
+   - VCRUNTIME140_1.dll
+
+   Upstream/vendor: Microsoft
+   License: Microsoft Visual C++ Redistributable license terms.
