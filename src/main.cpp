@@ -516,7 +516,12 @@ YourClassName::YourClassName(QWidget *parent)
     vgaGainSlider = new QSlider(Qt::Horizontal, this);
     vgaGainSlider->setRange(0, 15);
     vgaGainSlider->setValue(3);
-    
+
+    volumeSlider = new QSlider(Qt::Horizontal, this);
+    volumeSlider->setRange(0, 200);
+    volumeSlider->setValue(100);
+
+    volumeLabel = new QLabel("Volume: 100%", this);
     lnaGainLabel = new QLabel("LNA Gain: 1", this);
     vgaGainLabel = new QLabel("VGA Gain: 3", this);
     
@@ -684,6 +689,8 @@ YourClassName::YourClassName(QWidget *parent)
     layout->addWidget(lnaGainSlider);
     layout->addWidget(vgaGainLabel);
     layout->addWidget(vgaGainSlider);
+    layout->addWidget(volumeLabel);
+    layout->addWidget(volumeSlider);
     layout->addLayout(chckbox);
     layout->addWidget(audioDeviceComboBox);
     layout->addWidget(bandwidthLineEdit);
@@ -702,7 +709,7 @@ YourClassName::YourClassName(QWidget *parent)
     scaleWidget->setTuning(listeningFrequency, globalFrequency, globalBandwidth, globalModulationType);
     scaleWidget->setMarkerPosition(0.5);
     scaleWidget->setRange(minFrequency, maxFrequency);
-    
+
     updateTimer = new QTimer(this);
     updateSpectrumTimerInterval();
     stopPollTimer = new QTimer(this);
@@ -733,6 +740,19 @@ YourClassName::YourClassName(QWidget *parent)
             sendRemoteControlCommand("settings");
         }
     });
+    connect(volumeSlider, &QSlider::valueChanged, this, [this](int value) {
+        volumeLabel->setText(QString("Volume: %1%").arg(value));
+
+        const float volume = value / 100.0f;
+
+        if (audioProcessor) {
+            audioProcessor->setVolume(volume);
+        }
+
+        if (remoteAudioPlayer) {
+            remoteAudioPlayer->setVolume(volume);
+        }
+    });
     connect(startButton, &QPushButton::clicked, this, &YourClassName::startFobosProcessing);
     connect(stopButton, &QPushButton::clicked, this, &YourClassName::stopFobosProcessing);
     connect(modeBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onDirectSamplingChanged);
@@ -760,6 +780,8 @@ YourClassName::YourClassName(QWidget *parent)
                 sendNetworkAudioFrame(pcmData);
             },
             Qt::QueuedConnection);
+    connect(audioCheckbox, &QCheckBox::toggled,
+            this, &YourClassName::onAudioEnabledChanged);
     connect(sampleBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onSampleRateChanged);
     connect(bandwidthLineEdit, &QLineEdit::textChanged, this, &YourClassName::onBandwidthChanged);
     connect(scaleWidget, SIGNAL(frequencyChanged()), this, SLOT(updateFrequency()));
@@ -832,6 +854,66 @@ YourClassName::~YourClassName() {
         iqData = nullptr;
     }
 }
+
+bool YourClassName::restartStreamForHardwareChange() {
+    if (!device || isIdle()) {
+        return applyFobosSettings();
+    }
+
+    qDebug() << "[LiveHardware] restarting stream for hardware change";
+
+    if (updateTimer) updateTimer->stop();
+    if (audioProcessor) audioProcessor->stopDemodulation();
+
+    if (processor) {
+        processor->requestStop();
+        if (processor->isRunning() && !processor->wait(1500)) {
+            processor->forceStop(1000);
+        }
+        processor->finalizeStopped();
+    }
+
+    IqBuffer::clear();
+
+    if (!applyFobosSettings()) {
+        qDebug() << "[LiveHardware] applyFobosSettings failed";
+        runState = RadioRunState::Idle;
+        updateUiForRunState();
+        return false;
+    }
+
+    fftResult = std::make_unique<FFTResult>();
+    updateSpectrumTimerInterval();
+    settingRange();
+
+    const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
+    const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
+    const bool queueAudioBlocks = !serverIqStreaming;
+
+    if (serverIqStreaming && processor) {
+        processor->updateNetworkIqSettings(pendingSettings, serverChannelIqStreaming);
+    }
+
+    processor->startProcessing(device,
+                               pendingSettings.syncEnabled,
+                               pendingSettings.sampleRate,
+                               queueAudioBlocks,
+                               serverIqStreaming);
+
+    if (updateTimer) {
+        updateTimer->start();
+    }
+
+    pendingAudioStartAfterStreamReady = queueAudioBlocks;
+    streamStartCallbackCount = processor ? processor->callbackCount() : 0;
+    streamStartElapsedTimer.restart();
+    if (streamWatchdogTimer) streamWatchdogTimer->start();
+
+    runState = RadioRunState::Running;
+    updateUiForRunState();
+    return true;
+}
+
 
 uint8_t YourClassName::currentGpoValue() const {
     uint8_t value = 0;
@@ -1304,6 +1386,31 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         publishSettingsToGlobals();
         updateUiFromPendingSettings();
         applyLiveRemoteSettings(previousSettings);
+        const bool audioChanged =
+            previousSettings.audioEnabled != pendingSettings.audioEnabled;
+
+        if (audioChanged && !isIdle()) {
+            if (pendingSettings.audioEnabled) {
+                if (audioProcessor) {
+                    audioProcessor->startDemodulation();
+                }
+            } else {
+                if (audioProcessor) {
+                    audioProcessor->stopDemodulation();
+                }
+                pendingAudioStartAfterStreamReady = false;
+            }
+        }
+        const bool restartRequired =
+            std::abs(previousSettings.sampleRate - pendingSettings.sampleRate) > 0.5 ||
+            previousSettings.inputMode != pendingSettings.inputMode ||
+            previousSettings.clockSource != pendingSettings.clockSource ||
+            previousSettings.fftLength != pendingSettings.fftLength;
+
+        if (restartRequired && !isIdle()) {
+            restartStreamForHardwareChange();
+        }
+
         if (processor && processor->isRunning() && isClientIqProcessingMode()) {
             processor->updateNetworkIqSettings(pendingSettings, isChannelIqProcessingMode());
         }
@@ -1635,14 +1742,74 @@ void YourClassName::updateUiForRunState() {
     if (clkBox) clkBox->setEnabled(idle);
     if (fftComboBox) fftComboBox->setEnabled(idle);
     if (audioDeviceComboBox) audioDeviceComboBox->setEnabled(idle);
-    if (audioCheckbox) audioCheckbox->setEnabled(idle);
+    const bool liveAudioControlsEnabled =
+        idle || runState == RadioRunState::Running;
+
+    if (audioCheckbox) audioCheckbox->setEnabled(liveAudioControlsEnabled);
     if (syncCheckbox) syncCheckbox->setEnabled(false);
-    if (bandwidthLineEdit) bandwidthLineEdit->setEnabled(idle);
-    if (lnaGainSlider) lnaGainSlider->setEnabled(true);
-    if (vgaGainSlider) vgaGainSlider->setEnabled(true);
+    const bool liveDemodControlsEnabled =
+        idle || runState == RadioRunState::Running;
+
+    if (bandwidthLineEdit) bandwidthLineEdit->setEnabled(liveDemodControlsEnabled);
+    const bool gainControlsEnabled =
+        idle || runState == RadioRunState::Running;
+
+    if (lnaGainSlider) lnaGainSlider->setEnabled(gainControlsEnabled);
+    if (vgaGainSlider) vgaGainSlider->setEnabled(gainControlsEnabled);
+    const bool gpioEnabled =
+        idle || runState == RadioRunState::Running;
     for (int i = 0; i < 8; ++i) {
         if (checkBoxes[i]) {
-            checkBoxes[i]->setEnabled(idle);
+            checkBoxes[i]->setEnabled(gpioEnabled);
+        }
+    }
+}
+
+void YourClassName::onAudioEnabledChanged(bool checked) {
+    pendingSettings.audioEnabled = checked;
+    publishSettingsToGlobals();
+
+    qDebug() << "[Audio] checkbox changed" << checked
+             << "networkMode" << static_cast<int>(networkMode)
+             << "processingMode" << static_cast<int>(networkProcessingMode)
+             << "runState" << runStateName(runState);
+
+    if (isNetworkClientMode()) {
+        sendRemoteControlCommand("settings");
+
+        if (isClientIqProcessingMode()) {
+            if (checked) {
+                IqBuffer::clear();
+                pendingNetworkAudioStartAfterIqPrebuffer = true;
+            } else {
+                pendingNetworkAudioStartAfterIqPrebuffer = false;
+                if (audioProcessor) {
+                    audioProcessor->stopDemodulation();
+                }
+            }
+        } else {
+            if (!checked && remoteAudioPlayer) {
+                remoteAudioPlayer->stop();
+            }
+        }
+
+        return;
+    }
+
+    if (isIdle()) {
+        return;
+    }
+
+    if (checked) {
+        if (processor && processor->isRunning() && audioProcessor) {
+            audioProcessor->startDemodulation();
+        } else {
+            pendingAudioStartAfterStreamReady = true;
+        }
+    } else {
+        pendingAudioStartAfterStreamReady = false;
+        if (audioProcessor) {
+            audioProcessor->stopDemodulation();
         }
     }
 }
@@ -2194,13 +2361,24 @@ void YourClassName::onAudioDeviceChanged(int index) {
 void YourClassName::onBandwidthChanged() {
     bool ok = false;
     const double bandwidth = bandwidthLineEdit->text().toDouble(&ok);
-    if (ok && bandwidth > 0.0) {
-        pendingSettings.bandwidth = bandwidth;
-        publishSettingsToGlobals();
-        settingRange();
-        if (isNetworkClientMode()) {
-            sendRemoteControlCommand("settings");
-        }
+
+    if (!ok || bandwidth <= 0.0) {
+        return;
+    }
+
+    pendingSettings.bandwidth = bandwidth;
+    publishSettingsToGlobals();
+    settingRange();
+
+    if (scaleWidget) {
+        scaleWidget->setTuning(pendingSettings.listeningFrequency,
+                               pendingSettings.centerFrequency,
+                               pendingSettings.bandwidth,
+                               pendingSettings.modulationType);
+    }
+
+    if (isNetworkClientMode()) {
+        sendRemoteControlCommand("settings");
     }
 }
 
@@ -2547,54 +2725,65 @@ void YourClassName::updateSpectrum() {
     //waterfallWidget->setData(fftFrequencies, fftMagnitudes, minFrequency, maxFrequency, fftLength, secondGraph, contrast, sensitivity);
     //qDebug() << "all took" << timer.elapsed() << "milliseconds";
 }
- 
+
 void YourClassName::onSampleRateChanged(int index) {
     qDebug() << "[FobosLifecycle] onSampleRateChanged enter"
              << "index" << index
              << "state" << runStateName(runState)
              << "deviceOpened" << deviceOpened
              << "processorRunning" << (processor && processor->isRunning());
-    if (!isIdle()) {
-        qDebug() << "Stop processing before changing sample rate.";
-        revertHardwareControlsToSettings();
+
+    if (!sampleBox || index < 0) {
         return;
     }
 
     bool ok = false;
-    double selectedSampleRate = sampleBox->currentData().toDouble(&ok);
-    if (!ok) {
-        qDebug() << "Invalid sample rate selected.";
-        fftResult = std::make_unique<FFTResult>();
+    const double selectedSampleRate = sampleBox->itemData(index).toDouble(&ok);
 
+    if (!ok || selectedSampleRate <= 0.0) {
+        qDebug() << "Invalid sample rate selected.";
         return;
     }
-    const bool sampleRateChanged = std::abs(pendingSettings.sampleRate - selectedSampleRate) > 0.5;
+
+    const bool sampleRateChanged =
+        std::abs(pendingSettings.sampleRate - selectedSampleRate) > 0.5;
+
     qDebug() << "[FobosLifecycle] sample rate selected"
              << "previous" << pendingSettings.sampleRate
              << "selected" << selectedSampleRate
              << "changed" << sampleRateChanged
              << "device" << device;
-    pendingSettings.sampleRate = selectedSampleRate;
-    if (sampleRateChanged && device) {
-        const bool selectedRateMatchesOpenSession =
-            appliedSampleRate > 0.0 && std::abs(appliedSampleRate - selectedSampleRate) <= 0.5;
-        sampleRateReopenRequired = !selectedRateMatchesOpenSession;
-        qDebug() << "[FobosLifecycle] sample rate changed while Fobos session is open"
-                 << "selectedRateMatchesOpenSession" << selectedRateMatchesOpenSession
-                 << "sampleRateReopenRequired" << sampleRateReopenRequired
-                 << "willReopenOnNextStart" << sampleRateReopenRequired;
-    } else if (!device) {
-        sampleRateReopenRequired = false;
+
+    if (!sampleRateChanged) {
+        return;
     }
-    publishSettingsToGlobals();
-    qDebug() << "Attempting to set sample rate to:" << selectedSampleRate;
-    qDebug() << "Sample rate will be applied on the next start.";
+
+    pendingSettings.sampleRate = selectedSampleRate;
     normalizeTuning(pendingSettings);
     publishSettingsToGlobals();
     settingRange();
+
     if (isNetworkClientMode()) {
         sendRemoteControlCommand("settings");
+        return;
     }
+
+    if (!isIdle()) {
+        restartStreamForHardwareChange();
+        return;
+    }
+
+    if (device) {
+        const bool selectedRateMatchesOpenSession =
+            appliedSampleRate > 0.0 &&
+            std::abs(appliedSampleRate - selectedSampleRate) <= 0.5;
+
+        sampleRateReopenRequired = !selectedRateMatchesOpenSession;
+    } else {
+        sampleRateReopenRequired = false;
+    }
+
+    qDebug() << "Sample rate will be applied on the next start.";
 }
 
 void YourClassName::onListeningFrequencyEntered() {
@@ -2737,38 +2926,53 @@ void YourClassName::listFobosDevices() {
 }
 
 void YourClassName::onDirectSamplingChanged(int index) {
-    if (!isIdle()) {
-        qDebug() << "Stop processing before changing input mode.";
-        revertHardwareControlsToSettings();
+    Q_UNUSED(index);
+
+    if (!modeBox) {
         return;
     }
 
-    int value = modeBox->currentData().toInt();
+    const int value = modeBox->currentData().toInt();
+
+    if (pendingSettings.inputMode == value) {
+        return;
+    }
+
     pendingSettings.inputMode = value;
-    if (value != 0){
-    pendingSettings.centerFrequency = 0;
-    pendingSettings.listeningFrequency = 1250000;
-    normalizeTuning(pendingSettings);
-    frequencyLineEdit->setText(QString::number(pendingSettings.centerFrequency, 'f', 0));
-    listeningFrequencyLineEdit->setText(QString::number(pendingSettings.listeningFrequency, 'f', 0));
-    publishSettingsToGlobals();
+
+    if (value != 0) {
+        pendingSettings.centerFrequency = 0;
+        pendingSettings.listeningFrequency = 1250000;
+    } else {
+        pendingSettings.centerFrequency = 100000000;
+        pendingSettings.listeningFrequency = 100000000;
     }
-      else  if (value == 0){
-    pendingSettings.listeningFrequency = 100000000;
-    pendingSettings.centerFrequency = 100000000;
+
     normalizeTuning(pendingSettings);
-    frequencyLineEdit->setText(QString::number(pendingSettings.centerFrequency, 'f', 0));
-    listeningFrequencyLineEdit->setText(QString::number(pendingSettings.listeningFrequency, 'f', 0));
-    publishSettingsToGlobals();
+
+    if (frequencyLineEdit) {
+        frequencyLineEdit->setText(QString::number(pendingSettings.centerFrequency, 'f', 0));
     }
-    qDebug() << "Current mode set to" << globalMode;
-    qDebug() << "Input mode will be applied on the next start.";
+
+    if (listeningFrequencyLineEdit) {
+        listeningFrequencyLineEdit->setText(QString::number(pendingSettings.listeningFrequency, 'f', 0));
+    }
+
+    publishSettingsToGlobals();
     settingRange();
+
     if (isNetworkClientMode()) {
         sendRemoteControlCommand("settings");
+        return;
     }
-}
 
+    if (!isIdle()) {
+        restartStreamForHardwareChange();
+        return;
+    }
+
+    qDebug() << "Input mode will be applied on the next start.";
+}
 void YourClassName::settingRange() {
     if (!scaleWidget || globalSampleRate <= 0.0) {
         return;
@@ -2977,7 +3181,7 @@ void YourClassName::startFobosProcessing() {
         networkController &&
         networkController->isControlReady();
     const bool serverLocalAudioEnabled = pendingSettings.audioEnabled && !serverIqStreaming;
-    const bool queueAudioBlocks = serverLocalAudioEnabled;
+    const bool queueAudioBlocks = !serverIqStreaming;
     if (audioProcessor) {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }

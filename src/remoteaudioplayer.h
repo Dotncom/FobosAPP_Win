@@ -7,6 +7,8 @@
 #include <QTimer>
 #include <windows.h>
 #include <mmsystem.h>
+#include <atomic>
+#include <algorithm>
 
 class RemoteAudioPlayer : public QObject {
     Q_OBJECT
@@ -17,6 +19,7 @@ public:
 
     void playPcmFrame(const QByteArray &pcmData);
     void stop();
+    void setVolume(float volume);
 
 private slots:
     void cleanupCompletedBuffers();
@@ -26,9 +29,9 @@ private:
         WAVEHDR header;
         QByteArray data;
     };
-
-    bool openDevice();
+    std::atomic<float> outputVolume = 1.0f;
     void releaseBlock(AudioBlock *block);
+    bool openDevice();
 
     HWAVEOUT waveOut = nullptr;
     QList<AudioBlock *> activeBlocks;

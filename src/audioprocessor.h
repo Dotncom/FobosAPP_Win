@@ -59,6 +59,8 @@ public:
     void startAudioOutput();
     void processAudioBuffer();
 //  void setUdpSocket(QUdpSocket *socket);
+public:
+    void setVolume(float volume);
 
 
 public slots:
@@ -90,7 +92,7 @@ private:
     WAVEHDR waveHdrs[NUM_BUFFERS];
     std::atomic<bool> bufferReady[NUM_BUFFERS];
     std::atomic<int> currentBufferIndex = 0;
-
+    std::atomic<float> outputVolume = 1.0f;
     std::condition_variable cv;
     std::mutex audioMutex;
     std::mutex waveOutMutex;

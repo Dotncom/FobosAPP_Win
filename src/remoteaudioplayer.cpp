@@ -46,6 +46,10 @@ bool RemoteAudioPlayer::openDevice() {
     return true;
 }
 
+void RemoteAudioPlayer::setVolume(float volume) {
+    outputVolume.store(std::clamp(volume, 0.0f, 3.0f));
+}
+
 void RemoteAudioPlayer::playPcmFrame(const QByteArray &pcmData) {
     if (pcmData.isEmpty()) {
         return;
@@ -63,7 +67,19 @@ void RemoteAudioPlayer::playPcmFrame(const QByteArray &pcmData) {
 
     auto *block = new AudioBlock();
     std::memset(&block->header, 0, sizeof(WAVEHDR));
-    block->data = pcmData;
+    const float volume = outputVolume.load();
+    QByteArray adjusted = pcmData;
+
+    auto *samples = reinterpret_cast<qint16 *>(adjusted.data());
+    const int sampleCount = adjusted.size() / sizeof(qint16);
+
+    for (int i = 0; i < sampleCount; ++i) {
+        int sample = static_cast<int>(samples[i] * volume);
+        sample = std::clamp(sample, -32768, 32767);
+        samples[i] = static_cast<qint16>(sample);
+    }
+
+    block->data = adjusted;
     block->header.lpData = block->data.data();
     block->header.dwBufferLength = static_cast<DWORD>(block->data.size());
 

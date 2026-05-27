@@ -167,6 +167,10 @@ void AudioProcessor::setLocalPlaybackEnabled(bool enabled) {
     }
 }
 
+void AudioProcessor::setVolume(float volume) {
+    outputVolume.store(std::clamp(volume, 0.0f, 3.0f));
+}
+
 void AudioProcessor::startDemodulation() {
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
@@ -638,11 +642,14 @@ void AudioProcessor::SDRThread() {
     std::vector<short> audioSamples;
     int activeModulationType = currentSettingsSnapshot().modulationType;
     uint64_t audioBlockCounter = 0;
+    double activeBandwidth = currentSettingsSnapshot().bandwidth;
 
     while (running) {
         const RadioSettings settings = currentSettingsSnapshot();
-        if (activeModulationType != settings.modulationType) {
+        if (activeModulationType != settings.modulationType ||
+            std::abs(activeBandwidth - settings.bandwidth) > 1.0) {
             activeModulationType = settings.modulationType;
+            activeBandwidth = settings.bandwidth;
             resetDemodulatorState();
         }
 
@@ -742,9 +749,17 @@ void AudioProcessor::startAudioOutput() {
             QByteArray pcmFrame;
             const size_t samplesToCopy = (std::min)(queuedAudioSamples(), static_cast<size_t>(BUFFER_SIZE));
             if (samplesToCopy > 0) {
-                std::copy(audioBuffer.begin() + static_cast<std::ptrdiff_t>(audioBufferReadOffset),
-                          audioBuffer.begin() + static_cast<std::ptrdiff_t>(audioBufferReadOffset + samplesToCopy),
-                          waveBuffers[i].begin());
+                const float volume = outputVolume.load();
+
+                for (size_t n = 0; n < samplesToCopy; ++n) {
+                    const short in = audioBuffer[audioBufferReadOffset + n];
+
+                    int sample = static_cast<int>(in * volume);
+                    sample = std::clamp(sample, -32768, 32767);
+
+                    waveBuffers[i][n] = static_cast<short>(sample);
+                }
+
                 discardAudioSamples(samplesToCopy);
             }
 

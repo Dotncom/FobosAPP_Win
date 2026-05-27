@@ -115,6 +115,7 @@ private slots:
     void openNetworkSettingsDialog();
     void onNetworkStatusChanged(const QString &status);
     void onNetworkControlCommandReceived(const QJsonObject &command);
+    void onAudioEnabledChanged(bool checked);
 protected:
 	void onWaterfallScaleChanged(int delta);
     void wheelEvent(QWheelEvent *event) override;
@@ -131,8 +132,8 @@ protected:
 
 private:
     QWidget *centralWidget;
-    
     QStringList getFobosDevices();
+    bool restartStreamForHardwareChange();
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
     bool applyFobosSettings();
@@ -195,7 +196,9 @@ private:
     QSlider *sensitivitySlider;
     QSlider *levelMinSlider;
     QSlider *levelMaxSlider;
-    
+    QSlider *volumeSlider;
+
+    QLabel *volumeLabel;
     QLabel *lnaGainLabel;
     QLabel *centralFrequencyLabel;
     QLabel *listeningFrequencyLabel;
