@@ -1,9 +1,8 @@
 # FobosAPP
 
 FobosAPP is a Windows SDR receiver application for RigExpert Fobos SDR hardware.
-Version 2.0 focuses on stable real-device operation, usable audio demodulation,
-network remote operation, and support for both the standard Fobos API and the
-special Fobos SDR agile API.
+Version 2.9 beta keeps the stable real-device and network work from the 2.x
+line, and adds experimental video/image decoding modes for field testing.
 
 ## Windows Release Package
 
@@ -16,7 +15,11 @@ diagnostic logs to `FobosAPP_diagnostic.log`.
 
 ## Main Features
 
-- AM, SAM, NFM, WFM, USB, LSB, DSB, CW, FT8, RTTY, FSK, and PSK mode selection.
+- AM, SAM, NFM, WFM, USB, LSB, DSB, CW, FT8, RTTY, FSK, PSK, ATV, SSTV, APT,
+  WEFAX, and Meteor LRPT beta mode selection.
+- Digital Audio dock with FT8/RTTY/FSK/PSK decoding work.
+- Video dock with analog TV, SSTV, NOAA APT, HF WEFAX, and Meteor LRPT beta
+  monitor/test modes.
 - Stable async Fobos streaming path with safer start, stop, and retune handling.
 - Live retuning of frequency, sample rate, FFT length, gains, bandwidth, audio,
   and display settings.
@@ -51,8 +54,9 @@ powershell -ExecutionPolicy Bypass -File tools\deploy_windows.ps1
 
 ## Current Limitations
 
-- Digital modes are prepared as demodulation modes, but full protocol decoders
-  are not implemented yet.
+- The new WEFAX, LRPT, and analog video paths are beta features and need more
+  testing with real signals.
+- Meteor LRPT currently provides a QPSK IQ monitor, not a final decoded image.
 - Full IQ client processing needs a fast LAN and can be too heavy for slower
   network links.
 - Multi-client observer/control transfer mode is new and should receive more

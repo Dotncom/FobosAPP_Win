@@ -30,6 +30,8 @@ double clampDouble(double value, double low, double high) {
 
 double networkChannelTargetRate(const RadioSettings &settings) {
     switch (settings.modulationType) {
+    case MOD_ATV:
+        return clampDouble((std::max)(2400000.0, settings.bandwidth * 1.4), 2400000.0, 8000000.0);
     case MOD_WFM:
         return clampDouble((std::max)(384000.0, settings.bandwidth * 3.0), 384000.0, 768000.0);
     case MOD_NFM:
@@ -52,6 +54,9 @@ double networkChannelTargetRate(const RadioSettings &settings) {
 double networkChannelCutoff(const RadioSettings &settings, double outputRate) {
     double requestedCutoff = settings.bandwidth * 0.6;
     switch (settings.modulationType) {
+    case MOD_ATV:
+        requestedCutoff = (std::max)(1000000.0, settings.bandwidth * 0.9);
+        break;
     case MOD_WFM:
         requestedCutoff = (std::max)(120000.0, settings.bandwidth * 0.6);
         break;
@@ -77,6 +82,16 @@ double networkChannelCutoff(const RadioSettings &settings, double outputRate) {
         break;
     }
     return (std::min)(requestedCutoff, outputRate * 0.45);
+}
+
+int networkChannelFrameSamplesForRate(double outputRate) {
+    if (outputRate >= 4000000.0) {
+        return NETWORK_CHANNEL_FRAME_SAMPLES * 32;
+    }
+    if (outputRate >= 1000000.0) {
+        return NETWORK_CHANNEL_FRAME_SAMPLES * 16;
+    }
+    return NETWORK_CHANNEL_FRAME_SAMPLES;
 }
 
 char quantizeIqSample(float sample) {
@@ -614,6 +629,7 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
     const int decimationFactor = (std::max)(1, static_cast<int>(std::floor(inputRate / targetRate)));
     const double outputRate = inputRate / static_cast<double>(decimationFactor);
     const double cutoff = networkChannelCutoff(settings, outputRate);
+    const int frameSamples = networkChannelFrameSamplesForRate(outputRate);
     const float lowPassAlpha = static_cast<float>((std::clamp)(
         1.0 - std::exp(-TWO_PI * cutoff / outputRate),
         0.000001,
@@ -687,7 +703,7 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
         appendInt16Le(networkIqFrameBuffer, std::real(lowPass) * gain);
         appendInt16Le(networkIqFrameBuffer, std::imag(lowPass) * gain);
 
-        if (networkIqFrameBuffer.size() >= NETWORK_CHANNEL_FRAME_SAMPLES * FLOATS_PER_IQ_SAMPLE * static_cast<int>(sizeof(qint16))) {
+        if (networkIqFrameBuffer.size() >= frameSamples * FLOATS_PER_IQ_SAMPLE * static_cast<int>(sizeof(qint16))) {
             emit iqFrameReady(networkIqFrameBuffer,
                               outputRate,
                               networkIqFrameBuffer.size() / (FLOATS_PER_IQ_SAMPLE * static_cast<int>(sizeof(qint16))));

@@ -37,6 +37,8 @@ QVector<QPair<QString, double>> defaultSteps() {
         {"1 MHz", 1000000.0},
         {"5 MHz", 5000000.0},
         {"10 MHz", 10000000.0},
+        {"50 MHz", 50000000.0},
+        {"100 MHz", 100000000.0},
     };
 }
 
@@ -85,6 +87,9 @@ FrequencyControl::FrequencyControl(QWidget *parent)
     connect(unitCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         updateSpinRange();
         updateDisplayedValue();
+    });
+    connect(stepCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        updateSpinRange();
     });
     connect(minusButton, &QPushButton::clicked, this, [this]() {
         adjustByStep(-1);

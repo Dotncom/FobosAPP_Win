@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 2.0.0)
+project(FobosAPP VERSION 2.9.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(Qt5_DIR "C:/Qt/5.15.2/msvc2019_64/")
@@ -46,6 +46,10 @@ set(SOURCES
     src/recordingmanager.cpp
     src/recordingmanager.h
     src/radiosettings.h
+    src/videoprocessor.cpp
+    src/videoprocessor.h
+    src/videowidget.cpp
+    src/videowidget.h
     src/fft.cpp
     src/fft.h
     src/audioprocessor.cpp

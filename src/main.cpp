@@ -22,6 +22,7 @@
 #include <QPushButton>
 #include <QKeyEvent>
 #include <QAbstractButton>
+#include <QColor>
 #include <QCoreApplication>
 #include <QSettings>
 #include <cmath>
@@ -88,6 +89,8 @@ constexpr int AUDIO_LOW_PASS_SLIDER_STEP_HZ = 100;
 constexpr int AUDIO_LOW_PASS_SLIDER_MAX = 200;
 constexpr int AUDIO_HIGH_PASS_SLIDER_STEP_HZ = 25;
 constexpr int AUDIO_HIGH_PASS_SLIDER_MAX = 40;
+constexpr int VIDEO_SNAPSHOT_INTERVAL_MS = 90;
+constexpr std::size_t VIDEO_SNAPSHOT_MAX_FLOATS = 262144 * 2;
 
 QMutex gLogMutex;
 QFile gLogFile;
@@ -304,6 +307,16 @@ double defaultBandwidthForModulation(int modulationType) {
         return 2500.0;
     case MOD_FSK:
         return 12000.0;
+    case MOD_ATV:
+        return 5000000.0;
+    case MOD_SSTV:
+        return 3000.0;
+    case MOD_APT:
+        return 40000.0;
+    case MOD_WEFAX:
+        return 3000.0;
+    case MOD_LRPT:
+        return 140000.0;
     case MOD_AM:
     default:
         return 10000.0;
@@ -312,6 +325,40 @@ double defaultBandwidthForModulation(int modulationType) {
 
 QString formatBandwidthHz(double bandwidth) {
     return QString::number(bandwidth, 'f', 0);
+}
+
+QImage createSstvTestPattern() {
+    constexpr int width = 320;
+    constexpr int height = 256;
+    QImage image(width, height, QImage::Format_RGB32);
+    static const QRgb bars[] = {
+        qRgb(255, 255, 255),
+        qRgb(255, 255, 0),
+        qRgb(0, 255, 255),
+        qRgb(0, 255, 0),
+        qRgb(255, 0, 255),
+        qRgb(255, 0, 0),
+        qRgb(0, 0, 255),
+        qRgb(16, 16, 16),
+    };
+
+    for (int y = 0; y < height; ++y) {
+        QRgb *line = reinterpret_cast<QRgb *>(image.scanLine(y));
+        for (int x = 0; x < width; ++x) {
+            if (y < 86) {
+                line[x] = bars[(x * 8) / width];
+            } else if (y < 172) {
+                const int value = (x * 255) / (width - 1);
+                line[x] = qRgb(value, value, value);
+            } else {
+                const bool checker = (((x / 16) + (y / 16)) % 2) == 0;
+                const int ramp = ((x + y) * 255) / (width + height - 2);
+                line[x] = checker ? qRgb(ramp, 80, 255 - ramp)
+                                  : qRgb(255 - ramp, ramp, 80);
+            }
+        }
+    }
+    return image;
 }
 
 void diagnosticMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &message) {
@@ -950,24 +997,47 @@ YourClassName::YourClassName(QWidget *parent)
     controlsDock->setWidget(controlsScrollArea);
     addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
 
+    modulationButtonGroup = new QButtonGroup(this);
+    auto addModulationRadioButton = [this](QWidget *parent,
+                                           QHBoxLayout *targetLayout,
+                                           const QString &label,
+                                           int modulationId,
+                                           const QString &toolTip) -> QRadioButton * {
+        QRadioButton *button = new QRadioButton(label, parent);
+        if (!toolTip.isEmpty()) {
+            button->setToolTip(toolTip);
+        }
+        modulationButtonGroup->addButton(button, modulationId);
+        targetLayout->addWidget(button);
+        return button;
+    };
+
     QWidget *digitalWidget = new QWidget(this);
     QVBoxLayout *digitalLayout = new QVBoxLayout(digitalWidget);
     QHBoxLayout *digitalHeaderLayout = new QHBoxLayout();
+    QHBoxLayout *digitalModeLayout = new QHBoxLayout();
     digitalDecodeCheckbox = new QCheckBox("Decode", digitalWidget);
     digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
     QPushButton *digitalClearButton = new QPushButton("Clear", digitalWidget);
-    digitalStatusLabel = new QLabel("Digital decoder idle", digitalWidget);
+    digitalStatusLabel = new QLabel("Digital audio decoder idle", digitalWidget);
     digitalTextEdit = new QPlainTextEdit(digitalWidget);
     digitalTextEdit->setReadOnly(true);
     digitalTextEdit->setMaximumBlockCount(2000);
-    digitalTextEdit->setPlaceholderText("Decoded RTTY/FSK text will appear here.");
+    digitalTextEdit->setPlaceholderText("Decoded digital-audio text will appear here.");
+    digitalModeLayout->addWidget(new QLabel("Mode:", digitalWidget));
+    addModulationRadioButton(digitalWidget, digitalModeLayout, "FT8", MOD_FT8, "FT8 weak-signal decoder");
+    addModulationRadioButton(digitalWidget, digitalModeLayout, "RTTY", MOD_RTTY, "AFSK RTTY decoder");
+    addModulationRadioButton(digitalWidget, digitalModeLayout, "FSK", MOD_FSK, "Frequency-shift keying decoder");
+    addModulationRadioButton(digitalWidget, digitalModeLayout, "PSK", MOD_PSK, "PSK audio mode placeholder");
+    digitalModeLayout->addStretch();
     digitalHeaderLayout->addWidget(digitalDecodeCheckbox);
     digitalHeaderLayout->addStretch();
     digitalHeaderLayout->addWidget(digitalClearButton);
     digitalLayout->addLayout(digitalHeaderLayout);
+    digitalLayout->addLayout(digitalModeLayout);
     digitalLayout->addWidget(digitalStatusLabel);
     digitalLayout->addWidget(digitalTextEdit);
-    digitalDock = new QDockWidget("Digital", this);
+    digitalDock = new QDockWidget("Digital Audio", this);
     digitalDock->setObjectName("digitalDock");
     digitalDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
     digitalDock->setFeatures(QDockWidget::DockWidgetMovable |
@@ -976,6 +1046,58 @@ YourClassName::YourClassName(QWidget *parent)
     digitalDock->setWidget(digitalWidget);
     addDockWidget(Qt::RightDockWidgetArea, digitalDock);
     digitalDock->hide();
+
+    QWidget *videoPanel = new QWidget(this);
+    QVBoxLayout *videoLayout = new QVBoxLayout(videoPanel);
+    QHBoxLayout *videoHeaderLayout = new QHBoxLayout();
+    QHBoxLayout *videoModeLayout = new QHBoxLayout();
+    videoDecodeCheckbox = new QCheckBox("Decode", videoPanel);
+    videoDecodeCheckbox->setChecked(videoDecodeEnabled);
+    videoDemodCombo = new QComboBox(videoPanel);
+    videoDemodCombo->addItem("FM video", VideoProcessor::FmVideo);
+    videoDemodCombo->addItem("AM video", VideoProcessor::AmVideo);
+    videoStandardCombo = new QComboBox(videoPanel);
+    videoStandardCombo->addItem("PAL 15.625 kHz", 15625.0);
+    videoStandardCombo->addItem("NTSC 15.734 kHz", 15734.2657);
+    videoInvertCheckbox = new QCheckBox("Invert", videoPanel);
+    videoHSyncCheckbox = new QCheckBox("HSync", videoPanel);
+    videoHSyncCheckbox->setChecked(true);
+    videoHSyncCheckbox->setToolTip("Align video lines by the darkest horizontal sync pulse");
+    videoVSyncCheckbox = new QCheckBox("VSync", videoPanel);
+    videoVSyncCheckbox->setChecked(true);
+    videoVSyncCheckbox->setToolTip("Reset analog video frame on broad vertical sync pulses");
+    videoTestPatternCheckbox = new QCheckBox("Test", videoPanel);
+    videoTestPatternCheckbox->setToolTip("Generate an internal test pattern for the selected video mode");
+    videoStatusLabel = new QLabel("Video decoder disabled", videoPanel);
+    videoWidget = new VideoWidget(videoPanel);
+    videoModeLayout->addWidget(new QLabel("Mode:", videoPanel));
+    addModulationRadioButton(videoPanel, videoModeLayout, "ATV", MOD_ATV, "Analog television video demodulator");
+    addModulationRadioButton(videoPanel, videoModeLayout, "SSTV", MOD_SSTV, "Slow-scan television image decoder");
+    addModulationRadioButton(videoPanel, videoModeLayout, "APT", MOD_APT, "NOAA APT weather satellite image decoder");
+    addModulationRadioButton(videoPanel, videoModeLayout, "WEFAX", MOD_WEFAX, "HF weather fax image decoder");
+    addModulationRadioButton(videoPanel, videoModeLayout, "LRPT", MOD_LRPT, "Meteor LRPT beta IQ monitor");
+    videoModeLayout->addStretch();
+    videoHeaderLayout->addWidget(videoDecodeCheckbox);
+    videoHeaderLayout->addWidget(videoDemodCombo);
+    videoHeaderLayout->addWidget(videoStandardCombo);
+    videoHeaderLayout->addWidget(videoInvertCheckbox);
+    videoHeaderLayout->addWidget(videoHSyncCheckbox);
+    videoHeaderLayout->addWidget(videoVSyncCheckbox);
+    videoHeaderLayout->addWidget(videoTestPatternCheckbox);
+    videoHeaderLayout->addStretch();
+    videoLayout->addLayout(videoModeLayout);
+    videoLayout->addLayout(videoHeaderLayout);
+    videoLayout->addWidget(videoStatusLabel);
+    videoLayout->addWidget(videoWidget, 1);
+    videoDock = new QDockWidget("Video", this);
+    videoDock->setObjectName("videoDock");
+    videoDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+    videoDock->setFeatures(QDockWidget::DockWidgetMovable |
+                           QDockWidget::DockWidgetFloatable |
+                           QDockWidget::DockWidgetClosable);
+    videoDock->setWidget(videoPanel);
+    addDockWidget(Qt::RightDockWidgetArea, videoDock);
+    videoDock->hide();
 
     QHBoxLayout *scaleLayout = new QHBoxLayout();
     QVBoxLayout *contrastLayout = new QVBoxLayout();
@@ -1082,6 +1204,12 @@ YourClassName::YourClassName(QWidget *parent)
     digitalDecoder->moveToThread(digitalDecoderThread);
     connect(digitalDecoderThread, &QThread::finished, digitalDecoder, &QObject::deleteLater);
     digitalDecoderThread->start();
+    videoProcessorThread = new QThread(this);
+    videoProcessorThread->setObjectName(QStringLiteral("VideoProcessorThread"));
+    videoProcessor = new VideoProcessor();
+    videoProcessor->moveToThread(videoProcessorThread);
+    connect(videoProcessorThread, &QThread::finished, videoProcessor, &QObject::deleteLater);
+    videoProcessorThread->start();
     playbackManager = new PlaybackManager(this);
     recordingManager = new RecordingManager(this);
     networkController = new NetworkController(this);
@@ -1109,10 +1237,14 @@ YourClassName::YourClassName(QWidget *parent)
     refreshButton = new QPushButton("Refresh USB Devices", this);
     fobosButton = new QPushButton("Show Fobos Details", this);
     networkButton = new QPushButton("Network", this);
-    digitalToggleButton = new QPushButton("Digital", this);
+    digitalToggleButton = new QPushButton("Digital Audio", this);
     digitalToggleButton->setCheckable(true);
-    digitalToggleButton->setMaximumWidth(90);
-    digitalToggleButton->setToolTip("Show or hide the digital decoder panel");
+    digitalToggleButton->setMaximumWidth(120);
+    digitalToggleButton->setToolTip("Show or hide the digital audio decoder panel");
+    videoToggleButton = new QPushButton("Video", this);
+    videoToggleButton->setCheckable(true);
+    videoToggleButton->setMaximumWidth(80);
+    videoToggleButton->setToolTip("Show or hide the video/image decoder panel");
     recordingModeCombo = new QComboBox(this);
     recordingModeCombo->addItem("Audio WAV", static_cast<int>(RecordingManager::Mode::AudioWav));
     recordingModeCombo->addItem("Channel IQ WAV", static_cast<int>(RecordingManager::Mode::ChannelIqWav));
@@ -1192,17 +1324,20 @@ YourClassName::YourClassName(QWidget *parent)
         {"AM 10 kHz", 10000.0},
         {"NFM 12.5 kHz", 12500.0},
         {"WFM 200 kHz", 200000.0},
+        {"SSTV 3 kHz", 3000.0},
+        {"NOAA APT 40 kHz", 40000.0},
+        {"WEFAX 3 kHz", 3000.0},
+        {"LRPT 140 kHz", 140000.0},
+        {"ATV 5 MHz", 5000000.0},
     });
     bandwidthControl->setValueHz(defaultBandwidthForModulation(MOD_AM));
    
-    modulationButtonGroup = new QButtonGroup(this);
-    QStringList modulationNames = {"AM", "NFM", "SAM", "USB", "LSB", "DSB", "CW", "WFM", "FT8", "RTTY", "FSK", "PSK"};
+    QStringList modulationNames = {"AM", "NFM", "SAM", "USB", "LSB", "DSB", "CW", "WFM"};
     QVector<int> modulationIds = {MOD_AM, MOD_NFM, MOD_SAM, MOD_USB, MOD_LSB, MOD_DSB,
-                                  MOD_CW, MOD_WFM, MOD_FT8, MOD_RTTY, MOD_FSK, MOD_PSK};
+                                  MOD_CW, MOD_WFM};
     
     QHBoxLayout* row1 = new QHBoxLayout();
     QHBoxLayout* row2 = new QHBoxLayout();
-    QHBoxLayout* row3 = new QHBoxLayout();
     
     scaleLayout->addLayout(contrastLayout);
     scaleLayout->addLayout(sensLayout);
@@ -1211,6 +1346,7 @@ YourClassName::YourClassName(QWidget *parent)
     
     graphToolLayout->addStretch();
     graphToolLayout->addWidget(digitalToggleButton);
+    graphToolLayout->addWidget(videoToggleButton);
 
     graphLayout->addLayout(graphToolLayout);
     graphLayout->addWidget(graphWidget);
@@ -1219,17 +1355,11 @@ YourClassName::YourClassName(QWidget *parent)
     graphLayout->addLayout(scaleLayout);
     
     for (int i = 0; i < modulationNames.size(); ++i) {
-        QRadioButton* radioButton = new QRadioButton(modulationNames[i]);
-        modulationButtonGroup->addButton(radioButton, modulationIds[i]);
-        
-        if (i < 4) {
-            row1->addWidget(radioButton);
-        } else if (i < 8) {
-        row2->addWidget(radioButton);
-        } else {
-            row3->addWidget(radioButton);
-        }
-        
+        QRadioButton* radioButton = addModulationRadioButton(controlsWidget,
+                                                             i < 4 ? row1 : row2,
+                                                             modulationNames[i],
+                                                             modulationIds[i],
+                                                             QString());
         if (i == 0) {
             radioButton->setChecked(true); 
         }
@@ -1288,7 +1418,6 @@ YourClassName::YourClassName(QWidget *parent)
     layout->addWidget(bandwidthControl);
     layout->addLayout(row1);
     layout->addLayout(row2);
-    layout->addLayout(row3);
     
     controlsWidget->setLayout(layout);
     centralWidget->setLayout(graphLayout);
@@ -1309,10 +1438,13 @@ YourClassName::YourClassName(QWidget *parent)
     stopPollTimer->setInterval(100);
     streamWatchdogTimer = new QTimer(this);
     streamWatchdogTimer->setInterval(250);
+    videoSnapshotTimer = new QTimer(this);
+    videoSnapshotTimer->setInterval(VIDEO_SNAPSHOT_INTERVAL_MS);
     
     connect(updateTimer, &QTimer::timeout, this, &YourClassName::updateSpectrum);
     connect(stopPollTimer, &QTimer::timeout, this, &YourClassName::pollStopCompletion);
     connect(streamWatchdogTimer, &QTimer::timeout, this, &YourClassName::checkStreamStartup);
+    connect(videoSnapshotTimer, &QTimer::timeout, this, &YourClassName::processVideoSnapshotFrame);
     connect(graphCheckbox, &QCheckBox::toggled, this, &YourClassName::doubleGraphEnable);
     connect(colorCheckbox, &QCheckBox::toggled, this, &YourClassName::colorGraphEnable);
     connect(syncCheckbox, &QCheckBox::toggled, this, &YourClassName::syncEnable);
@@ -1475,6 +1607,71 @@ YourClassName::YourClassName(QWidget *parent)
     });
     connect(digitalDecoder, &DigitalDecoder::textDecoded, this, &YourClassName::onDigitalTextDecoded);
     connect(digitalDecoder, &DigitalDecoder::statusChanged, this, &YourClassName::onDigitalDecoderStatusChanged);
+    connect(videoToggleButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (videoDock) {
+            videoDock->setVisible(checked);
+        }
+    });
+    connect(videoDock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (videoToggleButton && videoToggleButton->isChecked() != visible) {
+            QSignalBlocker blocker(videoToggleButton);
+            videoToggleButton->setChecked(visible);
+        }
+        updateVideoProcessorMode();
+        updateIqFrameProducerSettings();
+    });
+    connect(videoDecodeCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        videoDecodeEnabled = checked;
+        updateVideoProcessorMode();
+        updateIqFrameProducerSettings();
+    });
+    connect(videoDemodCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
+        updateVideoProcessorMode();
+    });
+    connect(videoStandardCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
+        updateVideoProcessorMode();
+    });
+    connect(videoInvertCheckbox, &QCheckBox::toggled, this, [this]() {
+        updateVideoProcessorMode();
+    });
+    connect(videoHSyncCheckbox, &QCheckBox::toggled, this, [this]() {
+        updateVideoProcessorMode();
+    });
+    connect(videoVSyncCheckbox, &QCheckBox::toggled, this, [this]() {
+        updateVideoProcessorMode();
+    });
+    connect(videoTestPatternCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        const bool analogVideoTest = checked && pendingSettings.modulationType == MOD_ATV;
+        const bool sstvTest = checked && pendingSettings.modulationType == MOD_SSTV;
+        const bool aptTest = checked && pendingSettings.modulationType == MOD_APT;
+        const bool wefaxTest = checked && pendingSettings.modulationType == MOD_WEFAX;
+        if (videoProcessor && videoProcessorThread) {
+            QMetaObject::invokeMethod(videoProcessor,
+                                      [processor = videoProcessor, analogVideoTest]() {
+                                          processor->setTestPatternEnabled(analogVideoTest);
+                                      },
+                                      Qt::QueuedConnection);
+            QMetaObject::invokeMethod(videoProcessor,
+                                      [processor = videoProcessor, sstvTest]() {
+                                          processor->setSstvTestPatternEnabled(sstvTest);
+                                      },
+                                      Qt::QueuedConnection);
+            QMetaObject::invokeMethod(videoProcessor,
+                                      [processor = videoProcessor, aptTest]() {
+                                          processor->setAptTestPatternEnabled(aptTest);
+                                      },
+                                      Qt::QueuedConnection);
+            QMetaObject::invokeMethod(videoProcessor,
+                                      [processor = videoProcessor, wefaxTest]() {
+                                          processor->setWefaxTestPatternEnabled(wefaxTest);
+                                      },
+                                      Qt::QueuedConnection);
+        }
+        updateVideoProcessorMode();
+        updateIqFrameProducerSettings();
+    });
+    connect(videoProcessor, &VideoProcessor::frameReady, videoWidget, &VideoWidget::setFrame);
+    connect(videoProcessor, &VideoProcessor::statusChanged, this, &YourClassName::onVideoStatusChanged);
     connect(recordingManager, &RecordingManager::statusChanged, this, &YourClassName::updateRecordingStatus);
     connect(recordButton, &QPushButton::toggled, this, [this](bool checked) {
         if (checked) {
@@ -1506,6 +1703,9 @@ YourClassName::YourClassName(QWidget *parent)
                     recordingManager->appendAudioFrame(pcmData);
                 }
                 processDigitalAudioFrame(pcmData);
+                processSstvAudioFrame(pcmData);
+                processAptAudioFrame(pcmData);
+                processWefaxAudioFrame(pcmData);
                 sendNetworkAudioFrame(pcmData);
             },
             Qt::QueuedConnection);
@@ -1536,6 +1736,7 @@ YourClassName::YourClassName(QWidget *parent)
     updateUiFromPendingSettings();
     publishSettingsToGlobals();
     updateDigitalDecoderMode();
+    updateVideoProcessorMode();
     updateUiForRunState();
     refreshPlaybackFiles();
     qApp->installEventFilter(this);
@@ -1553,6 +1754,9 @@ YourClassName::~YourClassName() {
     }
     if (streamWatchdogTimer) {
         streamWatchdogTimer->stop();
+    }
+    if (videoSnapshotTimer) {
+        videoSnapshotTimer->stop();
     }
     pendingAudioStartAfterStreamReady = false;
     pendingNetworkAudioStartAfterIqPrebuffer = false;
@@ -1587,6 +1791,17 @@ YourClassName::~YourClassName() {
         }
         digitalDecoder = nullptr;
         digitalDecoderThread = nullptr;
+    }
+
+    if (videoProcessorThread) {
+        videoProcessorThread->quit();
+        if (!videoProcessorThread->wait(3000)) {
+            qDebug() << "[Video] processor thread did not stop in time; terminating";
+            videoProcessorThread->terminate();
+            videoProcessorThread->wait();
+        }
+        videoProcessor = nullptr;
+        videoProcessorThread = nullptr;
     }
 
     if (audioProcessor) { 
@@ -1848,7 +2063,10 @@ void YourClassName::publishSettingsToGlobals() {
     if (audioProcessor) {
         audioProcessor->configure(audioProcessorSettings());
     }
-    if (runState == RadioRunState::Running && isChannelIqRecordingActive()) {
+    const bool iqFrameProducerActive =
+        isChannelIqRecordingActive() ||
+        (networkMode == NetworkMode::Server && isClientIqProcessingMode());
+    if (runState == RadioRunState::Running && iqFrameProducerActive) {
         updateIqFrameProducerSettings();
     }
 }
@@ -1895,9 +2113,9 @@ void YourClassName::updateIqFrameProducerSettings() {
     }
 
     const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
+    const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
     const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
     const bool channelIqRecording = isChannelIqRecordingActive();
-
     processor->configureNetworkIqStreaming(pendingSettings,
                                            serverIqStreaming || channelIqRecording,
                                            serverChannelIqStreaming || channelIqRecording);
@@ -1946,6 +2164,7 @@ void YourClassName::connectDataProcessorSignals() {
                     recordingManager->mode() == RecordingManager::Mode::ChannelIqWav) {
                     recordingManager->appendIqFrame(iqData, sampleRate, sampleCount);
                 }
+                processVideoIqFrame(iqData, sampleRate, sampleCount);
                 sendNetworkIqFrame(iqData, sampleRate, sampleCount);
             },
             Qt::QueuedConnection);
@@ -1961,6 +2180,8 @@ void YourClassName::applyServerLocalOutputPolicy() {
     if (audioProcessor) {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
+    updateVideoProcessorMode();
+    updateIqFrameProducerSettings();
 
     if (!updateTimer || runState != RadioRunState::Running || networkMode != NetworkMode::Server) {
         return;
@@ -1979,6 +2200,37 @@ void YourClassName::applyServerLocalOutputPolicy() {
     } else if (updateTimer->isActive()) {
         updateTimer->stop();
     }
+}
+
+bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings,
+                                                           const char *reason) {
+    if (pendingSettings.inputMode != 0 ||
+        isIdle() ||
+        !hasActiveFobosDevice() ||
+        std::abs(previousSettings.centerFrequency - pendingSettings.centerFrequency) <= 0.5) {
+        return true;
+    }
+
+    double tunedFrequency = pendingSettings.centerFrequency;
+    const int result = setActiveFrequencySafely(pendingSettings.centerFrequency, &tunedFrequency);
+    if (result == FOBOS_ERR_OK) {
+        pendingSettings.actualFrequency = tunedFrequency;
+        if (hardwareSettingsApplied) {
+            appliedHardwareSettings.centerFrequency = pendingSettings.centerFrequency;
+            appliedHardwareSettings.actualFrequency = tunedFrequency;
+        }
+        qDebug() << "[LiveTune]" << reason
+                 << "center applied"
+                 << "requested" << pendingSettings.centerFrequency
+                 << "actual" << tunedFrequency;
+        return true;
+    }
+
+    qDebug() << "[LiveTune]" << reason
+             << "center apply failed"
+             << "requested" << pendingSettings.centerFrequency
+             << "error" << result;
+    return false;
 }
 
 void YourClassName::resetNetworkIqReceptionState(bool clearGraph, bool clearWaterfall, bool restartAudioPrebuffer) {
@@ -2384,6 +2636,11 @@ void YourClassName::updateUiFromPendingSettings() {
         digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
         digitalDecodeCheckbox->blockSignals(false);
     }
+    if (videoDecodeCheckbox) {
+        videoDecodeCheckbox->blockSignals(true);
+        videoDecodeCheckbox->setChecked(videoDecodeEnabled);
+        videoDecodeCheckbox->blockSignals(false);
+    }
     const float volume = volumePercent / 100.0f;
     if (audioProcessor) {
         audioProcessor->setVolume(volume);
@@ -2400,6 +2657,7 @@ void YourClassName::updateUiFromPendingSettings() {
     updateSpectrumTimerInterval();
     settingRange();
     updateDigitalDecoderMode();
+    updateVideoProcessorMode();
 }
 
 void YourClassName::loadPersistentSettings() {
@@ -2455,6 +2713,29 @@ void YourClassName::loadPersistentSettings() {
     networkControlPort = static_cast<quint16>((std::clamp)(settings.value("network/controlPort", static_cast<int>(networkControlPort)).toInt(), 1, 65535));
     serverDisableLocalVisualAudio = settings.value("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio).toBool();
     digitalDecodeEnabled = settings.value("digital/decodeEnabled", digitalDecodeEnabled).toBool();
+    videoDecodeEnabled = settings.value("video/decodeEnabled", videoDecodeEnabled).toBool();
+    if (videoDemodCombo) {
+        const int demodMode = settings.value("video/demodMode", VideoProcessor::FmVideo).toInt();
+        const int demodIndex = videoDemodCombo->findData(demodMode);
+        if (demodIndex >= 0) {
+            videoDemodCombo->setCurrentIndex(demodIndex);
+        }
+    }
+    if (videoStandardCombo) {
+        const int standardIndex = (std::clamp)(settings.value("video/standardIndex", 0).toInt(),
+                                               0,
+                                               (std::max)(0, videoStandardCombo->count() - 1));
+        videoStandardCombo->setCurrentIndex(standardIndex);
+    }
+    if (videoInvertCheckbox) {
+        videoInvertCheckbox->setChecked(settings.value("video/invert", false).toBool());
+    }
+    if (videoHSyncCheckbox) {
+        videoHSyncCheckbox->setChecked(settings.value("video/hSync", true).toBool());
+    }
+    if (videoVSyncCheckbox) {
+        videoVSyncCheckbox->setChecked(settings.value("video/vSync", true).toBool());
+    }
 
     normalizeTuning(pendingSettings);
     qDebug() << (settingsFileExists ? "[Settings] loaded" : "[Settings] using defaults; settings file will be created on clean exit")
@@ -2500,6 +2781,12 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("network/processingMode", static_cast<int>(networkProcessingMode));
     settings.setValue("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio);
     settings.setValue("digital/decodeEnabled", digitalDecodeEnabled);
+    settings.setValue("video/decodeEnabled", videoDecodeEnabled);
+    settings.setValue("video/demodMode", videoDemodCombo ? videoDemodCombo->currentData().toInt() : VideoProcessor::FmVideo);
+    settings.setValue("video/standardIndex", videoStandardCombo ? videoStandardCombo->currentIndex() : 0);
+    settings.setValue("video/invert", videoInvertCheckbox && videoInvertCheckbox->isChecked());
+    settings.setValue("video/hSync", !videoHSyncCheckbox || videoHSyncCheckbox->isChecked());
+    settings.setValue("video/vSync", !videoVSyncCheckbox || videoVSyncCheckbox->isChecked());
     settings.sync();
 
     if (settings.status() == QSettings::NoError) {
@@ -2515,20 +2802,7 @@ void YourClassName::applyLiveRemoteSettings(const RadioSettings &previousSetting
         return;
     }
 
-    if (pendingSettings.inputMode == 0 &&
-        std::abs(previousSettings.centerFrequency - pendingSettings.centerFrequency) > 0.5) {
-        double tunedFrequency = pendingSettings.centerFrequency;
-        const int result = setActiveFrequencySafely(pendingSettings.centerFrequency, &tunedFrequency);
-        if (result == FOBOS_ERR_OK) {
-            pendingSettings.actualFrequency = tunedFrequency;
-            if (hardwareSettingsApplied) {
-                appliedHardwareSettings.centerFrequency = pendingSettings.centerFrequency;
-                appliedHardwareSettings.actualFrequency = tunedFrequency;
-            }
-        } else {
-            qDebug() << "[Network] failed to tune remote frequency while running" << result;
-        }
-    }
+    applyCenterFrequencyToHardwareIfNeeded(previousSettings, "remote settings");
 
     if (hardwareSettingsApplied && previousSettings.lnaGain != pendingSettings.lnaGain) {
         const int result = setActiveLnaGainSafely(static_cast<unsigned int>(pendingSettings.lnaGain));
@@ -3001,6 +3275,9 @@ void YourClassName::playNetworkAudioFrame(const QJsonObject &frame) {
 
     const QByteArray pcmData = QByteArray::fromBase64(frame.value("pcm").toString().toLatin1());
     processDigitalAudioFrame(pcmData);
+    processSstvAudioFrame(pcmData);
+    processAptAudioFrame(pcmData);
+    processWefaxAudioFrame(pcmData);
     remoteAudioPlayer->playPcmFrame(pcmData);
 }
 
@@ -3021,6 +3298,87 @@ void YourClassName::processDigitalAudioFrame(const QByteArray &pcmData) {
                               Qt::QueuedConnection);
 }
 
+void YourClassName::processSstvAudioFrame(const QByteArray &pcmData) {
+    const bool suppressServerLocalOutput =
+        networkMode == NetworkMode::Server &&
+        serverDisableLocalVisualAudio &&
+        networkController &&
+        networkController->isControlReady();
+    if (!videoProcessor ||
+        !videoProcessorThread ||
+        !videoDecodeEnabled ||
+        !videoDock ||
+        !videoDock->isVisible() ||
+        !videoDecodeCheckbox ||
+        !videoDecodeCheckbox->isChecked() ||
+        pendingSettings.modulationType != MOD_SSTV ||
+        pcmData.isEmpty() ||
+        suppressServerLocalOutput ||
+        (videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked())) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, pcmData]() {
+                                  processor->processSstvPcmFrame(pcmData, 48000);
+                              },
+                              Qt::QueuedConnection);
+}
+
+void YourClassName::processAptAudioFrame(const QByteArray &pcmData) {
+    const bool suppressServerLocalOutput =
+        networkMode == NetworkMode::Server &&
+        serverDisableLocalVisualAudio &&
+        networkController &&
+        networkController->isControlReady();
+    if (!videoProcessor ||
+        !videoProcessorThread ||
+        !videoDecodeEnabled ||
+        !videoDock ||
+        !videoDock->isVisible() ||
+        !videoDecodeCheckbox ||
+        !videoDecodeCheckbox->isChecked() ||
+        pendingSettings.modulationType != MOD_APT ||
+        pcmData.isEmpty() ||
+        suppressServerLocalOutput ||
+        (videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked())) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, pcmData]() {
+                                  processor->processAptPcmFrame(pcmData, 48000);
+                              },
+                              Qt::QueuedConnection);
+}
+
+void YourClassName::processWefaxAudioFrame(const QByteArray &pcmData) {
+    const bool suppressServerLocalOutput =
+        networkMode == NetworkMode::Server &&
+        serverDisableLocalVisualAudio &&
+        networkController &&
+        networkController->isControlReady();
+    if (!videoProcessor ||
+        !videoProcessorThread ||
+        !videoDecodeEnabled ||
+        !videoDock ||
+        !videoDock->isVisible() ||
+        !videoDecodeCheckbox ||
+        !videoDecodeCheckbox->isChecked() ||
+        pendingSettings.modulationType != MOD_WEFAX ||
+        pcmData.isEmpty() ||
+        suppressServerLocalOutput ||
+        (videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked())) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, pcmData]() {
+                                  processor->processWefaxPcmFrame(pcmData, 48000);
+                              },
+                              Qt::QueuedConnection);
+}
+
 void YourClassName::updateDigitalDecoderMode() {
     if (!digitalDecoder || !digitalDecoderThread) {
         return;
@@ -3031,6 +3389,314 @@ void YourClassName::updateDigitalDecoderMode() {
                               [decoder = digitalDecoder, enabled, settings]() {
                                   decoder->setEnabled(enabled);
                                   decoder->configure(settings, 48000);
+                              },
+                              Qt::QueuedConnection);
+}
+
+bool YourClassName::isVideoDecodeActive() const {
+    const bool suppressServerLocalOutput =
+        networkMode == NetworkMode::Server &&
+        serverDisableLocalVisualAudio &&
+        networkController &&
+        networkController->isControlReady();
+    return videoDecodeEnabled &&
+           videoDock &&
+           videoDock->isVisible() &&
+           videoDecodeCheckbox &&
+           videoDecodeCheckbox->isChecked() &&
+           (pendingSettings.modulationType == MOD_ATV ||
+            pendingSettings.modulationType == MOD_LRPT) &&
+           (!videoTestPatternCheckbox || !videoTestPatternCheckbox->isChecked()) &&
+           !suppressServerLocalOutput;
+}
+
+void YourClassName::processVideoIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount) {
+    if (!isVideoDecodeActive() ||
+        !videoProcessor ||
+        !videoProcessorThread ||
+        iqData.isEmpty() ||
+        sampleRate <= 0.0 ||
+        sampleCount <= 0) {
+        return;
+    }
+    if (videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked()) {
+        return;
+    }
+    if (videoIqFramePending.exchange(true)) {
+        return;
+    }
+    if (pendingSettings.modulationType == MOD_LRPT) {
+        const int bytesPerIq = iqData.size() >= sampleCount * 4 ? 4 : 2;
+        std::vector<float> floatSamples;
+        floatSamples.reserve(static_cast<std::size_t>(sampleCount) * 2);
+        const auto *src = reinterpret_cast<const uchar *>(iqData.constData());
+        for (int i = 0; i < sampleCount; ++i) {
+            float iSample = 0.0f;
+            float qSample = 0.0f;
+            if (bytesPerIq == 4) {
+                const int offset = i * 4;
+                if (offset + 3 >= iqData.size()) {
+                    break;
+                }
+                const qint16 rawI = static_cast<qint16>(src[offset] | (src[offset + 1] << 8));
+                const qint16 rawQ = static_cast<qint16>(src[offset + 2] | (src[offset + 3] << 8));
+                iSample = rawI / 32768.0f;
+                qSample = rawQ / 32768.0f;
+            } else {
+                const int offset = i * 2;
+                if (offset + 1 >= iqData.size()) {
+                    break;
+                }
+                iSample = (static_cast<int>(src[offset]) - 128) / 128.0f;
+                qSample = (static_cast<int>(src[offset + 1]) - 128) / 128.0f;
+            }
+            floatSamples.push_back(iSample);
+            floatSamples.push_back(qSample);
+        }
+        if (floatSamples.size() < 8) {
+            videoIqFramePending.store(false);
+            return;
+        }
+        RadioSettings settings = spectrumProcessingSettings();
+        settings.sampleRate = sampleRate;
+        QMetaObject::invokeMethod(videoProcessor,
+                                  [this, processor = videoProcessor, samples = std::move(floatSamples), settings]() {
+                                      processor->processFloatIqSnapshot(samples, settings);
+                                      QMetaObject::invokeMethod(this,
+                                                                [this]() {
+                                                                    videoIqFramePending.store(false);
+                                                                },
+                                                                Qt::QueuedConnection);
+                                  },
+                                  Qt::QueuedConnection);
+        return;
+    }
+
+    if (iqData.size() == sampleCount * 2 && sampleRate > 10000000.0) {
+        if (videoStatusLabel) {
+            videoStatusLabel->setText(QStringLiteral("Video: switch to ATV/channel IQ for wide signals"));
+        }
+        videoIqFramePending.store(false);
+        return;
+    }
+
+    QMetaObject::invokeMethod(videoProcessor,
+                              [this, processor = videoProcessor, iqData, sampleRate, sampleCount]() {
+                                  processor->processIqFrame(iqData, sampleRate, sampleCount);
+                                  QMetaObject::invokeMethod(this,
+                                                            [this]() {
+                                                                videoIqFramePending.store(false);
+                                                            },
+                                                            Qt::QueuedConnection);
+                              },
+                              Qt::QueuedConnection);
+}
+
+void YourClassName::processVideoSnapshotFrame() {
+    const bool channelIqStreamMode =
+        networkMode != NetworkMode::Disabled &&
+        isChannelIqProcessingMode();
+    if (!isVideoDecodeActive() ||
+        channelIqStreamMode ||
+        !videoProcessor ||
+        !videoProcessorThread) {
+        return;
+    }
+    if (videoIqFramePending.exchange(true)) {
+        return;
+    }
+
+    std::vector<float> snapshot;
+    std::uint64_t sequence = 0;
+    if (!IqBuffer::snapshot(snapshot, &sequence) || snapshot.size() < 4) {
+        videoIqFramePending.store(false);
+        return;
+    }
+
+    if (snapshot.size() > VIDEO_SNAPSHOT_MAX_FLOATS) {
+        std::vector<float> tail(snapshot.end() - static_cast<std::ptrdiff_t>(VIDEO_SNAPSHOT_MAX_FLOATS),
+                                snapshot.end());
+        snapshot.swap(tail);
+    }
+
+    RadioSettings settings = spectrumProcessingSettings();
+    QMetaObject::invokeMethod(videoProcessor,
+                              [this, processor = videoProcessor, samples = std::move(snapshot), settings]() {
+                                  processor->processFloatIqSnapshot(samples, settings);
+                                  QMetaObject::invokeMethod(this,
+                                                            [this]() {
+                                                                videoIqFramePending.store(false);
+                                                            },
+                                                            Qt::QueuedConnection);
+                              },
+                              Qt::QueuedConnection);
+}
+
+void YourClassName::updateVideoProcessorMode() {
+    if (!videoProcessor || !videoProcessorThread) {
+        return;
+    }
+
+    const bool iqVideoEnabled = isVideoDecodeActive();
+    const bool analogVideoEnabled = iqVideoEnabled && pendingSettings.modulationType == MOD_ATV;
+    videoIqFramePending.store(false);
+    const bool testPatternEnabled = videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked();
+    const bool analogVideoTest = testPatternEnabled && pendingSettings.modulationType == MOD_ATV;
+    const bool sstvTest = testPatternEnabled && pendingSettings.modulationType == MOD_SSTV;
+    const bool aptTest = testPatternEnabled && pendingSettings.modulationType == MOD_APT;
+    const bool wefaxTest = testPatternEnabled && pendingSettings.modulationType == MOD_WEFAX;
+    const bool lrptTest = testPatternEnabled && pendingSettings.modulationType == MOD_LRPT;
+    const bool suppressServerLocalOutput =
+        networkMode == NetworkMode::Server &&
+        serverDisableLocalVisualAudio &&
+        networkController &&
+        networkController->isControlReady();
+    const bool sstvEnabled =
+        videoDock &&
+        videoDock->isVisible() &&
+        pendingSettings.modulationType == MOD_SSTV &&
+        (sstvTest ||
+         (videoDecodeEnabled &&
+          videoDecodeCheckbox &&
+          videoDecodeCheckbox->isChecked())) &&
+        !suppressServerLocalOutput;
+    const bool aptEnabled =
+        videoDock &&
+        videoDock->isVisible() &&
+        pendingSettings.modulationType == MOD_APT &&
+        (aptTest ||
+         (videoDecodeEnabled &&
+          videoDecodeCheckbox &&
+          videoDecodeCheckbox->isChecked())) &&
+        !suppressServerLocalOutput;
+    const bool wefaxEnabled =
+        videoDock &&
+        videoDock->isVisible() &&
+        pendingSettings.modulationType == MOD_WEFAX &&
+        (wefaxTest ||
+         (videoDecodeEnabled &&
+          videoDecodeCheckbox &&
+          videoDecodeCheckbox->isChecked())) &&
+        !suppressServerLocalOutput;
+    const bool lrptEnabled =
+        videoDock &&
+        videoDock->isVisible() &&
+        pendingSettings.modulationType == MOD_LRPT &&
+        (lrptTest ||
+         (videoDecodeEnabled &&
+          videoDecodeCheckbox &&
+          videoDecodeCheckbox->isChecked())) &&
+        !suppressServerLocalOutput;
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, analogVideoTest]() {
+                                  processor->setTestPatternEnabled(analogVideoTest);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, sstvEnabled]() {
+                                  processor->configureSstv(sstvEnabled);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, sstvTest]() {
+                                  processor->setSstvTestPatternEnabled(sstvTest);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, aptEnabled]() {
+                                  processor->configureApt(aptEnabled);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, aptTest]() {
+                                  processor->setAptTestPatternEnabled(aptTest);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, wefaxEnabled]() {
+                                  processor->configureWefax(wefaxEnabled);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, wefaxTest]() {
+                                  processor->setWefaxTestPatternEnabled(wefaxTest);
+                              },
+                              Qt::QueuedConnection);
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor, lrptEnabled]() {
+                                  processor->configureLrpt(lrptEnabled);
+                              },
+                              Qt::QueuedConnection);
+
+    const bool channelIqStreamMode =
+        networkMode != NetworkMode::Disabled &&
+        isChannelIqProcessingMode();
+    const bool snapshotVideoEnabled = iqVideoEnabled && !channelIqStreamMode;
+    if (videoSnapshotTimer) {
+        if (snapshotVideoEnabled && !videoSnapshotTimer->isActive()) {
+            videoSnapshotTimer->start();
+        } else if (!snapshotVideoEnabled && videoSnapshotTimer->isActive()) {
+            videoSnapshotTimer->stop();
+        }
+    }
+    if (sstvTest) {
+        if (videoStatusLabel) {
+            videoStatusLabel->setText(QStringLiteral("SSTV Robot36 test stream"));
+        }
+    }
+    if (aptTest) {
+        if (videoStatusLabel) {
+            videoStatusLabel->setText(QStringLiteral("NOAA APT test stream"));
+        }
+    }
+    if (wefaxTest) {
+        if (videoStatusLabel) {
+            videoStatusLabel->setText(QStringLiteral("WEFAX test stream"));
+        }
+    }
+    if (lrptTest) {
+        if (videoStatusLabel) {
+            videoStatusLabel->setText(QStringLiteral("Meteor LRPT beta: QPSK monitor test"));
+        }
+    }
+    if (!iqVideoEnabled && !sstvTest && !aptTest && !wefaxTest && !lrptEnabled && videoWidget) {
+        videoWidget->clearFrame();
+    }
+    if (pendingSettings.modulationType == MOD_SSTV && !sstvTest && videoStatusLabel) {
+        videoStatusLabel->setText(QStringLiteral("SSTV: image decoder setup ready"));
+    }
+    if (pendingSettings.modulationType == MOD_APT && !aptTest && videoStatusLabel) {
+        videoStatusLabel->setText(QStringLiteral("NOAA APT: image decoder setup ready"));
+    }
+    if (pendingSettings.modulationType == MOD_WEFAX && !wefaxTest && videoStatusLabel) {
+        videoStatusLabel->setText(QStringLiteral("WEFAX: image decoder setup ready"));
+    }
+    if (pendingSettings.modulationType == MOD_LRPT && !lrptTest && videoStatusLabel) {
+        videoStatusLabel->setText(QStringLiteral("Meteor LRPT beta: QPSK IQ monitor ready"));
+    }
+    const int demodMode = videoDemodCombo ? videoDemodCombo->currentData().toInt()
+                                          : VideoProcessor::FmVideo;
+    const double lineRate = videoStandardCombo ? videoStandardCombo->currentData().toDouble()
+                                               : 15625.0;
+    const bool invertVideo = videoInvertCheckbox && videoInvertCheckbox->isChecked();
+    const bool hSyncEnabled = !videoHSyncCheckbox || videoHSyncCheckbox->isChecked();
+    const bool vSyncEnabled = !videoVSyncCheckbox || videoVSyncCheckbox->isChecked();
+    QMetaObject::invokeMethod(videoProcessor,
+                              [processor = videoProcessor,
+                               analogVideoEnabled,
+                               demodMode,
+                               lineRate,
+                               invertVideo,
+                               hSyncEnabled,
+                               vSyncEnabled]() {
+                                  processor->configure(analogVideoEnabled,
+                                                       demodMode,
+                                                       lineRate,
+                                                       384,
+                                                       288,
+                                                       invertVideo,
+                                                       hSyncEnabled,
+                                                       vSyncEnabled);
                               },
                               Qt::QueuedConnection);
 }
@@ -3396,16 +4062,21 @@ void YourClassName::onPlaybackStatusChanged(const QString &status) {
 
 void YourClassName::handlePlaybackAudioFrame(const QByteArray &pcmData) {
     processDigitalAudioFrame(pcmData);
+    processSstvAudioFrame(pcmData);
+    processAptAudioFrame(pcmData);
+    processWefaxAudioFrame(pcmData);
     if (remoteAudioPlayer) {
         remoteAudioPlayer->playPcmFrame(pcmData);
     }
 }
 
 void YourClassName::handlePlaybackIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount) {
-    Q_UNUSED(sampleCount);
     if (iqData.size() < static_cast<int>(2 * sizeof(qint16))) {
         return;
     }
+    processVideoIqFrame(iqData,
+                        sampleRate,
+                        sampleCount > 0 ? sampleCount : iqData.size() / (2 * static_cast<int>(sizeof(qint16))));
     const int bytesPerIq = 2 * static_cast<int>(sizeof(qint16));
     std::vector<float> floatSamples(static_cast<std::size_t>(iqData.size() / sizeof(qint16)));
     const auto *src = reinterpret_cast<const uchar *>(iqData.constData());
@@ -3522,13 +4193,15 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
     if (frameSampleRate <= 0.0) {
         return;
     }
+    const int frameSampleCount = frame.value("sampleCount").toInt(iqBytes.size() / bytesPerIqSample);
+    processVideoIqFrame(iqBytes, frameSampleRate, frameSampleCount);
     if (channelizedFrame &&
         recordingManager &&
         recordingManager->isRecording() &&
         recordingManager->mode() == RecordingManager::Mode::ChannelIqWav) {
         recordingManager->appendIqFrame(iqBytes,
                                         frameSampleRate,
-                                        frame.value("sampleCount").toInt(iqBytes.size() / bytesPerIqSample));
+                                        frameSampleCount);
     }
 
     RadioSettings iqSettings = pendingSettings;
@@ -4098,25 +4771,12 @@ void YourClassName::updateCentralFrequency() {
 }
 
 void YourClassName::updateTuningFromScale(double tunedListeningFrequency, double tunedCenterFrequency) {
+    const RadioSettings previousSettings = pendingSettings;
     pendingSettings.listeningFrequency = tunedListeningFrequency;
     pendingSettings.centerFrequency = tunedCenterFrequency;
     normalizeTuning(pendingSettings);
 
-    if (pendingSettings.inputMode == 0) {
-        if (!isIdle() && hasActiveFobosDevice()) {
-            double tunedFrequency = pendingSettings.centerFrequency;
-            const int result = setActiveFrequencySafely(pendingSettings.centerFrequency, &tunedFrequency);
-            if (result == FOBOS_ERR_OK) {
-                pendingSettings.actualFrequency = tunedFrequency;
-                if (hardwareSettingsApplied) {
-                    appliedHardwareSettings.centerFrequency = pendingSettings.centerFrequency;
-                    appliedHardwareSettings.actualFrequency = tunedFrequency;
-                }
-            } else {
-                qDebug() << "Failed to tune frequency from scale, error code:" << result;
-            }
-        }
-    }
+    applyCenterFrequencyToHardwareIfNeeded(previousSettings, "scale");
 
     publishSettingsToGlobals();
     if (frequencyControl) {
@@ -4202,6 +4862,8 @@ void YourClassName::onModulationChanged(int id) {
         scaleWidget->setModulationType(id);
     }
     updateDigitalDecoderMode();
+    updateVideoProcessorMode();
+    updateIqFrameProducerSettings();
     settingRange();
     qDebug() << "Modulation type changed to:" << id
              << "bandwidth preset" << pendingSettings.bandwidth;
@@ -4224,6 +4886,53 @@ void YourClassName::onDigitalTextDecoded(const QString &text) {
 void YourClassName::onDigitalDecoderStatusChanged(const QString &status) {
     if (digitalStatusLabel) {
         digitalStatusLabel->setText(status);
+    }
+}
+
+void YourClassName::onVideoStatusChanged(const QString &status) {
+    if (videoStatusLabel) {
+        if (pendingSettings.modulationType == MOD_SSTV) {
+            if (status.startsWith(QStringLiteral("SSTV"))) {
+                videoStatusLabel->setText(status);
+                return;
+            }
+            const bool sstvTest = videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked();
+            videoStatusLabel->setText(sstvTest
+                                      ? QStringLiteral("SSTV: internal image test pattern")
+                                      : QStringLiteral("SSTV: image decoder setup ready"));
+            return;
+        }
+        if (pendingSettings.modulationType == MOD_APT) {
+            if (status.startsWith(QStringLiteral("NOAA APT"))) {
+                videoStatusLabel->setText(status);
+                return;
+            }
+            const bool aptTest = videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked();
+            videoStatusLabel->setText(aptTest
+                                      ? QStringLiteral("NOAA APT test stream")
+                                      : QStringLiteral("NOAA APT: image decoder setup ready"));
+            return;
+        }
+        if (pendingSettings.modulationType == MOD_WEFAX) {
+            if (status.startsWith(QStringLiteral("WEFAX"))) {
+                videoStatusLabel->setText(status);
+                return;
+            }
+            const bool wefaxTest = videoTestPatternCheckbox && videoTestPatternCheckbox->isChecked();
+            videoStatusLabel->setText(wefaxTest
+                                      ? QStringLiteral("WEFAX test stream")
+                                      : QStringLiteral("WEFAX: image decoder setup ready"));
+            return;
+        }
+        if (pendingSettings.modulationType == MOD_LRPT) {
+            if (status.startsWith(QStringLiteral("Meteor LRPT"))) {
+                videoStatusLabel->setText(status);
+                return;
+            }
+            videoStatusLabel->setText(QStringLiteral("Meteor LRPT beta: QPSK IQ monitor ready"));
+            return;
+        }
+        videoStatusLabel->setText(status);
     }
 }
 
@@ -5009,8 +5718,10 @@ void YourClassName::onListeningFrequencyEntered() {
         return;
     }
 
+    const RadioSettings previousSettings = pendingSettings;
     pendingSettings.listeningFrequency = listeningFrequencyControl->valueHz();
     normalizeTuning(pendingSettings);
+    applyCenterFrequencyToHardwareIfNeeded(previousSettings, "listening control");
     publishSettingsToGlobals();
     if (frequencyControl) {
         QSignalBlocker blocker(frequencyControl);
@@ -5028,23 +5739,12 @@ void YourClassName::onListeningFrequencyEntered() {
 }
     
 void YourClassName::onFrequencyEntered() {
+    const RadioSettings previousSettings = pendingSettings;
     if (pendingSettings.inputMode == 0) {
         if (frequencyControl) {
             pendingSettings.centerFrequency = frequencyControl->valueHz();
             normalizeTuning(pendingSettings, true);
-            if (!isIdle() && hasActiveFobosDevice()) {
-                double tunedFrequency = pendingSettings.centerFrequency;
-                const int result = setActiveFrequencySafely(pendingSettings.centerFrequency, &tunedFrequency);
-                if (result == FOBOS_ERR_OK) {
-                    pendingSettings.actualFrequency = tunedFrequency;
-                    if (hardwareSettingsApplied) {
-                        appliedHardwareSettings.centerFrequency = pendingSettings.centerFrequency;
-                        appliedHardwareSettings.actualFrequency = tunedFrequency;
-                    }
-                } else {
-                    qDebug() << "Failed to tune frequency while running, error code:" << result;
-                }
-            }
+            applyCenterFrequencyToHardwareIfNeeded(previousSettings, "center control");
             publishSettingsToGlobals();
             QSignalBlocker frequencyBlocker(frequencyControl);
             frequencyControl->setValueHz(pendingSettings.centerFrequency);

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.9.0-beta - 2026-05-28
+
+FobosAPP 2.9 beta is an intentionally experimental video/image decoding build.
+The new decoders are present so users with suitable signals can help test them.
+
+### Added
+
+- Video dock modes for ATV, SSTV, NOAA APT, HF WEFAX, and Meteor LRPT beta.
+- SSTV decoder support for Robot, Martin, Scottie, Wraase, and PD-family modes,
+  plus an internal SSTV test pattern.
+- NOAA APT image decoder with a real decoder-path test pattern.
+- HF WEFAX beta decoder with a real decoder-path test pattern.
+- Meteor LRPT beta QPSK IQ monitor for signal inspection and future image work.
+- Analog video VSync option and PAL/NTSC line-rate presets.
+
+### Changed
+
+- Moved video/image modes into the Video dock and digital text/audio modes into
+  the Digital Audio dock.
+- Added video/image bandwidth presets for SSTV, APT, WEFAX, and LRPT.
+- Extended audio filtering and FT8 decode work from the 2.x development builds.
+
+### Known Issues
+
+- WEFAX, LRPT, and analog video are beta-quality and need real-signal testing.
+- LRPT currently shows a QPSK/IQ monitor rather than a finished satellite image.
+- Video decoding can still be CPU-heavy on weak clients or wide IQ streams.
+
 ## 2.0.0 - 2026-05-27
 
 FobosAPP 2.0 is the first broadly usable Windows release after the audio,

@@ -27,14 +27,21 @@ enum ModulationMode {
     MOD_FT8 = 8,
     MOD_RTTY = 9,
     MOD_FSK = 10,
-    MOD_PSK = 11
+    MOD_PSK = 11,
+    MOD_ATV = 12,
+    MOD_SSTV = 13,
+    MOD_APT = 14,
+    MOD_WEFAX = 15,
+    MOD_LRPT = 16
 };
 
 inline bool isUpperSidebandMode(int modulationType) {
     return modulationType == MOD_USB ||
            modulationType == MOD_FT8 ||
            modulationType == MOD_RTTY ||
-           modulationType == MOD_PSK;
+           modulationType == MOD_PSK ||
+           modulationType == MOD_SSTV ||
+           modulationType == MOD_WEFAX;
 }
 
 inline bool isLowerSidebandMode(int modulationType) {
@@ -44,7 +51,9 @@ inline bool isLowerSidebandMode(int modulationType) {
 inline bool isFrequencyDiscriminatorMode(int modulationType) {
     return modulationType == MOD_NFM ||
            modulationType == MOD_WFM ||
-           modulationType == MOD_FSK;
+           modulationType == MOD_FSK ||
+           modulationType == MOD_ATV ||
+           modulationType == MOD_APT;
 }
 
 struct RadioSettings {

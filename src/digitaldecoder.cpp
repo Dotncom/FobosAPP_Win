@@ -864,8 +864,8 @@ void DigitalDecoder::setEnabled(bool enabled) {
     }
     decoderEnabled = enabled;
     reset();
-    updateStatus(enabled ? QStringLiteral("Digital decoder ready")
-                         : QStringLiteral("Digital decoder disabled"));
+    updateStatus(enabled ? QStringLiteral("Digital audio decoder ready")
+                         : QStringLiteral("Digital audio decoder disabled"));
 }
 
 bool DigitalDecoder::isEnabled() const {
@@ -962,7 +962,7 @@ void DigitalDecoder::configureForMode(int modulationType, int sampleRate) {
     reset();
 
     if (!decoderEnabled) {
-        updateStatus(QStringLiteral("Digital decoder disabled"));
+        updateStatus(QStringLiteral("Digital audio decoder disabled"));
         return;
     }
 
@@ -975,9 +975,9 @@ void DigitalDecoder::configureForMode(int modulationType, int sampleRate) {
     } else if (modulationType == MOD_PSK) {
         updateStatus(QStringLiteral("PSK mode: clean audio pass-through; PSK31 decoder not implemented yet"));
     } else if (isDigitalMode(modulationType)) {
-        updateStatus(QStringLiteral("Digital decoder waiting for supported mode"));
+        updateStatus(QStringLiteral("Digital audio decoder waiting for supported mode"));
     } else {
-        updateStatus(QStringLiteral("Digital decoder idle"));
+        updateStatus(QStringLiteral("Digital audio decoder idle"));
     }
 }
 

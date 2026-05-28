@@ -36,6 +36,7 @@
 #include <QDebug>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <QRadioButton>
 #include <QButtonGroup>
 #include <QElapsedTimer>
@@ -51,6 +52,8 @@
 #include "recordingmanager.h"
 #include "remoteaudioplayer.h"
 #include "radiosettings.h"
+#include "videoprocessor.h"
+#include "videowidget.h"
 #include "frequencycontrol.h"
 #include "scalewidget.h"
 #include "MyGraphWidget.h"
@@ -132,6 +135,7 @@ private slots:
     void onPlaybackStarted(const QString &filePath, PlaybackManager::WavInfo info);
     void onPlaybackStopped();
     void onPlaybackStatusChanged(const QString &status);
+    void onVideoStatusChanged(const QString &status);
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 	void onWaterfallScaleChanged(int delta);
@@ -196,6 +200,7 @@ private:
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
     void connectDataProcessorSignals();
     void applyServerLocalOutputPolicy();
+    bool applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings, const char *reason);
     void resetNetworkIqReceptionState(bool clearGraph, bool clearWaterfall, bool restartAudioPrebuffer);
     void loadPersistentSettings();
     void savePersistentSettings();
@@ -208,7 +213,14 @@ private:
     void sendNetworkIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     void receiveNetworkIqFrame(const QJsonObject &frame);
     void processDigitalAudioFrame(const QByteArray &pcmData);
+    void processSstvAudioFrame(const QByteArray &pcmData);
+    void processAptAudioFrame(const QByteArray &pcmData);
+    void processWefaxAudioFrame(const QByteArray &pcmData);
     void updateDigitalDecoderMode();
+    bool isVideoDecodeActive() const;
+    void processVideoIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
+    void processVideoSnapshotFrame();
+    void updateVideoProcessorMode();
     RadioSettings audioProcessorSettings() const;
     RadioSettings spectrumProcessingSettings() const;
     RecordingManager::Mode selectedRecordingMode() const;
@@ -232,12 +244,15 @@ private:
     QComboBox *audioDeviceComboBox = nullptr;
     QComboBox *recordingModeCombo = nullptr;
     QComboBox *playbackFileCombo = nullptr;
+    QComboBox *videoDemodCombo = nullptr;
+    QComboBox *videoStandardCombo = nullptr;
     QButtonGroup *modulationButtonGroup = nullptr;
     
     QPushButton *refreshButton = nullptr;
     QPushButton *fobosButton = nullptr;
     QPushButton *networkButton = nullptr;
     QPushButton *digitalToggleButton = nullptr;
+    QPushButton *videoToggleButton = nullptr;
     QPushButton *recordButton = nullptr;
     QPushButton *playbackRefreshButton = nullptr;
     QPushButton *playbackButton = nullptr;
@@ -250,6 +265,11 @@ private:
     QCheckBox *graphCheckbox = nullptr;
     QCheckBox *colorCheckbox = nullptr;
     QCheckBox *digitalDecodeCheckbox = nullptr;
+    QCheckBox *videoDecodeCheckbox = nullptr;
+    QCheckBox *videoInvertCheckbox = nullptr;
+    QCheckBox *videoHSyncCheckbox = nullptr;
+    QCheckBox *videoVSyncCheckbox = nullptr;
+    QCheckBox *videoTestPatternCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
@@ -277,6 +297,7 @@ private:
     QLabel *vgaGainLabel = nullptr;
     QLabel *scaleLabel = nullptr;
     QLabel *digitalStatusLabel = nullptr;
+    QLabel *videoStatusLabel = nullptr;
     QLabel *recordingStatusLabel = nullptr;
     QLabel *playbackStatusLabel = nullptr;
        
@@ -288,11 +309,14 @@ private:
     QTimer *stopPollTimer = nullptr;
     QTimer *streamWatchdogTimer = nullptr;
     QTimer *networkSettingsDebounceTimer = nullptr;
+    QTimer *videoSnapshotTimer = nullptr;
 
     DataProcessor *processor = nullptr;
     AudioProcessor *audioProcessor = nullptr;
     DigitalDecoder *digitalDecoder = nullptr;
     QThread *digitalDecoderThread = nullptr;
+    VideoProcessor *videoProcessor = nullptr;
+    QThread *videoProcessorThread = nullptr;
     PlaybackManager *playbackManager = nullptr;
     RecordingManager *recordingManager = nullptr;
     NetworkController *networkController = nullptr;
@@ -302,7 +326,9 @@ private:
     ScaleWidget *scaleWidget = nullptr;
     QDockWidget *controlsDock = nullptr;
     QDockWidget *digitalDock = nullptr;
+    QDockWidget *videoDock = nullptr;
     QPlainTextEdit *digitalTextEdit = nullptr;
+    VideoWidget *videoWidget = nullptr;
     
     bool deviceOpened;
     int openedDeviceIndex = -1;
@@ -346,6 +372,8 @@ private:
     quint16 networkControlPort = 21090;
     bool serverDisableLocalVisualAudio = true;
     bool digitalDecodeEnabled = true;
+    bool videoDecodeEnabled = false;
+    std::atomic_bool videoIqFramePending{false};
     bool momentaryRecordingActive = false;
     bool offlineIqPlaybackActive = false;
     bool offlineIqPlaybackHasMetadata = false;

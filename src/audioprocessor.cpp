@@ -37,10 +37,14 @@ double wrapRadians(double phase) {
 
 double channelCutoffForMode(int modulationType, double bandwidth) {
     switch (modulationType) {
+    case MOD_ATV:
+        return (std::min)(250000.0, (std::max)(80000.0, bandwidth * 0.15));
     case MOD_WFM:
         return (std::min)(140000.0, (std::max)(80000.0, bandwidth * 0.55));
     case MOD_NFM:
         return (std::min)(25000.0, (std::max)(6000.0, bandwidth * 0.55));
+    case MOD_APT:
+        return (std::min)(36000.0, (std::max)(18000.0, bandwidth * 0.55));
     case MOD_FSK:
         return (std::min)(12000.0, (std::max)(2500.0, bandwidth * 0.55));
     case MOD_USB:
@@ -48,6 +52,8 @@ double channelCutoffForMode(int modulationType, double bandwidth) {
     case MOD_FT8:
     case MOD_RTTY:
     case MOD_PSK:
+    case MOD_SSTV:
+    case MOD_WEFAX:
         return (std::min)(SSB_MAX_AUDIO_HZ, (std::max)(700.0, bandwidth * 0.95));
     case MOD_CW:
         return (std::min)(1500.0, (std::max)(250.0, bandwidth * 0.5));
@@ -62,10 +68,14 @@ double channelCutoffForMode(int modulationType, double bandwidth) {
 
 double demodAudioCutoffForMode(int modulationType, double bandwidth) {
     switch (modulationType) {
+    case MOD_ATV:
+        return 15000.0;
     case MOD_WFM:
         return 15000.0;
     case MOD_NFM:
         return 3000.0;
+    case MOD_APT:
+        return 12000.0;
     case MOD_FSK:
         return 5000.0;
     case MOD_USB:
@@ -73,6 +83,8 @@ double demodAudioCutoffForMode(int modulationType, double bandwidth) {
     case MOD_FT8:
     case MOD_RTTY:
     case MOD_PSK:
+    case MOD_SSTV:
+    case MOD_WEFAX:
         return (std::min)(SSB_MAX_AUDIO_HZ, (std::max)(700.0, bandwidth * 0.95));
     case MOD_CW:
         return 1200.0;
@@ -86,8 +98,14 @@ double demodAudioCutoffForMode(int modulationType, double bandwidth) {
 }
 
 double targetChannelRate(int modulationType, double bandwidth) {
+    if (modulationType == MOD_ATV) {
+        return clampDouble((std::max)(384000.0, bandwidth * 0.2), 384000.0, FM_MAX_CHANNEL_RATE);
+    }
     if (modulationType == MOD_WFM) {
         return clampDouble((std::max)(384000.0, bandwidth * 3.0), 384000.0, FM_MAX_CHANNEL_RATE);
+    }
+    if (modulationType == MOD_APT) {
+        return 240000.0;
     }
     if (modulationType == MOD_NFM || modulationType == MOD_FSK) {
         return clampDouble((std::max)(FM_MIN_CHANNEL_RATE, bandwidth * 4.0),
@@ -101,7 +119,9 @@ bool isDigitalAudioMode(int modulationType) {
     return modulationType == MOD_FT8 ||
            modulationType == MOD_RTTY ||
            modulationType == MOD_FSK ||
-           modulationType == MOD_PSK;
+           modulationType == MOD_PSK ||
+           modulationType == MOD_SSTV ||
+           modulationType == MOD_WEFAX;
 }
 
 int channelDecimationFactor(double inputRate, int modulationType, double bandwidth) {
@@ -554,7 +574,9 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         float demodulatedSample = 0.0f;
 
         switch (modulationType) {
+        case MOD_ATV:
         case MOD_NFM:
+        case MOD_APT:
         case MOD_WFM:
         case MOD_FSK: {
             float limitedI = lowPassI;
@@ -577,7 +599,10 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
                 demodulatedSample *= 10.0f;
             } else {
                 fmDeemphasisState += fmDeemphasisAlpha * (demodulatedSample - fmDeemphasisState);
-                demodulatedSample = fmDeemphasisState * (modulationType == MOD_WFM ? 2.5f : 8.0f);
+                demodulatedSample = fmDeemphasisState * ((modulationType == MOD_WFM || modulationType == MOD_ATV) ? 2.5f : 8.0f);
+                if (modulationType == MOD_APT) {
+                    demodulatedSample *= 0.5f;
+                }
             }
             break;
         }
@@ -585,6 +610,8 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         case MOD_FT8:
         case MOD_RTTY:
         case MOD_PSK:
+        case MOD_SSTV:
+        case MOD_WEFAX:
         case MOD_LSB: {
             const float oscI = static_cast<float>(std::cos(sidebandPhase));
             const float oscQ = static_cast<float>(std::sin(sidebandPhase));
