@@ -74,7 +74,7 @@ qDebug() << "MyWaterfallWidget::initializeGL done";
 void MyWaterfallWidget::resizeGL(int w, int h) {
         glViewport(0, 0, w, h);
         ensureLineBuffer();
-        resetWaterfallTexture(w, h);
+        resizeWaterfallTexturePreserve(w, h);
         if (waterfallVbo.isCreated()) {
             waterfallVbo.bind();
             waterfallVbo.allocate(std::max(1, w) * 3);
@@ -96,6 +96,60 @@ void MyWaterfallWidget::resetWaterfallTexture(int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, textureWidth, textureHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, blank.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void MyWaterfallWidget::resizeWaterfallTexturePreserve(int w, int h) {
+    const int newWidth = std::max(1, w);
+    const int newHeight = std::max(1, h);
+    if (newWidth == textureWidth && newHeight == textureHeight) {
+        return;
+    }
+
+    if (waterfallTexture == 0 || textureWidth <= 0 || textureHeight <= 0) {
+        resetWaterfallTexture(newWidth, newHeight);
+        return;
+    }
+
+    const int oldWidth = textureWidth;
+    const int oldHeight = textureHeight;
+    const int oldWriteRow = waterfallWriteRow;
+    std::vector<unsigned char> oldPixels(static_cast<size_t>(oldWidth) * oldHeight * 3, 0);
+
+    glBindTexture(GL_TEXTURE_2D, waterfallTexture);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, oldPixels.data());
+    if (glGetError() != GL_NO_ERROR) {
+        glBindTexture(GL_TEXTURE_2D, 0);
+        resetWaterfallTexture(newWidth, newHeight);
+        return;
+    }
+
+    std::vector<unsigned char> resized(static_cast<size_t>(newWidth) * newHeight * 3, 0);
+    for (int y = 0; y < newHeight; ++y) {
+        const int sourceVisualY = std::min(oldHeight - 1, static_cast<int>((static_cast<long long>(y) * oldHeight) / newHeight));
+        const int sourceRow = (oldWriteRow + sourceVisualY) % oldHeight;
+        for (int x = 0; x < newWidth; ++x) {
+            const int sourceX = std::min(oldWidth - 1, static_cast<int>((static_cast<long long>(x) * oldWidth) / newWidth));
+            const size_t sourceIndex = (static_cast<size_t>(sourceRow) * oldWidth + sourceX) * 3;
+            const size_t destIndex = (static_cast<size_t>(y) * newWidth + x) * 3;
+            resized[destIndex + 0] = oldPixels[sourceIndex + 0];
+            resized[destIndex + 1] = oldPixels[sourceIndex + 1];
+            resized[destIndex + 2] = oldPixels[sourceIndex + 2];
+        }
+    }
+
+    textureWidth = newWidth;
+    textureHeight = newHeight;
+    waterfallWriteRow = 0;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, textureWidth, textureHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, resized.data());
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -282,7 +336,7 @@ void MyWaterfallWidget::paintGL() {
     const int texHeight = std::max(1, height());
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     if (texWidth != textureWidth || texHeight != textureHeight) {
-        resetWaterfallTexture(texWidth, texHeight);
+        resizeWaterfallTexturePreserve(texWidth, texHeight);
     }
     if (pendingTextureLine && !lineData.empty()) {
         waterfallWriteRow = (waterfallWriteRow + textureHeight - 1) % textureHeight;

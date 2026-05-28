@@ -31,14 +31,20 @@ set(SOURCES
     src/dataprocessor.cpp
     src/dataprocessor.h
     src/diagnosticlogging.h
+    src/digitaldecoder.cpp
+    src/digitaldecoder.h
     src/frequencycontrol.cpp
     src/frequencycontrol.h
     src/iqbuffer.cpp
     src/iqbuffer.h
     src/networkcontroller.cpp
     src/networkcontroller.h
+    src/playbackmanager.cpp
+    src/playbackmanager.h
     src/remoteaudioplayer.cpp
     src/remoteaudioplayer.h
+    src/recordingmanager.cpp
+    src/recordingmanager.h
     src/radiosettings.h
     src/fft.cpp
     src/fft.h

@@ -66,6 +66,7 @@ build/
 out/
 release/
 release.zip
+recordings/
 
 # Bundled binary deps / SDKs
 fftw-3.3.5-dll64/

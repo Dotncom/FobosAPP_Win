@@ -343,6 +343,9 @@ bool NetworkController::isPriorityRequestBlocked(const QString &peerIdValue) con
 }
 
 void NetworkController::setStatus(const QString &status) {
+    if (currentStatus == status) {
+        return;
+    }
     currentStatus = status;
     emit statusChanged(status);
 }
@@ -589,6 +592,9 @@ void NetworkController::processSocketData(QTcpSocket *socket, QByteArray &buffer
 void NetworkController::processLine(QTcpSocket *socket, const QByteArray &line) {
     if (line == HELLO_MESSAGE.trimmed()) {
         if (currentMode == NetworkMode::Server && peerSockets.contains(socket)) {
+            if (readyPeerSockets.contains(socket)) {
+                return;
+            }
             readyPeerSockets.insert(socket);
             peerLastMessageTimers[socket].restart();
             if (!peerSocket) {
@@ -598,9 +604,10 @@ void NetworkController::processLine(QTcpSocket *socket, const QByteArray &line) 
             const QString message = QString("Control channel ready: %1")
                                         .arg(peerLabel(socket));
             setStatus(message);
-            sendRoleUpdate(socket);
             if (socket == peerSocket) {
                 broadcastRoleUpdates();
+            } else {
+                sendRoleUpdate(socket);
             }
             startHeartbeat();
             controlReady = true;
@@ -611,6 +618,9 @@ void NetworkController::processLine(QTcpSocket *socket, const QByteArray &line) 
 
     if (line == OK_MESSAGE.trimmed()) {
         if (currentMode == NetworkMode::Client && socket == clientSocket) {
+            if (controlReady) {
+                return;
+            }
             handshakeTimer->stop();
             controlReady = true;
             const QString message = QString("Control channel ready: %1:%2")

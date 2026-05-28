@@ -17,6 +17,7 @@
 #include <QCheckBox>
 #include <QMainWindow>
 #include <QDockWidget>
+#include <QPlainTextEdit>
 //#include <QAudioOutput>
 //#include <QAudioDeviceInfo>
 //#include <QAudio>
@@ -43,8 +44,11 @@
 #include <cstdint>
 #include "fft.h"
 #include "dataprocessor.h"
+#include "digitaldecoder.h"
 #include "audioprocessor.h"
 #include "networkcontroller.h"
+#include "playbackmanager.h"
+#include "recordingmanager.h"
 #include "remoteaudioplayer.h"
 #include "radiosettings.h"
 #include "frequencycontrol.h"
@@ -118,7 +122,18 @@ private slots:
     void onNetworkStatusChanged(const QString &status);
     void onNetworkControlCommandReceived(const QJsonObject &command);
     void onAudioEnabledChanged(bool checked);
+    void onDigitalTextDecoded(const QString &text);
+    void onDigitalDecoderStatusChanged(const QString &status);
+    void startRecording(bool momentary);
+    void stopRecording(bool momentaryRelease);
+    void startPlayback();
+    void stopPlayback();
+    void refreshPlaybackFiles();
+    void onPlaybackStarted(const QString &filePath, PlaybackManager::WavInfo info);
+    void onPlaybackStopped();
+    void onPlaybackStatusChanged(const QString &status);
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
 	void onWaterfallScaleChanged(int delta);
     void wheelEvent(QWheelEvent *event) override;
         //void closeEvent(QCloseEvent *event) override {
@@ -171,9 +186,13 @@ private:
     void appendNetworkState(QJsonObject &command) const;
     void applyNetworkStateFromCommand(const QJsonObject &command);
     bool sendRemoteControlCommand(const QString &action, const QJsonObject &extra = QJsonObject());
+    void scheduleRemoteSettingsCommand(int delayMs = 120);
+    void cancelPendingRemoteSettingsCommand();
     QJsonObject settingsToJson() const;
     void applySettingsFromJson(const QJsonObject &settingsJson);
     void updateUiFromPendingSettings();
+    void updateNetworkButtonText();
+    void updateAudioFilterLabels();
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
     void connectDataProcessorSignals();
     void applyServerLocalOutputPolicy();
@@ -188,6 +207,17 @@ private:
     void playNetworkAudioFrame(const QJsonObject &frame);
     void sendNetworkIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     void receiveNetworkIqFrame(const QJsonObject &frame);
+    void processDigitalAudioFrame(const QByteArray &pcmData);
+    void updateDigitalDecoderMode();
+    RadioSettings audioProcessorSettings() const;
+    RadioSettings spectrumProcessingSettings() const;
+    RecordingManager::Mode selectedRecordingMode() const;
+    bool isChannelIqRecordingActive() const;
+    void updateIqFrameProducerSettings();
+    void updateRecordingStatus(const QString &status);
+    void handlePlaybackAudioFrame(const QByteArray &pcmData);
+    void handlePlaybackIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
+    QString selectedPlaybackFilePath() const;
     void showTuneContextMenu(double frequency, const QPoint &globalPos);
     void tuneSignalCenterAt(double frequency);
     void tuneSidebandEdgeAt(double frequency, int modulationType);
@@ -200,11 +230,17 @@ private:
     QComboBox *sampleBox = nullptr;
     QComboBox *fftComboBox = nullptr;
     QComboBox *audioDeviceComboBox = nullptr;
+    QComboBox *recordingModeCombo = nullptr;
+    QComboBox *playbackFileCombo = nullptr;
     QButtonGroup *modulationButtonGroup = nullptr;
     
     QPushButton *refreshButton = nullptr;
     QPushButton *fobosButton = nullptr;
     QPushButton *networkButton = nullptr;
+    QPushButton *digitalToggleButton = nullptr;
+    QPushButton *recordButton = nullptr;
+    QPushButton *playbackRefreshButton = nullptr;
+    QPushButton *playbackButton = nullptr;
     QPushButton *startButton = nullptr;
     QPushButton *stopButton = nullptr;
     
@@ -213,6 +249,7 @@ private:
     QCheckBox *syncCheckbox = nullptr;
     QCheckBox *graphCheckbox = nullptr;
     QCheckBox *colorCheckbox = nullptr;
+    QCheckBox *digitalDecodeCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
@@ -223,8 +260,12 @@ private:
     QSlider *levelMinSlider = nullptr;
     QSlider *levelMaxSlider = nullptr;
     QSlider *volumeSlider = nullptr;
+    QSlider *audioLowPassSlider = nullptr;
+    QSlider *audioHighPassSlider = nullptr;
 
     QLabel *volumeLabel = nullptr;
+    QLabel *audioLowPassLabel = nullptr;
+    QLabel *audioHighPassLabel = nullptr;
     QLabel *lnaGainLabel = nullptr;
     QLabel *centralFrequencyLabel = nullptr;
     QLabel *listeningFrequencyLabel = nullptr;
@@ -235,6 +276,9 @@ private:
     QLabel *levelMaxLabel = nullptr;
     QLabel *vgaGainLabel = nullptr;
     QLabel *scaleLabel = nullptr;
+    QLabel *digitalStatusLabel = nullptr;
+    QLabel *recordingStatusLabel = nullptr;
+    QLabel *playbackStatusLabel = nullptr;
        
     FrequencyControl *frequencyControl = nullptr;
     FrequencyControl *listeningFrequencyControl = nullptr;
@@ -243,15 +287,22 @@ private:
     QTimer *updateTimer = nullptr;
     QTimer *stopPollTimer = nullptr;
     QTimer *streamWatchdogTimer = nullptr;
+    QTimer *networkSettingsDebounceTimer = nullptr;
 
     DataProcessor *processor = nullptr;
     AudioProcessor *audioProcessor = nullptr;
+    DigitalDecoder *digitalDecoder = nullptr;
+    QThread *digitalDecoderThread = nullptr;
+    PlaybackManager *playbackManager = nullptr;
+    RecordingManager *recordingManager = nullptr;
     NetworkController *networkController = nullptr;
     RemoteAudioPlayer *remoteAudioPlayer = nullptr;
     MyGraphWidget *graphWidget = nullptr;
     MyWaterfallWidget *waterfallWidget = nullptr;
     ScaleWidget *scaleWidget = nullptr;
     QDockWidget *controlsDock = nullptr;
+    QDockWidget *digitalDock = nullptr;
+    QPlainTextEdit *digitalTextEdit = nullptr;
     
     bool deviceOpened;
     int openedDeviceIndex = -1;
@@ -294,6 +345,14 @@ private:
     QString networkBindAddress = "0.0.0.0";
     quint16 networkControlPort = 21090;
     bool serverDisableLocalVisualAudio = true;
+    bool digitalDecodeEnabled = true;
+    bool momentaryRecordingActive = false;
+    bool offlineIqPlaybackActive = false;
+    bool offlineIqPlaybackHasMetadata = false;
+    double offlineIqPlaybackSampleRate = 0.0;
+    bool pendingPlaybackAudioStartAfterIqPrebuffer = false;
+    bool playbackSettingsSaved = false;
+    RadioSettings settingsBeforePlayback;
     int volumePercent = 100;
     QElapsedTimer networkSpectrumFrameTimer;
     uint64_t networkSpectrumFrameSequence = 0;

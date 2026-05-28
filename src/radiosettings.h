@@ -61,6 +61,8 @@ struct RadioSettings {
     int lnaGain = 1;
     int vgaGain = 3;
     int audioDeviceId = 0;
+    double audioLowPassHz = 0.0;
+    double audioHighPassHz = 0.0;
     bool audioEnabled = false;
     bool syncEnabled = false;
     std::uint8_t gpoValue = 0;

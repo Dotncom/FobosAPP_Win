@@ -8,6 +8,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -17,6 +18,9 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTextStream>
+#include <QTextCursor>
+#include <QPushButton>
+#include <QKeyEvent>
 #include <QAbstractButton>
 #include <QCoreApplication>
 #include <QSettings>
@@ -80,6 +84,10 @@ constexpr qint64 NETWORK_IQ_MAX_PENDING_BYTES = 8 * 1024 * 1024;
 constexpr uint64_t NETWORK_IQ_DROP_LOG_INTERVAL = 200;
 constexpr double NETWORK_AUDIO_PREBUFFER_SECONDS = 0.55;
 constexpr qint64 NETWORK_SPECTRUM_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+constexpr int AUDIO_LOW_PASS_SLIDER_STEP_HZ = 100;
+constexpr int AUDIO_LOW_PASS_SLIDER_MAX = 200;
+constexpr int AUDIO_HIGH_PASS_SLIDER_STEP_HZ = 25;
+constexpr int AUDIO_HIGH_PASS_SLIDER_MAX = 40;
 
 QMutex gLogMutex;
 QFile gLogFile;
@@ -218,6 +226,59 @@ int levelToSliderValue(float level) {
 
 QString levelLabelText(const QString &name, float level) {
     return QString("%1: %2").arg(name, QString::number(level, 'f', 1));
+}
+
+double clampAudioLowPassHz(double hz) {
+    if (!std::isfinite(hz) || hz <= 0.0) {
+        return 0.0;
+    }
+    return (std::clamp)(hz, static_cast<double>(AUDIO_LOW_PASS_SLIDER_STEP_HZ),
+                        static_cast<double>(AUDIO_LOW_PASS_SLIDER_STEP_HZ * AUDIO_LOW_PASS_SLIDER_MAX));
+}
+
+double clampAudioHighPassHz(double hz) {
+    if (!std::isfinite(hz) || hz <= 0.0) {
+        return 0.0;
+    }
+    return (std::clamp)(hz, static_cast<double>(AUDIO_HIGH_PASS_SLIDER_STEP_HZ),
+                        static_cast<double>(AUDIO_HIGH_PASS_SLIDER_STEP_HZ * AUDIO_HIGH_PASS_SLIDER_MAX));
+}
+
+double audioLowPassSliderValueToHz(int value) {
+    return value <= 0 ? 0.0 : clampAudioLowPassHz(value * AUDIO_LOW_PASS_SLIDER_STEP_HZ);
+}
+
+int audioLowPassHzToSliderValue(double hz) {
+    if (!std::isfinite(hz) || hz <= 0.0) {
+        return 0;
+    }
+    return (std::clamp)(static_cast<int>(std::lround(hz / AUDIO_LOW_PASS_SLIDER_STEP_HZ)),
+                        1,
+                        AUDIO_LOW_PASS_SLIDER_MAX);
+}
+
+double audioHighPassSliderValueToHz(int value) {
+    return value <= 0 ? 0.0 : clampAudioHighPassHz(value * AUDIO_HIGH_PASS_SLIDER_STEP_HZ);
+}
+
+int audioHighPassHzToSliderValue(double hz) {
+    if (!std::isfinite(hz) || hz <= 0.0) {
+        return 0;
+    }
+    return (std::clamp)(static_cast<int>(std::lround(hz / AUDIO_HIGH_PASS_SLIDER_STEP_HZ)),
+                        1,
+                        AUDIO_HIGH_PASS_SLIDER_MAX);
+}
+
+QString audioFilterFrequencyText(double hz) {
+    if (!std::isfinite(hz) || hz <= 0.0) {
+        return QString();
+    }
+    if (hz >= 1000.0) {
+        const int decimals = hz >= 10000.0 ? 0 : 1;
+        return QString("%1 kHz").arg(hz / 1000.0, 0, 'f', decimals);
+    }
+    return QString("%1 Hz").arg(static_cast<int>(std::lround(hz)));
 }
 
 double defaultBandwidthForModulation(int modulationType) {
@@ -888,6 +949,34 @@ YourClassName::YourClassName(QWidget *parent)
                               QDockWidget::DockWidgetFloatable);
     controlsDock->setWidget(controlsScrollArea);
     addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
+
+    QWidget *digitalWidget = new QWidget(this);
+    QVBoxLayout *digitalLayout = new QVBoxLayout(digitalWidget);
+    QHBoxLayout *digitalHeaderLayout = new QHBoxLayout();
+    digitalDecodeCheckbox = new QCheckBox("Decode", digitalWidget);
+    digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
+    QPushButton *digitalClearButton = new QPushButton("Clear", digitalWidget);
+    digitalStatusLabel = new QLabel("Digital decoder idle", digitalWidget);
+    digitalTextEdit = new QPlainTextEdit(digitalWidget);
+    digitalTextEdit->setReadOnly(true);
+    digitalTextEdit->setMaximumBlockCount(2000);
+    digitalTextEdit->setPlaceholderText("Decoded RTTY/FSK text will appear here.");
+    digitalHeaderLayout->addWidget(digitalDecodeCheckbox);
+    digitalHeaderLayout->addStretch();
+    digitalHeaderLayout->addWidget(digitalClearButton);
+    digitalLayout->addLayout(digitalHeaderLayout);
+    digitalLayout->addWidget(digitalStatusLabel);
+    digitalLayout->addWidget(digitalTextEdit);
+    digitalDock = new QDockWidget("Digital", this);
+    digitalDock->setObjectName("digitalDock");
+    digitalDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
+    digitalDock->setFeatures(QDockWidget::DockWidgetMovable |
+                             QDockWidget::DockWidgetFloatable |
+                             QDockWidget::DockWidgetClosable);
+    digitalDock->setWidget(digitalWidget);
+    addDockWidget(Qt::RightDockWidgetArea, digitalDock);
+    digitalDock->hide();
+
     QHBoxLayout *scaleLayout = new QHBoxLayout();
     QVBoxLayout *contrastLayout = new QVBoxLayout();
     QVBoxLayout *sensLayout = new QVBoxLayout();
@@ -895,7 +984,8 @@ YourClassName::YourClassName(QWidget *parent)
     QVBoxLayout *levelMaxLayout = new QVBoxLayout();
     QVBoxLayout *layout = new QVBoxLayout();
     QGridLayout *checkboxLayout = new QGridLayout();
-     QVBoxLayout *graphLayout = new QVBoxLayout();
+    QVBoxLayout *graphLayout = new QVBoxLayout();
+    QHBoxLayout *graphToolLayout = new QHBoxLayout();
     
     for (int i = 0; i < 8; ++i) {
         checkBoxes[i] = new QCheckBox(QString("GPIO %1").arg(i + 1), this);
@@ -926,7 +1016,21 @@ YourClassName::YourClassName(QWidget *parent)
     volumeSlider->setRange(0, 200);
     volumeSlider->setValue(100);
 
+    audioLowPassSlider = new QSlider(Qt::Horizontal, this);
+    audioLowPassSlider->setRange(0, AUDIO_LOW_PASS_SLIDER_MAX);
+    audioLowPassSlider->setSingleStep(1);
+    audioLowPassSlider->setPageStep(10);
+    audioLowPassSlider->setValue(0);
+
+    audioHighPassSlider = new QSlider(Qt::Horizontal, this);
+    audioHighPassSlider->setRange(0, AUDIO_HIGH_PASS_SLIDER_MAX);
+    audioHighPassSlider->setSingleStep(1);
+    audioHighPassSlider->setPageStep(4);
+    audioHighPassSlider->setValue(0);
+
     volumeLabel = new QLabel("Volume: 100%", this);
+    audioLowPassLabel = new QLabel("Audio LPF: Auto", this);
+    audioHighPassLabel = new QLabel("Audio HPF: Off", this);
     lnaGainLabel = new QLabel("LNA Gain: 1", this);
     vgaGainLabel = new QLabel("VGA Gain: 3", this);
     
@@ -972,8 +1076,21 @@ YourClassName::YourClassName(QWidget *parent)
 
     processor = new DataProcessor( this);
     audioProcessor = new AudioProcessor(this);
+    digitalDecoderThread = new QThread(this);
+    digitalDecoderThread->setObjectName(QStringLiteral("DigitalDecoderThread"));
+    digitalDecoder = new DigitalDecoder();
+    digitalDecoder->moveToThread(digitalDecoderThread);
+    connect(digitalDecoderThread, &QThread::finished, digitalDecoder, &QObject::deleteLater);
+    digitalDecoderThread->start();
+    playbackManager = new PlaybackManager(this);
+    recordingManager = new RecordingManager(this);
     networkController = new NetworkController(this);
     remoteAudioPlayer = new RemoteAudioPlayer(this);
+    networkSettingsDebounceTimer = new QTimer(this);
+    networkSettingsDebounceTimer->setSingleShot(true);
+    connect(networkSettingsDebounceTimer, &QTimer::timeout, this, [this]() {
+        sendRemoteControlCommand("settings");
+    });
     connectDataProcessorSignals();
     
     graphWidget = new MyGraphWidget(this);
@@ -992,6 +1109,23 @@ YourClassName::YourClassName(QWidget *parent)
     refreshButton = new QPushButton("Refresh USB Devices", this);
     fobosButton = new QPushButton("Show Fobos Details", this);
     networkButton = new QPushButton("Network", this);
+    digitalToggleButton = new QPushButton("Digital", this);
+    digitalToggleButton->setCheckable(true);
+    digitalToggleButton->setMaximumWidth(90);
+    digitalToggleButton->setToolTip("Show or hide the digital decoder panel");
+    recordingModeCombo = new QComboBox(this);
+    recordingModeCombo->addItem("Audio WAV", static_cast<int>(RecordingManager::Mode::AudioWav));
+    recordingModeCombo->addItem("Channel IQ WAV", static_cast<int>(RecordingManager::Mode::ChannelIqWav));
+    recordButton = new QPushButton("Record", this);
+    recordButton->setCheckable(true);
+    recordButton->setToolTip("Start/stop recording. Hold F9 for momentary recording.");
+    recordingStatusLabel = new QLabel("Recording: idle", this);
+    playbackStatusLabel = new QLabel("Playback: idle", this);
+    playbackFileCombo = new QComboBox(this);
+    playbackFileCombo->setMinimumContentsLength(24);
+    playbackRefreshButton = new QPushButton("Refresh Playback", this);
+    playbackButton = new QPushButton("Play", this);
+    playbackButton->setCheckable(true);
     startButton = new QPushButton("Start", this);
     stopButton = new QPushButton("Stop", this);
     
@@ -1075,6 +1209,10 @@ YourClassName::YourClassName(QWidget *parent)
     scaleLayout->addLayout(levelMinLayout);
     scaleLayout->addLayout(levelMaxLayout);
     
+    graphToolLayout->addStretch();
+    graphToolLayout->addWidget(digitalToggleButton);
+
+    graphLayout->addLayout(graphToolLayout);
     graphLayout->addWidget(graphWidget);
     graphLayout->addWidget(scaleWidget); 
     graphLayout->addWidget(waterfallWidget);
@@ -1097,7 +1235,24 @@ YourClassName::YourClassName(QWidget *parent)
         }
     }
     
-    layout->addWidget(refreshButton);
+    QHBoxLayout *deviceButtonLayout = new QHBoxLayout();
+    deviceButtonLayout->addWidget(refreshButton);
+    deviceButtonLayout->addWidget(fobosButton);
+
+    QHBoxLayout *networkLnaLayout = new QHBoxLayout();
+    networkLnaLayout->addWidget(networkButton);
+    networkLnaLayout->addWidget(lnaGainLabel);
+    networkLnaLayout->addWidget(lnaGainSlider);
+
+    QHBoxLayout *recordingLayout = new QHBoxLayout();
+    recordingLayout->addWidget(recordingModeCombo);
+    recordingLayout->addWidget(recordButton);
+
+    QHBoxLayout *playbackButtonLayout = new QHBoxLayout();
+    playbackButtonLayout->addWidget(playbackRefreshButton);
+    playbackButtonLayout->addWidget(playbackButton);
+
+    layout->addLayout(deviceButtonLayout);
     layout->addWidget(comboBox);
     layout->addWidget(clkBox);
     layout->addWidget(modeBox);
@@ -1111,16 +1266,22 @@ YourClassName::YourClassName(QWidget *parent)
     layout->addWidget(fftComboBox);
     layout->addWidget(scaleLabel);
     layout->addWidget(scaleSlider);
-    layout->addWidget(fobosButton);
-    layout->addWidget(networkButton);
+    layout->addLayout(networkLnaLayout);
     layout->addWidget(startButton);
     layout->addWidget(stopButton);
-    layout->addWidget(lnaGainLabel);
-    layout->addWidget(lnaGainSlider);
     layout->addWidget(vgaGainLabel);
     layout->addWidget(vgaGainSlider);
     layout->addWidget(volumeLabel);
     layout->addWidget(volumeSlider);
+    layout->addWidget(audioLowPassLabel);
+    layout->addWidget(audioLowPassSlider);
+    layout->addWidget(audioHighPassLabel);
+    layout->addWidget(audioHighPassSlider);
+    layout->addWidget(recordingStatusLabel);
+    layout->addLayout(recordingLayout);
+    layout->addWidget(playbackStatusLabel);
+    layout->addWidget(playbackFileCombo);
+    layout->addLayout(playbackButtonLayout);
     layout->addLayout(chckbox);
     layout->addWidget(audioDeviceComboBox);
     layout->addWidget(bandwidthLabel);
@@ -1132,9 +1293,11 @@ YourClassName::YourClassName(QWidget *parent)
     controlsWidget->setLayout(layout);
     centralWidget->setLayout(graphLayout);
     graphLayout->setStretch(0, 2);
-    graphLayout->setStretch(1, 0);
-    graphLayout->setStretch(2, 5);
-    graphLayout->setStretch(3, 0);
+    graphLayout->setStretch(0, 0);
+    graphLayout->setStretch(1, 2);
+    graphLayout->setStretch(2, 0);
+    graphLayout->setStretch(3, 5);
+    graphLayout->setStretch(4, 0);
     
     scaleWidget->setTuning(listeningFrequency, globalFrequency, globalBandwidth, globalModulationType);
     scaleWidget->setMarkerPosition(0.5);
@@ -1171,7 +1334,7 @@ YourClassName::YourClassName(QWidget *parent)
     connect(levelMaxSlider, &QSlider::valueChanged, this, &YourClassName::onLevelMaxChanged);
     connect(scaleSlider, &QSlider::sliderReleased, this, [this]() {
         if (isNetworkClientMode() && !isFullIqProcessingMode()) {
-            sendRemoteControlCommand("settings");
+            scheduleRemoteSettingsCommand();
         }
     });
     connect(volumeSlider, &QSlider::valueChanged, this, [this](int value) {
@@ -1186,6 +1349,22 @@ YourClassName::YourClassName(QWidget *parent)
 
         if (remoteAudioPlayer) {
             remoteAudioPlayer->setVolume(volume);
+        }
+    });
+    connect(audioLowPassSlider, &QSlider::valueChanged, this, [this](int value) {
+        pendingSettings.audioLowPassHz = audioLowPassSliderValueToHz(value);
+        updateAudioFilterLabels();
+        publishSettingsToGlobals();
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+        }
+    });
+    connect(audioHighPassSlider, &QSlider::valueChanged, this, [this](int value) {
+        pendingSettings.audioHighPassHz = audioHighPassSliderValueToHz(value);
+        updateAudioFilterLabels();
+        publishSettingsToGlobals();
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
         }
     });
     connect(startButton, &QPushButton::clicked, this, &YourClassName::startFobosProcessing);
@@ -1225,7 +1404,7 @@ YourClassName::YourClassName(QWidget *parent)
     connect(networkButton, &QPushButton::clicked, this, &YourClassName::openNetworkSettingsDialog);
     connect(networkController, &NetworkController::statusChanged, this, &YourClassName::onNetworkStatusChanged);
     connect(networkController, &NetworkController::channelReady, this, [this](const QString &status) {
-        onNetworkStatusChanged(status);
+        Q_UNUSED(status);
         if (isNetworkClientMode()) {
             networkClientReconnectPending = false;
             if (runState == RadioRunState::Running) {
@@ -1274,10 +1453,59 @@ YourClassName::YourClassName(QWidget *parent)
         });
     });
     connect(networkController, &NetworkController::controlCommandReceived, this, &YourClassName::onNetworkControlCommandReceived);
+    connect(digitalClearButton, &QPushButton::clicked, this, [this]() {
+        if (digitalTextEdit) {
+            digitalTextEdit->clear();
+        }
+    });
+    connect(digitalToggleButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (digitalDock) {
+            digitalDock->setVisible(checked);
+        }
+    });
+    connect(digitalDock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (digitalToggleButton && digitalToggleButton->isChecked() != visible) {
+            QSignalBlocker blocker(digitalToggleButton);
+            digitalToggleButton->setChecked(visible);
+        }
+    });
+    connect(digitalDecodeCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        digitalDecodeEnabled = checked;
+        updateDigitalDecoderMode();
+    });
+    connect(digitalDecoder, &DigitalDecoder::textDecoded, this, &YourClassName::onDigitalTextDecoded);
+    connect(digitalDecoder, &DigitalDecoder::statusChanged, this, &YourClassName::onDigitalDecoderStatusChanged);
+    connect(recordingManager, &RecordingManager::statusChanged, this, &YourClassName::updateRecordingStatus);
+    connect(recordButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            startRecording(false);
+        } else {
+            stopRecording(false);
+        }
+    });
+    connect(playbackRefreshButton, &QPushButton::clicked, this, &YourClassName::refreshPlaybackFiles);
+    connect(playbackButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            startPlayback();
+        } else {
+            stopPlayback();
+        }
+    });
+    connect(playbackManager, &PlaybackManager::audioFrameReady, this, &YourClassName::handlePlaybackAudioFrame);
+    connect(playbackManager, &PlaybackManager::iqFrameReady, this, &YourClassName::handlePlaybackIqFrame);
+    connect(playbackManager, &PlaybackManager::started, this, &YourClassName::onPlaybackStarted);
+    connect(playbackManager, &PlaybackManager::stopped, this, &YourClassName::onPlaybackStopped);
+    connect(playbackManager, &PlaybackManager::statusChanged, this, &YourClassName::onPlaybackStatusChanged);
     connect(audioProcessor,
             &AudioProcessor::audioFrameReady,
             this,
             [this](const QByteArray &pcmData) {
+                if (recordingManager &&
+                    recordingManager->isRecording() &&
+                    recordingManager->mode() == RecordingManager::Mode::AudioWav) {
+                    recordingManager->appendAudioFrame(pcmData);
+                }
+                processDigitalAudioFrame(pcmData);
                 sendNetworkAudioFrame(pcmData);
             },
             Qt::QueuedConnection);
@@ -1307,12 +1535,18 @@ YourClassName::YourClassName(QWidget *parent)
     loadPersistentSettings();
     updateUiFromPendingSettings();
     publishSettingsToGlobals();
+    updateDigitalDecoderMode();
     updateUiForRunState();
+    refreshPlaybackFiles();
+    qApp->installEventFilter(this);
 }
 
 YourClassName::~YourClassName() {
+    qApp->removeEventFilter(this);
     refreshSettingsFromUi();
     savePersistentSettings();
+    stopPlayback();
+    stopRecording(false);
 
     if (stopPollTimer) {
         stopPollTimer->stop();
@@ -1322,6 +1556,7 @@ YourClassName::~YourClassName() {
     }
     pendingAudioStartAfterStreamReady = false;
     pendingNetworkAudioStartAfterIqPrebuffer = false;
+    pendingPlaybackAudioStartAfterIqPrebuffer = false;
     if (updateTimer) {
         updateTimer->stop();
     }
@@ -1341,6 +1576,17 @@ YourClassName::~YourClassName() {
             processor->forceStop(1000);
         }
         processor->finalizeStopped();
+    }
+
+    if (digitalDecoderThread) {
+        digitalDecoderThread->quit();
+        if (!digitalDecoderThread->wait(3000)) {
+            qDebug() << "[Digital] decoder thread did not stop in time; terminating";
+            digitalDecoderThread->terminate();
+            digitalDecoderThread->wait();
+        }
+        digitalDecoder = nullptr;
+        digitalDecoderThread = nullptr;
     }
 
     if (audioProcessor) { 
@@ -1369,7 +1615,30 @@ YourClassName::~YourClassName() {
     }
 }
 
+bool YourClassName::eventFilter(QObject *watched, QEvent *event) {
+    Q_UNUSED(watched);
+    if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        if (keyEvent && keyEvent->key() == Qt::Key_F9 && !keyEvent->isAutoRepeat()) {
+            if (event->type() == QEvent::KeyPress) {
+                startRecording(true);
+            } else {
+                stopRecording(true);
+            }
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 bool YourClassName::restartStreamForHardwareChange() {
+    if (isChannelIqRecordingActive() &&
+        networkMode != NetworkMode::Disabled &&
+        isFullIqProcessingMode()) {
+        stopRecording(false);
+        updateRecordingStatus(QStringLiteral("Recording stopped: Channel IQ cannot run during Full IQ streaming"));
+    }
+
     if (isIdle()) {
         if (!hasActiveFobosDevice()) {
             qDebug() << "[LiveHardware] settings changed while idle; no open Fobos session to restart";
@@ -1433,6 +1702,7 @@ bool YourClassName::restartStreamForHardwareChange() {
     const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
     const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
     const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
+    const bool channelIqRecording = isChannelIqRecordingActive();
     const bool suppressServerLocalOutput =
         networkMode == NetworkMode::Server &&
         serverDisableLocalVisualAudio &&
@@ -1444,8 +1714,10 @@ bool YourClassName::restartStreamForHardwareChange() {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
 
-    if (serverIqStreaming && processor) {
-        processor->updateNetworkIqSettings(pendingSettings, serverChannelIqStreaming);
+    if ((serverIqStreaming || channelIqRecording) && processor) {
+        processor->configureNetworkIqStreaming(pendingSettings,
+                                               true,
+                                               serverChannelIqStreaming || channelIqRecording);
     }
 
     processor->startProcessing(activeFobosDevice(),
@@ -1453,7 +1725,7 @@ bool YourClassName::restartStreamForHardwareChange() {
                                pendingSettings.syncEnabled,
                                pendingSettings.sampleRate,
                                queueAudioBlocks,
-                               serverIqStreaming);
+                               serverIqStreaming || channelIqRecording);
 
     deviceOpened = true;
 
@@ -1541,6 +1813,12 @@ void YourClassName::refreshSettingsFromUi() {
     if (audioDeviceComboBox) {
         pendingSettings.audioDeviceId = audioDeviceComboBox->currentData().toInt();
     }
+    if (audioLowPassSlider) {
+        pendingSettings.audioLowPassHz = audioLowPassSliderValueToHz(audioLowPassSlider->value());
+    }
+    if (audioHighPassSlider) {
+        pendingSettings.audioHighPassHz = audioHighPassSliderValueToHz(audioHighPassSlider->value());
+    }
     if (audioCheckbox) {
         pendingSettings.audioEnabled = audioCheckbox->isChecked();
     }
@@ -1568,7 +1846,10 @@ void YourClassName::publishSettingsToGlobals() {
     syncWariable = pendingSettings.syncEnabled;
     deviceID = pendingSettings.audioDeviceId;
     if (audioProcessor) {
-        audioProcessor->configure(pendingSettings);
+        audioProcessor->configure(audioProcessorSettings());
+    }
+    if (runState == RadioRunState::Running && isChannelIqRecordingActive()) {
+        updateIqFrameProducerSettings();
     }
 }
 
@@ -1591,6 +1872,48 @@ bool YourClassName::isFullIqProcessingMode() const {
 bool YourClassName::isClientIqProcessingMode(NetworkProcessingMode mode) const {
     return mode == NetworkProcessingMode::ChannelIqClientSide ||
            mode == NetworkProcessingMode::FullIqClientSide;
+}
+
+RecordingManager::Mode YourClassName::selectedRecordingMode() const {
+    if (!recordingModeCombo) {
+        return RecordingManager::Mode::AudioWav;
+    }
+    bool ok = false;
+    const int value = recordingModeCombo->currentData().toInt(&ok);
+    return ok ? static_cast<RecordingManager::Mode>(value) : RecordingManager::Mode::AudioWav;
+}
+
+bool YourClassName::isChannelIqRecordingActive() const {
+    return recordingManager &&
+           recordingManager->isRecording() &&
+           recordingManager->mode() == RecordingManager::Mode::ChannelIqWav;
+}
+
+void YourClassName::updateIqFrameProducerSettings() {
+    if (!processor) {
+        return;
+    }
+
+    const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
+    const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
+    const bool channelIqRecording = isChannelIqRecordingActive();
+
+    processor->configureNetworkIqStreaming(pendingSettings,
+                                           serverIqStreaming || channelIqRecording,
+                                           serverChannelIqStreaming || channelIqRecording);
+}
+
+void YourClassName::updateRecordingStatus(const QString &status) {
+    if (recordingStatusLabel) {
+        recordingStatusLabel->setText(status);
+    }
+}
+
+QString YourClassName::selectedPlaybackFilePath() const {
+    if (!playbackFileCombo) {
+        return QString();
+    }
+    return playbackFileCombo->currentData().toString();
 }
 
 void YourClassName::appendNetworkState(QJsonObject &command) const {
@@ -1618,6 +1941,11 @@ void YourClassName::connectDataProcessorSignals() {
             &DataProcessor::iqFrameReady,
             this,
             [this](const QByteArray &iqData, double sampleRate, int sampleCount) {
+                if (recordingManager &&
+                    recordingManager->isRecording() &&
+                    recordingManager->mode() == RecordingManager::Mode::ChannelIqWav) {
+                    recordingManager->appendIqFrame(iqData, sampleRate, sampleCount);
+                }
                 sendNetworkIqFrame(iqData, sampleRate, sampleCount);
             },
             Qt::QueuedConnection);
@@ -1759,6 +2087,8 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["fftLength"] = pendingSettings.fftLength;
     settings["lnaGain"] = pendingSettings.lnaGain;
     settings["vgaGain"] = pendingSettings.vgaGain;
+    settings["audioLowPassHz"] = pendingSettings.audioLowPassHz;
+    settings["audioHighPassHz"] = pendingSettings.audioHighPassHz;
     settings["audioEnabled"] = pendingSettings.audioEnabled;
     settings["syncEnabled"] = false;
     settings["gpoValue"] = static_cast<int>(pendingSettings.gpoValue);
@@ -1769,6 +2099,10 @@ QJsonObject YourClassName::settingsToJson() const {
 bool YourClassName::sendRemoteControlCommand(const QString &action, const QJsonObject &extra) {
     if (!networkController || networkMode != NetworkMode::Client) {
         return false;
+    }
+
+    if (action != QStringLiteral("settings")) {
+        cancelPendingRemoteSettingsCommand();
     }
 
     const bool controlActionAllowed =
@@ -1799,6 +2133,36 @@ bool YourClassName::sendRemoteControlCommand(const QString &action, const QJsonO
     return sent;
 }
 
+void YourClassName::scheduleRemoteSettingsCommand(int delayMs) {
+    if (!isNetworkClientMode() ||
+        !networkController ||
+        !networkController->clientHasControl()) {
+        return;
+    }
+
+    if (!networkSettingsDebounceTimer) {
+        sendRemoteControlCommand("settings");
+        return;
+    }
+
+    const int clampedDelayMs = (std::clamp)(delayMs, 0, 1000);
+    if (clampedDelayMs == 0) {
+        networkSettingsDebounceTimer->stop();
+        sendRemoteControlCommand("settings");
+        return;
+    }
+
+    if (!networkSettingsDebounceTimer->isActive()) {
+        networkSettingsDebounceTimer->start(clampedDelayMs);
+    }
+}
+
+void YourClassName::cancelPendingRemoteSettingsCommand() {
+    if (networkSettingsDebounceTimer) {
+        networkSettingsDebounceTimer->stop();
+    }
+}
+
 void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
     auto readInt = [&settingsJson](const char *key, int currentValue) {
         return settingsJson.contains(key) ? settingsJson.value(key).toInt(currentValue) : currentValue;
@@ -1822,6 +2186,8 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
     pendingSettings.fftLength = readInt("fftLength", pendingSettings.fftLength);
     pendingSettings.lnaGain = readInt("lnaGain", pendingSettings.lnaGain);
     pendingSettings.vgaGain = readInt("vgaGain", pendingSettings.vgaGain);
+    pendingSettings.audioLowPassHz = clampAudioLowPassHz(readDouble("audioLowPassHz", pendingSettings.audioLowPassHz));
+    pendingSettings.audioHighPassHz = clampAudioHighPassHz(readDouble("audioHighPassHz", pendingSettings.audioHighPassHz));
     pendingSettings.audioEnabled = readBool("audioEnabled", pendingSettings.audioEnabled);
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>(readInt("gpoValue", pendingSettings.gpoValue));
@@ -2002,6 +2368,22 @@ void YourClassName::updateUiFromPendingSettings() {
     if (volumeLabel) {
         volumeLabel->setText(QString("Volume: %1%").arg(volumePercent));
     }
+    if (audioLowPassSlider) {
+        audioLowPassSlider->blockSignals(true);
+        audioLowPassSlider->setValue(audioLowPassHzToSliderValue(pendingSettings.audioLowPassHz));
+        audioLowPassSlider->blockSignals(false);
+    }
+    if (audioHighPassSlider) {
+        audioHighPassSlider->blockSignals(true);
+        audioHighPassSlider->setValue(audioHighPassHzToSliderValue(pendingSettings.audioHighPassHz));
+        audioHighPassSlider->blockSignals(false);
+    }
+    updateAudioFilterLabels();
+    if (digitalDecodeCheckbox) {
+        digitalDecodeCheckbox->blockSignals(true);
+        digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
+        digitalDecodeCheckbox->blockSignals(false);
+    }
     const float volume = volumePercent / 100.0f;
     if (audioProcessor) {
         audioProcessor->setVolume(volume);
@@ -2017,6 +2399,7 @@ void YourClassName::updateUiFromPendingSettings() {
     }
     updateSpectrumTimerInterval();
     settingRange();
+    updateDigitalDecoderMode();
 }
 
 void YourClassName::loadPersistentSettings() {
@@ -2042,6 +2425,8 @@ void YourClassName::loadPersistentSettings() {
     pendingSettings.lnaGain = (std::clamp)(settings.value("receiver/lnaGain", pendingSettings.lnaGain).toInt(), 0, 1);
     pendingSettings.vgaGain = (std::clamp)(settings.value("receiver/vgaGain", pendingSettings.vgaGain).toInt(), 0, 31);
     pendingSettings.audioDeviceId = (std::max)(0, settings.value("receiver/audioDeviceId", pendingSettings.audioDeviceId).toInt());
+    pendingSettings.audioLowPassHz = clampAudioLowPassHz(settings.value("audio/lowPassHz", pendingSettings.audioLowPassHz).toDouble());
+    pendingSettings.audioHighPassHz = clampAudioHighPassHz(settings.value("audio/highPassHz", pendingSettings.audioHighPassHz).toDouble());
     pendingSettings.audioEnabled = settings.value("receiver/audioEnabled", pendingSettings.audioEnabled).toBool();
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>((std::clamp)(settings.value("receiver/gpoValue", static_cast<int>(pendingSettings.gpoValue)).toInt(), 0, 255));
@@ -2069,6 +2454,7 @@ void YourClassName::loadPersistentSettings() {
     networkBindAddress = settings.value("network/bindAddress", networkBindAddress).toString();
     networkControlPort = static_cast<quint16>((std::clamp)(settings.value("network/controlPort", static_cast<int>(networkControlPort)).toInt(), 1, 65535));
     serverDisableLocalVisualAudio = settings.value("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio).toBool();
+    digitalDecodeEnabled = settings.value("digital/decodeEnabled", digitalDecodeEnabled).toBool();
 
     normalizeTuning(pendingSettings);
     qDebug() << (settingsFileExists ? "[Settings] loaded" : "[Settings] using defaults; settings file will be created on clean exit")
@@ -2105,12 +2491,15 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("display/secondGraph", secondGraph);
     settings.setValue("display/color", colorf);
     settings.setValue("audio/volumePercent", volumePercent);
+    settings.setValue("audio/lowPassHz", pendingSettings.audioLowPassHz);
+    settings.setValue("audio/highPassHz", pendingSettings.audioHighPassHz);
 
     settings.setValue("network/serverAddress", networkServerAddress);
     settings.setValue("network/bindAddress", networkBindAddress);
     settings.setValue("network/controlPort", static_cast<int>(networkControlPort));
     settings.setValue("network/processingMode", static_cast<int>(networkProcessingMode));
     settings.setValue("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio);
+    settings.setValue("digital/decodeEnabled", digitalDecodeEnabled);
     settings.sync();
 
     if (settings.status() == QSettings::NoError) {
@@ -2196,7 +2585,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
                      << "peer" << peerLabel
                      << "controllerPeerId" << command.value("controllerPeerId").toString();
             updateUiForRunState();
-            onNetworkStatusChanged(networkController ? networkController->statusText() : QString());
+            updateNetworkButtonText();
             return;
         }
 
@@ -2376,10 +2765,8 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             applyServerLocalOutputPolicy();
         }
 
-        if (processor && processor->isRunning() && isClientIqProcessingMode()) {
-            processor->updateNetworkIqSettings(pendingSettings, isChannelIqProcessingMode());
-        } else if (processor && processor->isRunning()) {
-            processor->configureNetworkIqStreaming(pendingSettings, false, false);
+        if (processor && processor->isRunning()) {
+            updateIqFrameProducerSettings();
         }
     }
 
@@ -2601,6 +2988,9 @@ void YourClassName::playNetworkAudioFrame(const QJsonObject &frame) {
     if (networkMode != NetworkMode::Client || !remoteAudioPlayer) {
         return;
     }
+    if (runState != RadioRunState::Running) {
+        return;
+    }
 
     if (frame.value("sampleRate").toInt(48000) != 48000 ||
         frame.value("channels").toInt(1) != 1 ||
@@ -2610,7 +3000,435 @@ void YourClassName::playNetworkAudioFrame(const QJsonObject &frame) {
     }
 
     const QByteArray pcmData = QByteArray::fromBase64(frame.value("pcm").toString().toLatin1());
+    processDigitalAudioFrame(pcmData);
     remoteAudioPlayer->playPcmFrame(pcmData);
+}
+
+void YourClassName::processDigitalAudioFrame(const QByteArray &pcmData) {
+    if (!digitalDecoder ||
+        !digitalDecoderThread ||
+        !digitalDecodeEnabled ||
+        !digitalDecodeCheckbox ||
+        !digitalDecodeCheckbox->isChecked()) {
+        return;
+    }
+
+    const RadioSettings settings = pendingSettings;
+    QMetaObject::invokeMethod(digitalDecoder,
+                              [decoder = digitalDecoder, pcmData, settings]() {
+                                  decoder->processPcmFrame(pcmData, settings, 48000);
+                              },
+                              Qt::QueuedConnection);
+}
+
+void YourClassName::updateDigitalDecoderMode() {
+    if (!digitalDecoder || !digitalDecoderThread) {
+        return;
+    }
+    const bool enabled = digitalDecodeEnabled;
+    const RadioSettings settings = pendingSettings;
+    QMetaObject::invokeMethod(digitalDecoder,
+                              [decoder = digitalDecoder, enabled, settings]() {
+                                  decoder->setEnabled(enabled);
+                                  decoder->configure(settings, 48000);
+                              },
+                              Qt::QueuedConnection);
+}
+
+RadioSettings YourClassName::audioProcessorSettings() const {
+    RadioSettings settings = pendingSettings;
+    if (offlineIqPlaybackActive && offlineIqPlaybackSampleRate > 0.0) {
+        settings.sampleRate = offlineIqPlaybackSampleRate;
+        settings.centerFrequency = pendingSettings.listeningFrequency;
+        settings.actualFrequency = pendingSettings.listeningFrequency;
+        settings.inputMode = 0;
+    }
+    return settings;
+}
+
+RadioSettings YourClassName::spectrumProcessingSettings() const {
+    RadioSettings settings = pendingSettings;
+    if (offlineIqPlaybackActive && offlineIqPlaybackSampleRate > 0.0) {
+        settings.sampleRate = offlineIqPlaybackSampleRate;
+        settings.centerFrequency = pendingSettings.listeningFrequency;
+        settings.actualFrequency = pendingSettings.listeningFrequency;
+        settings.inputMode = 0;
+    }
+    return settings;
+}
+
+void YourClassName::startRecording(bool momentary) {
+    if (!recordingManager) {
+        return;
+    }
+    if (recordingManager->isRecording()) {
+        if (momentary) {
+            momentaryRecordingActive = false;
+        }
+        return;
+    }
+
+    const RecordingManager::Mode mode = selectedRecordingMode();
+    if (mode == RecordingManager::Mode::ChannelIqWav &&
+        networkMode != NetworkMode::Disabled &&
+        isFullIqProcessingMode() &&
+        runState == RadioRunState::Running) {
+        updateRecordingStatus(QStringLiteral("Recording blocked: Channel IQ cannot run during Full IQ streaming"));
+        if (recordButton) {
+            QSignalBlocker blocker(recordButton);
+            recordButton->setChecked(false);
+            recordButton->setText(QStringLiteral("Record"));
+        }
+        momentaryRecordingActive = false;
+        return;
+    }
+
+    QString errorMessage;
+    recordingManager->setDisplayScalePercent(currentScale);
+    if (!recordingManager->start(mode, pendingSettings, &errorMessage)) {
+        updateRecordingStatus(QStringLiteral("Recording failed: %1").arg(errorMessage));
+        if (recordButton) {
+            QSignalBlocker blocker(recordButton);
+            recordButton->setChecked(false);
+            recordButton->setText(QStringLiteral("Record"));
+        }
+        momentaryRecordingActive = false;
+        return;
+    }
+
+    momentaryRecordingActive = momentary;
+    if (recordButton) {
+        QSignalBlocker blocker(recordButton);
+        recordButton->setChecked(true);
+        recordButton->setText(momentary ? QStringLiteral("Hold F9") : QStringLiteral("Stop Rec"));
+    }
+    if (recordingModeCombo) {
+        recordingModeCombo->setEnabled(false);
+    }
+    if (mode == RecordingManager::Mode::ChannelIqWav) {
+        updateIqFrameProducerSettings();
+    }
+}
+
+void YourClassName::stopRecording(bool momentaryRelease) {
+    if (!recordingManager) {
+        return;
+    }
+    if (momentaryRelease && !momentaryRecordingActive) {
+        return;
+    }
+
+    const bool wasChannelIqRecording = isChannelIqRecordingActive();
+    momentaryRecordingActive = false;
+    recordingManager->stop();
+    if (recordButton) {
+        QSignalBlocker blocker(recordButton);
+        recordButton->setChecked(false);
+        recordButton->setText(QStringLiteral("Record"));
+    }
+    if (recordingModeCombo) {
+        recordingModeCombo->setEnabled(true);
+    }
+    if (wasChannelIqRecording) {
+        updateIqFrameProducerSettings();
+    }
+}
+
+void YourClassName::refreshPlaybackFiles() {
+    if (!playbackFileCombo) {
+        return;
+    }
+
+    const QString previousPath = selectedPlaybackFilePath();
+    playbackFileCombo->blockSignals(true);
+    playbackFileCombo->clear();
+
+    QDir recordingsDir(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recordings")));
+    const QFileInfoList files = recordingsDir.entryInfoList(QStringList() << QStringLiteral("*.wav"),
+                                                            QDir::Files,
+                                                            QDir::Time);
+    for (const QFileInfo &fileInfo : files) {
+        PlaybackManager::WavInfo info;
+        if (!PlaybackManager::readWavInfo(fileInfo.absoluteFilePath(), info)) {
+            continue;
+        }
+
+        const double seconds = info.dataSize / static_cast<double>(
+            info.sampleRate * info.channels * (info.bitsPerSample / 8));
+        const QString type = info.mode == PlaybackManager::Mode::AudioWav
+                                 ? QStringLiteral("Audio")
+                                 : QStringLiteral("Ch IQ");
+        const QString label = QStringLiteral("%1  %2  %3 Hz  %4 s")
+                                  .arg(fileInfo.fileName(),
+                                       type,
+                                       QString::number(info.sampleRate),
+                                       QString::number(seconds, 'f', 1));
+        playbackFileCombo->addItem(label, fileInfo.absoluteFilePath());
+    }
+
+    if (playbackFileCombo->count() == 0) {
+        playbackFileCombo->addItem(QStringLiteral("No WAV recordings found"), QString());
+        playbackFileCombo->setEnabled(false);
+        if (playbackButton) {
+            playbackButton->setEnabled(false);
+        }
+    } else {
+        playbackFileCombo->setEnabled(true);
+        if (playbackButton) {
+            playbackButton->setEnabled(true);
+        }
+        const int previousIndex = playbackFileCombo->findData(previousPath);
+        if (previousIndex >= 0) {
+            playbackFileCombo->setCurrentIndex(previousIndex);
+        }
+    }
+
+    playbackFileCombo->blockSignals(false);
+}
+
+void YourClassName::startPlayback() {
+    if (!playbackManager) {
+        return;
+    }
+    if (playbackManager->isPlaying()) {
+        return;
+    }
+    if (runState != RadioRunState::Idle || deviceOpened || (processor && processor->isRunning())) {
+        onPlaybackStatusChanged(QStringLiteral("Playback blocked: stop receiver first"));
+        if (playbackButton) {
+            QSignalBlocker blocker(playbackButton);
+            playbackButton->setChecked(false);
+        }
+        return;
+    }
+    if (recordingManager && recordingManager->isRecording()) {
+        onPlaybackStatusChanged(QStringLiteral("Playback blocked: stop recording first"));
+        if (playbackButton) {
+            QSignalBlocker blocker(playbackButton);
+            playbackButton->setChecked(false);
+        }
+        return;
+    }
+
+    const QString path = selectedPlaybackFilePath();
+    if (path.isEmpty()) {
+        onPlaybackStatusChanged(QStringLiteral("Playback: no file selected"));
+        if (playbackButton) {
+            QSignalBlocker blocker(playbackButton);
+            playbackButton->setChecked(false);
+        }
+        return;
+    }
+
+    PlaybackManager::WavInfo info;
+    QString errorMessage;
+    if (!PlaybackManager::readWavInfo(path, info, &errorMessage)) {
+        onPlaybackStatusChanged(QStringLiteral("Playback failed: %1").arg(errorMessage));
+        if (playbackButton) {
+            QSignalBlocker blocker(playbackButton);
+            playbackButton->setChecked(false);
+        }
+        return;
+    }
+    if (info.mode == PlaybackManager::Mode::AudioWav && (info.channels != 1 || info.sampleRate != 48000)) {
+        onPlaybackStatusChanged(QStringLiteral("Playback failed: audio WAV must be mono 48 kHz"));
+        if (playbackButton) {
+            QSignalBlocker blocker(playbackButton);
+            playbackButton->setChecked(false);
+        }
+        return;
+    }
+
+    if (!playbackManager->start(path, &errorMessage)) {
+        onPlaybackStatusChanged(QStringLiteral("Playback failed: %1").arg(errorMessage));
+        if (playbackButton) {
+            QSignalBlocker blocker(playbackButton);
+            playbackButton->setChecked(false);
+        }
+    }
+}
+
+void YourClassName::stopPlayback() {
+    if (playbackManager && playbackManager->isPlaying()) {
+        playbackManager->stop();
+        return;
+    }
+    if (playbackButton && playbackButton->isChecked()) {
+        QSignalBlocker blocker(playbackButton);
+        playbackButton->setChecked(false);
+        playbackButton->setText(QStringLiteral("Play"));
+    }
+}
+
+void YourClassName::onPlaybackStarted(const QString &filePath, PlaybackManager::WavInfo info) {
+    Q_UNUSED(filePath);
+    if (playbackButton) {
+        QSignalBlocker blocker(playbackButton);
+        playbackButton->setChecked(true);
+        playbackButton->setText(QStringLiteral("Stop Play"));
+    }
+    if (playbackFileCombo) {
+        playbackFileCombo->setEnabled(false);
+    }
+    if (playbackRefreshButton) {
+        playbackRefreshButton->setEnabled(false);
+    }
+    if (startButton) {
+        startButton->setEnabled(false);
+    }
+
+    if (info.mode == PlaybackManager::Mode::ChannelIqWav) {
+        if (!playbackSettingsSaved) {
+            settingsBeforePlayback = pendingSettings;
+            playbackSettingsSaved = true;
+        }
+        offlineIqPlaybackActive = true;
+        offlineIqPlaybackHasMetadata = info.hasRadioSettings;
+        offlineIqPlaybackSampleRate = info.sampleRate;
+        IqBuffer::clear();
+        IqBuffer::setSampleRateEstimate(info.sampleRate);
+        const bool audioEnabledBeforePlayback = pendingSettings.audioEnabled;
+        const int audioDeviceBeforePlayback = pendingSettings.audioDeviceId;
+        if (info.hasRadioSettings) {
+            pendingSettings.deviceIndex = info.radioSettings.deviceIndex;
+            pendingSettings.clockSource = info.radioSettings.clockSource;
+            pendingSettings.inputMode = info.radioSettings.inputMode;
+            pendingSettings.centerFrequency = info.radioSettings.centerFrequency;
+            pendingSettings.actualFrequency = info.radioSettings.actualFrequency;
+            pendingSettings.listeningFrequency = info.radioSettings.listeningFrequency;
+            pendingSettings.sampleRate = info.radioSettings.sampleRate;
+            pendingSettings.bandwidth = info.radioSettings.bandwidth;
+            pendingSettings.modulationType = info.radioSettings.modulationType;
+            pendingSettings.fftLength = info.radioSettings.fftLength;
+            if (info.radioSettings.lnaGain >= 0) {
+                pendingSettings.lnaGain = info.radioSettings.lnaGain;
+            }
+            if (info.radioSettings.vgaGain >= 0) {
+                pendingSettings.vgaGain = info.radioSettings.vgaGain;
+            }
+            const double playbackCenter = info.radioSettings.listeningFrequency > 0.0
+                                              ? info.radioSettings.listeningFrequency
+                                              : info.radioSettings.centerFrequency;
+            if (playbackCenter > 0.0) {
+                pendingSettings.listeningFrequency = playbackCenter;
+            }
+        } else {
+            pendingSettings.sampleRate = info.sampleRate;
+            pendingSettings.centerFrequency = pendingSettings.listeningFrequency;
+            pendingSettings.actualFrequency = pendingSettings.listeningFrequency;
+            pendingSettings.inputMode = 0;
+        }
+        pendingSettings.audioEnabled = audioEnabledBeforePlayback;
+        pendingSettings.audioDeviceId = audioDeviceBeforePlayback;
+        if (info.hasScalePercent) {
+            currentScale = std::clamp(info.scalePercent,
+                                      static_cast<double>(minScale) / 10.0,
+                                      static_cast<double>(maxScale) / 10.0);
+        } else if (info.hasRadioSettings &&
+                   info.radioSettings.sampleRate > 0.0 &&
+                   info.sampleRate > 0) {
+            const double channelScalePercent =
+                (static_cast<double>(info.sampleRate) / info.radioSettings.sampleRate) * 100.0;
+            currentScale = std::clamp(channelScalePercent,
+                                      static_cast<double>(minScale) / 10.0,
+                                      static_cast<double>(maxScale) / 10.0);
+        }
+        publishSettingsToGlobals();
+        updateUiFromPendingSettings();
+        fftResult = std::make_unique<FFTResult>();
+        updateSpectrumTimerInterval();
+        if (audioProcessor) {
+            audioProcessor->configure(audioProcessorSettings());
+        }
+        pendingPlaybackAudioStartAfterIqPrebuffer = pendingSettings.audioEnabled;
+        if (updateTimer) {
+            updateTimer->start();
+        }
+        settingRange();
+    } else {
+        offlineIqPlaybackActive = false;
+        offlineIqPlaybackHasMetadata = false;
+        offlineIqPlaybackSampleRate = 0.0;
+    }
+}
+
+void YourClassName::onPlaybackStopped() {
+    if (offlineIqPlaybackActive) {
+        offlineIqPlaybackActive = false;
+        offlineIqPlaybackHasMetadata = false;
+        offlineIqPlaybackSampleRate = 0.0;
+        pendingPlaybackAudioStartAfterIqPrebuffer = false;
+        if (audioProcessor) {
+            audioProcessor->stopDemodulation();
+        }
+        if (updateTimer && runState == RadioRunState::Idle) {
+            updateTimer->stop();
+        }
+    }
+    if (playbackSettingsSaved) {
+        pendingSettings = settingsBeforePlayback;
+        playbackSettingsSaved = false;
+        publishSettingsToGlobals();
+        updateUiFromPendingSettings();
+    }
+    if (remoteAudioPlayer && runState == RadioRunState::Idle) {
+        remoteAudioPlayer->stop();
+    }
+    if (playbackButton) {
+        QSignalBlocker blocker(playbackButton);
+        playbackButton->setChecked(false);
+        playbackButton->setText(QStringLiteral("Play"));
+    }
+    if (playbackFileCombo) {
+        playbackFileCombo->setEnabled(playbackFileCombo->count() > 0 && !selectedPlaybackFilePath().isEmpty());
+    }
+    if (playbackRefreshButton) {
+        playbackRefreshButton->setEnabled(true);
+    }
+    updateUiForRunState();
+}
+
+void YourClassName::onPlaybackStatusChanged(const QString &status) {
+    if (playbackStatusLabel) {
+        playbackStatusLabel->setText(status);
+    }
+}
+
+void YourClassName::handlePlaybackAudioFrame(const QByteArray &pcmData) {
+    processDigitalAudioFrame(pcmData);
+    if (remoteAudioPlayer) {
+        remoteAudioPlayer->playPcmFrame(pcmData);
+    }
+}
+
+void YourClassName::handlePlaybackIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount) {
+    Q_UNUSED(sampleCount);
+    if (iqData.size() < static_cast<int>(2 * sizeof(qint16))) {
+        return;
+    }
+    const int bytesPerIq = 2 * static_cast<int>(sizeof(qint16));
+    std::vector<float> floatSamples(static_cast<std::size_t>(iqData.size() / sizeof(qint16)));
+    const auto *src = reinterpret_cast<const uchar *>(iqData.constData());
+    for (int i = 0, out = 0; i + bytesPerIq - 1 < iqData.size(); i += bytesPerIq) {
+        const qint16 iSample = static_cast<qint16>(src[i] | (src[i + 1] << 8));
+        const qint16 qSample = static_cast<qint16>(src[i + 2] | (src[i + 3] << 8));
+        floatSamples[static_cast<std::size_t>(out++)] = iSample / 32768.0f;
+        floatSamples[static_cast<std::size_t>(out++)] = qSample / 32768.0f;
+    }
+    IqBuffer::setSampleRateEstimate(sampleRate);
+    IqBuffer::publish(floatSamples.data(), floatSamples.size(), pendingSettings.audioEnabled);
+    if (pendingPlaybackAudioStartAfterIqPrebuffer && pendingSettings.audioEnabled && audioProcessor && sampleRate > 0.0) {
+        const double queuedIqSamples = static_cast<double>(IqBuffer::queuedFloatCount()) / 2.0;
+        const double queuedSeconds = queuedIqSamples / sampleRate;
+        if (queuedSeconds >= NETWORK_AUDIO_PREBUFFER_SECONDS) {
+            pendingPlaybackAudioStartAfterIqPrebuffer = false;
+            qDebug() << "[PlaybackIQ] starting demodulator after IQ prebuffer"
+                     << "queuedSeconds" << queuedSeconds
+                     << "queuedBlocks" << IqBuffer::queuedBlocks()
+                     << "sampleRate" << sampleRate;
+            audioProcessor->startDemodulation();
+        }
+    }
 }
 
 void YourClassName::sendNetworkIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount) {
@@ -2703,6 +3521,14 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
     const double frameSampleRate = frame.value("sampleRate").toDouble(pendingSettings.sampleRate);
     if (frameSampleRate <= 0.0) {
         return;
+    }
+    if (channelizedFrame &&
+        recordingManager &&
+        recordingManager->isRecording() &&
+        recordingManager->mode() == RecordingManager::Mode::ChannelIqWav) {
+        recordingManager->appendIqFrame(iqBytes,
+                                        frameSampleRate,
+                                        frame.value("sampleCount").toInt(iqBytes.size() / bytesPerIqSample));
     }
 
     RadioSettings iqSettings = pendingSettings;
@@ -2866,7 +3692,7 @@ void YourClassName::onAudioEnabledChanged(bool checked) {
              << "runState" << runStateName(runState);
 
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
 
         if (isClientIqProcessingMode()) {
             if (checked) {
@@ -2884,6 +3710,19 @@ void YourClassName::onAudioEnabledChanged(bool checked) {
             }
         }
 
+        return;
+    }
+
+    if (offlineIqPlaybackActive) {
+        if (checked) {
+            if (audioProcessor) {
+                audioProcessor->configure(audioProcessorSettings());
+            }
+            pendingPlaybackAudioStartAfterIqPrebuffer = true;
+        } else if (audioProcessor) {
+            pendingPlaybackAudioStartAfterIqPrebuffer = false;
+            audioProcessor->stopDemodulation();
+        }
         return;
     }
 
@@ -3290,7 +4129,7 @@ void YourClassName::updateTuningFromScale(double tunedListeningFrequency, double
     }
     settingRange();
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
@@ -3362,11 +4201,29 @@ void YourClassName::onModulationChanged(int id) {
     if (scaleWidget) {
         scaleWidget->setModulationType(id);
     }
+    updateDigitalDecoderMode();
     settingRange();
     qDebug() << "Modulation type changed to:" << id
              << "bandwidth preset" << pendingSettings.bandwidth;
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
+    }
+}
+
+void YourClassName::onDigitalTextDecoded(const QString &text) {
+    if (!digitalTextEdit || text.isEmpty()) {
+        return;
+    }
+
+    QTextCursor cursor = digitalTextEdit->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    cursor.insertText(text);
+    digitalTextEdit->setTextCursor(cursor);
+}
+
+void YourClassName::onDigitalDecoderStatusChanged(const QString &status) {
+    if (digitalStatusLabel) {
+        digitalStatusLabel->setText(status);
     }
 }
 
@@ -3455,7 +4312,7 @@ void YourClassName::onWaterfallScaleChanged(int delta) {
     scaleSlider->setValue(value);
 
     if (isNetworkClientMode() && !isFullIqProcessingMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
@@ -3576,7 +4433,7 @@ void YourClassName::onBandwidthChanged() {
     }
 
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
@@ -3676,6 +4533,12 @@ void YourClassName::openNetworkSettingsDialog() {
         networkControlPort = static_cast<quint16>(portSpin->value());
         serverDisableLocalVisualAudio = serverDisableLocalUiCheck->isChecked();
         networkProcessingMode = static_cast<NetworkProcessingMode>(processingCombo->currentData().toInt());
+        if (isChannelIqRecordingActive() &&
+            networkMode != NetworkMode::Disabled &&
+            isFullIqProcessingMode()) {
+            stopRecording(false);
+            updateRecordingStatus(QStringLiteral("Recording stopped: Channel IQ cannot run during Full IQ streaming"));
+        }
 
         const bool networkModeChanged = previousNetworkMode != networkMode;
         const bool processingModeChanged = previousProcessingMode != networkProcessingMode;
@@ -3702,6 +4565,9 @@ void YourClassName::openNetworkSettingsDialog() {
                 remoteAudioPlayer->stop();
             }
             networkController->stop();
+            if (runState == RadioRunState::Running) {
+                updateIqFrameProducerSettings();
+            }
             savePersistentSettings();
             return;
         }
@@ -3762,6 +4628,9 @@ void YourClassName::openNetworkSettingsDialog() {
                 updateTimer->start();
             }
         }
+        if (runState == RadioRunState::Running) {
+            updateIqFrameProducerSettings();
+        }
         savePersistentSettings();
     });
 
@@ -3793,8 +4662,7 @@ void YourClassName::openNetworkSettingsDialog() {
     }
 }
 
-void YourClassName::onNetworkStatusChanged(const QString &status) {
-    qDebug() << "[Network]" << status;
+void YourClassName::updateNetworkButtonText() {
     if (!networkButton) {
         return;
     }
@@ -3819,6 +4687,26 @@ void YourClassName::onNetworkStatusChanged(const QString &status) {
     default:
         networkButton->setText("Network");
         break;
+    }
+}
+
+void YourClassName::onNetworkStatusChanged(const QString &status) {
+    qDebug() << "[Network]" << status;
+    updateNetworkButtonText();
+}
+
+void YourClassName::updateAudioFilterLabels() {
+    if (audioLowPassLabel) {
+        const QString value = pendingSettings.audioLowPassHz > 0.0
+                                  ? audioFilterFrequencyText(pendingSettings.audioLowPassHz)
+                                  : QStringLiteral("Auto");
+        audioLowPassLabel->setText(QStringLiteral("Audio LPF: %1").arg(value));
+    }
+    if (audioHighPassLabel) {
+        const QString value = pendingSettings.audioHighPassHz > 0.0
+                                  ? audioFilterFrequencyText(pendingSettings.audioHighPassHz)
+                                  : QStringLiteral("Off");
+        audioHighPassLabel->setText(QStringLiteral("Audio HPF: %1").arg(value));
     }
 }
 
@@ -3856,7 +4744,7 @@ bool YourClassName::applyFftLengthChange(int newFftLength, bool notifyRemote) {
     }
 
     if (notifyRemote && isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 
     return true;
@@ -3898,7 +4786,7 @@ void YourClassName::populateSampleRates() {
         if (defaultIndex >= 0) {
             sampleBox->setCurrentIndex(defaultIndex);
         }
-        qDebug() << "[Network] using fallback sample-rate list; no local Fobos device is required for client control";
+        qDebug() << "[FobosDevices] using fallback sample-rate list; no local receiver is required for client control";
     };
 
     void *sampleRateDevice = activeFobosDevice();
@@ -3921,7 +4809,7 @@ void YourClassName::populateSampleRates() {
         openedForSampleRates = (ret == FOBOS_ERR_OK && sampleRateDevice);
     }
     if (ret != FOBOS_ERR_OK) {
-        qDebug() << "Failed to open device for sample-rate list, error code:" << ret;
+        qDebug() << "[FobosDevices] sample-rate list unavailable; using fallback, open result:" << ret;
         addDefaultSampleRates();
         return;
     }
@@ -4002,7 +4890,8 @@ void YourClassName::updateSpectrum() {
     std::vector<float> spectrumMagnitudes;
     bool haveSpectrum = false;
     try {
-        haveSpectrum = fftResult->storeFFTResults(pendingSettings, spectrumFrequencies, spectrumMagnitudes);
+        const RadioSettings spectrumSettings = spectrumProcessingSettings();
+        haveSpectrum = fftResult->storeFFTResults(spectrumSettings, spectrumFrequencies, spectrumMagnitudes);
     } catch (const std::bad_alloc &error) {
         qCritical() << "[Spectrum] bad_alloc" << error.what()
                     << "sampleRate" << pendingSettings.sampleRate
@@ -4093,7 +4982,7 @@ void YourClassName::onSampleRateChanged(int index) {
         if (isClientIqProcessingMode()) {
             resetNetworkIqReceptionState(false, false, pendingSettings.audioEnabled);
         }
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
         return;
     }
 
@@ -4134,7 +5023,7 @@ void YourClassName::onListeningFrequencyEntered() {
     qDebug() << "Frequency set to" << listeningFrequency << "Hz";
     settingRange();
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
     
@@ -4180,7 +5069,7 @@ void YourClassName::onFrequencyEntered() {
     }
     settingRange();
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
@@ -4396,7 +5285,7 @@ void YourClassName::onDirectSamplingChanged(int index) {
     settingRange();
 
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
         return;
     }
 
@@ -4416,7 +5305,10 @@ void YourClassName::settingRange() {
     double overallMin = DIRECT_MIN_FREQUENCY;
     double overallMax = directMaxFrequency(globalSampleRate);
 
-    if (globalMode == 0) {
+    if (offlineIqPlaybackActive && !offlineIqPlaybackHasMetadata) {
+        overallMin = globalFrequency - globalSampleRate / 2.0;
+        overallMax = globalFrequency + globalSampleRate / 2.0;
+    } else if (globalMode == 0) {
         overallMin = (std::max)(RF_MIN_LISTENING_FREQUENCY,
                                 globalFrequency - globalSampleRate / 2.0);
         overallMax = (std::max)(overallMin,
@@ -4452,7 +5344,7 @@ void YourClassName::onCheckboxStateChanged(int state) {
             qDebug() << "GPO state will be applied on the next start.";
         }
         if (isNetworkClientMode()) {
-            sendRemoteControlCommand("settings");
+            scheduleRemoteSettingsCommand();
         }
     }
 }
@@ -4471,7 +5363,7 @@ void YourClassName::onLnaGainChanged(int value) {
     }
 
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
@@ -4489,7 +5381,7 @@ void YourClassName::onVgaGainChanged(int value) {
     }
 
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
@@ -4503,11 +5395,22 @@ void YourClassName::onClkChanged(int index) {
     pendingSettings.clockSource = clkBox->currentData().toInt();
     qDebug() << "Clock source will be applied on the next start.";
     if (isNetworkClientMode()) {
-        sendRemoteControlCommand("settings");
+        scheduleRemoteSettingsCommand();
     }
 }
 
 void YourClassName::startFobosProcessing() {
+    if (playbackManager && playbackManager->isPlaying()) {
+        stopPlayback();
+    }
+
+    if (isChannelIqRecordingActive() &&
+        networkMode != NetworkMode::Disabled &&
+        isFullIqProcessingMode()) {
+        stopRecording(false);
+        updateRecordingStatus(QStringLiteral("Recording stopped: Channel IQ cannot run during Full IQ streaming"));
+    }
+
     if (isNetworkClientMode()) {
         if (sendRemoteControlCommand("start")) {
             runState = RadioRunState::Running;
@@ -4621,6 +5524,7 @@ void YourClassName::startFobosProcessing() {
     const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
     const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
     const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
+    const bool channelIqRecording = isChannelIqRecordingActive();
     const bool suppressServerLocalOutput =
         networkMode == NetworkMode::Server &&
         serverDisableLocalVisualAudio &&
@@ -4631,8 +5535,10 @@ void YourClassName::startFobosProcessing() {
     if (audioProcessor) {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
-    if (serverIqStreaming && processor) {
-        processor->updateNetworkIqSettings(pendingSettings, serverChannelIqStreaming);
+    if ((serverIqStreaming || channelIqRecording) && processor) {
+        processor->configureNetworkIqStreaming(pendingSettings,
+                                               true,
+                                               serverChannelIqStreaming || channelIqRecording);
     }
     qDebug() << "[FobosLifecycle] starting DataProcessor"
              << "device" << activeFobosDevice()
@@ -4641,13 +5547,14 @@ void YourClassName::startFobosProcessing() {
              << "syncEnabled" << pendingSettings.syncEnabled
              << "queueAudioBlocks" << queueAudioBlocks
              << "serverIqStreaming" << serverIqStreaming
-             << "serverChannelIqStreaming" << serverChannelIqStreaming;
+             << "serverChannelIqStreaming" << serverChannelIqStreaming
+             << "channelIqRecording" << channelIqRecording;
     processor->startProcessing(activeFobosDevice(),
                                activeFobosApiKind,
                                pendingSettings.syncEnabled,
                                pendingSettings.sampleRate,
                                queueAudioBlocks,
-                               serverIqStreaming);
+                               serverIqStreaming || channelIqRecording);
     pendingAudioStartAfterStreamReady = serverLocalAudioEnabled;
     streamStartCallbackCount = processor ? processor->callbackCount() : 0;
     streamStartElapsedTimer.restart();
@@ -4866,6 +5773,15 @@ void YourClassName::pollStopCompletion() {
 }
  
 void YourClassName::stopFobosProcessing() {
+    if (playbackManager && playbackManager->isPlaying()) {
+        stopPlayback();
+        return;
+    }
+
+    if (recordingManager && recordingManager->isRecording()) {
+        stopRecording(false);
+    }
+
     if (isNetworkClientMode()) {
         const bool sent = sendRemoteControlCommand("stop");
         if (!sent) {

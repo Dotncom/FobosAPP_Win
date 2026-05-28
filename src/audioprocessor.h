@@ -122,6 +122,9 @@ private:
     bool fmPreviousValid = false;
     float fmDeemphasisState = 0.0f;
     float demodAudioLowPassState = 0.0f;
+    float demodAudioLowPassState2 = 0.0f;
+    float demodAudioLowPassState3 = 0.0f;
+    float demodAudioHighPassState = 0.0f;
     double samCarrierPhase = 0.0;
     double samCarrierFrequency = 0.0;
     double sidebandFilterPhase = 0.0;

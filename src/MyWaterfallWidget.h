@@ -38,6 +38,7 @@ protected:
 private:
     void ensureLineBuffer();
     void resetWaterfallTexture(int w, int h);
+    void resizeWaterfallTexturePreserve(int w, int h);
     double frequencyAtX(int x) const;
     QMutex mutex;
 	QOpenGLBuffer waterfallVbo;

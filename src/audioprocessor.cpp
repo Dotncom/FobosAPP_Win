@@ -65,7 +65,7 @@ double demodAudioCutoffForMode(int modulationType, double bandwidth) {
     case MOD_WFM:
         return 15000.0;
     case MOD_NFM:
-        return 3500.0;
+        return 3000.0;
     case MOD_FSK:
         return 5000.0;
     case MOD_USB:
@@ -78,10 +78,10 @@ double demodAudioCutoffForMode(int modulationType, double bandwidth) {
         return 1200.0;
     case MOD_DSB:
     case MOD_SAM:
-        return (std::min)(10000.0, (std::max)(1000.0, bandwidth * 0.45));
+        return (std::min)(6500.0, (std::max)(1000.0, bandwidth * 0.45));
     case MOD_AM:
     default:
-        return (std::min)(10000.0, (std::max)(1000.0, bandwidth * 0.45));
+        return (std::min)(6000.0, (std::max)(1000.0, bandwidth * 0.45));
     }
 }
 
@@ -95,6 +95,13 @@ double targetChannelRate(int modulationType, double bandwidth) {
                            384000.0);
     }
     return AM_CHANNEL_RATE;
+}
+
+bool isDigitalAudioMode(int modulationType) {
+    return modulationType == MOD_FT8 ||
+           modulationType == MOD_RTTY ||
+           modulationType == MOD_FSK ||
+           modulationType == MOD_PSK;
 }
 
 int channelDecimationFactor(double inputRate, int modulationType, double bandwidth) {
@@ -359,6 +366,9 @@ void AudioProcessor::resetDemodulatorState() {
     fmPreviousValid = false;
     fmDeemphasisState = 0.0f;
     demodAudioLowPassState = 0.0f;
+    demodAudioLowPassState2 = 0.0f;
+    demodAudioLowPassState3 = 0.0f;
+    demodAudioHighPassState = 0.0f;
     samCarrierPhase = 0.0;
     samCarrierFrequency = 0.0;
     sidebandFilterPhase = 0.0;
@@ -428,13 +438,28 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         0.000001,
         1.0
         ));
-    const double demodAudioCutoff = (std::min)(demodAudioCutoffForMode(modulationType, bandwidth),
-                                               AUDIO_OUTPUT_RATE * 0.45);
+    const bool digitalAudioMode = isDigitalAudioMode(modulationType);
+    double demodAudioCutoff = demodAudioCutoffForMode(modulationType, bandwidth);
+    if (!digitalAudioMode && settings.audioLowPassHz > 0.0) {
+        demodAudioCutoff = clampDouble(settings.audioLowPassHz, 100.0, 20000.0);
+    }
+    demodAudioCutoff = (std::min)(demodAudioCutoff, AUDIO_OUTPUT_RATE * 0.45);
     const float demodAudioLowPassAlpha = static_cast<float>((std::clamp)(
         1.0 - std::exp(-TWO_PI * demodAudioCutoff / AUDIO_OUTPUT_RATE),
         0.000001,
         1.0
         ));
+    const double demodAudioHighPassCutoff =
+        (!digitalAudioMode && settings.audioHighPassHz > 0.0)
+            ? clampDouble(settings.audioHighPassHz, 10.0, 1000.0)
+            : 0.0;
+    const float demodAudioHighPassAlpha =
+        demodAudioHighPassCutoff > 0.0
+            ? static_cast<float>((std::clamp)(
+                  1.0 - std::exp(-TWO_PI * demodAudioHighPassCutoff / AUDIO_OUTPUT_RATE),
+                  0.000001,
+                  1.0))
+            : 0.0f;
 
     const bool lowerSideband = isLowerSidebandMode(modulationType);
     const double sidebandHighCut = (std::min)(cutoff, rfChannelRate * 0.45);
@@ -465,6 +490,9 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     std::array<std::complex<float>, 4> sidebandStates = sidebandLowPassStates;
     double sidebandPhase = sidebandFilterPhase;
     float audioLowPass = demodAudioLowPassState;
+    float audioLowPass2 = demodAudioLowPassState2;
+    float audioLowPass3 = demodAudioLowPassState3;
+    float audioHighPass = demodAudioHighPassState;
     double samPhase = samCarrierPhase;
     double samFrequency = samCarrierFrequency;
     const double samMaxFrequency = TWO_PI * SAM_LOCK_RANGE_HZ / rfChannelRate;
@@ -605,19 +633,36 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
 
         audioLowPass += demodAudioLowPassAlpha * (demodulatedSample - audioLowPass);
         demodulatedSample = audioLowPass;
+        if (!digitalAudioMode) {
+            audioLowPass2 += demodAudioLowPassAlpha * (demodulatedSample - audioLowPass2);
+            audioLowPass3 += demodAudioLowPassAlpha * (audioLowPass2 - audioLowPass3);
+            demodulatedSample = audioLowPass3;
+        } else {
+            audioLowPass2 = demodulatedSample;
+            audioLowPass3 = demodulatedSample;
+        }
 
         audioResamplePhase += outputStep;
         while (audioResamplePhase >= 1.0) {
             audioResamplePhase -= 1.0;
 
-            amDcEstimate += 0.0005f * (demodulatedSample - amDcEstimate);
-            const float acSample = demodulatedSample - amDcEstimate;
+            amDcEstimate += (digitalAudioMode ? 0.0001f : 0.0005f) *
+                            (demodulatedSample - amDcEstimate);
+            float acSample = demodulatedSample - amDcEstimate;
+            if (demodAudioHighPassAlpha > 0.0f) {
+                audioHighPass += demodAudioHighPassAlpha * (acSample - audioHighPass);
+                acSample -= audioHighPass;
+            } else {
+                audioHighPass = 0.0f;
+            }
             const float absSample = std::fabs(acSample);
             const float agcCoeff = absSample > amAgcLevel ? 0.01f : 0.0002f;
             amAgcLevel += agcCoeff * (absSample - amAgcLevel);
             amAgcLevel = (std::max)(amAgcLevel, 0.0001f);
 
-            const float normalized = std::tanh(acSample * (0.35f / amAgcLevel));
+            const float normalized = digitalAudioMode
+                                         ? acSample * (0.25f / amAgcLevel)
+                                         : std::tanh(acSample * (0.35f / amAgcLevel));
             const float finiteSample = std::isfinite(normalized) ? normalized : 0.0f;
             const float clamped = (std::clamp)(finiteSample, -1.0f, 1.0f);
             audioSamples.push_back(static_cast<short>(clamped * 32767.0f));
@@ -630,6 +675,9 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     sidebandLowPassStates = sidebandStates;
     fmPreviousSample = std::complex<float>(fmPrevI, fmPrevQ);
     demodAudioLowPassState = audioLowPass;
+    demodAudioLowPassState2 = audioLowPass2;
+    demodAudioLowPassState3 = audioLowPass3;
+    demodAudioHighPassState = audioHighPass;
     samCarrierPhase = wrapRadians(samPhase);
     samCarrierFrequency = samFrequency;
     sidebandFilterPhase = wrapRadians(sidebandPhase);
@@ -647,13 +695,19 @@ void AudioProcessor::SDRThread() {
     int activeModulationType = currentSettingsSnapshot().modulationType;
     uint64_t audioBlockCounter = 0;
     double activeBandwidth = currentSettingsSnapshot().bandwidth;
+    double activeAudioLowPassHz = currentSettingsSnapshot().audioLowPassHz;
+    double activeAudioHighPassHz = currentSettingsSnapshot().audioHighPassHz;
 
     while (running) {
         const RadioSettings settings = currentSettingsSnapshot();
         if (activeModulationType != settings.modulationType ||
-            std::abs(activeBandwidth - settings.bandwidth) > 1.0) {
+            std::abs(activeBandwidth - settings.bandwidth) > 1.0 ||
+            std::abs(activeAudioLowPassHz - settings.audioLowPassHz) > 1.0 ||
+            std::abs(activeAudioHighPassHz - settings.audioHighPassHz) > 1.0) {
             activeModulationType = settings.modulationType;
             activeBandwidth = settings.bandwidth;
+            activeAudioLowPassHz = settings.audioLowPassHz;
+            activeAudioHighPassHz = settings.audioHighPassHz;
             resetDemodulatorState();
         }
 
