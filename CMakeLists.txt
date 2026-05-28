@@ -31,6 +31,8 @@ set(SOURCES
     src/dataprocessor.cpp
     src/dataprocessor.h
     src/diagnosticlogging.h
+    src/dmrdecoder.cpp
+    src/dmrdecoder.h
     src/digitaldecoder.cpp
     src/digitaldecoder.h
     src/frequencycontrol.cpp

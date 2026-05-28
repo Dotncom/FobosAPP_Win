@@ -142,14 +142,16 @@ constexpr std::array<std::array<int, FT8_LDPC_MAX_CHECK_DEGREE>, FT8_LDPC_CHECK_
 bool isSupportedDecoderMode(int modulationType) {
     return modulationType == MOD_FT8 ||
            modulationType == MOD_RTTY ||
-           modulationType == MOD_FSK;
+           modulationType == MOD_FSK ||
+           modulationType == MOD_DMR;
 }
 
 bool isDigitalMode(int modulationType) {
     return modulationType == MOD_FT8 ||
            modulationType == MOD_RTTY ||
            modulationType == MOD_FSK ||
-           modulationType == MOD_PSK;
+           modulationType == MOD_PSK ||
+           modulationType == MOD_DMR;
 }
 
 qint16 readPcm16Le(const char *data) {
@@ -881,6 +883,7 @@ void DigitalDecoder::reset() {
     spaceI = 0.0;
     spaceQ = 0.0;
     resetFt8State();
+    dmrDecoder.reset();
 }
 
 void DigitalDecoder::configure(const RadioSettings &settings, int sampleRate) {
@@ -904,6 +907,18 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
     QString decodedText;
     const int sampleCount = pcmData.size() / static_cast<int>(sizeof(qint16));
     const char *raw = pcmData.constData();
+
+    if (settings.modulationType == MOD_DMR) {
+        const DmrDecoder::Result result =
+            dmrDecoder.processPcmFrame(pcmData, sampleRate, settings.listeningFrequency);
+        if (result.statusChanged && !result.statusText.isEmpty()) {
+            updateStatus(result.statusText);
+        }
+        if (!result.decodedText.isEmpty()) {
+            emit textDecoded(result.decodedText);
+        }
+        return;
+    }
 
     if (settings.modulationType == MOD_FT8) {
         processFt8Samples(raw, sampleCount, sampleRate, decodedText);
@@ -972,6 +987,8 @@ void DigitalDecoder::configureForMode(int modulationType, int sampleRate) {
         updateStatus(QStringLiteral("FSK decoder: Baudot 45.45 baud from discriminator"));
     } else if (modulationType == MOD_FT8) {
         updateStatus(QStringLiteral("FT8 detector: waiting for a 15 s frame"));
+    } else if (modulationType == MOD_DMR) {
+        updateStatus(QStringLiteral("DMR monitor: searching 4FSK sync"));
     } else if (modulationType == MOD_PSK) {
         updateStatus(QStringLiteral("PSK mode: clean audio pass-through; PSK31 decoder not implemented yet"));
     } else if (isDigitalMode(modulationType)) {

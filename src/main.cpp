@@ -10,8 +10,10 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QList>
 #include <QMenu>
 #include <QMessageLogContext>
 #include <QMutexLocker>
@@ -163,6 +165,10 @@ double directMaxFrequency(double sampleRate) {
     return (std::max)(DIRECT_MIN_FREQUENCY, sampleRate / 2.0 - 1.0);
 }
 
+double directMinFrequencyForMode(int inputMode, double sampleRate) {
+    return inputMode == 1 ? -directMaxFrequency(sampleRate) : DIRECT_MIN_FREQUENCY;
+}
+
 void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
     if (settings.sampleRate <= 0.0) {
         return;
@@ -188,9 +194,11 @@ void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
     } else {
         settings.centerFrequency = 0.0;
         settings.actualFrequency = 0.0;
+        const double directMin = directMinFrequencyForMode(settings.inputMode, settings.sampleRate);
+        const double directMax = directMaxFrequency(settings.sampleRate);
         settings.listeningFrequency = (std::clamp)(settings.listeningFrequency,
-                                                   DIRECT_MIN_FREQUENCY,
-                                                   directMaxFrequency(settings.sampleRate));
+                                                   directMin,
+                                                   directMax);
     }
 }
 
@@ -307,6 +315,8 @@ double defaultBandwidthForModulation(int modulationType) {
         return 2500.0;
     case MOD_FSK:
         return 12000.0;
+    case MOD_DMR:
+        return 12500.0;
     case MOD_ATV:
         return 5000000.0;
     case MOD_SSTV:
@@ -1016,8 +1026,36 @@ YourClassName::YourClassName(QWidget *parent)
     QVBoxLayout *digitalLayout = new QVBoxLayout(digitalWidget);
     QHBoxLayout *digitalHeaderLayout = new QHBoxLayout();
     QHBoxLayout *digitalModeLayout = new QHBoxLayout();
+    QGridLayout *dmrLabLayout = new QGridLayout();
     digitalDecodeCheckbox = new QCheckBox("Decode", digitalWidget);
     digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
+    dmrLabCaptureCheckbox = new QCheckBox("DMR Lab", digitalWidget);
+    dmrLabCaptureCheckbox->setToolTip("Write expected DMR test metadata next to audio/IQ recordings");
+    dmrLabColorCodeCombo = new QComboBox(digitalWidget);
+    dmrLabColorCodeCombo->addItem("?", -1);
+    for (int cc = 0; cc <= 15; ++cc) {
+        dmrLabColorCodeCombo->addItem(QString::number(cc), cc);
+    }
+    dmrLabSlotCombo = new QComboBox(digitalWidget);
+    dmrLabSlotCombo->addItem("?", 0);
+    dmrLabSlotCombo->addItem("TS1", 1);
+    dmrLabSlotCombo->addItem("TS2", 2);
+    dmrLabCallTypeCombo = new QComboBox(digitalWidget);
+    dmrLabCallTypeCombo->addItem("?", QStringLiteral("unknown"));
+    dmrLabCallTypeCombo->addItem("Group", QStringLiteral("group"));
+    dmrLabCallTypeCombo->addItem("Private", QStringLiteral("private"));
+    dmrLabCallTypeCombo->addItem("All", QStringLiteral("all_call"));
+    dmrLabSourceIdEdit = new QLineEdit(digitalWidget);
+    dmrLabSourceIdEdit->setPlaceholderText(QStringLiteral("Src ID"));
+    dmrLabTargetIdEdit = new QLineEdit(digitalWidget);
+    dmrLabTargetIdEdit->setPlaceholderText(QStringLiteral("TG/Target"));
+    dmrLabRadioEdit = new QLineEdit(digitalWidget);
+    dmrLabRadioEdit->setPlaceholderText(QStringLiteral("Radio"));
+    dmrLabNotesEdit = new QLineEdit(digitalWidget);
+    dmrLabNotesEdit->setPlaceholderText(QStringLiteral("Test note"));
+    dmrLabColorCodeCombo->setMaximumWidth(64);
+    dmrLabSlotCombo->setMaximumWidth(72);
+    dmrLabCallTypeCombo->setMaximumWidth(92);
     QPushButton *digitalClearButton = new QPushButton("Clear", digitalWidget);
     digitalStatusLabel = new QLabel("Digital audio decoder idle", digitalWidget);
     digitalTextEdit = new QPlainTextEdit(digitalWidget);
@@ -1029,12 +1067,25 @@ YourClassName::YourClassName(QWidget *parent)
     addModulationRadioButton(digitalWidget, digitalModeLayout, "RTTY", MOD_RTTY, "AFSK RTTY decoder");
     addModulationRadioButton(digitalWidget, digitalModeLayout, "FSK", MOD_FSK, "Frequency-shift keying decoder");
     addModulationRadioButton(digitalWidget, digitalModeLayout, "PSK", MOD_PSK, "PSK audio mode placeholder");
+    addModulationRadioButton(digitalWidget, digitalModeLayout, "DMR", MOD_DMR, "DMR 4FSK sync monitor");
     digitalModeLayout->addStretch();
+    dmrLabLayout->addWidget(dmrLabCaptureCheckbox, 0, 0);
+    dmrLabLayout->addWidget(new QLabel("CC:", digitalWidget), 0, 1);
+    dmrLabLayout->addWidget(dmrLabColorCodeCombo, 0, 2);
+    dmrLabLayout->addWidget(new QLabel("Slot:", digitalWidget), 0, 3);
+    dmrLabLayout->addWidget(dmrLabSlotCombo, 0, 4);
+    dmrLabLayout->addWidget(new QLabel("Call:", digitalWidget), 0, 5);
+    dmrLabLayout->addWidget(dmrLabCallTypeCombo, 0, 6);
+    dmrLabLayout->addWidget(dmrLabSourceIdEdit, 1, 0, 1, 2);
+    dmrLabLayout->addWidget(dmrLabTargetIdEdit, 1, 2, 1, 2);
+    dmrLabLayout->addWidget(dmrLabRadioEdit, 1, 4, 1, 3);
+    dmrLabLayout->addWidget(dmrLabNotesEdit, 2, 0, 1, 7);
     digitalHeaderLayout->addWidget(digitalDecodeCheckbox);
     digitalHeaderLayout->addStretch();
     digitalHeaderLayout->addWidget(digitalClearButton);
     digitalLayout->addLayout(digitalHeaderLayout);
     digitalLayout->addLayout(digitalModeLayout);
+    digitalLayout->addLayout(dmrLabLayout);
     digitalLayout->addWidget(digitalStatusLabel);
     digitalLayout->addWidget(digitalTextEdit);
     digitalDock = new QDockWidget("Digital Audio", this);
@@ -1323,6 +1374,7 @@ YourClassName::YourClassName(QWidget *parent)
         {"AM 6 kHz", 6000.0},
         {"AM 10 kHz", 10000.0},
         {"NFM 12.5 kHz", 12500.0},
+        {"DMR 12.5 kHz", 12500.0},
         {"WFM 200 kHz", 200000.0},
         {"SSTV 3 kHz", 3000.0},
         {"NOAA APT 40 kHz", 40000.0},
@@ -1605,6 +1657,24 @@ YourClassName::YourClassName(QWidget *parent)
         digitalDecodeEnabled = checked;
         updateDigitalDecoderMode();
     });
+    auto updateDmrLabControls = [this](bool enabled) {
+        const QList<QWidget *> controls = {
+            dmrLabColorCodeCombo,
+            dmrLabSlotCombo,
+            dmrLabCallTypeCombo,
+            dmrLabSourceIdEdit,
+            dmrLabTargetIdEdit,
+            dmrLabRadioEdit,
+            dmrLabNotesEdit,
+        };
+        for (QWidget *control : controls) {
+            if (control) {
+                control->setEnabled(enabled);
+            }
+        }
+    };
+    connect(dmrLabCaptureCheckbox, &QCheckBox::toggled, this, updateDmrLabControls);
+    updateDmrLabControls(dmrLabCaptureCheckbox && dmrLabCaptureCheckbox->isChecked());
     connect(digitalDecoder, &DigitalDecoder::textDecoded, this, &YourClassName::onDigitalTextDecoded);
     connect(digitalDecoder, &DigitalDecoder::statusChanged, this, &YourClassName::onDigitalDecoderStatusChanged);
     connect(videoToggleButton, &QPushButton::toggled, this, [this](bool checked) {
@@ -2101,6 +2171,52 @@ RecordingManager::Mode YourClassName::selectedRecordingMode() const {
     return ok ? static_cast<RecordingManager::Mode>(value) : RecordingManager::Mode::AudioWav;
 }
 
+QJsonObject YourClassName::recordingLabMetadata() const {
+    QJsonObject lab;
+    if (!dmrLabCaptureCheckbox || !dmrLabCaptureCheckbox->isChecked()) {
+        return lab;
+    }
+
+    lab["schema"] = QStringLiteral("dmr-lab-capture");
+    lab["schemaVersion"] = 1;
+    lab["mode"] = QStringLiteral("DMR");
+    lab["description"] = QStringLiteral("Expected values are user-supplied lab references for decoder verification.");
+
+    if (dmrLabColorCodeCombo) {
+        const int colorCode = dmrLabColorCodeCombo->currentData().toInt();
+        if (colorCode >= 0) {
+            lab["expectedColorCode"] = colorCode;
+        }
+    }
+    if (dmrLabSlotCombo) {
+        const int slot = dmrLabSlotCombo->currentData().toInt();
+        if (slot == 1 || slot == 2) {
+            lab["expectedTimeslot"] = slot;
+        }
+    }
+    if (dmrLabCallTypeCombo) {
+        const QString callType = dmrLabCallTypeCombo->currentData().toString();
+        if (!callType.isEmpty() && callType != QStringLiteral("unknown")) {
+            lab["expectedCallType"] = callType;
+        }
+    }
+
+    auto addText = [&lab](const QString &key, const QLineEdit *edit) {
+        if (!edit) {
+            return;
+        }
+        const QString text = edit->text().trimmed();
+        if (!text.isEmpty()) {
+            lab[key] = text;
+        }
+    };
+    addText(QStringLiteral("expectedSourceId"), dmrLabSourceIdEdit);
+    addText(QStringLiteral("expectedTargetId"), dmrLabTargetIdEdit);
+    addText(QStringLiteral("radio"), dmrLabRadioEdit);
+    addText(QStringLiteral("notes"), dmrLabNotesEdit);
+    return lab;
+}
+
 bool YourClassName::isChannelIqRecordingActive() const {
     return recordingManager &&
            recordingManager->isRecording() &&
@@ -2501,6 +2617,13 @@ void YourClassName::updateUiFromPendingSettings() {
     }
     if (listeningFrequencyControl) {
         QSignalBlocker blocker(listeningFrequencyControl);
+        if (pendingSettings.inputMode == 0) {
+            listeningFrequencyControl->setRangeHz(RF_MIN_LISTENING_FREQUENCY, 6000000000.0);
+        } else {
+            listeningFrequencyControl->setRangeHz(directMinFrequencyForMode(pendingSettings.inputMode,
+                                                                            pendingSettings.sampleRate),
+                                                  directMaxFrequency(pendingSettings.sampleRate));
+        }
         listeningFrequencyControl->setValueHz(pendingSettings.listeningFrequency);
     }
     if (bandwidthControl) {
@@ -2713,6 +2836,33 @@ void YourClassName::loadPersistentSettings() {
     networkControlPort = static_cast<quint16>((std::clamp)(settings.value("network/controlPort", static_cast<int>(networkControlPort)).toInt(), 1, 65535));
     serverDisableLocalVisualAudio = settings.value("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio).toBool();
     digitalDecodeEnabled = settings.value("digital/decodeEnabled", digitalDecodeEnabled).toBool();
+    auto setComboToData = [](QComboBox *combo, const QVariant &data) {
+        if (!combo) {
+            return;
+        }
+        const int index = combo->findData(data);
+        if (index >= 0) {
+            combo->setCurrentIndex(index);
+        }
+    };
+    if (dmrLabCaptureCheckbox) {
+        dmrLabCaptureCheckbox->setChecked(settings.value("digital/dmrLabCaptureEnabled", false).toBool());
+    }
+    setComboToData(dmrLabColorCodeCombo, settings.value("digital/dmrLabColorCode", -1));
+    setComboToData(dmrLabSlotCombo, settings.value("digital/dmrLabTimeslot", 0));
+    setComboToData(dmrLabCallTypeCombo, settings.value("digital/dmrLabCallType", QStringLiteral("unknown")));
+    if (dmrLabSourceIdEdit) {
+        dmrLabSourceIdEdit->setText(settings.value("digital/dmrLabSourceId").toString());
+    }
+    if (dmrLabTargetIdEdit) {
+        dmrLabTargetIdEdit->setText(settings.value("digital/dmrLabTargetId").toString());
+    }
+    if (dmrLabRadioEdit) {
+        dmrLabRadioEdit->setText(settings.value("digital/dmrLabRadio").toString());
+    }
+    if (dmrLabNotesEdit) {
+        dmrLabNotesEdit->setText(settings.value("digital/dmrLabNotes").toString());
+    }
     videoDecodeEnabled = settings.value("video/decodeEnabled", videoDecodeEnabled).toBool();
     if (videoDemodCombo) {
         const int demodMode = settings.value("video/demodMode", VideoProcessor::FmVideo).toInt();
@@ -2781,6 +2931,14 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("network/processingMode", static_cast<int>(networkProcessingMode));
     settings.setValue("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio);
     settings.setValue("digital/decodeEnabled", digitalDecodeEnabled);
+    settings.setValue("digital/dmrLabCaptureEnabled", dmrLabCaptureCheckbox && dmrLabCaptureCheckbox->isChecked());
+    settings.setValue("digital/dmrLabColorCode", dmrLabColorCodeCombo ? dmrLabColorCodeCombo->currentData().toInt() : -1);
+    settings.setValue("digital/dmrLabTimeslot", dmrLabSlotCombo ? dmrLabSlotCombo->currentData().toInt() : 0);
+    settings.setValue("digital/dmrLabCallType", dmrLabCallTypeCombo ? dmrLabCallTypeCombo->currentData().toString() : QStringLiteral("unknown"));
+    settings.setValue("digital/dmrLabSourceId", dmrLabSourceIdEdit ? dmrLabSourceIdEdit->text().trimmed() : QString());
+    settings.setValue("digital/dmrLabTargetId", dmrLabTargetIdEdit ? dmrLabTargetIdEdit->text().trimmed() : QString());
+    settings.setValue("digital/dmrLabRadio", dmrLabRadioEdit ? dmrLabRadioEdit->text().trimmed() : QString());
+    settings.setValue("digital/dmrLabNotes", dmrLabNotesEdit ? dmrLabNotesEdit->text().trimmed() : QString());
     settings.setValue("video/decodeEnabled", videoDecodeEnabled);
     settings.setValue("video/demodMode", videoDemodCombo ? videoDemodCombo->currentData().toInt() : VideoProcessor::FmVideo);
     settings.setValue("video/standardIndex", videoStandardCombo ? videoStandardCombo->currentIndex() : 0);
@@ -3751,6 +3909,7 @@ void YourClassName::startRecording(bool momentary) {
 
     QString errorMessage;
     recordingManager->setDisplayScalePercent(currentScale);
+    recordingManager->setLabMetadata(recordingLabMetadata());
     if (!recordingManager->start(mode, pendingSettings, &errorMessage)) {
         updateRecordingStatus(QStringLiteral("Recording failed: %1").arg(errorMessage));
         if (recordButton) {
@@ -5963,7 +6122,7 @@ void YourClassName::onDirectSamplingChanged(int index) {
 
     if (value != 0) {
         pendingSettings.centerFrequency = 0;
-        pendingSettings.listeningFrequency = 1250000;
+        pendingSettings.listeningFrequency = value == 1 ? 0 : 1250000;
     } else {
         pendingSettings.centerFrequency = 100000000;
         pendingSettings.listeningFrequency = 100000000;
@@ -6002,7 +6161,7 @@ void YourClassName::settingRange() {
     }
 
     double newRange = globalSampleRate * (currentScale / 100.0);
-    double overallMin = DIRECT_MIN_FREQUENCY;
+    double overallMin = directMinFrequencyForMode(globalMode, globalSampleRate);
     double overallMax = directMaxFrequency(globalSampleRate);
 
     if (offlineIqPlaybackActive && !offlineIqPlaybackHasMetadata) {
@@ -6013,6 +6172,14 @@ void YourClassName::settingRange() {
                                 globalFrequency - globalSampleRate / 2.0);
         overallMax = (std::max)(overallMin,
                                 globalFrequency + globalSampleRate / 2.0);
+    }
+
+    if (listeningFrequencyControl) {
+        const double controlMin = globalMode == 0 ? RF_MIN_LISTENING_FREQUENCY : overallMin;
+        const double controlMax = globalMode == 0 ? 6000000000.0 : overallMax;
+        QSignalBlocker blocker(listeningFrequencyControl);
+        listeningFrequencyControl->setRangeHz(controlMin, controlMax);
+        listeningFrequencyControl->setValueHz((std::clamp)(listeningFrequency, controlMin, controlMax));
     }
 
     const double availableRange = (std::max)(1.0, overallMax - overallMin);

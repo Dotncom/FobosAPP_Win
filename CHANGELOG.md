@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.0.0-beta - 2026-05-28
+
+FobosAPP 3.0 beta starts the DMR work as a laboratory/test build. DMR is not a
+finished voice decoder yet; this release exposes a DMR sync/activity monitor and
+recording metadata tools so controlled test captures can drive the next stage.
+
+### Added
+
+- DMR beta mode in the Digital Audio dock.
+- DMR 4FSK sync/activity monitor with frequency-tagged lock and burst reports.
+- DMR Lab Capture fields for known test values such as Color Code, timeslot,
+  source ID, target/talkgroup ID, radio model, and notes.
+- JSON sidecar metadata written next to audio and Channel IQ recordings.
+
+### Fixed
+
+- Corrected the `HF1 + HF2` direct-sampling display model: the spectrum,
+  waterfall, and scale now span `-sampleRate/2 .. 0 .. +sampleRate/2`.
+- `HF1 + HF2` audio/channel-IQ selection now follows the negative-frequency
+  side for HF1 and the positive-frequency side for HF2.
+
+### Known Issues
+
+- DMR is currently a beta sync/activity monitor, not a complete DMR decoder.
+- DMR symbol/frame synchronization still needs controlled lab captures before
+  payload and voice decoding can be considered reliable.
+- Video/image beta limitations from 2.9 remain.
+
 ## 2.9.0-beta - 2026-05-28
 
 FobosAPP 2.9 beta is an intentionally experimental video/image decoding build.

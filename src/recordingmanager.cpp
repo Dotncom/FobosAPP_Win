@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -55,6 +56,7 @@ bool RecordingManager::start(Mode mode, const RadioSettings &settings, QString *
 
     activeMode = mode;
     recordingSettings = settings;
+    recordingStartedAtUtc = QDateTime::currentDateTimeUtc();
     dataBytesWritten = 0;
     waveOpen = false;
     waveSampleRate = 0;
@@ -70,12 +72,15 @@ bool RecordingManager::start(Mode mode, const RadioSettings &settings, QString *
             recording = false;
             return false;
         }
-        updateStatus(QStringLiteral("Recording audio: %1").arg(QFileInfo(filePath).fileName()));
+        updateStatus(QStringLiteral("Recording audio: %1%2")
+                         .arg(QFileInfo(filePath).fileName(),
+                              labMetadata.isEmpty() ? QString() : QStringLiteral(" + lab JSON")));
         return true;
     }
 
     filePath = makeRecordingPath(QStringLiteral("channel_iq.wav"));
-    updateStatus(QStringLiteral("Recording channel IQ: waiting for IQ frames"));
+    updateStatus(QStringLiteral("Recording channel IQ: waiting for IQ frames%1")
+                     .arg(labMetadata.isEmpty() ? QString() : QStringLiteral(" + lab JSON")));
     return true;
 }
 
@@ -96,7 +101,10 @@ void RecordingManager::stop() {
     dataBytesWritten = 0;
 
     if (!finishedFile.isEmpty() && finishedBytes > 0) {
-        updateStatus(QStringLiteral("Recording saved: %1").arg(QFileInfo(finishedFile).fileName()));
+        const bool sidecarWritten = writeSidecarMetadata(finishedFile, finishedBytes);
+        updateStatus(QStringLiteral("Recording saved: %1%2")
+                         .arg(QFileInfo(finishedFile).fileName(),
+                              sidecarWritten ? QStringLiteral(" + JSON") : QString()));
     } else {
         updateStatus(QStringLiteral("Recording stopped: no data"));
     }
@@ -118,6 +126,10 @@ void RecordingManager::setDisplayScalePercent(double scalePercent) {
     if (std::isfinite(scalePercent) && scalePercent > 0.0) {
         displayScalePercent = scalePercent;
     }
+}
+
+void RecordingManager::setLabMetadata(const QJsonObject &metadata) {
+    labMetadata = metadata;
 }
 
 void RecordingManager::appendAudioFrame(const QByteArray &pcmData) {
@@ -219,11 +231,13 @@ void RecordingManager::writeWaveHeader(int sampleRate, int channels, int bitsPer
     outputFile.write(header);
 }
 
-QByteArray RecordingManager::makeMetadataChunk() const {
+QJsonObject RecordingManager::makeMetadataObject() const {
     QJsonObject root;
     root["app"] = QStringLiteral("FobosAPP");
-    root["version"] = 1;
+    root["version"] = 2;
     root["mode"] = activeMode == Mode::ChannelIqWav ? QStringLiteral("channel_iq") : QStringLiteral("audio");
+    root["recordedAtUtc"] = recordingStartedAtUtc.toString(Qt::ISODateWithMs);
+    root["recordedAtLocal"] = recordingStartedAtUtc.toLocalTime().toString(Qt::ISODateWithMs);
     root["deviceIndex"] = recordingSettings.deviceIndex;
     root["clockSource"] = recordingSettings.clockSource;
     root["inputMode"] = recordingSettings.inputMode;
@@ -240,6 +254,17 @@ QByteArray RecordingManager::makeMetadataChunk() const {
     root["audioHighPassHz"] = recordingSettings.audioHighPassHz;
     root["scalePercent"] = displayScalePercent;
     root["gpoValue"] = static_cast<int>(recordingSettings.gpoValue);
+    root["waveSampleRate"] = waveSampleRate;
+    root["waveChannels"] = waveChannels;
+    root["waveBitsPerSample"] = waveBitsPerSample;
+    if (!labMetadata.isEmpty()) {
+        root["lab"] = labMetadata;
+    }
+    return root;
+}
+
+QByteArray RecordingManager::makeMetadataChunk() const {
+    const QJsonObject root = makeMetadataObject();
     return QJsonDocument(root).toJson(QJsonDocument::Compact);
 }
 
@@ -259,6 +284,40 @@ void RecordingManager::patchWaveHeader() {
         outputFile.write(le32Bytes(dataSize));
     }
     outputFile.flush();
+}
+
+bool RecordingManager::writeSidecarMetadata(const QString &finishedFile, quint64 finishedBytes) {
+    if (finishedFile.isEmpty()) {
+        return false;
+    }
+
+    QFileInfo info(finishedFile);
+    QJsonObject root = makeMetadataObject();
+    root["sidecarVersion"] = 1;
+    root["fileName"] = info.fileName();
+    root["filePath"] = info.absoluteFilePath();
+    root["dataBytes"] = static_cast<double>(finishedBytes);
+    root["waveHeaderBytes"] = static_cast<double>(waveHeaderBytes);
+    const int bytesPerFrame = waveChannels * waveBitsPerSample / 8;
+    if (waveSampleRate > 0 && bytesPerFrame > 0) {
+        root["durationSeconds"] =
+            static_cast<double>(finishedBytes) /
+            static_cast<double>(waveSampleRate * bytesPerFrame);
+    }
+
+    const QString jsonPath = info.absoluteDir().filePath(info.completeBaseName() + QStringLiteral(".json"));
+    QFile jsonFile(jsonPath);
+    if (!jsonFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        qDebug() << "[Recording] failed to write sidecar metadata"
+                 << jsonPath
+                 << jsonFile.errorString();
+        return false;
+    }
+
+    jsonFile.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    jsonFile.close();
+    qDebug() << "[Recording] sidecar metadata saved" << jsonPath;
+    return true;
 }
 
 QString RecordingManager::makeRecordingPath(const QString &suffix) const {

@@ -127,8 +127,11 @@ void FrequencyControl::setValueHz(double valueHz) {
 }
 
 void FrequencyControl::setRangeHz(double minimumHz, double maximumHz) {
-    minimumValueHz = (std::max)(0.0, minimumHz);
-    maximumValueHz = (std::max)(minimumValueHz + 1.0, maximumHz);
+    minimumValueHz = std::isfinite(minimumHz) ? minimumHz : 0.0;
+    maximumValueHz = std::isfinite(maximumHz) ? maximumHz : minimumValueHz + 1.0;
+    if (maximumValueHz <= minimumValueHz) {
+        maximumValueHz = minimumValueHz + 1.0;
+    }
     currentValueHz = (std::clamp)(currentValueHz, minimumValueHz, maximumValueHz);
     updateSpinRange();
     updateDisplayedValue();

@@ -8,6 +8,7 @@
 
 #include <vector>
 
+#include "dmrdecoder.h"
 #include "radiosettings.h"
 
 class DigitalDecoder : public QObject {
@@ -79,6 +80,7 @@ private:
     std::vector<double> recentFt8CandidateHz;
     std::vector<int> recentFt8CandidateAnalysis;
     QString lastStatus;
+    DmrDecoder dmrDecoder;
 };
 
 #endif // DIGITALDECODER_H

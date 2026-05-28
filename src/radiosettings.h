@@ -32,7 +32,8 @@ enum ModulationMode {
     MOD_SSTV = 13,
     MOD_APT = 14,
     MOD_WEFAX = 15,
-    MOD_LRPT = 16
+    MOD_LRPT = 16,
+    MOD_DMR = 17
 };
 
 inline bool isUpperSidebandMode(int modulationType) {
@@ -53,7 +54,8 @@ inline bool isFrequencyDiscriminatorMode(int modulationType) {
            modulationType == MOD_WFM ||
            modulationType == MOD_FSK ||
            modulationType == MOD_ATV ||
-           modulationType == MOD_APT;
+           modulationType == MOD_APT ||
+           modulationType == MOD_DMR;
 }
 
 struct RadioSettings {

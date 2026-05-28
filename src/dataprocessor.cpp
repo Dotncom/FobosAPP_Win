@@ -661,7 +661,14 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
         if (!std::isfinite(qSample)) {
             qSample = 0.0f;
         }
-        if (settings.inputMode == 2) {
+        if (settings.inputMode == 1) {
+            if (fShift < 0.0) {
+                qSample = 0.0f;
+            } else {
+                iSample = qSample;
+                qSample = 0.0f;
+            }
+        } else if (settings.inputMode == 2) {
             qSample = 0.0f;
         } else if (settings.inputMode == 3) {
             iSample = qSample;

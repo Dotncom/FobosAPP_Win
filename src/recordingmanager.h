@@ -3,6 +3,8 @@
 
 #include <QObject>
 #include <QFile>
+#include <QDateTime>
+#include <QJsonObject>
 #include <QString>
 
 #include "radiosettings.h"
@@ -25,6 +27,7 @@ public:
     Mode mode() const;
     QString currentFilePath() const;
     void setDisplayScalePercent(double scalePercent);
+    void setLabMetadata(const QJsonObject &metadata);
 
     void appendAudioFrame(const QByteArray &pcmData);
     void appendIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
@@ -35,15 +38,19 @@ signals:
 private:
     bool openWaveFile(int sampleRate, int channels, int bitsPerSample, QString *errorMessage = nullptr);
     void writeWaveHeader(int sampleRate, int channels, int bitsPerSample);
+    QJsonObject makeMetadataObject() const;
     QByteArray makeMetadataChunk() const;
     void patchWaveHeader();
+    bool writeSidecarMetadata(const QString &finishedFile, quint64 finishedBytes);
     QString makeRecordingPath(const QString &suffix) const;
     void updateStatus(const QString &status);
 
     QFile outputFile;
     Mode activeMode = Mode::AudioWav;
     RadioSettings recordingSettings;
+    QJsonObject labMetadata;
     QString filePath;
+    QDateTime recordingStartedAtUtc;
     bool recording = false;
     bool waveOpen = false;
     int waveSampleRate = 0;

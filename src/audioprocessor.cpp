@@ -43,6 +43,8 @@ double channelCutoffForMode(int modulationType, double bandwidth) {
         return (std::min)(140000.0, (std::max)(80000.0, bandwidth * 0.55));
     case MOD_NFM:
         return (std::min)(25000.0, (std::max)(6000.0, bandwidth * 0.55));
+    case MOD_DMR:
+        return (std::min)(9500.0, (std::max)(6000.0, bandwidth * 0.75));
     case MOD_APT:
         return (std::min)(36000.0, (std::max)(18000.0, bandwidth * 0.55));
     case MOD_FSK:
@@ -74,6 +76,8 @@ double demodAudioCutoffForMode(int modulationType, double bandwidth) {
         return 15000.0;
     case MOD_NFM:
         return 3000.0;
+    case MOD_DMR:
+        return 6000.0;
     case MOD_APT:
         return 12000.0;
     case MOD_FSK:
@@ -107,6 +111,9 @@ double targetChannelRate(int modulationType, double bandwidth) {
     if (modulationType == MOD_APT) {
         return 240000.0;
     }
+    if (modulationType == MOD_DMR) {
+        return 96000.0;
+    }
     if (modulationType == MOD_NFM || modulationType == MOD_FSK) {
         return clampDouble((std::max)(FM_MIN_CHANNEL_RATE, bandwidth * 4.0),
                            FM_MIN_CHANNEL_RATE,
@@ -121,7 +128,8 @@ bool isDigitalAudioMode(int modulationType) {
            modulationType == MOD_FSK ||
            modulationType == MOD_PSK ||
            modulationType == MOD_SSTV ||
-           modulationType == MOD_WEFAX;
+           modulationType == MOD_WEFAX ||
+           modulationType == MOD_DMR;
 }
 
 int channelDecimationFactor(double inputRate, int modulationType, double bandwidth) {
@@ -530,7 +538,14 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         if (!std::isfinite(qSample)) {
             qSample = 0.0f;
         }
-        if (inputMode == 2) {
+        if (inputMode == 1) {
+            if (fShift < 0.0) {
+                qSample = 0.0f;
+            } else {
+                iSample = qSample;
+                qSample = 0.0f;
+            }
+        } else if (inputMode == 2) {
             qSample = 0.0f;
         } else if (inputMode == 3) {
             iSample = qSample;
@@ -578,7 +593,8 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         case MOD_NFM:
         case MOD_APT:
         case MOD_WFM:
-        case MOD_FSK: {
+        case MOD_FSK:
+        case MOD_DMR: {
             float limitedI = lowPassI;
             float limitedQ = lowPassQ;
             const float magnitude = std::sqrt(limitedI * limitedI + limitedQ * limitedQ);
@@ -595,7 +611,7 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
             fmPrevI = limitedI;
             fmPrevQ = limitedQ;
             fmPreviousValid = true;
-            if (modulationType == MOD_FSK) {
+            if (modulationType == MOD_FSK || modulationType == MOD_DMR) {
                 demodulatedSample *= 10.0f;
             } else {
                 fmDeemphasisState += fmDeemphasisAlpha * (demodulatedSample - fmDeemphasisState);

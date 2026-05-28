@@ -121,6 +121,66 @@ bool FFTResult::storeFFTResults(const RadioSettings &settings,
 
     const int samplesToCopy = std::min(currentFftLength, availableIqSamples);
     const int sourceStart = availableIqSamples - samplesToCopy;
+
+    auto magnitudeDb = [this, samplesToCopy](int index) {
+        const float re = std::isfinite(fftOut[index][0]) ? fftOut[index][0] : 0.0f;
+        const float im = std::isfinite(fftOut[index][1]) ? fftOut[index][1] : 0.0f;
+        const float value =
+            std::sqrt(re * re + im * im) /
+            static_cast<float>((std::max)(1, samplesToCopy));
+        if (std::isfinite(value) && value > 0.0f) {
+            return (std::max)(FFT_MAGNITUDE_FLOOR_DB, 20.0f * std::log10(value));
+        }
+        return FFT_MAGNITUDE_FLOOR_DB;
+    };
+
+    if (inputMode == 1) {
+        const int halfLength = currentFftLength / 2;
+        std::vector<float> hf1Positive(halfLength + 1, FFT_MAGNITUDE_FLOOR_DB);
+        std::vector<float> hf2Positive(halfLength + 1, FFT_MAGNITUDE_FLOOR_DB);
+        std::vector<float> shiftedMagnitude(currentFftLength, FFT_MAGNITUDE_FLOOR_DB);
+
+        for (int i = 0; i < currentFftLength; ++i) {
+            fftIn[i][0] = 0.0f;
+            fftIn[i][1] = 0.0f;
+        }
+        for (int i = 0; i < samplesToCopy; ++i) {
+            const int sourceIndex = sourceStart + i;
+            const float iValue = iqSnapshot[2 * sourceIndex];
+            fftIn[i][0] = std::isfinite(iValue) ? iValue : 0.0f;
+        }
+        fftwf_execute(plan);
+        for (int k = 0; k <= halfLength; ++k) {
+            hf1Positive[k] = magnitudeDb(k);
+        }
+
+        for (int i = 0; i < currentFftLength; ++i) {
+            fftIn[i][0] = 0.0f;
+            fftIn[i][1] = 0.0f;
+        }
+        for (int i = 0; i < samplesToCopy; ++i) {
+            const int sourceIndex = sourceStart + i;
+            const float qValue = iqSnapshot[2 * sourceIndex + 1];
+            fftIn[i][0] = std::isfinite(qValue) ? qValue : 0.0f;
+        }
+        fftwf_execute(plan);
+        for (int k = 0; k <= halfLength; ++k) {
+            hf2Positive[k] = magnitudeDb(k);
+        }
+
+        for (int i = 0; i < currentFftLength; ++i) {
+            if (i < halfLength) {
+                shiftedMagnitude[i] = hf1Positive[halfLength - i];
+            } else {
+                shiftedMagnitude[i] = hf2Positive[i - halfLength];
+            }
+            outMagnitudes[(i + halfLength) % currentFftLength] = shiftedMagnitude[i];
+            outFrequencies[i] =
+                (i - currentFftLength / 2) * (sampleRate / currentFftLength) + centerFrequency;
+        }
+        return true;
+    }
+
     for (int i = 0; i < samplesToCopy; ++i) {
         const int sourceIndex = sourceStart + i;
         if (inputMode == 2) {
@@ -140,16 +200,9 @@ bool FFTResult::storeFFTResults(const RadioSettings &settings,
     }
 
     fftwf_execute(plan);
-    const float fftNormalization = 1.0f / static_cast<float>((std::max)(1, samplesToCopy));
     for (int i = 0; i < currentFftLength; ++i) {
-        const float re = std::isfinite(fftOut[i][0]) ? fftOut[i][0] : 0.0f;
-        const float im = std::isfinite(fftOut[i][1]) ? fftOut[i][1] : 0.0f;
-        magnitude[i] = std::sqrt(re * re + im * im) * fftNormalization;
-        if (std::isfinite(magnitude[i]) && magnitude[i] > 0.0f) {
-            outMagnitudes[i] = (std::max)(FFT_MAGNITUDE_FLOOR_DB, 20.0f * std::log10(magnitude[i]));
-        } else {
-            outMagnitudes[i] = FFT_MAGNITUDE_FLOOR_DB;
-        }
+        magnitude[i] = magnitudeDb(i);
+        outMagnitudes[i] = magnitude[i];
         outFrequencies[i] = (i - currentFftLength / 2) * (sampleRate / currentFftLength) + centerFrequency;
     }
     return true;

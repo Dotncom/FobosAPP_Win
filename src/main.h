@@ -230,6 +230,7 @@ private:
     void handlePlaybackAudioFrame(const QByteArray &pcmData);
     void handlePlaybackIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     QString selectedPlaybackFilePath() const;
+    QJsonObject recordingLabMetadata() const;
     void showTuneContextMenu(double frequency, const QPoint &globalPos);
     void tuneSignalCenterAt(double frequency);
     void tuneSidebandEdgeAt(double frequency, int modulationType);
@@ -246,6 +247,9 @@ private:
     QComboBox *playbackFileCombo = nullptr;
     QComboBox *videoDemodCombo = nullptr;
     QComboBox *videoStandardCombo = nullptr;
+    QComboBox *dmrLabColorCodeCombo = nullptr;
+    QComboBox *dmrLabSlotCombo = nullptr;
+    QComboBox *dmrLabCallTypeCombo = nullptr;
     QButtonGroup *modulationButtonGroup = nullptr;
     
     QPushButton *refreshButton = nullptr;
@@ -265,6 +269,7 @@ private:
     QCheckBox *graphCheckbox = nullptr;
     QCheckBox *colorCheckbox = nullptr;
     QCheckBox *digitalDecodeCheckbox = nullptr;
+    QCheckBox *dmrLabCaptureCheckbox = nullptr;
     QCheckBox *videoDecodeCheckbox = nullptr;
     QCheckBox *videoInvertCheckbox = nullptr;
     QCheckBox *videoHSyncCheckbox = nullptr;
@@ -301,6 +306,11 @@ private:
     QLabel *recordingStatusLabel = nullptr;
     QLabel *playbackStatusLabel = nullptr;
        
+    QLineEdit *dmrLabSourceIdEdit = nullptr;
+    QLineEdit *dmrLabTargetIdEdit = nullptr;
+    QLineEdit *dmrLabRadioEdit = nullptr;
+    QLineEdit *dmrLabNotesEdit = nullptr;
+
     FrequencyControl *frequencyControl = nullptr;
     FrequencyControl *listeningFrequencyControl = nullptr;
     FrequencyControl *bandwidthControl = nullptr;
