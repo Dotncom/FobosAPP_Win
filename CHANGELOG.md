@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+## 3.2.0-beta - 2026-05-29
+
+### Added
+
+- Added `android/network-client`, an initial Android Studio project for a
+  lightweight FobosAPP network client. The skeleton connects to the existing TCP
+  control channel, sends basic server-side processing commands, receives
+  spectrum/audio frames, draws a simple spectrum/waterfall, plays 48 kHz mono
+  PCM audio, and handles basic observer/controller roles.
+- Improved the Android client skeleton with a collapsible controls panel,
+  explicit light edit-field styling for dark Android themes, server metadata
+  syncing from spectrum frames, debounced settings apply, and tap-to-tune on the
+  spectrum/waterfall frequency scale.
+- Added Android network-client spectrum zoom/pan, tap-to-tune scale handling,
+  waterfall level min/max sliders, and a desktop-style waterfall palette.
+- Embedded the FobosAPP icon into the Windows executable, Qt runtime resources,
+  Linux desktop install rules, and Android launcher resources.
+- Added Windows signing helper scripts and optional Android release signing
+  configuration driven by environment variables.
+
+### Known Issues
+
+- The Android client is still network-only; direct USB/OTG Fobos receiver access
+  is not implemented yet.
+- Android audio/display latency and remote-control responsiveness still need
+  wider testing on different phones and tablets.
+
 ## 3.1.0-beta - 2026-05-29
 
 ### Changed

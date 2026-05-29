@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file alias="fobosapp.png">../packaging/icons/fobosapp.png</file>
+    </qresource>
+</RCC>

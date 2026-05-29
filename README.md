@@ -2,9 +2,10 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, while the codebase has started
-moving toward Linux/Raspberry Pi support. Version 3.0 beta keeps the stable
-real-device, network, and video/image work
-from the 2.x line, and adds the first DMR laboratory monitoring tools.
+moving toward Linux, Raspberry Pi, and Android network-client support. Version
+3.2 beta keeps the stable real-device, network, and video/image work from the
+2.x line, adds the first DMR laboratory monitoring tools, and adds the first
+usable Android remote client.
 
 ## Windows Release Package
 
@@ -66,6 +67,29 @@ Build and deploy locally:
 ```powershell
 cmake --build build\Desktop_x86_windows_msvc2022_pe_64bit-Release --config Release
 powershell -ExecutionPolicy Bypass -File tools\deploy_windows.ps1
+```
+
+The application icon is stored in `packaging/icons` and is embedded into the
+Windows executable, the Qt runtime resources, Linux desktop installs, and the
+Android network client launcher.
+
+Optional Windows code signing requires a real code-signing certificate from a
+trusted certificate authority if you want Windows to show a verified publisher.
+After the certificate is available as a PFX file, deploy and sign with:
+
+```powershell
+$env:FOBOSAPP_CODESIGN_PFX="C:\path\to\certificate.pfx"
+$env:FOBOSAPP_CODESIGN_PASSWORD="pfx-password"
+powershell -ExecutionPolicy Bypass -File tools\deploy_windows.ps1 -Sign
+```
+
+You can also sign an already-built executable directly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\sign_windows.ps1 `
+  -Path release\bin\FobosAPP.exe `
+  -PfxPath C:\path\to\certificate.pfx `
+  -CertPassword pfx-password
 ```
 
 Initial Linux configure example:
@@ -149,6 +173,29 @@ on the machine that demodulates audio. Open
 `http://<raspberry-ip>:21092/audio.wav` from the player, replacing the IP and
 port as needed. This mode also carries 48 kHz mono PCM, but uses an ordinary
 HTTP WAV stream instead of the FobosAPP UDP framing.
+
+## Android Network Client
+
+An early Android network-client skeleton lives in `android/network-client`.
+It is a separate Android Studio project that talks to the existing FobosAPP
+network server over the TCP control channel. The first Android step supports
+server-side processing only: remote start/stop/settings, observer/controller
+role handling, spectrum/waterfall display, and 48 kHz mono ready-audio playback.
+
+Direct Android USB access to the Fobos receiver is not part of this first
+skeleton; it should be developed after the network client is stable on real
+phones/tablets.
+
+Android debug APKs are signed by the normal Android debug key. For a signed
+release APK, set these environment variables before running
+`./gradlew assembleRelease` from `android/network-client`:
+
+```bash
+export FOBOSAPP_ANDROID_KEYSTORE=/path/to/release.keystore
+export FOBOSAPP_ANDROID_KEY_ALIAS=fobosapp
+export FOBOSAPP_ANDROID_KEYSTORE_PASSWORD=...
+export FOBOSAPP_ANDROID_KEY_PASSWORD=...
+```
 
 ## Current Limitations
 

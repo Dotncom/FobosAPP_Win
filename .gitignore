@@ -67,6 +67,10 @@ out/
 release/
 release.zip
 recordings/
+.gradle/
+local.properties
+*.apk
+*.aab
 
 # Bundled binary deps / SDKs
 fftw-3.3.5-dll64/

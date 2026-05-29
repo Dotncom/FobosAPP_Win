@@ -18,6 +18,7 @@
 #include <QMessageLogContext>
 #include <QMutexLocker>
 #include <QHostAddress>
+#include <QIcon>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTextStream>
@@ -7147,6 +7148,7 @@ void YourClassName::stopFobosProcessing() {
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
+    app.setWindowIcon(QIcon(QStringLiteral(":/icons/fobosapp.png")));
     installDiagnosticLogger();
     installCrashLogger();
     logFobosApiInfo();

@@ -1,0 +1,586 @@
+package com.fobosapp.networkclient;
+
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.util.AttributeSet;
+import android.view.MotionEvent;
+import android.view.View;
+
+import java.util.Locale;
+
+public final class SpectrumView extends View {
+    public interface TuneRequestListener {
+        void onTuneRequested(double frequencyHz);
+    }
+
+    private static final int[] WATERFALL_COLORS = new int[] {
+            Color.rgb(0, 0, 32),
+            Color.rgb(0, 0, 80),
+            Color.rgb(0, 0, 144),
+            Color.rgb(0, 0, 240),
+            Color.rgb(0, 80, 255),
+            Color.rgb(80, 240, 48),
+            Color.rgb(30, 144, 255),
+            Color.rgb(255, 255, 255),
+            Color.rgb(255, 255, 0),
+            Color.rgb(254, 109, 22),
+            Color.rgb(255, 0, 0),
+            Color.rgb(198, 0, 0),
+            Color.rgb(117, 0, 0)
+    };
+
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private double[] frequencies = new double[0];
+    private float[] magnitudes = new float[0];
+    private double minFrequency = 0.0;
+    private double maxFrequency = 1.0;
+    private double visibleMinFrequency = 0.0;
+    private double visibleMaxFrequency = 1.0;
+    private double listeningFrequency = 0.0;
+    private double bandwidth = 0.0;
+    private int modulationType = RadioSettings.MOD_AM;
+    private float levelMin = -130.0f;
+    private float levelMax = -50.0f;
+    private Bitmap waterfall;
+    private int[] waterfallPixels = new int[0];
+    private TuneRequestListener tuneRequestListener;
+    private float downX = 0.0f;
+    private float downY = 0.0f;
+    private float lastPanX = 0.0f;
+    private float pinchStartDistance = 0.0f;
+    private double pinchStartSpan = 1.0;
+    private double pinchFocusFrequency = 0.0;
+    private boolean gestureMoved = false;
+    private boolean pinching = false;
+    private boolean userZoomed = false;
+
+    public SpectrumView(Context context) {
+        super(context);
+        init();
+    }
+
+    public synchronized void setTuneRequestListener(TuneRequestListener listener) {
+        tuneRequestListener = listener;
+    }
+
+    public SpectrumView(Context context, AttributeSet attrs) {
+        super(context, attrs);
+        init();
+    }
+
+    public synchronized void setLevelRange(float minLevel, float maxLevel) {
+        if (!Float.isFinite(minLevel) || !Float.isFinite(maxLevel) || maxLevel <= minLevel) {
+            return;
+        }
+        levelMin = minLevel;
+        levelMax = maxLevel;
+        updateWaterfallRow();
+        invalidate();
+    }
+
+    public synchronized void setSpectrum(double[] newFrequencies,
+                                         float[] newMagnitudes,
+                                         double newMinFrequency,
+                                         double newMaxFrequency,
+                                         double newListeningFrequency,
+                                         double newBandwidth,
+                                         int newModulationType) {
+        frequencies = newFrequencies != null ? newFrequencies : new double[0];
+        magnitudes = newMagnitudes != null ? newMagnitudes : new float[0];
+        double oldVisibleCenter = (visibleMinFrequency + visibleMaxFrequency) * 0.5;
+        double oldVisibleSpan = visibleMaxFrequency - visibleMinFrequency;
+        minFrequency = newMinFrequency;
+        maxFrequency = newMaxFrequency > newMinFrequency ? newMaxFrequency : newMinFrequency + 1.0;
+        updateVisibleRange(oldVisibleCenter, oldVisibleSpan);
+        listeningFrequency = newListeningFrequency;
+        bandwidth = newBandwidth;
+        modulationType = newModulationType;
+        updateWaterfallRow();
+        invalidate();
+    }
+
+    @Override
+    protected synchronized void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        int width = getWidth();
+        int height = getHeight();
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+
+        int scaleHeight = frequencyScaleHeight();
+        int spectrumHeight = spectrumHeightFor(height);
+        int waterfallTop = spectrumHeight + scaleHeight;
+        canvas.drawColor(Color.rgb(10, 14, 18));
+        drawSpectrum(canvas, width, spectrumHeight);
+        drawFrequencyScale(canvas, width, spectrumHeight, scaleHeight);
+        drawWaterfall(canvas, width, waterfallTop, Math.max(1, height - waterfallTop));
+        drawTuning(canvas, width, height);
+    }
+
+    @Override
+    public synchronized boolean onTouchEvent(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                downX = event.getX();
+                downY = event.getY();
+                lastPanX = downX;
+                gestureMoved = false;
+                pinching = false;
+                return true;
+            case MotionEvent.ACTION_POINTER_DOWN:
+                if (event.getPointerCount() >= 2) {
+                    pinching = true;
+                    gestureMoved = true;
+                    pinchStartDistance = pointerDistance(event);
+                    pinchStartSpan = visibleMaxFrequency - visibleMinFrequency;
+                    pinchFocusFrequency = frequencyAtX(pointerCenterX(event), getWidth());
+                }
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                if (event.getPointerCount() >= 2 && pinching) {
+                    applyPinchZoom(event);
+                    return true;
+                }
+                if (event.getPointerCount() == 1 && !pinching) {
+                    applyPan(event.getX(), event.getY());
+                    return true;
+                }
+                return true;
+            case MotionEvent.ACTION_POINTER_UP:
+                pinching = event.getPointerCount() > 2;
+                if (event.getPointerCount() >= 1) {
+                    lastPanX = event.getX(0);
+                }
+                return true;
+            case MotionEvent.ACTION_UP:
+                if (!gestureMoved && tuneRequestListener != null) {
+                    tuneRequestListener.onTuneRequested(frequencyAtX(event.getX(), getWidth()));
+                }
+                pinching = false;
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                pinching = false;
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    @Override
+    protected synchronized void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight);
+        if (width <= 0 || height <= 0) {
+            waterfall = null;
+            return;
+        }
+        int waterfallHeight = Math.max(1, height - spectrumHeightFor(height) - frequencyScaleHeight());
+        resizeWaterfall(width, waterfallHeight);
+    }
+
+    private void resizeWaterfall(int width, int waterfallHeight) {
+        if (width <= 0 || waterfallHeight <= 0) {
+            return;
+        }
+        if (waterfall != null && waterfall.getWidth() == width && waterfall.getHeight() == waterfallHeight) {
+            return;
+        }
+        Bitmap next = Bitmap.createBitmap(width, waterfallHeight, Bitmap.Config.ARGB_8888);
+        int[] nextPixels = new int[width * waterfallHeight];
+        for (int i = 0; i < nextPixels.length; ++i) {
+            nextPixels[i] = Color.rgb(4, 8, 12);
+        }
+        if (waterfall != null) {
+            Rect src = new Rect(0, 0, waterfall.getWidth(), waterfall.getHeight());
+            Rect dst = new Rect(0, 0, width, waterfallHeight);
+            Canvas canvas = new Canvas(next);
+            canvas.drawColor(Color.rgb(4, 8, 12));
+            canvas.drawBitmap(waterfall, src, dst, null);
+            next.getPixels(nextPixels, 0, width, 0, 0, width, waterfallHeight);
+        }
+        waterfall = next;
+        waterfallPixels = nextPixels;
+    }
+
+    private void init() {
+        paint.setTypeface(android.graphics.Typeface.MONOSPACE);
+    }
+
+    private void drawSpectrum(Canvas canvas, int width, int spectrumHeight) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.rgb(15, 21, 27));
+        canvas.drawRect(0, 0, width, spectrumHeight, paint);
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(1.0f);
+        paint.setColor(Color.rgb(38, 50, 58));
+        for (int i = 1; i < 4; ++i) {
+            float y = spectrumHeight * i / 4.0f;
+            canvas.drawLine(0, y, width, y, paint);
+        }
+
+        int count = Math.min(frequencies.length, magnitudes.length);
+        if (count < 2) {
+            drawEmptyLabel(canvas, spectrumHeight);
+            return;
+        }
+
+        paint.setColor(Color.rgb(88, 214, 141));
+        paint.setStrokeWidth(2.0f);
+        boolean havePrevious = false;
+        float previousX = 0.0f;
+        float previousY = 0.0f;
+        for (int i = 0; i < count; ++i) {
+            double frequency = frequencies[i];
+            if (!Double.isFinite(frequency) ||
+                    frequency < visibleMinFrequency ||
+                    frequency > visibleMaxFrequency) {
+                continue;
+            }
+            float x = frequencyToX(frequency, width);
+            float y = magnitudeToY(displayMagnitudeAt(i, count), spectrumHeight);
+            if (havePrevious) {
+                canvas.drawLine(previousX, previousY, x, y, paint);
+            }
+            previousX = x;
+            previousY = y;
+            havePrevious = true;
+        }
+    }
+
+    private void drawWaterfall(Canvas canvas, int width, int top, int waterfallHeight) {
+        if (waterfall == null || waterfall.getWidth() != width || waterfall.getHeight() != waterfallHeight) {
+            resizeWaterfall(width, waterfallHeight);
+        }
+        if (waterfall != null) {
+            canvas.drawBitmap(waterfall, 0, top, null);
+        }
+    }
+
+    private void drawTuning(Canvas canvas, int width, int height) {
+        float x = frequencyToX(listeningFrequency, width);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(2.0f);
+        paint.setColor(Color.rgb(255, 218, 121));
+        canvas.drawLine(x, 0, x, height, paint);
+
+        if (bandwidth > 0.0) {
+            float half = (float) ((bandwidth / Math.max(1.0, visibleMaxFrequency - visibleMinFrequency)) * width / 2.0);
+            paint.setColor(Color.argb(70, 255, 218, 121));
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawRect(x - half, 0, x + half, height, paint);
+        }
+
+        paint.setColor(Color.rgb(225, 232, 238));
+        paint.setTextSize(28.0f);
+        paint.setStyle(Paint.Style.FILL);
+        String label = String.format(Locale.US,
+                "%s %.6f MHz",
+                RadioSettings.modulationLabel(modulationType),
+                listeningFrequency / 1_000_000.0);
+        canvas.drawText(label, 14.0f, 32.0f, paint);
+    }
+
+    private void drawFrequencyScale(Canvas canvas, int width, int top, int scaleHeight) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.rgb(7, 12, 16));
+        canvas.drawRect(0, top, width, top + scaleHeight, paint);
+
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(1.0f);
+        paint.setColor(Color.rgb(48, 70, 76));
+        canvas.drawLine(0, top + 0.5f, width, top + 0.5f, paint);
+        canvas.drawLine(0, top + scaleHeight - 0.5f, width, top + scaleHeight - 0.5f, paint);
+
+        int majorTicks = width >= 900 ? 9 : (width >= 540 ? 7 : 5);
+        int minorDivisions = 4;
+        double visibleSpan = Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+        paint.setStyle(Paint.Style.STROKE);
+        for (int tick = 0; tick < majorTicks; ++tick) {
+            double fraction = majorTicks <= 1 ? 0.0 : tick / (double) (majorTicks - 1);
+            float x = (float) (fraction * (width - 1.0));
+            paint.setColor(Color.rgb(86, 115, 112));
+            paint.setStrokeWidth(1.2f);
+            canvas.drawLine(x, top, x, top + dp(12), paint);
+            canvas.drawLine(x, top + scaleHeight - dp(8), x, top + scaleHeight, paint);
+
+            if (tick < majorTicks - 1) {
+                for (int minor = 1; minor < minorDivisions; ++minor) {
+                    double minorFraction = (tick + minor / (double) minorDivisions) / (majorTicks - 1.0);
+                    float minorX = (float) (minorFraction * (width - 1.0));
+                    paint.setColor(Color.rgb(42, 62, 67));
+                    canvas.drawLine(minorX, top, minorX, top + dp(6), paint);
+                }
+            }
+        }
+
+        paint.setColor(Color.rgb(185, 199, 208));
+        paint.setStyle(Paint.Style.FILL);
+        paint.setTextSize(width >= 540 ? 20.0f : 17.0f);
+        for (int tick = 0; tick < majorTicks; ++tick) {
+            boolean drawLabel = width >= 540 ||
+                    tick == 0 ||
+                    tick == majorTicks / 2 ||
+                    tick == majorTicks - 1;
+            if (!drawLabel) {
+                continue;
+            }
+            double fraction = majorTicks <= 1 ? 0.0 : tick / (double) (majorTicks - 1);
+            double frequency = visibleMinFrequency + fraction * visibleSpan;
+            String label = formatFrequencyLabel(frequency);
+            float labelWidth = paint.measureText(label);
+            float x = (float) (fraction * (width - 1.0));
+            float labelX = Math.max(dp(3), Math.min(width - labelWidth - dp(3), x - labelWidth * 0.5f));
+            canvas.drawText(label, labelX, top + scaleHeight - dp(12), paint);
+        }
+
+        double fullSpan = Math.max(1.0, maxFrequency - minFrequency);
+        double zoom = fullSpan / visibleSpan;
+        if (zoom > 1.05) {
+            String zoomLabel = String.format(Locale.US, "x%.1f", zoom);
+            paint.setColor(Color.rgb(255, 218, 121));
+            paint.setTextSize(18.0f);
+            float zoomWidth = paint.measureText(zoomLabel);
+            canvas.drawText(zoomLabel, width - zoomWidth - dp(8), top + dp(16), paint);
+        }
+    }
+
+    private void drawEmptyLabel(Canvas canvas, int spectrumHeight) {
+        paint.setColor(Color.rgb(130, 145, 155));
+        paint.setTextSize(28.0f);
+        paint.setStyle(Paint.Style.FILL);
+        canvas.drawText("Waiting for network spectrum...", 14.0f, spectrumHeight / 2.0f, paint);
+    }
+
+    private void updateWaterfallRow() {
+        if (waterfall == null || waterfall.getWidth() <= 0 || waterfall.getHeight() <= 0) {
+            return;
+        }
+        int width = waterfall.getWidth();
+        int height = waterfall.getHeight();
+        int requiredPixels = width * height;
+        if (waterfallPixels.length != requiredPixels) {
+            waterfallPixels = new int[requiredPixels];
+            for (int i = 0; i < waterfallPixels.length; ++i) {
+                waterfallPixels[i] = Color.rgb(4, 8, 12);
+            }
+        }
+        if (height > 1) {
+            System.arraycopy(waterfallPixels, 0, waterfallPixels, width, width * (height - 1));
+        }
+
+        int count = Math.min(frequencies.length, magnitudes.length);
+        if (count <= 0) {
+            for (int x = 0; x < width; ++x) {
+                waterfallPixels[x] = Color.rgb(4, 8, 12);
+            }
+            waterfall.setPixels(waterfallPixels, 0, width, 0, 0, width, height);
+            return;
+        }
+
+        for (int x = 0; x < width; ++x) {
+            double frequency = visibleMinFrequency +
+                    (x / (double) Math.max(1, width - 1)) *
+                            (visibleMaxFrequency - visibleMinFrequency);
+            int index = nearestIndexForFrequency(frequency, count);
+            waterfallPixels[x] = waterfallColor(displayMagnitudeAt(index, count));
+        }
+        waterfall.setPixels(waterfallPixels, 0, width, 0, 0, width, height);
+    }
+
+    private float magnitudeToY(float value, int spectrumHeight) {
+        float normalized = normalizedLevel(value);
+        return spectrumHeight - normalized * (spectrumHeight - 12.0f) - 6.0f;
+    }
+
+    private int waterfallColor(float value) {
+        float normalized = normalizedLevel(value);
+        float position = normalized * (WATERFALL_COLORS.length - 1);
+        int index = Math.max(0, Math.min(WATERFALL_COLORS.length - 2, (int) Math.floor(position)));
+        float t = position - index;
+        return lerpColor(WATERFALL_COLORS[index], WATERFALL_COLORS[index + 1], t);
+    }
+
+    private float normalizedLevel(float value) {
+        if (!Float.isFinite(value) || levelMax <= levelMin) {
+            return 0.0f;
+        }
+        return Math.max(0.0f, Math.min(1.0f, (value - levelMin) / (levelMax - levelMin)));
+    }
+
+    private float frequencyToX(double frequency, int width) {
+        double normalized = (frequency - visibleMinFrequency) /
+                Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+        normalized = Math.max(0.0, Math.min(1.0, normalized));
+        return (float) (normalized * (width - 1.0));
+    }
+
+    private double frequencyAtX(float x, int width) {
+        double normalized = x / Math.max(1.0, width - 1.0);
+        normalized = Math.max(0.0, Math.min(1.0, normalized));
+        return visibleMinFrequency + normalized * (visibleMaxFrequency - visibleMinFrequency);
+    }
+
+    private String formatFrequencyLabel(double frequency) {
+        double mhz = frequency / 1_000_000.0;
+        double spanMhz = Math.abs(visibleMaxFrequency - visibleMinFrequency) / 1_000_000.0;
+        if (spanMhz < 0.2) {
+            return String.format(Locale.US, "%.5f", mhz);
+        }
+        if (spanMhz < 2.0) {
+            return String.format(Locale.US, "%.4f", mhz);
+        }
+        return String.format(Locale.US, "%.3f", mhz);
+    }
+
+    private int frequencyScaleHeight() {
+        return Math.max(34, dp(36));
+    }
+
+    private int spectrumHeightFor(int totalHeight) {
+        int scaleHeight = frequencyScaleHeight();
+        int available = Math.max(1, totalHeight - scaleHeight);
+        int minSpectrum = dp(96);
+        int minWaterfall = dp(80);
+        int spectrumHeight = Math.max(minSpectrum, (int) (available * 0.40f));
+        if (available - spectrumHeight < minWaterfall) {
+            spectrumHeight = Math.max(1, available - minWaterfall);
+        }
+        return spectrumHeight;
+    }
+
+    private int lerpColor(int a, int b, float t) {
+        t = Math.max(0.0f, Math.min(1.0f, t));
+        int ar = Color.red(a);
+        int ag = Color.green(a);
+        int ab = Color.blue(a);
+        int br = Color.red(b);
+        int bg = Color.green(b);
+        int bb = Color.blue(b);
+        return Color.rgb(
+                (int) (ar + (br - ar) * t),
+                (int) (ag + (bg - ag) * t),
+                (int) (ab + (bb - ab) * t));
+    }
+
+    private int dp(int value) {
+        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    private float displayMagnitudeAt(int frequencyIndex, int count) {
+        if (count <= 0 || magnitudes.length == 0) {
+            return -160.0f;
+        }
+        int shiftedIndex = (frequencyIndex + count / 2) % count;
+        shiftedIndex = Math.max(0, Math.min(magnitudes.length - 1, shiftedIndex));
+        float value = magnitudes[shiftedIndex];
+        return Float.isFinite(value) ? value : -160.0f;
+    }
+
+    private int nearestIndexForFrequency(double frequency, int count) {
+        if (count <= 1) {
+            return 0;
+        }
+        if (frequencies.length < count ||
+                frequencies[0] >= frequencies[count - 1]) {
+            double normalized = (frequency - visibleMinFrequency) /
+                    Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+            return Math.max(0, Math.min(count - 1,
+                    (int) Math.round(normalized * (count - 1))));
+        }
+        int low = 0;
+        int high = count - 1;
+        while (low <= high) {
+            int mid = (low + high) >>> 1;
+            if (frequencies[mid] < frequency) {
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if (low <= 0) {
+            return 0;
+        }
+        if (low >= count) {
+            return count - 1;
+        }
+        return Math.abs(frequencies[low] - frequency) < Math.abs(frequencies[low - 1] - frequency)
+                ? low
+                : low - 1;
+    }
+
+    private void updateVisibleRange(double oldCenter, double oldSpan) {
+        double fullSpan = Math.max(1.0, maxFrequency - minFrequency);
+        if (!userZoomed || !Double.isFinite(oldSpan) || oldSpan <= 0.0) {
+            visibleMinFrequency = minFrequency;
+            visibleMaxFrequency = maxFrequency;
+            userZoomed = false;
+            return;
+        }
+        double span = Math.max(fullSpan / 100.0, Math.min(fullSpan, oldSpan));
+        double center = Double.isFinite(oldCenter) ? oldCenter : (minFrequency + maxFrequency) * 0.5;
+        setVisibleRange(center, span);
+    }
+
+    private void setVisibleRange(double center, double span) {
+        double fullSpan = Math.max(1.0, maxFrequency - minFrequency);
+        double clampedSpan = Math.max(fullSpan / 100.0, Math.min(fullSpan, span));
+        double half = clampedSpan * 0.5;
+        double clampedCenter = Math.max(minFrequency + half, Math.min(maxFrequency - half, center));
+        visibleMinFrequency = clampedCenter - half;
+        visibleMaxFrequency = clampedCenter + half;
+        userZoomed = clampedSpan < fullSpan * 0.99;
+    }
+
+    private void applyPan(float x, float y) {
+        float dx = x - lastPanX;
+        if (Math.abs(x - downX) > 8.0f || Math.abs(y - downY) > 8.0f) {
+            gestureMoved = true;
+        }
+        if (Math.abs(dx) > 0.5f && userZoomed) {
+            double span = visibleMaxFrequency - visibleMinFrequency;
+            double deltaHz = -dx / Math.max(1.0, getWidth() - 1.0) * span;
+            setVisibleRange((visibleMinFrequency + visibleMaxFrequency) * 0.5 + deltaHz, span);
+            invalidate();
+        }
+        lastPanX = x;
+    }
+
+    private void applyPinchZoom(MotionEvent event) {
+        float distance = pointerDistance(event);
+        if (pinchStartDistance <= 1.0f || distance <= 1.0f) {
+            return;
+        }
+        double scale = distance / pinchStartDistance;
+        double nextSpan = pinchStartSpan / Math.max(0.1, scale);
+        double focusX = pointerCenterX(event);
+        double oldVisibleSpan = Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+        double focusFraction = focusX / Math.max(1.0, getWidth() - 1.0);
+        double nextMin = pinchFocusFrequency - focusFraction * nextSpan;
+        double nextCenter = nextMin + nextSpan * 0.5;
+        setVisibleRange(nextCenter, nextSpan);
+        if (Math.abs(oldVisibleSpan - (visibleMaxFrequency - visibleMinFrequency)) > 0.5) {
+            invalidate();
+        }
+    }
+
+    private float pointerDistance(MotionEvent event) {
+        if (event.getPointerCount() < 2) {
+            return 0.0f;
+        }
+        float dx = event.getX(0) - event.getX(1);
+        float dy = event.getY(0) - event.getY(1);
+        return (float) Math.sqrt(dx * dx + dy * dy);
+    }
+
+    private float pointerCenterX(MotionEvent event) {
+        if (event.getPointerCount() < 2) {
+            return event.getX();
+        }
+        return (event.getX(0) + event.getX(1)) * 0.5f;
+    }
+}

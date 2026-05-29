@@ -103,7 +103,12 @@ set(SOURCES
     src/MyWaterfallWidget.h
     src/scalewidget.cpp
     src/scalewidget.h
+    src/app_resources.qrc
 )
+
+if(WIN32)
+    list(APPEND SOURCES packaging/windows/fobosapp.rc)
+endif()
 
 add_executable(FobosAPP ${SOURCES})
 
@@ -141,6 +146,9 @@ install(TARGETS FobosAPP RUNTIME DESTINATION bin)
 if(UNIX AND NOT APPLE)
     install(FILES packaging/linux/99-fobos-sdr.rules
             DESTINATION share/FobosAPP/udev)
+    install(FILES packaging/icons/fobosapp.png
+            RENAME fobosapp.png
+            DESTINATION share/icons/hicolor/256x256/apps)
     install(FILES packaging/linux/fobosapp.desktop.in
             RENAME FobosAPP.desktop
             DESTINATION share/applications)

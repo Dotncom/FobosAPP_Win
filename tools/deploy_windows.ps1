@@ -2,7 +2,11 @@ param(
     [string]$BuildDir = "build\Desktop_x86_windows_msvc2022_pe_64bit-Release",
     [string]$DeployDir = "release\bin",
     [string]$QtRoot = "C:\Qt\5.15.2\msvc2019_64",
-    [string]$VcRedistDir = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.40.33807\x64\Microsoft.VC143.CRT"
+    [string]$VcRedistDir = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.40.33807\x64\Microsoft.VC143.CRT",
+    [switch]$Sign,
+    [string]$PfxPath = $env:FOBOSAPP_CODESIGN_PFX,
+    [string]$CertPassword = $env:FOBOSAPP_CODESIGN_PASSWORD,
+    [string]$CertSubject = $env:FOBOSAPP_CODESIGN_SUBJECT
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,6 +67,11 @@ foreach ($DocFile in $DocFiles) {
 $LicensePath = Join-Path $Workspace "licenses"
 if (Test-Path -LiteralPath $LicensePath) {
     Copy-Item -LiteralPath $LicensePath -Destination (Join-Path $DeployPath "licenses") -Recurse -Force
+}
+
+if ($Sign) {
+    $SignScript = Join-Path $PSScriptRoot "sign_windows.ps1"
+    & $SignScript -Path (Join-Path $DeployPath "FobosAPP.exe") -PfxPath $PfxPath -CertPassword $CertPassword -CertSubject $CertSubject
 }
 
 Write-Host "Deployed FobosAPP to $DeployPath"

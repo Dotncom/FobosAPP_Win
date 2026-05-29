@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseKeystore = System.getenv('FOBOSAPP_ANDROID_KEYSTORE')
+def releaseKeyAlias = System.getenv('FOBOSAPP_ANDROID_KEY_ALIAS')
+def releaseStorePassword = System.getenv('FOBOSAPP_ANDROID_KEYSTORE_PASSWORD')
+def releaseKeyPassword = System.getenv('FOBOSAPP_ANDROID_KEY_PASSWORD')
+def hasReleaseSigning = releaseKeystore && releaseKeyAlias && releaseStorePassword && releaseKeyPassword
+
+android {
+    namespace 'com.fobosapp.networkclient'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.fobosapp.networkclient'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-network-alpha'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseKeystore)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled false
+        }
+    }
+}
