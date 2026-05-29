@@ -15,6 +15,11 @@ final class RadioSettings {
     static final int MOD_DMR = 17;
 
     static final int PROCESSING_SERVER_SIDE = 0;
+    static final int INPUT_RF = 0;
+    static final int INPUT_HF_COMBINED = 1;
+    static final int INPUT_HF1 = 2;
+    static final int INPUT_HF2 = 3;
+    private static final double DIRECT_MIN_FREQUENCY = 1.0;
 
     int deviceIndex = 0;
     int clockSource = 0;
@@ -125,5 +130,31 @@ final class RadioSettings {
             default:
                 return "AM";
         }
+    }
+
+    static boolean isDirectInput(int inputMode) {
+        return inputMode != INPUT_RF;
+    }
+
+    static double directMaxFrequency(double sampleRate) {
+        return Math.max(DIRECT_MIN_FREQUENCY, sampleRate / 2.0 - 1.0);
+    }
+
+    static double directMinFrequencyForMode(int inputMode, double sampleRate) {
+        return inputMode == INPUT_HF_COMBINED
+                ? -directMaxFrequency(sampleRate)
+                : DIRECT_MIN_FREQUENCY;
+    }
+
+    static double clampDirectListeningFrequency(int inputMode, double sampleRate, double frequencyHz) {
+        if (!isDirectInput(inputMode)) {
+            return frequencyHz;
+        }
+        double min = directMinFrequencyForMode(inputMode, sampleRate);
+        double max = directMaxFrequency(sampleRate);
+        if (Double.isNaN(frequencyHz) || Double.isInfinite(frequencyHz)) {
+            return inputMode == INPUT_HF_COMBINED ? 0.0 : 1_250_000.0;
+        }
+        return Math.max(min, Math.min(max, frequencyHz));
     }
 }

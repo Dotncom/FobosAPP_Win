@@ -39,6 +39,7 @@ final class FobosNetworkClient {
         final double sampleRate;
         final double bandwidth;
         final int modulationType;
+        final int inputMode;
 
         SpectrumFrame(double[] frequencies,
                       float[] magnitudes,
@@ -48,7 +49,8 @@ final class FobosNetworkClient {
                       double listeningFrequency,
                       double sampleRate,
                       double bandwidth,
-                      int modulationType) {
+                      int modulationType,
+                      int inputMode) {
             this.frequencies = frequencies;
             this.magnitudes = magnitudes;
             this.minFrequency = minFrequency;
@@ -58,6 +60,7 @@ final class FobosNetworkClient {
             this.sampleRate = sampleRate;
             this.bandwidth = bandwidth;
             this.modulationType = modulationType;
+            this.inputMode = inputMode;
         }
     }
 
@@ -292,11 +295,16 @@ final class FobosNetworkClient {
                 magnitudes,
                 command.optDouble("minFrequency", frequencies[0]),
                 command.optDouble("maxFrequency", frequencies[count - 1]),
-                command.optDouble("centerFrequency", 0.0),
-                command.optDouble("listeningFrequency", 0.0),
+                optionalDouble(command, "centerFrequency"),
+                optionalDouble(command, "listeningFrequency"),
                 command.optDouble("sampleRate", 0.0),
                 command.optDouble("bandwidth", 0.0),
-                command.optInt("modulationType", RadioSettings.MOD_AM));
+                command.optInt("modulationType", RadioSettings.MOD_AM),
+                command.has("inputMode") ? command.optInt("inputMode", -1) : -1);
+    }
+
+    private static double optionalDouble(JSONObject command, String key) {
+        return command.has(key) ? command.optDouble(key, Double.NaN) : Double.NaN;
     }
 
     private String readLine(InputStream inputStream) throws IOException {

@@ -45,6 +45,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private final Runnable deferredSettingsApply = () -> sendCommand("settings", false);
     private FobosNetworkClient client;
     private PcmAudioPlayer audioPlayer;
+    private UsbSandbox usbSandbox;
 
     private EditText hostEdit;
     private EditText portEdit;
@@ -62,6 +63,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private Button settingsButton;
     private Button controlsButton;
     private Button requestControlButton;
+    private Button usbScanButton;
+    private Button usbPermissionButton;
     private TextView statusText;
     private TextView levelMinLabel;
     private TextView levelMaxLabel;
@@ -100,6 +103,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         client = new FobosNetworkClient(this);
         audioPlayer = new PcmAudioPlayer();
         buildUi();
+        usbSandbox = new UsbSandbox(this, this::appendUsbLog);
+        usbSandbox.start();
         loadPrefs();
         updateButtons();
     }
@@ -114,6 +119,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         }
         if (audioPlayer != null) {
             audioPlayer.shutdown();
+        }
+        if (usbSandbox != null) {
+            usbSandbox.stop();
         }
     }
 
@@ -162,8 +170,20 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                     client.canControl() &&
                     SystemClock.uptimeMillis() < localSettingsGuardUntilMs;
             if (!waitingForLocalSettingsEcho) {
-                settings.centerFrequency = frame.centerFrequency > 0.0 ? frame.centerFrequency : settings.centerFrequency;
-                settings.listeningFrequency = frame.listeningFrequency > 0.0 ? frame.listeningFrequency : settings.listeningFrequency;
+                if (frame.inputMode >= RadioSettings.INPUT_RF && frame.inputMode <= RadioSettings.INPUT_HF2) {
+                    settings.inputMode = frame.inputMode;
+                }
+                if (isFinite(frame.centerFrequency)) {
+                    settings.centerFrequency = frame.centerFrequency;
+                    settings.actualFrequency = frame.centerFrequency;
+                }
+                if (RadioSettings.isDirectInput(settings.inputMode)) {
+                    settings.centerFrequency = 0.0;
+                    settings.actualFrequency = 0.0;
+                }
+                if (isFinite(frame.listeningFrequency)) {
+                    settings.listeningFrequency = frame.listeningFrequency;
+                }
                 settings.sampleRate = frame.sampleRate > 0.0 ? frame.sampleRate : settings.sampleRate;
                 settings.bandwidth = frame.bandwidth > 0.0 ? frame.bandwidth : settings.bandwidth;
                 settings.modulationType = frame.modulationType;
@@ -253,6 +273,14 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         connectionRow.addView(fieldWithLabel("Port", portEdit), new LinearLayout.LayoutParams(0, dp(62), 0.7f));
         connectionRow.addView(requestControlButton, new LinearLayout.LayoutParams(0, dp(48), 1.0f));
 
+        LinearLayout usbRow = row();
+        usbScanButton = button("USB scan");
+        usbPermissionButton = button("USB permission/open");
+        usbScanButton.setOnClickListener(v -> scanUsbDevices());
+        usbPermissionButton.setOnClickListener(v -> requestUsbPermission());
+        usbRow.addView(usbScanButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbRow.addView(usbPermissionButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+
         LinearLayout freqRow = row();
         centerEdit = edit("Center MHz");
         listenEdit = edit("Listen MHz");
@@ -266,10 +294,10 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
 
         LinearLayout modeRow = row();
         sampleRateSpinner = spinner(sampleRateLabels());
-        inputSpinner = spinner(new String[] {"RF", "HF1", "HF2", "HF1 + HF2"});
+        inputSpinner = spinner(new String[] {"RF", "HF1 + HF2", "HF1", "HF2"});
         modulationSpinner = spinner(modulationLabels());
         sampleRateSpinner.setOnItemSelectedListener(autoApplySpinnerListener(false));
-        inputSpinner.setOnItemSelectedListener(autoApplySpinnerListener(false));
+        inputSpinner.setOnItemSelectedListener(inputModeSpinnerListener());
         modulationSpinner.setOnItemSelectedListener(autoApplySpinnerListener(true));
         modeRow.addView(fieldWithLabel("Sample", sampleRateSpinner), new LinearLayout.LayoutParams(0, dp(62), 1.0f));
         modeRow.addView(fieldWithLabel("Input", inputSpinner), new LinearLayout.LayoutParams(0, dp(62), 0.8f));
@@ -302,6 +330,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         logScroll.addView(logText);
 
         settingsPanel.addView(connectionRow);
+        settingsPanel.addView(usbRow);
         settingsPanel.addView(freqRow);
         settingsPanel.addView(modeRow);
         settingsPanel.addView(optionsRow);
@@ -311,8 +340,16 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         spectrumView = new SpectrumView(this);
         spectrumView.setLevelRange(displayLevelMin, displayLevelMax);
         spectrumView.setTuneRequestListener(frequencyHz -> {
-            settings.listeningFrequency = frequencyHz;
-            setTextIfNotFocused(listenEdit, formatMhz(frequencyHz), true);
+            settings.listeningFrequency = RadioSettings.clampDirectListeningFrequency(
+                    settings.inputMode,
+                    settings.sampleRate,
+                    frequencyHz);
+            if (RadioSettings.isDirectInput(settings.inputMode)) {
+                settings.centerFrequency = 0.0;
+                settings.actualFrequency = 0.0;
+            }
+            setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
+            setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
             sendCommand("settings", true);
         });
 
@@ -343,6 +380,22 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         int port = safeInt(portEdit.getText().toString(), DEFAULT_PORT);
         client.connect(host.isEmpty() ? "127.0.0.1" : host, port);
         updateButtons();
+    }
+
+    private void scanUsbDevices() {
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.scanReport());
+    }
+
+    private void requestUsbPermission() {
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.requestPermissionForBestDevice());
     }
 
     private boolean sendCommand(String action, boolean logExplicitly) {
@@ -396,15 +449,29 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void collectSettingsFromUi() {
-        settings.centerFrequency = safeDouble(centerEdit.getText().toString(), settings.centerFrequency / 1_000_000.0) * 1_000_000.0;
-        settings.actualFrequency = settings.centerFrequency;
-        settings.listeningFrequency = safeDouble(listenEdit.getText().toString(), settings.listeningFrequency / 1_000_000.0) * 1_000_000.0;
-        settings.bandwidth = safeDouble(bandwidthEdit.getText().toString(), settings.bandwidth / 1_000.0) * 1_000.0;
         int sampleIndex = sampleRateSpinner.getSelectedItemPosition();
         if (sampleIndex >= 0 && sampleIndex < sampleRates.length) {
             settings.sampleRate = sampleRates[sampleIndex];
         }
         settings.inputMode = Math.max(0, inputSpinner.getSelectedItemPosition());
+        double requestedListening =
+                safeDouble(listenEdit.getText().toString(), settings.listeningFrequency / 1_000_000.0) *
+                        1_000_000.0;
+        if (RadioSettings.isDirectInput(settings.inputMode)) {
+            settings.centerFrequency = 0.0;
+            settings.actualFrequency = 0.0;
+            settings.listeningFrequency = RadioSettings.clampDirectListeningFrequency(
+                    settings.inputMode,
+                    settings.sampleRate,
+                    requestedListening);
+        } else {
+            settings.centerFrequency =
+                    safeDouble(centerEdit.getText().toString(), settings.centerFrequency / 1_000_000.0) *
+                            1_000_000.0;
+            settings.actualFrequency = settings.centerFrequency;
+            settings.listeningFrequency = requestedListening;
+        }
+        settings.bandwidth = safeDouble(bandwidthEdit.getText().toString(), settings.bandwidth / 1_000.0) * 1_000.0;
         int modulationIndex = modulationSpinner.getSelectedItemPosition();
         if (modulationIndex >= 0 && modulationIndex < modulationIds.length) {
             settings.modulationType = modulationIds[modulationIndex];
@@ -482,6 +549,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         sampleRateSpinner.setSelection(indexOfSampleRate(settings.sampleRate));
         inputSpinner.setSelection(Math.max(0, Math.min(inputSpinner.getCount() - 1, settings.inputMode)));
         modulationSpinner.setSelection(indexOfModulation(settings.modulationType));
+        boolean directInput = RadioSettings.isDirectInput(settings.inputMode);
+        centerEdit.setEnabled(!directInput);
+        centerEdit.setAlpha(directInput ? 0.55f : 1.0f);
         suppressUiCallbacks = false;
     }
 
@@ -708,6 +778,42 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         };
     }
 
+    private AdapterView.OnItemSelectedListener inputModeSpinnerListener() {
+        return new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (suppressUiCallbacks) {
+                    return;
+                }
+                int nextMode = Math.max(RadioSettings.INPUT_RF,
+                        Math.min(RadioSettings.INPUT_HF2, position));
+                if (settings.inputMode != nextMode) {
+                    settings.inputMode = nextMode;
+                    int sampleIndex = sampleRateSpinner.getSelectedItemPosition();
+                    if (sampleIndex >= 0 && sampleIndex < sampleRates.length) {
+                        settings.sampleRate = sampleRates[sampleIndex];
+                    }
+                    if (RadioSettings.isDirectInput(nextMode)) {
+                        settings.centerFrequency = 0.0;
+                        settings.actualFrequency = 0.0;
+                        settings.listeningFrequency =
+                                nextMode == RadioSettings.INPUT_HF_COMBINED ? 0.0 : 1_250_000.0;
+                    } else {
+                        settings.centerFrequency = 100_000_000.0;
+                        settings.actualFrequency = 100_000_000.0;
+                        settings.listeningFrequency = 100_000_000.0;
+                    }
+                    updateControlsFromSettings(true);
+                }
+                scheduleSettingsApply(FAST_APPLY_DELAY_MS);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        };
+    }
+
     private LinearLayout row() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.HORIZONTAL);
@@ -824,6 +930,15 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         logText.setText(next);
     }
 
+    private void appendUsbLog(String text) {
+        runOnMain(() -> {
+            if (statusText != null) {
+                statusText.setText("USB sandbox");
+            }
+            appendLog(text);
+        });
+    }
+
     private void runOnMain(Runnable runnable) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             runnable.run();
@@ -850,6 +965,10 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         } catch (RuntimeException e) {
             return fallback;
         }
+    }
+
+    private static boolean isFinite(double value) {
+        return !Double.isNaN(value) && !Double.isInfinite(value);
     }
 
     private static String formatMhz(double hz) {

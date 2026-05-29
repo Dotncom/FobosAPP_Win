@@ -81,6 +81,7 @@ libusb-1.0.27/
 .codex_sdrpp/
 .codex_upstream/
 third_party/fobos-linux/
+third_party/firmware/
 third_party/src/
 /fobos_agile/
 /old/

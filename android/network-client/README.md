@@ -21,13 +21,16 @@ a lightweight remote client, not a direct USB receiver build.
 - Supports the multi-client observer/controller role messages at a basic level.
 - Uses a collapsible controls panel so the spectrum/waterfall can fill the
   screen, especially in landscape orientation.
+- Includes a USB sandbox panel for early direct-receiver work. It can list
+  Android-visible USB devices, request permission for a likely Fobos device, and
+  safely open/close the device to verify Android USB Host access.
 
 ## Current Scope
 
 This first step intentionally uses only server-side processing. The Android app
 does not yet process Channel IQ or Full IQ locally, and it does not talk to the
-Fobos receiver over Android USB. Those are later phases after the network client
-is proven useful.
+Fobos receiver over Android USB for IQ streaming yet. The USB sandbox is only a
+diagnostic proof-of-life layer for the next direct-receiver phase.
 
 ## Build
 
@@ -55,3 +58,23 @@ SDK, and the Android Gradle Plugin declared in `build.gradle`.
 
 For now, keep the Android client in the same trusted LAN/VPN as the server.
 The control protocol is intentionally simple and is not encrypted by itself.
+
+## USB Sandbox Test Flow
+
+Use a powered USB-C/OTG hub or dock. The Fobos receiver can draw up to about
+5 V / 1 A, so direct phone power is not a reliable test setup.
+
+1. Connect external power to the hub/dock.
+2. Connect the hub/dock to the phone.
+3. Connect the Fobos receiver to the hub/dock.
+4. Open the Android client and expand the controls panel.
+5. Press `USB scan`.
+6. Confirm that a `16d0:132e` device appears.
+7. Press `USB permission/open` and accept the Android permission prompt.
+8. Check the log for `openDevice OK` and the detected `bcdDevice` hint.
+
+Expected Fobos identifiers from the patched desktop libraries:
+
+- VID/PID: `16d0:132e`
+- Standard API generation: `bcdDevice 0000`
+- Agile API generation: `bcdDevice 0101`

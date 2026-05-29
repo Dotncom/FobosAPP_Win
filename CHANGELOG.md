@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 3.2.1 - 2026-05-29
+
+### Added
+
+- Added an Android USB sandbox for the network client: visible USB device
+  listing, Fobos VID/PID highlighting, Android permission request flow, and a
+  safe open/close probe that reports raw descriptor `bcdDevice` hints.
+
+### Fixed
+
+- Fixed Android network-client input selection order to match the desktop/server
+  Fobos input IDs: RF, HF1+HF2, HF1, HF2.
+- Fixed Android HF tuning sync so zero/negative direct-sampling frequencies are
+  accepted from spectrum frames and direct inputs always send center frequency
+  as 0 Hz.
 
 ## 3.2.0-beta - 2026-05-29
 
