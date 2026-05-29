@@ -11,7 +11,9 @@
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
 
+#ifdef _MSC_VER
 #pragma comment(lib, "winmm.lib")
+#endif
 
 namespace {
 constexpr double AUDIO_OUTPUT_RATE = 48000.0;
@@ -139,7 +141,15 @@ int channelDecimationFactor(double inputRate, int modulationType, double bandwid
 
 }
 
-AudioProcessor::AudioProcessor(QObject *parent) : QObject(parent), running(false), workerThread(nullptr), hWaveOut(nullptr) {
+AudioProcessor::AudioProcessor(QObject *parent)
+    : QObject(parent),
+      running(false),
+      workerThread(nullptr)
+#ifdef _WIN32
+      , hWaveOut(nullptr)
+#endif
+{
+#ifdef _WIN32
     ZeroMemory(&format, sizeof(WAVEFORMATEX));
     format.wFormatTag = WAVE_FORMAT_PCM;
     format.nChannels = 1;
@@ -148,12 +158,15 @@ AudioProcessor::AudioProcessor(QObject *parent) : QObject(parent), running(false
     format.nBlockAlign = (format.nChannels * format.wBitsPerSample) / 8;
     format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
     format.cbSize = 0;
+#endif
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
         waveBuffers[i].resize(BUFFER_SIZE);
+#ifdef _WIN32
         ZeroMemory(&waveHdrs[i], sizeof(WAVEHDR));
         waveHdrs[i].lpData = reinterpret_cast<LPSTR>(waveBuffers[i].data());
         waveHdrs[i].dwBufferLength = BUFFER_SIZE * sizeof(short);
+#endif
         bufferReady[i] = true;
     }
 }
@@ -185,9 +198,11 @@ void AudioProcessor::setAudioDevice(int deviceID) {
         return;
     }
 
+#ifdef _WIN32
     if (hWaveOut && openedAudioDeviceID != deviceID) {
         closeAudioDevice();
     }
+#endif
     qDebug() << "Audio device selected. It will be opened when audio starts.";
 }
 
@@ -196,7 +211,7 @@ void AudioProcessor::setLocalPlaybackEnabled(bool enabled) {
     if (wasEnabled == enabled) {
         return;
     }
-    qDebug() << "[Audio] local waveOut playback" << (enabled ? "enabled" : "disabled");
+    qDebug() << "[Audio] local playback" << (enabled ? "enabled" : "disabled");
     if (!enabled) {
         closeAudioDevice();
     }
@@ -224,11 +239,15 @@ void AudioProcessor::startDemodulation() {
     resetDemodulatorState();
 
     if (localPlaybackEnabled.load()) {
+#ifdef _WIN32
         const int audioDeviceId = currentSettingsSnapshot().audioDeviceId;
         if (!openAudioDevice(audioDeviceId)) {
             closeAudioDevice();
             qDebug() << "Failed to open local audio output; demodulation will continue without waveOut playback.";
         }
+#else
+        qDebug() << "[Audio] local playback is routed through the Qt audio bridge on this platform.";
+#endif
     } else {
         qDebug() << "[Audio] local audio output disabled; demodulation will continue for streaming.";
     }
@@ -245,7 +264,9 @@ void AudioProcessor::stopDemodulation() {
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[Audio] stopDemodulation enter"
                  << "running" << running.load()
+#ifdef _WIN32
                  << "hWaveOut" << hWaveOut
+#endif
                  << "sdrJoinable" << sdrWorker.joinable()
                  << "audioJoinable" << audioWorker.joinable();
     }
@@ -290,6 +311,10 @@ void AudioProcessor::stopDemodulation() {
 }
 
 bool AudioProcessor::openAudioDevice(int deviceID) {
+#ifndef _WIN32
+    Q_UNUSED(deviceID);
+    return true;
+#else
     if (hWaveOut && waveHeadersPrepared && openedAudioDeviceID == deviceID) {
         audioDeviceClosing = false;
         return true;
@@ -314,9 +339,11 @@ bool AudioProcessor::openAudioDevice(int deviceID) {
     openedAudioDeviceID = deviceID;
     prepareWaveHeaders();
     return waveHeadersPrepared;
+#endif
 }
 
 void AudioProcessor::closeAudioDevice() {
+#ifdef _WIN32
     std::lock_guard<std::mutex> lock(waveOutMutex);
     if (!hWaveOut) {
         return;
@@ -328,9 +355,11 @@ void AudioProcessor::closeAudioDevice() {
     waveOutClose(hWaveOut);
     hWaveOut = nullptr;
     openedAudioDeviceID = -1;
+#endif
 }
 
 void AudioProcessor::pauseAudioDevice() {
+#ifdef _WIN32
     std::lock_guard<std::mutex> lock(waveOutMutex);
     if (!hWaveOut) {
         return;
@@ -342,11 +371,18 @@ void AudioProcessor::pauseAudioDevice() {
         bufferReady[i] = true;
     }
     cv.notify_all();
+#else
+    for (int i = 0; i < NUM_BUFFERS; ++i) {
+        bufferReady[i] = true;
+    }
+    cv.notify_all();
+#endif
 }
 
 void AudioProcessor::prepareWaveHeaders() {
     waveHeadersPrepared = false;
 
+#ifdef _WIN32
     for (int i = 0; i < NUM_BUFFERS; ++i) {
         ZeroMemory(&waveHdrs[i], sizeof(WAVEHDR));
         waveHdrs[i].lpData = reinterpret_cast<LPSTR>(waveBuffers[i].data());
@@ -362,15 +398,22 @@ void AudioProcessor::prepareWaveHeaders() {
     }
 
     waveHeadersPrepared = true;
+#endif
 }
 
 void AudioProcessor::unprepareWaveHeaders() {
+#ifdef _WIN32
     for (int i = 0; i < NUM_BUFFERS; ++i) {
         if (waveHdrs[i].dwFlags & WHDR_PREPARED) {
             waveOutUnprepareHeader(hWaveOut, &waveHdrs[i], sizeof(WAVEHDR));
         }
         bufferReady[i] = true;
     }
+#else
+    for (int i = 0; i < NUM_BUFFERS; ++i) {
+        bufferReady[i] = true;
+    }
+#endif
     waveHeadersPrepared = false;
 }
 
@@ -728,7 +771,9 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
 }
 
 void AudioProcessor::SDRThread() {
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "SDRThread started (Real IQ processing)";
     }
@@ -801,6 +846,7 @@ void AudioProcessor::SDRThread() {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#ifdef _WIN32
 void CALLBACK AudioProcessor::WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance,
                                               DWORD_PTR dwParam1, DWORD_PTR dwParam2) {
     if (uMsg == WOM_DONE) {
@@ -821,11 +867,14 @@ void CALLBACK AudioProcessor::WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR
         }
     }
 }
+#endif
 
 
 
 void AudioProcessor::startAudioOutput() {
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     while (running.load()) {
         std::unique_lock<std::mutex> lock(audioMutex);
         cv.wait(lock, [this] {
@@ -877,6 +926,7 @@ void AudioProcessor::startAudioOutput() {
 
             emit audioFrameReady(pcmFrame);
 
+#ifdef _WIN32
             MMRESULT result = MMSYSERR_NOERROR;
             {
                 std::lock_guard<std::mutex> waveLock(waveOutMutex);
@@ -890,6 +940,9 @@ void AudioProcessor::startAudioOutput() {
             if (result != MMSYSERR_NOERROR) {
                 qDebug() << "waveOutWrite failed!";
             }
+#else
+            bufferReady[i] = true;
+#endif
             lock.lock();
 
         }

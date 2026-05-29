@@ -1,5 +1,52 @@
 # Changelog
 
+## 3.1.0-beta - 2026-05-29
+
+### Changed
+
+- Started Linux/Raspberry Pi preparation by replacing Windows-only CMake paths
+  with platform-aware dependency discovery for Qt5, FFTW, standard libfobos,
+  and agile libfobos_sdr.
+- Guarded WinMM/Win32-only audio, diagnostics, thread-priority, and device
+  enumeration code so non-Windows builds can progress to dependency and runtime
+  integration work instead of failing immediately on Windows headers.
+- Added an initial non-Windows Qt5 Multimedia PCM playback path for local,
+  network, and playback audio frames.
+- Added Raspberry Pi OS/Debian helper scripts for dependency installation,
+  Linux configure/build, Linux launch, and a Windows source zip packager.
+- Added `tools/prepare_fobos_linux.sh` to build the vendored patched libfobos
+  and libfobos-sdr-agile source trees into a private project-local Linux prefix.
+- Added `third_party/patched/` source trees so Linux/Raspberry Pi builds use
+  the FobosAPP-compatible libraries instead of silently cloning official
+  upstream code. Upstream cloning is now an explicit opt-in test path only.
+- Disabled root-level udev rule installation in the vendored Fobos CMake builds;
+  Linux rules are installed by the documented packaging step instead.
+- Switched network IQ frames from base64 JSON blobs to binary payload frames with
+  compact JSON headers to reduce bandwidth and Raspberry Pi client CPU load.
+- In Full IQ client-processing mode, audio now falls back to server-demodulated
+  PCM while the client still receives Full IQ for the wide spectrum/waterfall.
+  This avoids forcing low-power clients to demodulate audio from 16+ MHz IQ.
+- Reverted aggressive Full IQ rate throttling after Raspberry Pi tests showed
+  lower traffic did not guarantee lower audio jitter when IQ continuity was lost.
+- Made the live IQ audio queue duration-based instead of a fixed float count, so
+  low-rate Channel IQ cannot build seconds of stale audio backlog on Raspberry Pi.
+- Increased the Qt audio output buffer on Linux to tolerate more network and
+  scheduler jitter during remote playback.
+- Added a lightweight UDP ready-audio relay: any instance can transmit
+  demodulated 48 kHz mono PCM to another FobosAPP instance for low-latency
+  playback without an external VLC loop.
+- Added a VLC-compatible HTTP/WAV ready-audio stream server so a Raspberry Pi
+  client can expose demodulated audio at `http://<host>:<port>/audio.wav`
+  without running a second FobosAPP instance on the listener.
+- Added Linux packaging drafts for udev USB access and a desktop launcher.
+
+### Known Issues
+
+- DMR remains a beta sync/activity monitor, not a complete DMR voice decoder.
+- Video/image modes remain beta-quality and still need real-signal validation.
+- The Qt5 Multimedia audio path still needs real Linux/Raspberry Pi testing and
+  may need latency/buffer tuning.
+
 ## 3.0.0-beta - 2026-05-28
 
 FobosAPP 3.0 beta starts the DMR work as a laboratory/test build. DMR is not a

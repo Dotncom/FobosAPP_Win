@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <QHostAddress>
 #include <QJsonDocument>
+#include <QJsonValue>
+#include <QVariant>
 #include <utility>
 
 namespace {
@@ -41,6 +43,7 @@ NetworkController::NetworkController(QObject *parent)
             peerLabels.insert(socket, label);
             peerPriorityKeys.insert(socket, priorityKey);
             peerReadBuffers.insert(socket, QByteArray());
+            socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
 
             setStatus(QString("Client connected from %1").arg(label));
 
@@ -234,6 +237,7 @@ void NetworkController::testClientConnection(const QString &serverAddress, quint
     localClientHasControl = true;
 
     clientSocket = new QTcpSocket(this);
+    clientSocket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     currentMode = NetworkMode::Client;
     setStatus(QString("Connecting to %1:%2").arg(serverAddress).arg(port));
 
@@ -302,6 +306,35 @@ bool NetworkController::sendControlCommand(const QJsonObject &command) {
     return sentAny;
 }
 
+bool NetworkController::sendBinaryCommand(const QJsonObject &command, const QByteArray &payload) {
+    if (payload.isEmpty()) {
+        return sendControlCommand(command);
+    }
+
+    if (currentMode == NetworkMode::Client) {
+        QTcpSocket *socket = activeSocket();
+        if (!socket || socket->state() != QAbstractSocket::ConnectedState || !controlReady) {
+            setStatus("Control channel is not ready");
+            return false;
+        }
+        return sendBinaryToSocket(socket, command, payload);
+    }
+
+    if (currentMode != NetworkMode::Server || readyPeerSockets.isEmpty()) {
+        setStatus("Control channel is not ready");
+        return false;
+    }
+
+    bool sentAny = false;
+    for (QTcpSocket *socket : std::as_const(peerSockets)) {
+        if (!isReadyPeer(socket)) {
+            continue;
+        }
+        sentAny = sendBinaryToSocket(socket, command, payload) || sentAny;
+    }
+    return sentAny;
+}
+
 bool NetworkController::sendControlCommandToPeer(const QString &peerIdValue, const QJsonObject &command) {
     QTcpSocket *socket = peerForId(peerIdValue);
     if (!isReadyPeer(socket)) {
@@ -359,6 +392,8 @@ void NetworkController::closeClientSocket() {
     clientSocket->deleteLater();
     clientSocket = nullptr;
     clientReadBuffer.clear();
+    clientPendingBinaryCommand = QJsonObject();
+    clientPendingBinaryBytes = 0;
 }
 
 void NetworkController::closePeerSocket(QTcpSocket *socket) {
@@ -368,6 +403,8 @@ void NetworkController::closePeerSocket(QTcpSocket *socket) {
         }
         readyPeerSockets.remove(peer);
         peerReadBuffers.remove(peer);
+        peerPendingBinaryCommands.remove(peer);
+        peerPendingBinaryBytes.remove(peer);
         peerIds.remove(peer);
         peerLabels.remove(peer);
         peerPriorityKeys.remove(peer);
@@ -393,6 +430,8 @@ void NetworkController::closePeerSocket(QTcpSocket *socket) {
     peerSockets.clear();
     readyPeerSockets.clear();
     peerReadBuffers.clear();
+    peerPendingBinaryCommands.clear();
+    peerPendingBinaryBytes.clear();
     peerIds.clear();
     peerLabels.clear();
     peerPriorityKeys.clear();
@@ -450,6 +489,31 @@ bool NetworkController::sendJsonToSocket(QTcpSocket *socket, const QJsonObject &
     const qint64 written = socket->write(payload);
     if (written != payload.size()) {
         const QString message = QString("Control channel write failed: %1").arg(socket->errorString());
+        if (currentMode == NetworkMode::Server && peerSockets.contains(socket)) {
+            closePeerSocket(socket);
+            promoteControllerIfNeeded();
+            setStatus(message);
+            emit channelError(message);
+        } else {
+            handleConnectionLost(message);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool NetworkController::sendBinaryToSocket(QTcpSocket *socket, const QJsonObject &command, const QByteArray &payload) {
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState) {
+        return false;
+    }
+
+    QJsonObject header = command;
+    header["payloadBytes"] = QString::number(payload.size());
+    const QByteArray headerBytes = QJsonDocument(header).toJson(QJsonDocument::Compact) + '\n';
+    const qint64 headerWritten = socket->write(headerBytes);
+    const qint64 payloadWritten = socket->write(payload);
+    if (headerWritten != headerBytes.size() || payloadWritten != payload.size()) {
+        const QString message = QString("Binary channel write failed: %1").arg(socket->errorString());
         if (currentMode == NetworkMode::Server && peerSockets.contains(socket)) {
             closePeerSocket(socket);
             promoteControllerIfNeeded();
@@ -575,7 +639,22 @@ void NetworkController::processSocketData(QTcpSocket *socket, QByteArray &buffer
 
     buffer += socket->readAll();
     int newlineIndex = -1;
-    while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+    while (true) {
+        if (deliverPendingBinaryPayload(socket, buffer)) {
+            continue;
+        }
+        const qint64 pendingBinaryBytes =
+            (currentMode == NetworkMode::Client && socket == clientSocket)
+                ? clientPendingBinaryBytes
+                : peerPendingBinaryBytes.value(socket, 0);
+        if (pendingBinaryBytes > 0) {
+            break;
+        }
+
+        newlineIndex = buffer.indexOf('\n');
+        if (newlineIndex < 0) {
+            break;
+        }
         QByteArray line = buffer.left(newlineIndex).trimmed();
         buffer.remove(0, newlineIndex + 1);
         if (!line.isEmpty()) {
@@ -587,6 +666,45 @@ void NetworkController::processSocketData(QTcpSocket *socket, QByteArray &buffer
             processLine(socket, line);
         }
     }
+}
+
+bool NetworkController::deliverPendingBinaryPayload(QTcpSocket *socket, QByteArray &buffer) {
+    if (!socket) {
+        return false;
+    }
+
+    qint64 payloadBytes = 0;
+    QJsonObject command;
+    if (currentMode == NetworkMode::Client && socket == clientSocket) {
+        payloadBytes = clientPendingBinaryBytes;
+        command = clientPendingBinaryCommand;
+    } else if (currentMode == NetworkMode::Server && peerSockets.contains(socket)) {
+        payloadBytes = peerPendingBinaryBytes.value(socket, 0);
+        command = peerPendingBinaryCommands.value(socket);
+    }
+
+    if (payloadBytes <= 0) {
+        return false;
+    }
+    if (buffer.size() < payloadBytes) {
+        return false;
+    }
+
+    const QByteArray payload = buffer.left(static_cast<int>(payloadBytes));
+    buffer.remove(0, static_cast<int>(payloadBytes));
+
+    if (currentMode == NetworkMode::Client && socket == clientSocket) {
+        clientPendingBinaryCommand = QJsonObject();
+        clientPendingBinaryBytes = 0;
+        lastMessageTimer.restart();
+    } else if (currentMode == NetworkMode::Server && peerSockets.contains(socket)) {
+        peerPendingBinaryCommands.remove(socket);
+        peerPendingBinaryBytes.remove(socket);
+        peerLastMessageTimers[socket].restart();
+    }
+
+    emit binaryCommandReceived(command, payload);
+    return true;
 }
 
 void NetworkController::processLine(QTcpSocket *socket, const QByteArray &line) {
@@ -650,6 +768,23 @@ void NetworkController::processLine(QTcpSocket *socket, const QByteArray &line) 
     }
 
     QJsonObject command = document.object();
+    if (command.value("type").toString() == QStringLiteral("iqbin")) {
+        bool ok = false;
+        const qint64 payloadBytes = command.value("payloadBytes").toVariant().toLongLong(&ok);
+        if (!ok || payloadBytes <= 0 || payloadBytes > (512LL * 1024LL * 1024LL)) {
+            setStatus(QString("Ignoring invalid binary payload header"));
+            return;
+        }
+        if (currentMode == NetworkMode::Client && socket == clientSocket) {
+            clientPendingBinaryCommand = command;
+            clientPendingBinaryBytes = payloadBytes;
+        } else if (currentMode == NetworkMode::Server && peerSockets.contains(socket)) {
+            peerPendingBinaryCommands.insert(socket, command);
+            peerPendingBinaryBytes.insert(socket, payloadBytes);
+        }
+        return;
+    }
+
     if (currentMode == NetworkMode::Client &&
         command.value("type").toString() == QStringLiteral("control") &&
         command.value("action").toString() == QStringLiteral("role")) {

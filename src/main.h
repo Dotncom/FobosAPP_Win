@@ -1,7 +1,6 @@
 #ifndef MAIN_H
 #define MAIN_H
 
-#include <Windows.h>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -30,6 +29,7 @@
 #include <QMessageBox>
 #include <QByteArray>
 #include <QJsonObject>
+#include <QList>
 #include <QVector>
 #include <QApplication>
 #include <QCoreApplication>
@@ -40,9 +40,14 @@
 #include <QRadioButton>
 #include <QButtonGroup>
 #include <QElapsedTimer>
+#include <QUdpSocket>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <cstdint>
+#ifdef _WIN32
 #include <windows.h>
 #include <mmsystem.h>
-#include <cstdint>
+#endif
 #include "fft.h"
 #include "dataprocessor.h"
 #include "digitaldecoder.h"
@@ -210,8 +215,17 @@ private:
     void displayNetworkSpectrumFrame(const QJsonObject &frame);
     void sendNetworkAudioFrame(const QByteArray &pcmData);
     void playNetworkAudioFrame(const QJsonObject &frame);
+    void updateAudioRelaySocket();
+    void sendAudioRelayFrame(const QByteArray &pcmData);
+    void receiveAudioRelayDatagrams();
+    void updateAudioHttpStreamServer();
+    void acceptAudioHttpClient();
+    void removeAudioHttpClient(QTcpSocket *client);
+    void sendAudioHttpFrame(const QByteArray &pcmData);
     void sendNetworkIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     void receiveNetworkIqFrame(const QJsonObject &frame);
+    void receiveNetworkIqFrameBinary(const QJsonObject &frame, const QByteArray &iqData);
+    void handleNetworkIqPayload(const QJsonObject &frame, QByteArray iqBytes);
     void processDigitalAudioFrame(const QByteArray &pcmData);
     void processSstvAudioFrame(const QByteArray &pcmData);
     void processAptAudioFrame(const QByteArray &pcmData);
@@ -396,6 +410,18 @@ private:
     uint64_t networkSpectrumFrameSequence = 0;
     uint64_t networkIqFrameSequence = 0;
     uint64_t networkIqFramesDropped = 0;
+    QElapsedTimer networkClientSettingsGuardTimer;
+    bool audioRelayTransmitEnabled = false;
+    QString audioRelayHost = "127.0.0.1";
+    quint16 audioRelayPort = 21091;
+    bool audioRelayReceiveEnabled = false;
+    quint16 audioRelayListenPort = 21091;
+    uint32_t audioRelaySequence = 0;
+    QUdpSocket *audioRelaySocket = nullptr;
+    bool audioHttpStreamEnabled = false;
+    quint16 audioHttpStreamPort = 21092;
+    QTcpServer *audioHttpServer = nullptr;
+    QList<QTcpSocket *> audioHttpClients;
     float displayLevelMin = -120.0f;
     float displayLevelMax = 0.0f;
     int minScale = 1;

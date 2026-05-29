@@ -1,9 +1,15 @@
 #include "remoteaudioplayer.h"
 
 #include <QDebug>
+#if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
+#include <QAudioDeviceInfo>
+#include <QAudioFormat>
+#endif
 #include <cstring>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "winmm.lib")
+#endif
 
 RemoteAudioPlayer::RemoteAudioPlayer(QObject *parent)
     : QObject(parent) {
@@ -16,6 +22,58 @@ RemoteAudioPlayer::~RemoteAudioPlayer() {
 }
 
 bool RemoteAudioPlayer::openDevice() {
+#ifndef _WIN32
+#ifdef FOBOSAPP_HAS_QT_AUDIO
+    if (qtAudioOutput && qtAudioDevice) {
+        return true;
+    }
+
+    QAudioFormat format;
+    format.setSampleRate(SAMPLE_RATE);
+    format.setChannelCount(1);
+    format.setSampleSize(16);
+    format.setCodec("audio/pcm");
+    format.setByteOrder(QAudioFormat::LittleEndian);
+    format.setSampleType(QAudioFormat::SignedInt);
+
+    const QAudioDeviceInfo deviceInfo = QAudioDeviceInfo::defaultOutputDevice();
+    if (deviceInfo.isNull()) {
+        qDebug() << "[NetworkAudio] no default Qt audio output device";
+        return false;
+    }
+    if (!deviceInfo.isFormatSupported(format)) {
+        const QAudioFormat nearest = deviceInfo.nearestFormat(format);
+        if (nearest.sampleRate() != SAMPLE_RATE ||
+            nearest.channelCount() != 1 ||
+            nearest.sampleSize() != 16 ||
+            nearest.sampleType() != QAudioFormat::SignedInt) {
+            qDebug() << "[NetworkAudio] default Qt audio output does not support 48 kHz mono s16 PCM";
+            return false;
+        }
+        format = nearest;
+    }
+
+    qtAudioOutput = new QAudioOutput(deviceInfo, format, this);
+    qtAudioOutput->setBufferSize(2 * SAMPLE_RATE * static_cast<int>(sizeof(qint16)));
+    qtAudioDevice = qtAudioOutput->start();
+    if (!qtAudioDevice) {
+        qDebug() << "[NetworkAudio] QAudioOutput start failed";
+        delete qtAudioOutput;
+        qtAudioOutput = nullptr;
+        return false;
+    }
+
+    qDebug() << "[NetworkAudio] Qt audio output opened" << deviceInfo.deviceName();
+    return true;
+#else
+    static bool logged = false;
+    if (!logged) {
+        qDebug() << "[NetworkAudio] remote PCM playback is not implemented on this platform yet";
+        logged = true;
+    }
+    return false;
+#endif
+#else
     if (waveOut) {
         return true;
     }
@@ -44,6 +102,7 @@ bool RemoteAudioPlayer::openDevice() {
     cleanupTimer.start();
     qDebug() << "[NetworkAudio] remote audio output opened";
     return true;
+#endif
 }
 
 void RemoteAudioPlayer::setVolume(float volume) {
@@ -58,6 +117,7 @@ void RemoteAudioPlayer::playPcmFrame(const QByteArray &pcmData) {
         return;
     }
 
+#ifdef _WIN32
     cleanupCompletedBuffers();
     if (activeBlocks.size() >= MAX_ACTIVE_BLOCKS) {
         qDebug() << "[NetworkAudio] dropping remote audio frame because playback queue is full"
@@ -98,9 +158,42 @@ void RemoteAudioPlayer::playPcmFrame(const QByteArray &pcmData) {
     }
 
     activeBlocks.append(block);
+#elif defined(FOBOSAPP_HAS_QT_AUDIO)
+    if (!qtAudioOutput || !qtAudioDevice) {
+        return;
+    }
+    if (qtAudioOutput->state() == QAudio::StoppedState) {
+        qtAudioDevice = qtAudioOutput->start();
+        if (!qtAudioDevice) {
+            qDebug() << "[NetworkAudio] QAudioOutput restart failed";
+            return;
+        }
+    }
+
+    QByteArray adjusted = pcmData;
+    const float volume = outputVolume.load();
+    auto *samples = reinterpret_cast<qint16 *>(adjusted.data());
+    const int sampleCount = adjusted.size() / sizeof(qint16);
+    for (int i = 0; i < sampleCount; ++i) {
+        int sample = static_cast<int>(samples[i] * volume);
+        sample = std::clamp(sample, -32768, 32767);
+        samples[i] = static_cast<qint16>(sample);
+    }
+
+    if (qtAudioOutput->bytesFree() < adjusted.size()) {
+        qDebug() << "[NetworkAudio] dropping Qt audio frame because playback buffer is full"
+                 << "bytesFree" << qtAudioOutput->bytesFree()
+                 << "frameBytes" << adjusted.size();
+        return;
+    }
+    qtAudioDevice->write(adjusted);
+#else
+    Q_UNUSED(pcmData);
+#endif
 }
 
 void RemoteAudioPlayer::cleanupCompletedBuffers() {
+#ifdef _WIN32
     if (!waveOut) {
         return;
     }
@@ -112,8 +205,10 @@ void RemoteAudioPlayer::cleanupCompletedBuffers() {
             releaseBlock(block);
         }
     }
+#endif
 }
 
+#ifdef _WIN32
 void RemoteAudioPlayer::releaseBlock(AudioBlock *block) {
     if (!block) {
         return;
@@ -123,10 +218,12 @@ void RemoteAudioPlayer::releaseBlock(AudioBlock *block) {
     }
     delete block;
 }
+#endif
 
 void RemoteAudioPlayer::stop() {
     cleanupTimer.stop();
 
+#ifdef _WIN32
     if (waveOut) {
         waveOutReset(waveOut);
     }
@@ -140,4 +237,13 @@ void RemoteAudioPlayer::stop() {
         waveOut = nullptr;
         qDebug() << "[NetworkAudio] remote audio output closed";
     }
+#elif defined(FOBOSAPP_HAS_QT_AUDIO)
+    qtAudioDevice = nullptr;
+    if (qtAudioOutput) {
+        qtAudioOutput->stop();
+        delete qtAudioOutput;
+        qtAudioOutput = nullptr;
+        qDebug() << "[NetworkAudio] Qt audio output closed";
+    }
+#endif
 }

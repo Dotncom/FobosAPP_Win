@@ -2,12 +2,15 @@
 
 #include <deque>
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 
 namespace {
 
 constexpr std::size_t MAX_QUEUED_BLOCKS = 256;
 constexpr std::size_t MAX_QUEUED_FLOATS = 16 * 1024 * 1024;
+constexpr std::size_t MIN_LIVE_QUEUED_FLOATS = 128 * 1024;
+constexpr double MAX_LIVE_QUEUED_SECONDS = 1.25;
 constexpr std::size_t MAX_SNAPSHOT_FLOATS = 524288 * 2;
 
 std::mutex g_iqMutex;
@@ -43,6 +46,21 @@ void appendToSnapshot(const float *samples, std::size_t floatCount) {
     g_iqSnapshotSize += floatCount;
 }
 
+std::size_t maxQueuedFloatsForLiveAudio() {
+    if (g_sampleRateEstimate <= 0.0 || !std::isfinite(g_sampleRateEstimate)) {
+        return MAX_QUEUED_FLOATS;
+    }
+
+    const double targetFloats = g_sampleRateEstimate * 2.0 * MAX_LIVE_QUEUED_SECONDS;
+    if (targetFloats <= 0.0) {
+        return MAX_QUEUED_FLOATS;
+    }
+
+    return (std::clamp)(static_cast<std::size_t>(targetFloats),
+                        MIN_LIVE_QUEUED_FLOATS,
+                        MAX_QUEUED_FLOATS);
+}
+
 } // namespace
 
 namespace IqBuffer {
@@ -71,7 +89,8 @@ void publish(const float *samples, std::size_t floatCount, bool queueBlock) {
     g_iqQueuedFloatCount += block.size();
     g_iqBlocks.push_back(std::move(block));
     g_iqBlockSequences.push_back(g_iqSequence);
-    while (g_iqBlocks.size() > MAX_QUEUED_BLOCKS || g_iqQueuedFloatCount > MAX_QUEUED_FLOATS) {
+    const std::size_t maxQueuedFloats = maxQueuedFloatsForLiveAudio();
+    while (g_iqBlocks.size() > MAX_QUEUED_BLOCKS || g_iqQueuedFloatCount > maxQueuedFloats) {
         g_iqQueuedFloatCount -= g_iqBlocks.front().size();
         g_iqBlocks.pop_front();
         g_iqBlockSequences.pop_front();

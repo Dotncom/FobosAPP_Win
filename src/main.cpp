@@ -17,6 +17,7 @@
 #include <QMenu>
 #include <QMessageLogContext>
 #include <QMutexLocker>
+#include <QHostAddress>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTextStream>
@@ -27,9 +28,14 @@
 #include <QColor>
 #include <QCoreApplication>
 #include <QSettings>
+#if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
+#include <QAudioDeviceInfo>
+#endif
 #include <cmath>
 #include <limits>
+#ifdef _WIN32
 #include <psapi.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -84,9 +90,13 @@ constexpr int NETWORK_CHANNEL_SPECTRUM_MAX_BINS = 768;
 constexpr int NETWORK_SPECTRUM_INTERVAL_MS = 100;
 constexpr int NETWORK_CHANNEL_SPECTRUM_INTERVAL_MS = 160;
 constexpr qint64 NETWORK_IQ_MAX_PENDING_BYTES = 8 * 1024 * 1024;
+constexpr qint64 NETWORK_CHANNEL_IQ_LOW_LATENCY_PENDING_BYTES = 2 * 1024 * 1024;
 constexpr uint64_t NETWORK_IQ_DROP_LOG_INTERVAL = 200;
+constexpr qint64 NETWORK_CLIENT_SETTINGS_GUARD_MS = 1500;
 constexpr double NETWORK_AUDIO_PREBUFFER_SECONDS = 0.55;
 constexpr qint64 NETWORK_SPECTRUM_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+constexpr int AUDIO_RELAY_HEADER_BYTES = 12;
+constexpr qint64 AUDIO_HTTP_MAX_PENDING_BYTES = 512 * 1024;
 constexpr int AUDIO_LOW_PASS_SLIDER_STEP_HZ = 100;
 constexpr int AUDIO_LOW_PASS_SLIDER_MAX = 200;
 constexpr int AUDIO_HIGH_PASS_SLIDER_STEP_HZ = 25;
@@ -99,6 +109,52 @@ QFile gLogFile;
 
 QString persistentSettingsFilePath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/FobosAPP.ini");
+}
+
+void appendLe32(QByteArray &buffer, quint32 value) {
+    buffer.append(static_cast<char>(value & 0xff));
+    buffer.append(static_cast<char>((value >> 8) & 0xff));
+    buffer.append(static_cast<char>((value >> 16) & 0xff));
+    buffer.append(static_cast<char>((value >> 24) & 0xff));
+}
+
+void appendLe16(QByteArray &buffer, quint16 value) {
+    buffer.append(static_cast<char>(value & 0xff));
+    buffer.append(static_cast<char>((value >> 8) & 0xff));
+}
+
+quint32 readLe32(const char *data) {
+    const auto *bytes = reinterpret_cast<const uchar *>(data);
+    return static_cast<quint32>(bytes[0]) |
+           (static_cast<quint32>(bytes[1]) << 8) |
+           (static_cast<quint32>(bytes[2]) << 16) |
+           (static_cast<quint32>(bytes[3]) << 24);
+}
+
+QByteArray streamingWavHeader() {
+    constexpr quint32 streamDataBytes = 0x7fffffffU;
+    constexpr quint16 channels = 1;
+    constexpr quint32 sampleRate = 48000;
+    constexpr quint16 bitsPerSample = 16;
+    constexpr quint16 blockAlign = channels * bitsPerSample / 8;
+    constexpr quint32 byteRate = sampleRate * blockAlign;
+
+    QByteArray header;
+    header.reserve(44);
+    header.append("RIFF", 4);
+    appendLe32(header, streamDataBytes + 36U);
+    header.append("WAVE", 4);
+    header.append("fmt ", 4);
+    appendLe32(header, 16);
+    appendLe16(header, 1);
+    appendLe16(header, channels);
+    appendLe32(header, sampleRate);
+    appendLe32(header, byteRate);
+    appendLe16(header, blockAlign);
+    appendLe16(header, bitsPerSample);
+    header.append("data", 4);
+    appendLe32(header, streamDataBytes);
+    return header;
 }
 
 const char *messageTypeName(QtMsgType type) {
@@ -415,6 +471,7 @@ void installDiagnosticLogger() {
              << (fobosVerboseLoggingEnabled() ? "enabled" : "disabled");
 }
 
+#ifdef _WIN32
 QString modulePathForAddress(void *address) {
     if (!address) {
         return QString();
@@ -452,6 +509,7 @@ LONG WINAPI diagnosticUnhandledExceptionFilter(EXCEPTION_POINTERS *exceptionInfo
                 << "parameters" << static_cast<quint32>(record->NumberParameters);
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#endif
 
 void diagnosticTerminateHandler() {
     qCritical() << "[Crash] std::terminate called";
@@ -459,7 +517,9 @@ void diagnosticTerminateHandler() {
 }
 
 void installCrashLogger() {
+#ifdef _WIN32
     SetUnhandledExceptionFilter(diagnosticUnhandledExceptionFilter);
+#endif
     std::set_terminate(diagnosticTerminateHandler);
     qDebug() << "[Log] Crash logger installed";
 }
@@ -948,6 +1008,7 @@ void logMemorySnapshot(const char *tag) {
         return;
     }
 
+#ifdef _WIN32
     PROCESS_MEMORY_COUNTERS_EX counters;
     ZeroMemory(&counters, sizeof(counters));
     counters.cb = sizeof(counters);
@@ -974,6 +1035,9 @@ void logMemorySnapshot(const char *tag) {
              << "privateMB" << (processOk ? toMb(counters.PrivateUsage) : -1.0)
              << "availPhysMB" << (systemOk ? toMb(memoryStatus.ullAvailPhys) : -1.0)
              << "memoryLoadPct" << (systemOk ? static_cast<int>(memoryStatus.dwMemoryLoad) : -1);
+#else
+    qDebug() << "[Memory]" << tag << "snapshot unavailable on this platform";
+#endif
 }
 
 } // namespace
@@ -1265,6 +1329,10 @@ YourClassName::YourClassName(QWidget *parent)
     recordingManager = new RecordingManager(this);
     networkController = new NetworkController(this);
     remoteAudioPlayer = new RemoteAudioPlayer(this);
+    audioRelaySocket = new QUdpSocket(this);
+    connect(audioRelaySocket, &QUdpSocket::readyRead, this, &YourClassName::receiveAudioRelayDatagrams);
+    audioHttpServer = new QTcpServer(this);
+    connect(audioHttpServer, &QTcpServer::newConnection, this, &YourClassName::acceptAudioHttpClient);
     networkSettingsDebounceTimer = new QTimer(this);
     networkSettingsDebounceTimer->setSingleShot(true);
     connect(networkSettingsDebounceTimer, &QTimer::timeout, this, [this]() {
@@ -1637,6 +1705,11 @@ YourClassName::YourClassName(QWidget *parent)
         });
     });
     connect(networkController, &NetworkController::controlCommandReceived, this, &YourClassName::onNetworkControlCommandReceived);
+    connect(networkController, &NetworkController::binaryCommandReceived, this, [this](const QJsonObject &command, const QByteArray &payload) {
+        if (networkMode == NetworkMode::Client && command.value("type").toString() == QStringLiteral("iqbin")) {
+            receiveNetworkIqFrameBinary(command, payload);
+        }
+    });
     connect(digitalClearButton, &QPushButton::clicked, this, [this]() {
         if (digitalTextEdit) {
             digitalTextEdit->clear();
@@ -1777,6 +1850,24 @@ YourClassName::YourClassName(QWidget *parent)
                 processAptAudioFrame(pcmData);
                 processWefaxAudioFrame(pcmData);
                 sendNetworkAudioFrame(pcmData);
+                sendAudioRelayFrame(pcmData);
+                sendAudioHttpFrame(pcmData);
+#if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
+                const bool suppressServerLocalOutput =
+                    networkMode == NetworkMode::Server &&
+                    serverDisableLocalVisualAudio &&
+                    networkController &&
+                    networkController->isControlReady();
+                const bool localQtPlayback =
+                    remoteAudioPlayer &&
+                    audioCheckbox &&
+                    audioCheckbox->isChecked() &&
+                    !suppressServerLocalOutput &&
+                    (networkMode != NetworkMode::Client || isClientIqProcessingMode());
+                if (localQtPlayback) {
+                    remoteAudioPlayer->playPcmFrame(pcmData);
+                }
+#endif
             },
             Qt::QueuedConnection);
     connect(audioCheckbox, &QCheckBox::toggled,
@@ -1807,6 +1898,8 @@ YourClassName::YourClassName(QWidget *parent)
     publishSettingsToGlobals();
     updateDigitalDecoderMode();
     updateVideoProcessorMode();
+    updateAudioRelaySocket();
+    updateAudioHttpStreamServer();
     updateUiForRunState();
     refreshPlaybackFiles();
     qApp->installEventFilter(this);
@@ -1837,6 +1930,16 @@ YourClassName::~YourClassName() {
     if (remoteAudioPlayer) {
         remoteAudioPlayer->stop();
     }
+    if (audioHttpServer) {
+        audioHttpServer->close();
+    }
+    for (QTcpSocket *client : std::as_const(audioHttpClients)) {
+        if (client) {
+            client->disconnectFromHost();
+            client->deleteLater();
+        }
+    }
+    audioHttpClients.clear();
     if (networkController) {
         networkController->stop();
     }
@@ -1993,8 +2096,9 @@ bool YourClassName::restartStreamForHardwareChange() {
         serverDisableLocalVisualAudio &&
         networkController &&
         networkController->isControlReady();
-    const bool serverLocalAudioEnabled = pendingSettings.audioEnabled && !serverIqStreaming;
-    const bool queueAudioBlocks = !serverIqStreaming;
+    const bool serverAudioStreamingForFullIq = serverFullIqStreaming && pendingSettings.audioEnabled;
+    const bool serverLocalAudioEnabled = pendingSettings.audioEnabled && (!serverIqStreaming || serverAudioStreamingForFullIq);
+    const bool queueAudioBlocks = !serverIqStreaming || serverAudioStreamingForFullIq;
     if (audioProcessor) {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
@@ -2409,7 +2513,9 @@ void YourClassName::startNetworkClientProcessing() {
     const bool switchingBetweenClientIqModes =
         networkClientIqProcessingActive &&
         activeNetworkClientProcessingMode != networkProcessingMode;
-    resetNetworkIqReceptionState(false, switchingBetweenClientIqModes, pendingSettings.audioEnabled);
+    resetNetworkIqReceptionState(false,
+                                 switchingBetweenClientIqModes,
+                                 pendingSettings.audioEnabled && !isFullIqProcessingMode());
     IqBuffer::setSampleRateEstimate(pendingSettings.sampleRate);
     publishSettingsToGlobals();
 
@@ -2481,6 +2587,10 @@ bool YourClassName::sendRemoteControlCommand(const QString &action, const QJsonO
         return false;
     }
 
+    if (action == QStringLiteral("settings") || action == QStringLiteral("start")) {
+        networkClientSettingsGuardTimer.restart();
+    }
+
     refreshSettingsFromUi();
 
     QJsonObject command;
@@ -2507,6 +2617,8 @@ void YourClassName::scheduleRemoteSettingsCommand(int delayMs) {
         !networkController->clientHasControl()) {
         return;
     }
+
+    networkClientSettingsGuardTimer.restart();
 
     if (!networkSettingsDebounceTimer) {
         sendRemoteControlCommand("settings");
@@ -2835,6 +2947,13 @@ void YourClassName::loadPersistentSettings() {
     networkBindAddress = settings.value("network/bindAddress", networkBindAddress).toString();
     networkControlPort = static_cast<quint16>((std::clamp)(settings.value("network/controlPort", static_cast<int>(networkControlPort)).toInt(), 1, 65535));
     serverDisableLocalVisualAudio = settings.value("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio).toBool();
+    audioRelayTransmitEnabled = settings.value("audioRelay/transmitEnabled", audioRelayTransmitEnabled).toBool();
+    audioRelayHost = settings.value("audioRelay/host", audioRelayHost).toString();
+    audioRelayPort = static_cast<quint16>((std::clamp)(settings.value("audioRelay/port", static_cast<int>(audioRelayPort)).toInt(), 1, 65535));
+    audioRelayReceiveEnabled = settings.value("audioRelay/receiveEnabled", audioRelayReceiveEnabled).toBool();
+    audioRelayListenPort = static_cast<quint16>((std::clamp)(settings.value("audioRelay/listenPort", static_cast<int>(audioRelayListenPort)).toInt(), 1, 65535));
+    audioHttpStreamEnabled = settings.value("audioHttpStream/enabled", audioHttpStreamEnabled).toBool();
+    audioHttpStreamPort = static_cast<quint16>((std::clamp)(settings.value("audioHttpStream/port", static_cast<int>(audioHttpStreamPort)).toInt(), 1, 65535));
     digitalDecodeEnabled = settings.value("digital/decodeEnabled", digitalDecodeEnabled).toBool();
     auto setComboToData = [](QComboBox *combo, const QVariant &data) {
         if (!combo) {
@@ -2930,6 +3049,13 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("network/controlPort", static_cast<int>(networkControlPort));
     settings.setValue("network/processingMode", static_cast<int>(networkProcessingMode));
     settings.setValue("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio);
+    settings.setValue("audioRelay/transmitEnabled", audioRelayTransmitEnabled);
+    settings.setValue("audioRelay/host", audioRelayHost);
+    settings.setValue("audioRelay/port", static_cast<int>(audioRelayPort));
+    settings.setValue("audioRelay/receiveEnabled", audioRelayReceiveEnabled);
+    settings.setValue("audioRelay/listenPort", static_cast<int>(audioRelayListenPort));
+    settings.setValue("audioHttpStream/enabled", audioHttpStreamEnabled);
+    settings.setValue("audioHttpStream/port", static_cast<int>(audioHttpStreamPort));
     settings.setValue("digital/decodeEnabled", digitalDecodeEnabled);
     settings.setValue("digital/dmrLabCaptureEnabled", dmrLabCaptureCheckbox && dmrLabCaptureCheckbox->isChecked());
     settings.setValue("digital/dmrLabColorCode", dmrLabColorCodeCombo ? dmrLabColorCodeCombo->currentData().toInt() : -1);
@@ -2997,7 +3123,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         return;
     }
 
-    if (networkMode == NetworkMode::Client && !isClientIqProcessingMode() && command.value("type").toString() == "audio") {
+    if (networkMode == NetworkMode::Client && !isChannelIqProcessingMode() && command.value("type").toString() == "audio") {
         playNetworkAudioFrame(command);
         return;
     }
@@ -3033,8 +3159,8 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             box.setText(QString("Client %1 requests control of the receiver.").arg(requesterLabel));
             box.setInformativeText("If you allow it, this client will become observer.");
             box.setIcon(QMessageBox::Question);
-            QCheckBox blockRequesterCheck("Block further requests from this client", &box);
-            box.setCheckBox(&blockRequesterCheck);
+            QCheckBox *blockRequesterCheck = new QCheckBox("Block further requests from this client", &box);
+            box.setCheckBox(blockRequesterCheck);
             QPushButton *allowButton = box.addButton("Allow", QMessageBox::AcceptRole);
             box.addButton("Deny", QMessageBox::RejectRole);
             box.exec();
@@ -3042,7 +3168,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             QJsonObject response;
             response["requesterId"] = requesterId;
             response["accepted"] = box.clickedButton() == allowButton;
-            response["blocked"] = blockRequesterCheck.isChecked();
+            response["blocked"] = blockRequesterCheck && blockRequesterCheck->isChecked();
             sendRemoteControlCommand("priorityResponse", response);
             return;
         }
@@ -3168,6 +3294,8 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             previousSettings.fftLength != pendingSettings.fftLength;
         const bool streamModeChanged =
             previousProcessingMode != networkProcessingMode;
+        const bool fullIqServerAudioPathChanged =
+            audioChanged && isFullIqProcessingMode();
 
         if (fftChanged) {
             applyFftLengthChange(pendingSettings.fftLength, false);
@@ -3189,7 +3317,8 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             std::abs(previousSettings.sampleRate - pendingSettings.sampleRate) > 0.5 ||
             previousSettings.inputMode != pendingSettings.inputMode ||
             previousSettings.clockSource != pendingSettings.clockSource ||
-            streamModeChanged;
+            streamModeChanged ||
+            fullIqServerAudioPathChanged;
 
         if (restartRequired && !isIdle()) {
             restartStreamForHardwareChange();
@@ -3400,7 +3529,7 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
 
 void YourClassName::sendNetworkAudioFrame(const QByteArray &pcmData) {
     if (networkMode != NetworkMode::Server ||
-        isClientIqProcessingMode() ||
+        isChannelIqProcessingMode() ||
         !networkController ||
         !networkController->isControlReady() ||
         pcmData.isEmpty()) {
@@ -3436,7 +3565,205 @@ void YourClassName::playNetworkAudioFrame(const QJsonObject &frame) {
     processSstvAudioFrame(pcmData);
     processAptAudioFrame(pcmData);
     processWefaxAudioFrame(pcmData);
+    sendAudioRelayFrame(pcmData);
+    sendAudioHttpFrame(pcmData);
     remoteAudioPlayer->playPcmFrame(pcmData);
+}
+
+void YourClassName::updateAudioRelaySocket() {
+    if (!audioRelaySocket) {
+        return;
+    }
+
+    if (!audioRelayReceiveEnabled) {
+        if (audioRelaySocket->state() != QAbstractSocket::UnconnectedState) {
+            audioRelaySocket->close();
+        }
+        return;
+    }
+
+    if (audioRelaySocket->state() != QAbstractSocket::UnconnectedState &&
+        audioRelaySocket->localPort() == audioRelayListenPort) {
+        return;
+    }
+
+    audioRelaySocket->close();
+    const bool bound = audioRelaySocket->bind(QHostAddress::AnyIPv4,
+                                              audioRelayListenPort,
+                                              QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
+    if (bound) {
+        qDebug() << "[AudioRelay] receive enabled on UDP port" << audioRelayListenPort;
+    } else {
+        qWarning() << "[AudioRelay] could not bind UDP port"
+                   << audioRelayListenPort
+                   << audioRelaySocket->errorString();
+    }
+}
+
+void YourClassName::sendAudioRelayFrame(const QByteArray &pcmData) {
+    if (!audioRelayTransmitEnabled ||
+        !audioRelaySocket ||
+        audioRelayHost.trimmed().isEmpty() ||
+        audioRelayPort == 0 ||
+        pcmData.isEmpty()) {
+        return;
+    }
+
+    QHostAddress targetAddress;
+    if (!targetAddress.setAddress(audioRelayHost.trimmed())) {
+        static QString lastInvalidHost;
+        if (lastInvalidHost != audioRelayHost) {
+            lastInvalidHost = audioRelayHost;
+            qWarning() << "[AudioRelay] target must be a numeric IP address:" << audioRelayHost;
+        }
+        return;
+    }
+
+    QByteArray datagram;
+    datagram.reserve(AUDIO_RELAY_HEADER_BYTES + pcmData.size());
+    datagram.append("FBA1", 4);
+    appendLe32(datagram, ++audioRelaySequence);
+    appendLe32(datagram, static_cast<quint32>(pcmData.size()));
+    datagram.append(pcmData);
+
+    audioRelaySocket->writeDatagram(datagram, targetAddress, audioRelayPort);
+}
+
+void YourClassName::receiveAudioRelayDatagrams() {
+    if (!audioRelayReceiveEnabled || !audioRelaySocket || !remoteAudioPlayer) {
+        return;
+    }
+
+    while (audioRelaySocket->hasPendingDatagrams()) {
+        const qint64 pendingSize = audioRelaySocket->pendingDatagramSize();
+        if (pendingSize < AUDIO_RELAY_HEADER_BYTES || pendingSize > 65507) {
+            QByteArray discard;
+            discard.resize(static_cast<int>((std::min)(pendingSize, qint64(65507))));
+            audioRelaySocket->readDatagram(discard.data(), discard.size());
+            continue;
+        }
+
+        QByteArray datagram;
+        datagram.resize(static_cast<int>(pendingSize));
+        audioRelaySocket->readDatagram(datagram.data(), datagram.size());
+
+        if (!datagram.startsWith("FBA1")) {
+            continue;
+        }
+
+        const quint32 payloadBytes = readLe32(datagram.constData() + 8);
+        if (payloadBytes == 0 ||
+            payloadBytes > static_cast<quint32>(datagram.size() - AUDIO_RELAY_HEADER_BYTES)) {
+            continue;
+        }
+
+        const QByteArray pcmData = datagram.mid(AUDIO_RELAY_HEADER_BYTES, static_cast<int>(payloadBytes));
+        remoteAudioPlayer->playPcmFrame(pcmData);
+    }
+}
+
+void YourClassName::updateAudioHttpStreamServer() {
+    if (!audioHttpServer) {
+        return;
+    }
+
+    if (!audioHttpStreamEnabled) {
+        if (audioHttpServer->isListening()) {
+            audioHttpServer->close();
+            qDebug() << "[AudioHTTP] stream server stopped";
+        }
+        for (QTcpSocket *client : std::as_const(audioHttpClients)) {
+            if (client) {
+                client->disconnectFromHost();
+                client->deleteLater();
+            }
+        }
+        audioHttpClients.clear();
+        return;
+    }
+
+    if (audioHttpServer->isListening() && audioHttpServer->serverPort() == audioHttpStreamPort) {
+        return;
+    }
+
+    for (QTcpSocket *client : std::as_const(audioHttpClients)) {
+        if (client) {
+            client->disconnectFromHost();
+            client->deleteLater();
+        }
+    }
+    audioHttpClients.clear();
+    audioHttpServer->close();
+
+    const bool listening = audioHttpServer->listen(QHostAddress::AnyIPv4, audioHttpStreamPort);
+    if (listening) {
+        qDebug() << "[AudioHTTP] VLC-compatible audio stream listening on"
+                 << QString("http://0.0.0.0:%1/audio.wav").arg(audioHttpStreamPort);
+    } else {
+        qWarning() << "[AudioHTTP] could not listen on port"
+                   << audioHttpStreamPort
+                   << audioHttpServer->errorString();
+    }
+}
+
+void YourClassName::acceptAudioHttpClient() {
+    if (!audioHttpServer) {
+        return;
+    }
+
+    while (QTcpSocket *client = audioHttpServer->nextPendingConnection()) {
+        audioHttpClients.append(client);
+        connect(client, &QTcpSocket::disconnected, this, [this, client]() {
+            removeAudioHttpClient(client);
+        });
+
+        QByteArray response;
+        response.append("HTTP/1.1 200 OK\r\n");
+        response.append("Content-Type: audio/wav\r\n");
+        response.append("Cache-Control: no-cache, no-store, must-revalidate\r\n");
+        response.append("Pragma: no-cache\r\n");
+        response.append("Connection: close\r\n");
+        response.append("\r\n");
+        response.append(streamingWavHeader());
+        client->write(response);
+        qDebug() << "[AudioHTTP] client connected"
+                 << client->peerAddress().toString()
+                 << "clients" << audioHttpClients.size();
+    }
+}
+
+void YourClassName::removeAudioHttpClient(QTcpSocket *client) {
+    if (!client) {
+        return;
+    }
+
+    audioHttpClients.removeAll(client);
+    client->deleteLater();
+    qDebug() << "[AudioHTTP] client disconnected"
+             << "clients" << audioHttpClients.size();
+}
+
+void YourClassName::sendAudioHttpFrame(const QByteArray &pcmData) {
+    if (!audioHttpStreamEnabled || audioHttpClients.isEmpty() || pcmData.isEmpty()) {
+        return;
+    }
+
+    for (int i = audioHttpClients.size() - 1; i >= 0; --i) {
+        QTcpSocket *client = audioHttpClients.at(i);
+        if (!client || client->state() != QAbstractSocket::ConnectedState) {
+            if (client) {
+                removeAudioHttpClient(client);
+            } else {
+                audioHttpClients.removeAt(i);
+            }
+            continue;
+        }
+
+        if (client->bytesToWrite() > AUDIO_HTTP_MAX_PENDING_BYTES) {
+            continue;
+        }
+        client->write(pcmData);
+    }
 }
 
 void YourClassName::processDigitalAudioFrame(const QByteArray &pcmData) {
@@ -4224,6 +4551,8 @@ void YourClassName::handlePlaybackAudioFrame(const QByteArray &pcmData) {
     processSstvAudioFrame(pcmData);
     processAptAudioFrame(pcmData);
     processWefaxAudioFrame(pcmData);
+    sendAudioRelayFrame(pcmData);
+    sendAudioHttpFrame(pcmData);
     if (remoteAudioPlayer) {
         remoteAudioPlayer->playPcmFrame(pcmData);
     }
@@ -4270,21 +4599,26 @@ void YourClassName::sendNetworkIqFrame(const QByteArray &iqData, double sampleRa
         return;
     }
 
+    const bool fullIqMode = isFullIqProcessingMode();
+    const qint64 pendingLimit = fullIqMode
+                                    ? NETWORK_IQ_MAX_PENDING_BYTES
+                                    : NETWORK_CHANNEL_IQ_LOW_LATENCY_PENDING_BYTES;
     const qint64 pendingBytes = networkController->pendingBytes();
-    if (pendingBytes > NETWORK_IQ_MAX_PENDING_BYTES) {
+    if (pendingBytes > pendingLimit) {
         ++networkIqFramesDropped;
         if (networkIqFramesDropped == 1 ||
             (networkIqFramesDropped % NETWORK_IQ_DROP_LOG_INTERVAL) == 0) {
-            qDebug() << "[NetworkIQ] dropping IQ frame because TCP queue is full"
+            qDebug() << "[NetworkIQ] dropping IQ frame because TCP queue is above low-latency limit"
                      << "dropped" << networkIqFramesDropped
                      << "pendingBytes" << pendingBytes
+                     << "pendingLimit" << pendingLimit
                      << "frameBytes" << iqData.size();
         }
         return;
     }
 
     QJsonObject frame;
-    frame["type"] = "iq";
+    frame["type"] = "iqbin";
     frame["sequence"] = QString::number(++networkIqFrameSequence);
     frame["sampleRate"] = sampleRate;
     frame["sourceSampleRate"] = pendingSettings.sampleRate;
@@ -4301,12 +4635,21 @@ void YourClassName::sendNetworkIqFrame(const QByteArray &iqData, double sampleRa
     frame["bandwidth"] = pendingSettings.bandwidth;
     frame["modulationType"] = pendingSettings.modulationType;
     frame["inputMode"] = isChannelIqProcessingMode() ? 0 : pendingSettings.inputMode;
-    frame["iq"] = QString::fromLatin1(iqData.toBase64());
+    frame["payloadEncoding"] = "raw";
 
-    networkController->sendControlCommand(frame);
+    networkController->sendBinaryCommand(frame, iqData);
 }
 
 void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
+    QByteArray iqBytes = QByteArray::fromBase64(frame.value("iq").toString().toLatin1());
+    handleNetworkIqPayload(frame, std::move(iqBytes));
+}
+
+void YourClassName::receiveNetworkIqFrameBinary(const QJsonObject &frame, const QByteArray &iqData) {
+    handleNetworkIqPayload(frame, iqData);
+}
+
+void YourClassName::handleNetworkIqPayload(const QJsonObject &frame, QByteArray iqBytes) {
     if (networkMode != NetworkMode::Client || !isClientIqProcessingMode()) {
         return;
     }
@@ -4337,7 +4680,6 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
         return;
     }
 
-    QByteArray iqBytes = QByteArray::fromBase64(frame.value("iq").toString().toLatin1());
     const int bytesPerFloat = channelizedFrame ? static_cast<int>(sizeof(qint16)) : 1;
     const int bytesPerIqSample = 2 * bytesPerFloat;
     if (iqBytes.size() < bytesPerIqSample) {
@@ -4380,6 +4722,11 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
             audioProcessor->configure(iqSettings);
         }
     } else {
+        const bool protectLocalControlSettings =
+            networkController &&
+            networkController->clientHasControl() &&
+            networkClientSettingsGuardTimer.isValid() &&
+            networkClientSettingsGuardTimer.elapsed() < NETWORK_CLIENT_SETTINGS_GUARD_MS;
         bool processingSettingsChanged = false;
         auto updateDouble = [&processingSettingsChanged](double &target, double value) {
             if (std::abs(target - value) > 0.5) {
@@ -4394,15 +4741,24 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
             }
         };
 
-        updateDouble(pendingSettings.sampleRate, iqSettings.sampleRate);
-        updateDouble(pendingSettings.centerFrequency, iqSettings.centerFrequency);
-        updateDouble(pendingSettings.actualFrequency, iqSettings.actualFrequency);
-        updateDouble(pendingSettings.listeningFrequency, iqSettings.listeningFrequency);
-        updateDouble(pendingSettings.bandwidth, iqSettings.bandwidth);
-        updateInt(pendingSettings.modulationType, iqSettings.modulationType);
-        updateInt(pendingSettings.inputMode, iqSettings.inputMode);
+        if (!protectLocalControlSettings) {
+            updateDouble(pendingSettings.sampleRate, iqSettings.sampleRate);
+            updateDouble(pendingSettings.centerFrequency, iqSettings.centerFrequency);
+            updateDouble(pendingSettings.actualFrequency, iqSettings.actualFrequency);
+            updateDouble(pendingSettings.listeningFrequency, iqSettings.listeningFrequency);
+            updateDouble(pendingSettings.bandwidth, iqSettings.bandwidth);
+            updateInt(pendingSettings.modulationType, iqSettings.modulationType);
+            updateInt(pendingSettings.inputMode, iqSettings.inputMode);
+        } else if (fobosVerboseLoggingEnabled()) {
+            qDebug() << "[NetworkIQ] preserving local controller tuning while settings command settles"
+                     << "frameCenter" << iqSettings.centerFrequency
+                     << "frameListening" << iqSettings.listeningFrequency
+                     << "localCenter" << pendingSettings.centerFrequency
+                     << "localListening" << pendingSettings.listeningFrequency
+                     << "guardMs" << networkClientSettingsGuardTimer.elapsed();
+        }
 
-        if (processingSettingsChanged) {
+        if (processingSettingsChanged && !protectLocalControlSettings) {
             publishSettingsToGlobals();
             settingRange();
         }
@@ -4425,7 +4781,7 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
                  << "center" << iqSettings.centerFrequency
                  << "listening" << iqSettings.listeningFrequency
                  << "inputMode" << iqSettings.inputMode;
-        resetNetworkIqReceptionState(false, false, pendingSettings.audioEnabled);
+        resetNetworkIqReceptionState(false, false, pendingSettings.audioEnabled && !isFullIqProcessingMode());
         networkIqStreamMetadataValid = true;
         networkIqStreamWasChannelized = channelizedFrame;
         networkIqStreamSampleRate = frameSampleRate;
@@ -4448,8 +4804,9 @@ void YourClassName::receiveNetworkIqFrame(const QJsonObject &frame) {
         }
     }
 
+    const bool queueClientAudioIq = pendingSettings.audioEnabled && !isFullIqProcessingMode();
     IqBuffer::setSampleRateEstimate(frameSampleRate);
-    IqBuffer::publish(floatSamples.data(), floatSamples.size(), pendingSettings.audioEnabled);
+    IqBuffer::publish(floatSamples.data(), floatSamples.size(), queueClientAudioIq);
     if (isFullIqProcessingMode() && updateTimer && !updateTimer->isActive()) {
         qDebug() << "[NetworkIQ] restarting client spectrum timer after IQ frame";
         updateTimer->start();
@@ -4528,12 +4885,22 @@ void YourClassName::onAudioEnabledChanged(bool checked) {
 
         if (isClientIqProcessingMode()) {
             if (checked) {
-                IqBuffer::clear();
-                pendingNetworkAudioStartAfterIqPrebuffer = true;
+                if (isFullIqProcessingMode()) {
+                    pendingNetworkAudioStartAfterIqPrebuffer = false;
+                    if (audioProcessor) {
+                        audioProcessor->stopDemodulation();
+                    }
+                } else {
+                    IqBuffer::clear();
+                    pendingNetworkAudioStartAfterIqPrebuffer = true;
+                }
             } else {
                 pendingNetworkAudioStartAfterIqPrebuffer = false;
                 if (audioProcessor) {
                     audioProcessor->stopDemodulation();
+                }
+                if (remoteAudioPlayer) {
+                    remoteAudioPlayer->stop();
                 }
             }
         } else {
@@ -5235,6 +5602,7 @@ void YourClassName::wheelEvent(QWheelEvent *event) {
 }
 
 void YourClassName::populateAudioDevices() {
+#ifdef _WIN32
     UINT numDevices = waveOutGetNumDevs();
     qDebug() << "Number of waveOut devices found:" << numDevices;
 
@@ -5246,6 +5614,22 @@ void YourClassName::populateAudioDevices() {
             audioDeviceComboBox->addItem(deviceName, QVariant(i));
         }
     }
+#elif defined(FOBOSAPP_HAS_QT_AUDIO)
+    const QList<QAudioDeviceInfo> devices = QAudioDeviceInfo::availableDevices(QAudio::AudioOutput);
+    qDebug() << "Number of Qt audio output devices found:" << devices.size();
+    if (devices.isEmpty()) {
+        audioDeviceComboBox->addItem(QStringLiteral("Default audio output"), QVariant(0));
+        return;
+    }
+    for (int i = 0; i < devices.size(); ++i) {
+        const QString deviceName = devices.at(i).deviceName();
+        qDebug() << "Audio device" << i << ":" << deviceName;
+        audioDeviceComboBox->addItem(deviceName, QVariant(i));
+    }
+#else
+    qDebug() << "Native audio device enumeration is not implemented on this platform yet.";
+    audioDeviceComboBox->addItem(QStringLiteral("Default audio output"), QVariant(0));
+#endif
 }
 
 void YourClassName::onAudioDeviceChanged(int index) {
@@ -5338,6 +5722,30 @@ void YourClassName::openNetworkSettingsDialog() {
     QCheckBox *serverDisableLocalUiCheck = new QCheckBox("Disable local visual/audio on server when streaming is implemented", &dialog);
     serverDisableLocalUiCheck->setChecked(serverDisableLocalVisualAudio);
 
+    QCheckBox *audioRelayTransmitCheck = new QCheckBox("Send ready audio by UDP", &dialog);
+    audioRelayTransmitCheck->setChecked(audioRelayTransmitEnabled);
+
+    QLineEdit *audioRelayHostEdit = new QLineEdit(audioRelayHost, &dialog);
+    audioRelayHostEdit->setPlaceholderText("Target IP address");
+
+    QSpinBox *audioRelayPortSpin = new QSpinBox(&dialog);
+    audioRelayPortSpin->setRange(1, 65535);
+    audioRelayPortSpin->setValue(audioRelayPort);
+
+    QCheckBox *audioRelayReceiveCheck = new QCheckBox("Receive ready audio by UDP", &dialog);
+    audioRelayReceiveCheck->setChecked(audioRelayReceiveEnabled);
+
+    QSpinBox *audioRelayListenPortSpin = new QSpinBox(&dialog);
+    audioRelayListenPortSpin->setRange(1, 65535);
+    audioRelayListenPortSpin->setValue(audioRelayListenPort);
+
+    QCheckBox *audioHttpStreamCheck = new QCheckBox("Serve VLC-compatible HTTP/WAV audio", &dialog);
+    audioHttpStreamCheck->setChecked(audioHttpStreamEnabled);
+
+    QSpinBox *audioHttpStreamPortSpin = new QSpinBox(&dialog);
+    audioHttpStreamPortSpin->setRange(1, 65535);
+    audioHttpStreamPortSpin->setValue(audioHttpStreamPort);
+
     QLabel *statusLabel = new QLabel(networkController ? networkController->statusText() : QString("Network controller unavailable"), &dialog);
     statusLabel->setWordWrap(true);
 
@@ -5347,6 +5755,13 @@ void YourClassName::openNetworkSettingsDialog() {
     formLayout->addRow("Bind address:", bindAddressEdit);
     formLayout->addRow("Control port:", portSpin);
     formLayout->addRow("", serverDisableLocalUiCheck);
+    formLayout->addRow("Audio relay TX:", audioRelayTransmitCheck);
+    formLayout->addRow("Relay target IP:", audioRelayHostEdit);
+    formLayout->addRow("Relay target port:", audioRelayPortSpin);
+    formLayout->addRow("Audio relay RX:", audioRelayReceiveCheck);
+    formLayout->addRow("Relay listen port:", audioRelayListenPortSpin);
+    formLayout->addRow("VLC HTTP audio:", audioHttpStreamCheck);
+    formLayout->addRow("HTTP audio port:", audioHttpStreamPortSpin);
 
     QPushButton *testButton = new QPushButton("Apply / Test Channel", &dialog);
     QPushButton *requestControlButton = new QPushButton("Request Control", &dialog);
@@ -5371,9 +5786,16 @@ void YourClassName::openNetworkSettingsDialog() {
         processingCombo->setEnabled(selectedMode != NetworkMode::Disabled);
         portSpin->setEnabled(selectedMode != NetworkMode::Disabled);
         requestControlButton->setEnabled(selectedMode == NetworkMode::Client);
+        audioRelayHostEdit->setEnabled(audioRelayTransmitCheck->isChecked());
+        audioRelayPortSpin->setEnabled(audioRelayTransmitCheck->isChecked());
+        audioRelayListenPortSpin->setEnabled(audioRelayReceiveCheck->isChecked());
+        audioHttpStreamPortSpin->setEnabled(audioHttpStreamCheck->isChecked());
         testButton->setText(selectedMode == NetworkMode::Disabled ? "Apply" : "Apply / Test Channel");
     };
     connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, updateFieldState);
+    connect(audioRelayTransmitCheck, &QCheckBox::toggled, &dialog, updateFieldState);
+    connect(audioRelayReceiveCheck, &QCheckBox::toggled, &dialog, updateFieldState);
+    connect(audioHttpStreamCheck, &QCheckBox::toggled, &dialog, updateFieldState);
     updateFieldState();
 
     QMetaObject::Connection statusConnection;
@@ -5401,6 +5823,17 @@ void YourClassName::openNetworkSettingsDialog() {
         networkControlPort = static_cast<quint16>(portSpin->value());
         serverDisableLocalVisualAudio = serverDisableLocalUiCheck->isChecked();
         networkProcessingMode = static_cast<NetworkProcessingMode>(processingCombo->currentData().toInt());
+        audioRelayTransmitEnabled = audioRelayTransmitCheck->isChecked();
+        audioRelayHost = audioRelayHostEdit->text().trimmed().isEmpty()
+                             ? QString("127.0.0.1")
+                             : audioRelayHostEdit->text().trimmed();
+        audioRelayPort = static_cast<quint16>(audioRelayPortSpin->value());
+        audioRelayReceiveEnabled = audioRelayReceiveCheck->isChecked();
+        audioRelayListenPort = static_cast<quint16>(audioRelayListenPortSpin->value());
+        audioHttpStreamEnabled = audioHttpStreamCheck->isChecked();
+        audioHttpStreamPort = static_cast<quint16>(audioHttpStreamPortSpin->value());
+        updateAudioRelaySocket();
+        updateAudioHttpStreamServer();
         if (isChannelIqRecordingActive() &&
             networkMode != NetworkMode::Disabled &&
             isFullIqProcessingMode()) {
@@ -5848,7 +6281,7 @@ void YourClassName::onSampleRateChanged(int index) {
 
     if (isNetworkClientMode()) {
         if (isClientIqProcessingMode()) {
-            resetNetworkIqReceptionState(false, false, pendingSettings.audioEnabled);
+            resetNetworkIqReceptionState(false, false, pendingSettings.audioEnabled && !isFullIqProcessingMode());
         }
         scheduleRemoteSettingsCommand();
         return;
@@ -6397,8 +6830,9 @@ void YourClassName::startFobosProcessing() {
         serverDisableLocalVisualAudio &&
         networkController &&
         networkController->isControlReady();
-    const bool serverLocalAudioEnabled = pendingSettings.audioEnabled && !serverIqStreaming;
-    const bool queueAudioBlocks = !serverIqStreaming;
+    const bool serverAudioStreamingForFullIq = serverFullIqStreaming && pendingSettings.audioEnabled;
+    const bool serverLocalAudioEnabled = pendingSettings.audioEnabled && (!serverIqStreaming || serverAudioStreamingForFullIq);
+    const bool queueAudioBlocks = !serverIqStreaming || serverAudioStreamingForFullIq;
     if (audioProcessor) {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
@@ -6720,7 +7154,9 @@ int main(int argc, char *argv[]) {
     window.show(); 
 
     qDebug() << "App started";
+#ifdef _WIN32
         SetConsoleOutputCP(CP_UTF8);  // Устанавливаем UTF-8 для вывода
         SetConsoleCP(CP_UTF8);        // Устанавливаем UTF-8 для ввода
-        return app.exec();
+#endif
+    return app.exec();
 }

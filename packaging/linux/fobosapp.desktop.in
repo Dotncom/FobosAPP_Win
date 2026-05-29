@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FobosAPP
+Comment=RigExpert Fobos SDR receiver
+Exec=FobosAPP
+Icon=fobosapp
+Terminal=false
+Categories=AudioVideo;HamRadio;Science;

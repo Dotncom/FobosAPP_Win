@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <limits>
 #include <vector>
+#ifdef _WIN32
 #include <Windows.h>
+#endif
 
 #define FLOATS_PER_IQ_SAMPLE 2
 
@@ -343,7 +345,9 @@ void DataProcessor::startProcessing(void *device,
 }
 
 void DataProcessor::run() {
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] run enter";
     }

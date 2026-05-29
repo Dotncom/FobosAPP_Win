@@ -56,10 +56,10 @@ toolchain.cmake
 
 # Backups and drafts
 _stable_backups/
-git/
-fork winapi/
-shaders/
-fobos/
+/git/
+/fork winapi/
+/shaders/
+/fobos/
 
 # Build/output
 build/
@@ -76,8 +76,10 @@ libusb-1.0.27/
 .codex_libfobos/
 .codex_sdrpp/
 .codex_upstream/
-fobos_agile/
-old/
+third_party/fobos-linux/
+third_party/src/
+/fobos_agile/
+/old/
 
 # unused source
 src/udp_sender.cpp
@@ -86,6 +88,6 @@ src/ringbuffer.cpp
 src/ringbuffer.h
 
 # unused folders
-fobos/
-shaders/
+/fobos/
+/shaders/
 

@@ -25,8 +25,10 @@
 #include <string>
 #include <mutex>
 #include <thread>
+#ifdef _WIN32
 #include <windows.h>
 #include <mmsystem.h>
+#endif
 #include "radiosettings.h"
 
 //#include <QAudioDeviceInfo>
@@ -89,13 +91,17 @@ private:
     std::vector<short> waveBuffers[NUM_BUFFERS];
     std::vector<short> audioBuffer;
     size_t audioBufferReadOffset = 0;
+#ifdef _WIN32
     WAVEHDR waveHdrs[NUM_BUFFERS];
+#endif
     std::atomic<bool> bufferReady[NUM_BUFFERS];
     std::atomic<int> currentBufferIndex = 0;
     std::atomic<float> outputVolume = 1.0f;
     std::condition_variable cv;
     std::mutex audioMutex;
+#ifdef _WIN32
     std::mutex waveOutMutex;
+#endif
     mutable std::mutex settingsMutex;
     std::thread sdrWorker;
     std::thread audioWorker;
@@ -104,8 +110,10 @@ private:
     QWaitCondition condition;
     QTimer *update1Timer;
 
+#ifdef _WIN32
     WAVEFORMATEX format;
-    HWAVEOUT hWaveOut;
+    HWAVEOUT hWaveOut = nullptr;
+#endif
     bool waveHeadersPrepared = false;
     int openedAudioDeviceID = -1;
     int selectedAudioDeviceID = 0;
@@ -143,8 +151,10 @@ private:
     //UdpSender *udpSender;
 
 
+#ifdef _WIN32
     static void CALLBACK WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance,
                                          DWORD_PTR dwParam1, DWORD_PTR dwParam2);
+#endif
 
 };
 

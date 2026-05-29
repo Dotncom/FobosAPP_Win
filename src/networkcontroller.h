@@ -42,6 +42,7 @@ public:
     void startServer(const QString &bindAddress, quint16 port);
     void testClientConnection(const QString &serverAddress, quint16 port);
     bool sendControlCommand(const QJsonObject &command);
+    bool sendBinaryCommand(const QJsonObject &command, const QByteArray &payload);
     bool sendControlCommandToPeer(const QString &peerId, const QJsonObject &command);
     bool sendControlCommandToController(const QJsonObject &command);
     bool setControllerPeer(const QString &peerId);
@@ -53,6 +54,7 @@ signals:
     void channelReady(const QString &message);
     void channelError(const QString &message);
     void controlCommandReceived(const QJsonObject &command);
+    void binaryCommandReceived(const QJsonObject &command, const QByteArray &payload);
 
 private:
     void setStatus(const QString &status);
@@ -64,6 +66,7 @@ private:
     void sendProtocolLine(QTcpSocket *socket, const QByteArray &line);
     QTcpSocket *activeSocket() const;
     bool sendJsonToSocket(QTcpSocket *socket, const QJsonObject &command);
+    bool sendBinaryToSocket(QTcpSocket *socket, const QJsonObject &command, const QByteArray &payload);
     QTcpSocket *peerForId(const QString &peerId) const;
     QString peerId(QTcpSocket *socket) const;
     QString peerLabel(QTcpSocket *socket) const;
@@ -75,6 +78,7 @@ private:
     void handleConnectionLost(const QString &message);
     void processSocketData(QTcpSocket *socket, QByteArray &buffer);
     void processLine(QTcpSocket *socket, const QByteArray &line);
+    bool deliverPendingBinaryPayload(QTcpSocket *socket, QByteArray &buffer);
 
     QTcpServer *server = nullptr;
     QTcpSocket *clientSocket = nullptr;
@@ -82,6 +86,8 @@ private:
     QVector<QTcpSocket*> peerSockets;
     QSet<QTcpSocket*> readyPeerSockets;
     QHash<QTcpSocket*, QByteArray> peerReadBuffers;
+    QHash<QTcpSocket*, QJsonObject> peerPendingBinaryCommands;
+    QHash<QTcpSocket*, qint64> peerPendingBinaryBytes;
     QHash<QTcpSocket*, QString> peerIds;
     QHash<QTcpSocket*, QString> peerLabels;
     QHash<QTcpSocket*, QString> peerPriorityKeys;
@@ -91,6 +97,8 @@ private:
     QElapsedTimer lastMessageTimer;
     QHash<QTcpSocket*, QElapsedTimer> peerLastMessageTimers;
     QByteArray clientReadBuffer;
+    QJsonObject clientPendingBinaryCommand;
+    qint64 clientPendingBinaryBytes = 0;
     NetworkMode currentMode = NetworkMode::Disabled;
     QString currentStatus = "Network disabled";
     bool controlReady = false;
