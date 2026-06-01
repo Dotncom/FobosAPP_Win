@@ -33,6 +33,62 @@ public final class SpectrumView extends View {
             Color.rgb(117, 0, 0)
     };
 
+    private static final class BandMarker {
+        final double startHz;
+        final double endHz;
+        final String label;
+        final boolean amateur;
+
+        BandMarker(String label, double startMhz, double endMhz, boolean amateur) {
+            this.label = label;
+            this.startHz = startMhz * 1_000_000.0;
+            this.endHz = endMhz * 1_000_000.0;
+            this.amateur = amateur;
+        }
+    }
+
+    private static final BandMarker[] BAND_MARKERS = new BandMarker[] {
+            new BandMarker("MW BC", 0.5265, 1.705, false),
+            new BandMarker("SW 49m", 5.9, 6.2, false),
+            new BandMarker("SW 41m", 7.2, 7.45, false),
+            new BandMarker("SW 31m", 9.4, 9.9, false),
+            new BandMarker("SW 25m", 11.6, 12.1, false),
+            new BandMarker("SW 19m", 15.1, 15.8, false),
+            new BandMarker("CB", 26.965, 27.405, false),
+            new BandMarker("FM BC", 87.5, 108.0, false),
+            new BandMarker("Air", 118.0, 137.0, false),
+            new BandMarker("WX Sat", 137.0, 138.0, false),
+            new BandMarker("Marine", 156.0, 162.05, false),
+            new BandMarker("UHF Satcom", 240.0, 270.0, false),
+            new BandMarker("TETRA", 380.0, 430.0, false),
+            new BandMarker("PMR446", 446.0, 446.2, false),
+            new BandMarker("ADS-B", 1089.5, 1090.5, false),
+            new BandMarker("L-band Sat", 1525.0, 1660.5, false),
+            new BandMarker("GNSS L1", 1559.0, 1610.0, false),
+            new BandMarker("ISM 2.4", 2400.0, 2483.5, false),
+            new BandMarker("FPV 5.8", 5650.0, 5925.0, false),
+
+            new BandMarker("2200m", 0.1357, 0.1378, true),
+            new BandMarker("630m", 0.472, 0.479, true),
+            new BandMarker("160m", 1.81, 2.0, true),
+            new BandMarker("80m", 3.5, 3.8, true),
+            new BandMarker("60m", 5.3515, 5.3665, true),
+            new BandMarker("40m", 7.0, 7.2, true),
+            new BandMarker("30m", 10.1, 10.15, true),
+            new BandMarker("20m", 14.0, 14.35, true),
+            new BandMarker("17m", 18.068, 18.168, true),
+            new BandMarker("15m", 21.0, 21.45, true),
+            new BandMarker("12m", 24.89, 24.99, true),
+            new BandMarker("10m", 28.0, 29.7, true),
+            new BandMarker("6m", 50.0, 52.0, true),
+            new BandMarker("4m", 70.0, 70.5, true),
+            new BandMarker("2m", 144.0, 146.0, true),
+            new BandMarker("70cm", 430.0, 440.0, true),
+            new BandMarker("23cm", 1240.0, 1300.0, true),
+            new BandMarker("13cm", 2300.0, 2450.0, true),
+            new BandMarker("6cm", 5650.0, 5850.0, true)
+    };
+
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private double[] frequencies = new double[0];
     private float[] magnitudes = new float[0];
@@ -57,6 +113,8 @@ public final class SpectrumView extends View {
     private boolean gestureMoved = false;
     private boolean pinching = false;
     private boolean userZoomed = false;
+    private boolean showGeneralBandMarkers = false;
+    private boolean showAmateurBandMarkers = false;
 
     public SpectrumView(Context context) {
         super(context);
@@ -80,6 +138,16 @@ public final class SpectrumView extends View {
         levelMax = maxLevel;
         updateWaterfallRow();
         invalidate();
+    }
+
+    public synchronized void setBandMarkersEnabled(boolean generalEnabled, boolean amateurEnabled) {
+        showGeneralBandMarkers = generalEnabled;
+        showAmateurBandMarkers = amateurEnabled;
+        invalidate();
+    }
+
+    public synchronized double visibleSpanHz() {
+        return Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
     }
 
     public synchronized void setSpectrum(double[] newFrequencies,
@@ -215,6 +283,8 @@ public final class SpectrumView extends View {
         paint.setColor(Color.rgb(15, 21, 27));
         canvas.drawRect(0, 0, width, spectrumHeight, paint);
 
+        drawBandMarkers(canvas, width, spectrumHeight);
+
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(1.0f);
         paint.setColor(Color.rgb(38, 50, 58));
@@ -249,6 +319,66 @@ public final class SpectrumView extends View {
             previousX = x;
             previousY = y;
             havePrevious = true;
+        }
+    }
+
+    private void drawBandMarkers(Canvas canvas, int width, int spectrumHeight) {
+        if ((!showGeneralBandMarkers && !showAmateurBandMarkers) ||
+                visibleMaxFrequency <= visibleMinFrequency ||
+                width <= 1 ||
+                spectrumHeight <= 1) {
+            return;
+        }
+
+        paint.setTextSize(17.0f);
+        paint.setStyle(Paint.Style.FILL);
+        for (boolean amateurLayer : new boolean[] {false, true}) {
+            if (amateurLayer && !showAmateurBandMarkers) {
+                continue;
+            }
+            if (!amateurLayer && !showGeneralBandMarkers) {
+                continue;
+            }
+            int fill = amateurLayer ? Color.argb(42, 255, 198, 66)
+                                    : Color.argb(34, 76, 162, 255);
+            int edge = amateurLayer ? Color.argb(120, 255, 220, 96)
+                                    : Color.argb(96, 112, 196, 255);
+            int text = amateurLayer ? Color.argb(220, 255, 232, 150)
+                                    : Color.argb(205, 176, 224, 255);
+
+            for (BandMarker marker : BAND_MARKERS) {
+                if (marker.amateur != amateurLayer ||
+                        marker.endHz < visibleMinFrequency ||
+                        marker.startHz > visibleMaxFrequency) {
+                    continue;
+                }
+                double clippedStart = Math.max(marker.startHz, visibleMinFrequency);
+                double clippedEnd = Math.min(marker.endHz, visibleMaxFrequency);
+                int x1 = Math.max(0, Math.min(width - 1, (int) Math.floor(frequencyToX(clippedStart, width))));
+                int x2 = Math.max(0, Math.min(width - 1, (int) Math.ceil(frequencyToX(clippedEnd, width))));
+                if (x2 < x1) {
+                    int temp = x1;
+                    x1 = x2;
+                    x2 = temp;
+                }
+                int markerWidth = Math.max(1, x2 - x1);
+                paint.setColor(fill);
+                paint.setStyle(Paint.Style.FILL);
+                canvas.drawRect(x1, 0, x1 + markerWidth, spectrumHeight, paint);
+                paint.setColor(edge);
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(1.0f);
+                canvas.drawLine(x1, 0, x1, spectrumHeight, paint);
+                if (markerWidth > 2) {
+                    canvas.drawLine(x1 + markerWidth, 0, x1 + markerWidth, spectrumHeight, paint);
+                }
+                if (markerWidth >= dp(44)) {
+                    paint.setColor(text);
+                    paint.setStyle(Paint.Style.FILL);
+                    String label = ellipsize(marker.label, markerWidth - dp(6));
+                    canvas.drawText(label, x1 + dp(3), dp(17), paint);
+                }
+            }
         }
     }
 
@@ -435,6 +565,18 @@ public final class SpectrumView extends View {
             return String.format(Locale.US, "%.4f", mhz);
         }
         return String.format(Locale.US, "%.3f", mhz);
+    }
+
+    private String ellipsize(String label, int maxWidth) {
+        if (label == null || label.isEmpty() || paint.measureText(label) <= maxWidth) {
+            return label == null ? "" : label;
+        }
+        String ellipsis = "...";
+        int end = label.length();
+        while (end > 0 && paint.measureText(label.substring(0, end) + ellipsis) > maxWidth) {
+            --end;
+        }
+        return end <= 0 ? "" : label.substring(0, end) + ellipsis;
     }
 
     private int frequencyScaleHeight() {

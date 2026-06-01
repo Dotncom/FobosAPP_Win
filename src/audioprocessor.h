@@ -52,6 +52,7 @@ public:
     explicit AudioProcessor(QObject *parent = nullptr);
     ~AudioProcessor();
     void configure(const RadioSettings &settings);
+    void resetHfNoiseCancelState();
     void setAudioDevice(int deviceID);
     void setLocalPlaybackEnabled(bool enabled);
     void decimateIQ(    const std::vector<std::complex<float>>& inputIQ, std::vector<std::complex<float>>& outputIQ, int decimationFactor);
@@ -97,6 +98,7 @@ private:
     std::atomic<bool> bufferReady[NUM_BUFFERS];
     std::atomic<int> currentBufferIndex = 0;
     std::atomic<float> outputVolume = 1.0f;
+    std::atomic<bool> hfNoiseCancelResetRequested = false;
     std::condition_variable cv;
     std::mutex audioMutex;
 #ifdef _WIN32
@@ -139,6 +141,8 @@ private:
     double cwTonePhase = 0.0;
     float amDcEstimate = 0.0f;
     float amAgcLevel = 0.05f;
+    std::complex<float> hfNoiseCancelCoeff = {0.0f, 0.0f};
+    std::complex<float> hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
 
 	QByteArray byteArray;
     QString audioDeviceName;

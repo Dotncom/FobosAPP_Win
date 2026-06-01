@@ -1,5 +1,55 @@
 # Changelog
 
+## 3.5 - 2026-06-01
+
+### Added
+
+- Added Raspberry Pi/Linux network-server and client hardening around high
+  sample-rate Fobos operation, including binary spectrum frames, ready-audio
+  relay, and VLC-compatible HTTP/WAV audio streaming.
+- Added an Android network client with spectrum/waterfall display, audio
+  playback, zoom/pan, tap-to-tune, remote setting controls, preset editor, and
+  optional band-marker overlays.
+- Added desktop and Android fine-tuning controls, including a horizontal
+  mouse-wheel scale mode and an alternate dial mode on desktop.
+- Added editable frequency presets and editable spectrum band markers for
+  general ranges and amateur/HAM ranges.
+- Added collapsible desktop control panels and a compact band-marker display
+  mode that draws markers in the lower graph strip instead of tinting the full
+  spectrum.
+- Added initial Fobos SDR agile compatibility and scan-range UI preparation.
+- Added HF1/HF2 noise-cancel laboratory controls and reference spectrum overlay
+  tools for local-interference experiments.
+
+### Changed
+
+- Reworked the desktop control layout to reduce vertical space, move less-used
+  options into the settings dialog, and add English/Ukrainian UI text loading.
+- Improved network command reliability for Android and desktop clients,
+  including setting retransmission/debouncing and safer controller/observer
+  state updates.
+- Improved waterfall persistence and resize behavior so display-history is not
+  cleared during routine UI layout changes.
+- Improved Linux/Raspberry Pi packaging so vendored patched libfobos sources are
+  used instead of silently cloning upstream libraries.
+
+### Fixed
+
+- Fixed Android HF input ordering and direct-sampling tuning synchronization.
+- Fixed server/client priority transfer and several network disconnect/restart
+  edge cases.
+- Fixed client-side frequency and listening-frequency sync in Full IQ and
+  server-side spectrum modes.
+- Fixed desktop USB/LSB remote display behavior and direct-sampling spectrum
+  layout issues found during network testing.
+
+### Known Issues
+
+- DMR remains a beta sync/activity monitor, not a complete DMR voice decoder.
+- Video/image modes remain beta-quality and still need real-signal validation.
+- Android is still network-client focused; direct Android USB/OTG receiver
+  operation is prepared for future work but not production-ready.
+
 ## 3.2.1 - 2026-05-29
 
 ### Added

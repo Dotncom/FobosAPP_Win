@@ -54,7 +54,8 @@ Copy-Item -LiteralPath $QWindows -Destination (Join-Path $DeployPath "platforms\
 $DocFiles = @(
     "README.md",
     "CHANGELOG.md",
-    "THIRD_PARTY_LICENSES.txt"
+    "THIRD_PARTY_LICENSES.txt",
+    "translations.json"
 )
 
 foreach ($DocFile in $DocFiles) {

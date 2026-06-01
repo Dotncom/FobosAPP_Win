@@ -29,17 +29,20 @@ public:
 signals:
     void scaleChanged(int delta);
     void tuneContextRequested(double frequency, const QPoint &globalPos);
+    void autoTuneRequested(double frequency);
 protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
 	void wheelEvent(QWheelEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
 private:
     void ensureLineBuffer();
     void resetWaterfallTexture(int w, int h);
     void resizeWaterfallTexturePreserve(int w, int h);
     double frequencyAtX(int x) const;
+    double signalCenterNearFrequency(double frequency);
     QMutex mutex;
 	QOpenGLBuffer waterfallVbo;
     GLuint waterfallTexture;

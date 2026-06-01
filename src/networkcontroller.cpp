@@ -768,7 +768,7 @@ void NetworkController::processLine(QTcpSocket *socket, const QByteArray &line) 
     }
 
     QJsonObject command = document.object();
-    if (command.value("type").toString() == QStringLiteral("iqbin")) {
+    if (command.contains("payloadBytes")) {
         bool ok = false;
         const qint64 payloadBytes = command.value("payloadBytes").toVariant().toLongLong(&ok);
         if (!ok || payloadBytes <= 0 || payloadBytes > (512LL * 1024LL * 1024LL)) {

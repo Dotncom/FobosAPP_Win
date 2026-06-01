@@ -19,6 +19,7 @@ final class RadioSettings {
     static final int INPUT_HF_COMBINED = 1;
     static final int INPUT_HF1 = 2;
     static final int INPUT_HF2 = 3;
+    static final int INPUT_HF_NOISE_CANCEL = 4;
     private static final double DIRECT_MIN_FREQUENCY = 1.0;
 
     int deviceIndex = 0;
@@ -35,6 +36,11 @@ final class RadioSettings {
     int vgaGain = 3;
     double audioLowPassHz = 0.0;
     double audioHighPassHz = 0.0;
+    double hfNoiseCancelDepth = 1.0;
+    double hfNoiseCancelRefGainDb = 0.0;
+    double hfNoiseCancelRefDelayNs = 0.0;
+    double hfNoiseCancelRefTiltDb = 0.0;
+    boolean hfNoiseCancelFreeze = false;
     boolean audioEnabled = true;
     boolean syncEnabled = false;
     int gpoValue = 0;
@@ -56,6 +62,11 @@ final class RadioSettings {
         json.put("vgaGain", vgaGain);
         json.put("audioLowPassHz", audioLowPassHz);
         json.put("audioHighPassHz", audioHighPassHz);
+        json.put("hfNoiseCancelDepth", hfNoiseCancelDepth);
+        json.put("hfNoiseCancelRefGainDb", hfNoiseCancelRefGainDb);
+        json.put("hfNoiseCancelRefDelayNs", hfNoiseCancelRefDelayNs);
+        json.put("hfNoiseCancelRefTiltDb", hfNoiseCancelRefTiltDb);
+        json.put("hfNoiseCancelFreeze", hfNoiseCancelFreeze);
         json.put("audioEnabled", audioEnabled);
         json.put("syncEnabled", syncEnabled);
         json.put("gpoValue", gpoValue);
@@ -81,6 +92,15 @@ final class RadioSettings {
         vgaGain = json.optInt("vgaGain", vgaGain);
         audioLowPassHz = json.optDouble("audioLowPassHz", audioLowPassHz);
         audioHighPassHz = json.optDouble("audioHighPassHz", audioHighPassHz);
+        hfNoiseCancelDepth = clamp(json.optDouble("hfNoiseCancelDepth", hfNoiseCancelDepth),
+                hfNoiseCancelDepth, -2.0, 2.0);
+        hfNoiseCancelRefGainDb = clamp(json.optDouble("hfNoiseCancelRefGainDb", hfNoiseCancelRefGainDb),
+                hfNoiseCancelRefGainDb, -40.0, 40.0);
+        hfNoiseCancelRefDelayNs = clamp(json.optDouble("hfNoiseCancelRefDelayNs", hfNoiseCancelRefDelayNs),
+                hfNoiseCancelRefDelayNs, -2000.0, 2000.0);
+        hfNoiseCancelRefTiltDb = clamp(json.optDouble("hfNoiseCancelRefTiltDb", hfNoiseCancelRefTiltDb),
+                hfNoiseCancelRefTiltDb, -30.0, 30.0);
+        hfNoiseCancelFreeze = json.optBoolean("hfNoiseCancelFreeze", hfNoiseCancelFreeze);
         audioEnabled = json.optBoolean("audioEnabled", audioEnabled);
         syncEnabled = json.optBoolean("syncEnabled", syncEnabled);
         gpoValue = json.optInt("gpoValue", gpoValue);
@@ -156,5 +176,12 @@ final class RadioSettings {
             return inputMode == INPUT_HF_COMBINED ? 0.0 : 1_250_000.0;
         }
         return Math.max(min, Math.min(max, frequencyHz));
+    }
+
+    private static double clamp(double value, double fallback, double min, double max) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return fallback;
+        }
+        return Math.max(min, Math.min(max, value));
     }
 }

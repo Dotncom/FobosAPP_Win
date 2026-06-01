@@ -1,10 +1,10 @@
 # FobosAPP
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
-The current packaged release is Windows-first, while the codebase has started
-moving toward Linux, Raspberry Pi, and Android network-client support. Version
-3.2 beta keeps the stable real-device, network, and video/image work from the
-2.x line, adds the first DMR laboratory monitoring tools, and adds the first
+The current packaged release is Windows-first, with active Linux/Raspberry Pi
+and Android network-client support work. Version 3.5 keeps the stable
+real-device, network, and video/image work from the 2.x line, adds the first DMR
+laboratory monitoring tools, expands Raspberry Pi/network operation, and adds a
 usable Android remote client.
 
 ## Windows Release Package
@@ -176,15 +176,16 @@ HTTP WAV stream instead of the FobosAPP UDP framing.
 
 ## Android Network Client
 
-An early Android network-client skeleton lives in `android/network-client`.
-It is a separate Android Studio project that talks to the existing FobosAPP
-network server over the TCP control channel. The first Android step supports
-server-side processing only: remote start/stop/settings, observer/controller
-role handling, spectrum/waterfall display, and 48 kHz mono ready-audio playback.
+An Android network client lives in `android/network-client`. It is a separate
+Android Studio project that talks to the existing FobosAPP network server over
+the TCP control channel. The current Android client supports remote
+start/stop/settings, observer/controller role handling, spectrum/waterfall
+display, zoom/pan, tap-to-tune, frequency presets, band-marker overlays, and
+48 kHz mono ready-audio playback.
 
-Direct Android USB access to the Fobos receiver is not part of this first
-skeleton; it should be developed after the network client is stable on real
-phones/tablets.
+Direct Android USB access to the Fobos receiver is still experimental
+preparation work; the reliable Android path for this release is network-client
+operation against a desktop or Raspberry Pi FobosAPP server.
 
 Android debug APKs are signed by the normal Android debug key. For a signed
 release APK, set these environment variables before running
@@ -206,8 +207,5 @@ export FOBOSAPP_ANDROID_KEY_PASSWORD=...
 - Meteor LRPT currently provides a QPSK IQ monitor, not a final decoded image.
 - Full IQ client processing needs a fast LAN and can be too heavy for slower
   network links.
-- Multi-client observer/control transfer mode is new and should receive more
-  real-world testing.
-- Linux support is still at the early preparation stage. Non-Windows local
-  playback now uses an initial Qt5 Multimedia backend, but this path still needs
-  real Raspberry Pi testing.
+- Linux/Raspberry Pi support is usable for current test builds, but still needs
+  broader hardware and distribution testing.

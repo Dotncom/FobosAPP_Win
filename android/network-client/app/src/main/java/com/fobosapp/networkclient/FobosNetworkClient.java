@@ -14,6 +14,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -133,6 +135,7 @@ final class FobosNetworkClient {
     boolean sendControl(String action,
                         RadioSettings settings,
                         boolean serverDisableLocalVisualAudio,
+                        boolean fullResolutionSpectrumFrames,
                         JSONObject extra) {
         if (!isConnected()) {
             notifyStatus("Control channel is not ready");
@@ -150,6 +153,7 @@ final class FobosNetworkClient {
             command.put("action", action);
             command.put("processingMode", RadioSettings.PROCESSING_SERVER_SIDE);
             command.put("serverDisableLocalVisualAudio", serverDisableLocalVisualAudio);
+            command.put("fullResolutionSpectrumFrames", fullResolutionSpectrumFrames);
             command.put("settings", settings.toJson());
             if (extra != null) {
                 JSONArray keys = extra.names();
@@ -220,13 +224,21 @@ final class FobosNetworkClient {
                 continue;
             }
 
-            if ("iqbin".equals(command.optString("type"))) {
+            if (command.has("payloadBytes")) {
                 long bytes = parsePayloadBytes(command);
                 if (bytes <= 0L || bytes > MAX_BINARY_BYTES) {
-                    notifyStatus("Ignoring invalid IQ payload header");
-                    continue;
+                    notifyStatus("Ignoring invalid binary payload header");
+                    throw new IOException("Invalid binary payload header");
                 }
-                skipFully(inputStream, bytes);
+                if ("spectrumbin".equals(command.optString("type"))) {
+                    byte[] payload = readFully(inputStream, bytes);
+                    SpectrumFrame frame = parseBinarySpectrum(command, payload);
+                    if (frame != null) {
+                        listener.onSpectrum(frame);
+                    }
+                } else {
+                    skipFully(inputStream, bytes);
+                }
                 continue;
             }
 
@@ -303,6 +315,52 @@ final class FobosNetworkClient {
                 command.has("inputMode") ? command.optInt("inputMode", -1) : -1);
     }
 
+    private SpectrumFrame parseBinarySpectrum(JSONObject command, byte[] payload) {
+        if (!"f32le".equals(command.optString("binFormat", "f32le"))) {
+            notifyStatus("Unsupported spectrum binary format");
+            return null;
+        }
+        boolean hasReference = command.optBoolean("hasReferenceMagnitudes", false);
+        int count = command.optInt("fftLength", 0);
+        int minimumBytes = Math.max(0, count) * Float.BYTES * (hasReference ? 2 : 1);
+        if (count <= 0) {
+            count = payload.length / Float.BYTES / (hasReference ? 2 : 1);
+            minimumBytes = count * Float.BYTES * (hasReference ? 2 : 1);
+        }
+        if (count <= 0 || payload.length < minimumBytes) {
+            notifyStatus("Ignoring incomplete spectrum binary payload");
+            return null;
+        }
+
+        double minFrequency = command.optDouble("minFrequency", 0.0);
+        double maxFrequency = command.optDouble("maxFrequency", minFrequency + Math.max(1, count - 1));
+        if (!Double.isFinite(minFrequency) || !Double.isFinite(maxFrequency) || maxFrequency <= minFrequency) {
+            maxFrequency = minFrequency + Math.max(1, count - 1);
+        }
+
+        double[] frequencies = new double[count];
+        float[] magnitudes = new float[count];
+        ByteBuffer buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < count; ++i) {
+            double fraction = count <= 1 ? 0.0 : i / (double) (count - 1);
+            frequencies[i] = minFrequency + fraction * (maxFrequency - minFrequency);
+            float value = buffer.getFloat();
+            magnitudes[i] = Float.isFinite(value) ? value : -160.0f;
+        }
+
+        return new SpectrumFrame(
+                frequencies,
+                magnitudes,
+                minFrequency,
+                maxFrequency,
+                optionalDouble(command, "centerFrequency"),
+                optionalDouble(command, "listeningFrequency"),
+                command.optDouble("sampleRate", 0.0),
+                command.optDouble("bandwidth", 0.0),
+                command.optInt("modulationType", RadioSettings.MOD_AM),
+                command.has("inputMode") ? command.optInt("inputMode", -1) : -1);
+    }
+
     private static double optionalDouble(JSONObject command, String key) {
         return command.has(key) ? command.optDouble(key, Double.NaN) : Double.NaN;
     }
@@ -337,6 +395,22 @@ final class FobosNetworkClient {
             }
             remaining -= read;
         }
+    }
+
+    private byte[] readFully(InputStream inputStream, long bytes) throws IOException {
+        if (bytes > Integer.MAX_VALUE) {
+            throw new IOException("Binary payload is too large");
+        }
+        byte[] payload = new byte[(int) bytes];
+        int offset = 0;
+        while (running && offset < payload.length) {
+            int read = inputStream.read(payload, offset, payload.length - offset);
+            if (read < 0) {
+                throw new EOFException("Server closed connection during binary payload");
+            }
+            offset += read;
+        }
+        return payload;
     }
 
     private long parsePayloadBytes(JSONObject command) {

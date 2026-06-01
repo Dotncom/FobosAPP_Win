@@ -8,6 +8,7 @@
 #include <QVector>
 #include <thread>
 #include <mutex>
+#include <complex>
 #include <QObject>
 #include <QThread>
 #include <QWaitCondition>
@@ -35,8 +36,10 @@ public:
     ~FFTResult();
     bool storeFFTResults(const RadioSettings &settings,
                          std::vector<float> &outFrequencies,
-                         std::vector<float> &outMagnitudes);
+                         std::vector<float> &outMagnitudes,
+                         std::vector<float> *outReferenceMagnitudes = nullptr);
     void storeFFTResults();
+    void resetHfNoiseCancelState();
     std::mutex fftMutex;
 	void performFFTInThread();
 private:
@@ -46,6 +49,10 @@ private:
     fftwf_complex *fftOut;
     fftwf_plan plan;
     int planLength;
+    std::vector<std::complex<float>> hfNoiseCancelBins;
+    std::vector<std::complex<float>> hfNoiseCancelCrossPower;
+    std::vector<float> hfNoiseCancelMainPower;
+    std::vector<float> hfNoiseCancelRefPower;
 };
 
 

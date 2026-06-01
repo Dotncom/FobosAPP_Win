@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 3.0.0)
+project(FobosAPP VERSION 3.5.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,6 +78,8 @@ set(SOURCES
     src/digitaldecoder.h
     src/frequencycontrol.cpp
     src/frequencycontrol.h
+    src/finetunewidget.cpp
+    src/finetunewidget.h
     src/iqbuffer.cpp
     src/iqbuffer.h
     src/networkcontroller.cpp

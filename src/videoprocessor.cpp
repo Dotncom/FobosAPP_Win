@@ -657,10 +657,14 @@ void VideoProcessor::processFloatIqSnapshot(const std::vector<float> &iqSamples,
         if (!std::isfinite(qSample)) {
             qSample = 0.0f;
         }
-        if (settings.inputMode == 2) {
+        if (settings.inputMode == INPUT_HF1) {
             qSample = 0.0f;
-        } else if (settings.inputMode == 3) {
+        } else if (settings.inputMode == INPUT_HF2) {
             iSample = qSample;
+            qSample = 0.0f;
+        } else if (settings.inputMode == INPUT_HF_NOISE_CANCEL) {
+            const float refGain = std::abs(hfNoiseCancelReferenceCoefficient(settings, settings.listeningFrequency));
+            iSample -= static_cast<float>((std::clamp)(settings.hfNoiseCancelDepth, -2.0, 2.0)) * refGain * qSample;
             qSample = 0.0f;
         }
 
@@ -1895,10 +1899,14 @@ void VideoProcessor::processLrptFloatIqSnapshot(const std::vector<float> &iqSamp
         if (!std::isfinite(qSample)) {
             qSample = 0.0f;
         }
-        if (settings.inputMode == 2) {
+        if (settings.inputMode == INPUT_HF1) {
             qSample = 0.0f;
-        } else if (settings.inputMode == 3) {
+        } else if (settings.inputMode == INPUT_HF2) {
             iSample = qSample;
+            qSample = 0.0f;
+        } else if (settings.inputMode == INPUT_HF_NOISE_CANCEL) {
+            const float refGain = std::abs(hfNoiseCancelReferenceCoefficient(settings, settings.listeningFrequency));
+            iSample -= static_cast<float>((std::clamp)(settings.hfNoiseCancelDepth, -2.0, 2.0)) * refGain * qSample;
             qSample = 0.0f;
         }
 

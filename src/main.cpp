@@ -1,6 +1,7 @@
 #include "main.h"
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
+#include "finetunewidget.h"
 
 #include <fobos_sdr.h>
 #include <QDateTime>
@@ -12,6 +13,7 @@
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QList>
 #include <QMenu>
@@ -21,18 +23,26 @@
 #include <QIcon>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStackedWidget>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QHeaderView>
 #include <QTextStream>
 #include <QTextCursor>
 #include <QPushButton>
+#include <QToolButton>
 #include <QKeyEvent>
 #include <QAbstractButton>
+#include <QAbstractItemView>
 #include <QColor>
 #include <QCoreApplication>
+#include <QRegularExpression>
 #include <QSettings>
 #if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
 #include <QAudioDeviceInfo>
 #endif
 #include <cmath>
+#include <cstring>
 #include <limits>
 #ifdef _WIN32
 #include <psapi.h>
@@ -90,6 +100,7 @@ constexpr int NETWORK_SPECTRUM_MAX_BINS = 2048;
 constexpr int NETWORK_CHANNEL_SPECTRUM_MAX_BINS = 768;
 constexpr int NETWORK_SPECTRUM_INTERVAL_MS = 100;
 constexpr int NETWORK_CHANNEL_SPECTRUM_INTERVAL_MS = 160;
+constexpr int NETWORK_FULL_RESOLUTION_SPECTRUM_INTERVAL_MS = 50;
 constexpr qint64 NETWORK_IQ_MAX_PENDING_BYTES = 8 * 1024 * 1024;
 constexpr qint64 NETWORK_CHANNEL_IQ_LOW_LATENCY_PENDING_BYTES = 2 * 1024 * 1024;
 constexpr uint64_t NETWORK_IQ_DROP_LOG_INTERVAL = 200;
@@ -102,8 +113,27 @@ constexpr int AUDIO_LOW_PASS_SLIDER_STEP_HZ = 100;
 constexpr int AUDIO_LOW_PASS_SLIDER_MAX = 200;
 constexpr int AUDIO_HIGH_PASS_SLIDER_STEP_HZ = 25;
 constexpr int AUDIO_HIGH_PASS_SLIDER_MAX = 40;
+constexpr int FINE_TUNE_DIAL_MIN = -100;
+constexpr int FINE_TUNE_DIAL_MAX = 100;
+constexpr double FINE_TUNE_VISIBLE_RANGE_DIVISOR = 20.0;
+constexpr double FINE_TUNE_MIN_RANGE_HZ = 500.0;
+constexpr double FINE_TUNE_MAX_RANGE_HZ = 500000.0;
+constexpr int FINE_TUNE_MODE_SCALE = 0;
+constexpr int FINE_TUNE_MODE_DIAL = 1;
+constexpr int HF_NOISE_CANCEL_DEPTH_MIN = 0;
+constexpr int HF_NOISE_CANCEL_DEPTH_MAX = 200;
+constexpr int HF_NOISE_CANCEL_REF_GAIN_MIN = -400;
+constexpr int HF_NOISE_CANCEL_REF_GAIN_MAX = 400;
+constexpr int HF_NOISE_CANCEL_REF_DELAY_MIN_NS = -2000;
+constexpr int HF_NOISE_CANCEL_REF_DELAY_MAX_NS = 2000;
+constexpr int HF_NOISE_CANCEL_REF_TILT_MIN = -300;
+constexpr int HF_NOISE_CANCEL_REF_TILT_MAX = 300;
 constexpr int VIDEO_SNAPSHOT_INTERVAL_MS = 90;
 constexpr std::size_t VIDEO_SNAPSHOT_MAX_FLOATS = 262144 * 2;
+constexpr int AGILE_SCAN_MIN_POINTS = 2;
+constexpr int AGILE_SCAN_MAX_POINTS = 256;
+constexpr double AGILE_SCAN_MIN_STEP_MHZ = 0.001;
+constexpr double AGILE_SCAN_MAX_STEP_MHZ = 1000.0;
 
 QMutex gLogMutex;
 QFile gLogFile;
@@ -223,7 +253,7 @@ double directMaxFrequency(double sampleRate) {
 }
 
 double directMinFrequencyForMode(int inputMode, double sampleRate) {
-    return inputMode == 1 ? -directMaxFrequency(sampleRate) : DIRECT_MIN_FREQUENCY;
+    return inputMode == INPUT_HF_COMBINED ? -directMaxFrequency(sampleRate) : DIRECT_MIN_FREQUENCY;
 }
 
 void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
@@ -231,7 +261,7 @@ void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
         return;
     }
 
-    if (settings.inputMode == 0) {
+    if (settings.inputMode == INPUT_RF) {
         const double halfRate = settings.sampleRate / 2.0;
         settings.centerFrequency = (std::max)(RF_MIN_CENTER_FREQUENCY, settings.centerFrequency);
         settings.listeningFrequency = (std::max)(RF_MIN_LISTENING_FREQUENCY, settings.listeningFrequency);
@@ -257,6 +287,108 @@ void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
                                                    directMin,
                                                    directMax);
     }
+}
+
+QString agileScanPresetSpec(const QString &rangesMhz, double stepMhz) {
+    return QStringLiteral("%1\t%2").arg(rangesMhz.trimmed(),
+                                      QString::number(stepMhz, 'f', 6));
+}
+
+QString agileScanPresetRanges(const QString &spec, const QString &fallback = QString()) {
+    const QStringList parts = spec.split(QChar('\t'));
+    return parts.isEmpty() ? fallback : parts.first().trimmed();
+}
+
+double agileScanPresetStepMhz(const QString &spec, double fallback) {
+    const QStringList parts = spec.split(QChar('\t'));
+    if (parts.size() < 2) {
+        return fallback;
+    }
+    bool ok = false;
+    const double value = parts.at(1).toDouble(&ok);
+    return ok ? (std::clamp)(value, AGILE_SCAN_MIN_STEP_MHZ, AGILE_SCAN_MAX_STEP_MHZ) : fallback;
+}
+
+QVector<double> parseAgileScanFrequenciesMhz(const QString &rangesMhz,
+                                             double stepMhz,
+                                             QString *error) {
+    QVector<double> frequencies;
+    QString text = rangesMhz.trimmed();
+    text.replace(QChar(0x2013), QLatin1Char('-'));
+    text.replace(QChar(0x2014), QLatin1Char('-'));
+    text.replace(QLatin1Char('\\'), QLatin1Char(','));
+    text.replace(QLatin1Char('/'), QLatin1Char(','));
+    text.replace(QLatin1Char(';'), QLatin1Char(','));
+    text.replace(QRegularExpression(QStringLiteral("\\s+")), QString());
+    text.replace(QRegularExpression(QStringLiteral("mhz|мгц"), QRegularExpression::CaseInsensitiveOption),
+                 QString());
+
+    if (text.isEmpty()) {
+        if (error) {
+            *error = QStringLiteral("Scan ranges are empty");
+        }
+        return frequencies;
+    }
+
+    stepMhz = (std::clamp)(stepMhz, AGILE_SCAN_MIN_STEP_MHZ, AGILE_SCAN_MAX_STEP_MHZ);
+    const QStringList tokens = text.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &token : tokens) {
+        const int dashIndex = token.indexOf(QLatin1Char('-'));
+        bool startOk = false;
+        bool endOk = false;
+        double startMhz = 0.0;
+        double endMhz = 0.0;
+
+        if (dashIndex > 0) {
+            startMhz = token.left(dashIndex).toDouble(&startOk);
+            endMhz = token.mid(dashIndex + 1).toDouble(&endOk);
+        } else {
+            startMhz = token.toDouble(&startOk);
+            endMhz = startMhz;
+            endOk = startOk;
+        }
+
+        if (!startOk || !endOk || startMhz <= 0.0 || endMhz <= 0.0) {
+            if (error) {
+                *error = QStringLiteral("Bad scan range: %1").arg(token);
+            }
+            frequencies.clear();
+            return frequencies;
+        }
+        if (endMhz < startMhz) {
+            std::swap(startMhz, endMhz);
+        }
+
+        const int countBefore = frequencies.size();
+        for (double mhz = startMhz; mhz <= endMhz + stepMhz * 0.25; mhz += stepMhz) {
+            frequencies.push_back(mhz * 1000000.0);
+            if (frequencies.size() > AGILE_SCAN_MAX_POINTS) {
+                if (error) {
+                    *error = QStringLiteral("Too many scan points (%1 max). Increase step or split presets.")
+                                 .arg(AGILE_SCAN_MAX_POINTS);
+                }
+                frequencies.clear();
+                return frequencies;
+            }
+        }
+        if (frequencies.size() == countBefore) {
+            frequencies.push_back(startMhz * 1000000.0);
+        }
+    }
+
+    std::sort(frequencies.begin(), frequencies.end());
+    auto last = std::unique(frequencies.begin(), frequencies.end(), [](double a, double b) {
+        return std::abs(a - b) < 0.5;
+    });
+    frequencies.erase(last, frequencies.end());
+
+    if (frequencies.size() < AGILE_SCAN_MIN_POINTS) {
+        if (error) {
+            *error = QStringLiteral("Agile scan needs at least two frequencies");
+        }
+        frequencies.clear();
+    }
+    return frequencies;
 }
 
 int scalePercentToSliderValue(double scalePercent) {
@@ -347,6 +479,100 @@ QString audioFilterFrequencyText(double hz) {
         return QString("%1 kHz").arg(hz / 1000.0, 0, 'f', decimals);
     }
     return QString("%1 Hz").arg(static_cast<int>(std::lround(hz)));
+}
+
+double clampHfNoiseCancelDepth(double depth) {
+    if (!std::isfinite(depth)) {
+        return 1.0;
+    }
+    return (std::clamp)(depth,
+                        HF_NOISE_CANCEL_DEPTH_MIN / 100.0,
+                        HF_NOISE_CANCEL_DEPTH_MAX / 100.0);
+}
+
+int hfNoiseCancelDepthToSliderValue(double depth) {
+    return (std::clamp)(static_cast<int>(std::lround(clampHfNoiseCancelDepth(depth) * 100.0)),
+                        HF_NOISE_CANCEL_DEPTH_MIN,
+                        HF_NOISE_CANCEL_DEPTH_MAX);
+}
+
+double hfNoiseCancelSliderValueToDepth(int value) {
+    return (std::clamp)(value, HF_NOISE_CANCEL_DEPTH_MIN, HF_NOISE_CANCEL_DEPTH_MAX) / 100.0;
+}
+
+QString hfNoiseCancelDepthLabelText(double depth) {
+    return QString("HF cancel: %1%").arg(hfNoiseCancelDepthToSliderValue(depth));
+}
+
+double clampHfNoiseCancelRefGainDb(double gainDb) {
+    if (!std::isfinite(gainDb)) {
+        return 0.0;
+    }
+    return (std::clamp)(gainDb,
+                        HF_NOISE_CANCEL_REF_GAIN_MIN / 10.0,
+                        HF_NOISE_CANCEL_REF_GAIN_MAX / 10.0);
+}
+
+int hfNoiseCancelRefGainToSliderValue(double gainDb) {
+    return (std::clamp)(static_cast<int>(std::lround(clampHfNoiseCancelRefGainDb(gainDb) * 10.0)),
+                        HF_NOISE_CANCEL_REF_GAIN_MIN,
+                        HF_NOISE_CANCEL_REF_GAIN_MAX);
+}
+
+double hfNoiseCancelSliderValueToRefGainDb(int value) {
+    return (std::clamp)(value, HF_NOISE_CANCEL_REF_GAIN_MIN, HF_NOISE_CANCEL_REF_GAIN_MAX) / 10.0;
+}
+
+QString hfNoiseCancelRefGainLabelText(double gainDb) {
+    return QString("Ref gain: %1 dB").arg(clampHfNoiseCancelRefGainDb(gainDb), 0, 'f', 1);
+}
+
+double clampHfNoiseCancelRefDelayNs(double delayNs) {
+    if (!std::isfinite(delayNs)) {
+        return 0.0;
+    }
+    return (std::clamp)(delayNs,
+                        static_cast<double>(HF_NOISE_CANCEL_REF_DELAY_MIN_NS),
+                        static_cast<double>(HF_NOISE_CANCEL_REF_DELAY_MAX_NS));
+}
+
+int hfNoiseCancelRefDelayToSliderValue(double delayNs) {
+    return (std::clamp)(static_cast<int>(std::lround(clampHfNoiseCancelRefDelayNs(delayNs))),
+                        HF_NOISE_CANCEL_REF_DELAY_MIN_NS,
+                        HF_NOISE_CANCEL_REF_DELAY_MAX_NS);
+}
+
+double hfNoiseCancelSliderValueToRefDelayNs(int value) {
+    return (std::clamp)(value,
+                        HF_NOISE_CANCEL_REF_DELAY_MIN_NS,
+                        HF_NOISE_CANCEL_REF_DELAY_MAX_NS);
+}
+
+QString hfNoiseCancelRefDelayLabelText(double delayNs) {
+    return QString("Ref delay: %1 ns").arg(static_cast<int>(std::lround(clampHfNoiseCancelRefDelayNs(delayNs))));
+}
+
+double clampHfNoiseCancelRefTiltDb(double tiltDb) {
+    if (!std::isfinite(tiltDb)) {
+        return 0.0;
+    }
+    return (std::clamp)(tiltDb,
+                        HF_NOISE_CANCEL_REF_TILT_MIN / 10.0,
+                        HF_NOISE_CANCEL_REF_TILT_MAX / 10.0);
+}
+
+int hfNoiseCancelRefTiltToSliderValue(double tiltDb) {
+    return (std::clamp)(static_cast<int>(std::lround(clampHfNoiseCancelRefTiltDb(tiltDb) * 10.0)),
+                        HF_NOISE_CANCEL_REF_TILT_MIN,
+                        HF_NOISE_CANCEL_REF_TILT_MAX);
+}
+
+double hfNoiseCancelSliderValueToRefTiltDb(int value) {
+    return (std::clamp)(value, HF_NOISE_CANCEL_REF_TILT_MIN, HF_NOISE_CANCEL_REF_TILT_MAX) / 10.0;
+}
+
+QString hfNoiseCancelRefTiltLabelText(double tiltDb) {
+    return QString("Ref tilt: %1 dB").arg(clampHfNoiseCancelRefTiltDb(tiltDb), 0, 'f', 1);
 }
 
 double defaultBandwidthForModulation(int modulationType) {
@@ -941,6 +1167,71 @@ int setFobosAgileGpoSafely(fobos_sdr_dev_t *dev, uint8_t value) {
 #endif
 }
 
+int startFobosAgileScanSafely(fobos_sdr_dev_t *dev, double *frequencies, unsigned int count) {
+    if (!dev) {
+        return FOBOS_ERR_NOT_OPEN;
+    }
+    if (!frequencies ||
+        count < static_cast<unsigned int>(AGILE_SCAN_MIN_POINTS) ||
+        count > static_cast<unsigned int>(AGILE_SCAN_MAX_POINTS)) {
+        return FOBOS_ERR_UNSUPPORTED;
+    }
+#ifdef _WIN32
+    __try {
+        return fobos_sdr_start_scan(dev, frequencies, count);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FOBOS_ERR_LIBUSB;
+    }
+#else
+    return fobos_sdr_start_scan(dev, frequencies, count);
+#endif
+}
+
+int stopFobosAgileScanSafely(fobos_sdr_dev_t *dev) {
+    if (!dev) {
+        return FOBOS_ERR_NOT_OPEN;
+    }
+#ifdef _WIN32
+    __try {
+        return fobos_sdr_stop_scan(dev);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FOBOS_ERR_LIBUSB;
+    }
+#else
+    return fobos_sdr_stop_scan(dev);
+#endif
+}
+
+int isFobosAgileScanningSafely(fobos_sdr_dev_t *dev) {
+    if (!dev) {
+        return FOBOS_ERR_NOT_OPEN;
+    }
+#ifdef _WIN32
+    __try {
+        return fobos_sdr_is_scanning(dev);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FOBOS_ERR_LIBUSB;
+    }
+#else
+    return fobos_sdr_is_scanning(dev);
+#endif
+}
+
+int getFobosAgileScanIndexSafely(fobos_sdr_dev_t *dev) {
+    if (!dev) {
+        return FOBOS_ERR_NOT_OPEN;
+    }
+#ifdef _WIN32
+    __try {
+        return fobos_sdr_get_scan_index(dev);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FOBOS_ERR_LIBUSB;
+    }
+#else
+    return fobos_sdr_get_scan_index(dev);
+#endif
+}
+
 int setActiveClockSourceSafely(int value) {
     if (activeFobosApiKind == FobosApiKind::Agile) {
         return setFobosAgileClockSourceSafely(agileDevice, value);
@@ -1049,6 +1340,8 @@ YourClassName::YourClassName(QWidget *parent)
     : QMainWindow(parent), deviceOpened(false)
     {
 
+    loadUiTranslations();
+
     resize(1920, 1000);
     setMinimumSize(1180, 720);
 
@@ -1066,6 +1359,7 @@ YourClassName::YourClassName(QWidget *parent)
     controlsScrollArea->setWidget(controlsWidget);
     controlsDock = new QDockWidget("Controls", this);
     controlsDock->setObjectName("controlsDock");
+    markTranslatable(controlsDock, QStringLiteral("controls"), QStringLiteral("Controls"));
     controlsDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
     controlsDock->setFeatures(QDockWidget::DockWidgetMovable |
                               QDockWidget::DockWidgetFloatable);
@@ -1093,8 +1387,10 @@ YourClassName::YourClassName(QWidget *parent)
     QHBoxLayout *digitalModeLayout = new QHBoxLayout();
     QGridLayout *dmrLabLayout = new QGridLayout();
     digitalDecodeCheckbox = new QCheckBox("Decode", digitalWidget);
+    markTranslatable(digitalDecodeCheckbox, QStringLiteral("decode"), QStringLiteral("Decode"));
     digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
     dmrLabCaptureCheckbox = new QCheckBox("DMR Lab", digitalWidget);
+    markTranslatable(dmrLabCaptureCheckbox, QStringLiteral("dmr_lab"), QStringLiteral("DMR Lab"));
     dmrLabCaptureCheckbox->setToolTip("Write expected DMR test metadata next to audio/IQ recordings");
     dmrLabColorCodeCombo = new QComboBox(digitalWidget);
     dmrLabColorCodeCombo->addItem("?", -1);
@@ -1122,6 +1418,7 @@ YourClassName::YourClassName(QWidget *parent)
     dmrLabSlotCombo->setMaximumWidth(72);
     dmrLabCallTypeCombo->setMaximumWidth(92);
     QPushButton *digitalClearButton = new QPushButton("Clear", digitalWidget);
+    markTranslatable(digitalClearButton, QStringLiteral("clear"), QStringLiteral("Clear"));
     digitalStatusLabel = new QLabel("Digital audio decoder idle", digitalWidget);
     digitalTextEdit = new QPlainTextEdit(digitalWidget);
     digitalTextEdit->setReadOnly(true);
@@ -1155,6 +1452,7 @@ YourClassName::YourClassName(QWidget *parent)
     digitalLayout->addWidget(digitalTextEdit);
     digitalDock = new QDockWidget("Digital Audio", this);
     digitalDock->setObjectName("digitalDock");
+    markTranslatable(digitalDock, QStringLiteral("digital_audio"), QStringLiteral("Digital Audio"));
     digitalDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
     digitalDock->setFeatures(QDockWidget::DockWidgetMovable |
                              QDockWidget::DockWidgetFloatable |
@@ -1168,6 +1466,7 @@ YourClassName::YourClassName(QWidget *parent)
     QHBoxLayout *videoHeaderLayout = new QHBoxLayout();
     QHBoxLayout *videoModeLayout = new QHBoxLayout();
     videoDecodeCheckbox = new QCheckBox("Decode", videoPanel);
+    markTranslatable(videoDecodeCheckbox, QStringLiteral("decode"), QStringLiteral("Decode"));
     videoDecodeCheckbox->setChecked(videoDecodeEnabled);
     videoDemodCombo = new QComboBox(videoPanel);
     videoDemodCombo->addItem("FM video", VideoProcessor::FmVideo);
@@ -1176,6 +1475,7 @@ YourClassName::YourClassName(QWidget *parent)
     videoStandardCombo->addItem("PAL 15.625 kHz", 15625.0);
     videoStandardCombo->addItem("NTSC 15.734 kHz", 15734.2657);
     videoInvertCheckbox = new QCheckBox("Invert", videoPanel);
+    markTranslatable(videoInvertCheckbox, QStringLiteral("invert"), QStringLiteral("Invert"));
     videoHSyncCheckbox = new QCheckBox("HSync", videoPanel);
     videoHSyncCheckbox->setChecked(true);
     videoHSyncCheckbox->setToolTip("Align video lines by the darkest horizontal sync pulse");
@@ -1183,10 +1483,13 @@ YourClassName::YourClassName(QWidget *parent)
     videoVSyncCheckbox->setChecked(true);
     videoVSyncCheckbox->setToolTip("Reset analog video frame on broad vertical sync pulses");
     videoTestPatternCheckbox = new QCheckBox("Test", videoPanel);
+    markTranslatable(videoTestPatternCheckbox, QStringLiteral("test"), QStringLiteral("Test"));
     videoTestPatternCheckbox->setToolTip("Generate an internal test pattern for the selected video mode");
     videoStatusLabel = new QLabel("Video decoder disabled", videoPanel);
     videoWidget = new VideoWidget(videoPanel);
-    videoModeLayout->addWidget(new QLabel("Mode:", videoPanel));
+    QLabel *videoModeLabel = new QLabel("Mode:", videoPanel);
+    markTranslatable(videoModeLabel, QStringLiteral("mode"), QStringLiteral("Mode:"));
+    videoModeLayout->addWidget(videoModeLabel);
     addModulationRadioButton(videoPanel, videoModeLayout, "ATV", MOD_ATV, "Analog television video demodulator");
     addModulationRadioButton(videoPanel, videoModeLayout, "SSTV", MOD_SSTV, "Slow-scan television image decoder");
     addModulationRadioButton(videoPanel, videoModeLayout, "APT", MOD_APT, "NOAA APT weather satellite image decoder");
@@ -1206,6 +1509,7 @@ YourClassName::YourClassName(QWidget *parent)
     videoLayout->addWidget(videoStatusLabel);
     videoLayout->addWidget(videoWidget, 1);
     videoDock = new QDockWidget("Video", this);
+    markTranslatable(videoDock, QStringLiteral("video"), QStringLiteral("Video"));
     videoDock->setObjectName("videoDock");
     videoDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea | Qt::BottomDockWidgetArea);
     videoDock->setFeatures(QDockWidget::DockWidgetMovable |
@@ -1266,9 +1570,41 @@ YourClassName::YourClassName(QWidget *parent)
     audioHighPassSlider->setPageStep(4);
     audioHighPassSlider->setValue(0);
 
+    hfNoiseCancelDepthSlider = new QSlider(Qt::Horizontal, this);
+    hfNoiseCancelDepthSlider->setRange(HF_NOISE_CANCEL_DEPTH_MIN, HF_NOISE_CANCEL_DEPTH_MAX);
+    hfNoiseCancelDepthSlider->setSingleStep(5);
+    hfNoiseCancelDepthSlider->setPageStep(25);
+    hfNoiseCancelDepthSlider->setValue(hfNoiseCancelDepthToSliderValue(pendingSettings.hfNoiseCancelDepth));
+
+    hfNoiseCancelRefGainSlider = new QSlider(Qt::Horizontal, this);
+    hfNoiseCancelRefGainSlider->setRange(HF_NOISE_CANCEL_REF_GAIN_MIN, HF_NOISE_CANCEL_REF_GAIN_MAX);
+    hfNoiseCancelRefGainSlider->setSingleStep(5);
+    hfNoiseCancelRefGainSlider->setPageStep(30);
+    hfNoiseCancelRefGainSlider->setValue(hfNoiseCancelRefGainToSliderValue(pendingSettings.hfNoiseCancelRefGainDb));
+
+    hfNoiseCancelRefDelaySlider = new QSlider(Qt::Horizontal, this);
+    hfNoiseCancelRefDelaySlider->setRange(HF_NOISE_CANCEL_REF_DELAY_MIN_NS, HF_NOISE_CANCEL_REF_DELAY_MAX_NS);
+    hfNoiseCancelRefDelaySlider->setSingleStep(10);
+    hfNoiseCancelRefDelaySlider->setPageStep(100);
+    hfNoiseCancelRefDelaySlider->setValue(hfNoiseCancelRefDelayToSliderValue(pendingSettings.hfNoiseCancelRefDelayNs));
+
+    hfNoiseCancelRefTiltSlider = new QSlider(Qt::Horizontal, this);
+    hfNoiseCancelRefTiltSlider->setRange(HF_NOISE_CANCEL_REF_TILT_MIN, HF_NOISE_CANCEL_REF_TILT_MAX);
+    hfNoiseCancelRefTiltSlider->setSingleStep(5);
+    hfNoiseCancelRefTiltSlider->setPageStep(30);
+    hfNoiseCancelRefTiltSlider->setValue(hfNoiseCancelRefTiltToSliderValue(pendingSettings.hfNoiseCancelRefTiltDb));
+
+    hfNoiseCancelFreezeCheckbox = new QCheckBox("Freeze", this);
+    markTranslatable(hfNoiseCancelFreezeCheckbox, QStringLiteral("freeze"), QStringLiteral("Freeze"));
+    hfNoiseCancelFreezeCheckbox->setToolTip("Hold the small adaptive trim added on top of the manual HF2 reference");
+
     volumeLabel = new QLabel("Volume: 100%", this);
     audioLowPassLabel = new QLabel("Audio LPF: Auto", this);
     audioHighPassLabel = new QLabel("Audio HPF: Off", this);
+    hfNoiseCancelDepthLabel = new QLabel(hfNoiseCancelDepthLabelText(pendingSettings.hfNoiseCancelDepth), this);
+    hfNoiseCancelRefGainLabel = new QLabel(hfNoiseCancelRefGainLabelText(pendingSettings.hfNoiseCancelRefGainDb), this);
+    hfNoiseCancelRefDelayLabel = new QLabel(hfNoiseCancelRefDelayLabelText(pendingSettings.hfNoiseCancelRefDelayNs), this);
+    hfNoiseCancelRefTiltLabel = new QLabel(hfNoiseCancelRefTiltLabelText(pendingSettings.hfNoiseCancelRefTiltDb), this);
     lnaGainLabel = new QLabel("LNA Gain: 1", this);
     vgaGainLabel = new QLabel("VGA Gain: 3", this);
     
@@ -1285,29 +1621,36 @@ YourClassName::YourClassName(QWidget *parent)
     modeBox = new QComboBox(this);
     sampleBox = new QComboBox(this);
     clkBox = new QComboBox(this);
+    languageComboBox = new QComboBox(this);
+    languageComboBox->addItem("English", QStringLiteral("en"));
+    languageComboBox->hide();
+    languageComboBox->addItem(QString::fromUtf8("Українська"), QStringLiteral("uk"));
     
     audioCheckbox = new QCheckBox("Audio", this);
+    markTranslatable(audioCheckbox, QStringLiteral("audio"), QStringLiteral("Audio"));
     syncCheckbox = new QCheckBox("Sync", this);
+    markTranslatable(syncCheckbox, QStringLiteral("sync"), QStringLiteral("Sync"));
     syncCheckbox->setChecked(false);
     syncCheckbox->setEnabled(false);
     syncCheckbox->setToolTip("Async reader is forced for continuous streaming tests.");
     graphCheckbox = new QCheckBox("Spectr 2", this);
+    markTranslatable(graphCheckbox, QStringLiteral("spectrum2"), QStringLiteral("Spectr 2"));
     colorCheckbox = new QCheckBox("Colorful", this);
-
-    QHBoxLayout* chckbox = new QHBoxLayout();
-    chckbox->addWidget(audioCheckbox);
-    chckbox->addWidget(syncCheckbox);
-    chckbox->addWidget(graphCheckbox);
-    chckbox->addWidget(colorCheckbox);
+    markTranslatable(colorCheckbox, QStringLiteral("colorful"), QStringLiteral("Colorful"));
+    audioCheckbox->hide();
+    syncCheckbox->hide();
+    graphCheckbox->hide();
+    colorCheckbox->hide();
 
     comboBox->addItems(getFobosDevices());
     for (int i = 0; i < comboBox->count(); ++i) {
         comboBox->setItemData(i, i);
     }
-    modeBox->addItem("RF", 0);
-    modeBox->addItem("HF1 + HF2", 1);
-    modeBox->addItem("HF1", 2);
-    modeBox->addItem("HF2", 3);
+    modeBox->addItem("RF", INPUT_RF);
+    modeBox->addItem("HF1 + HF2", INPUT_HF_COMBINED);
+    modeBox->addItem("HF1", INPUT_HF1);
+    modeBox->addItem("HF2", INPUT_HF2);
+    modeBox->addItem("HF1 - HF2 cancel lab", INPUT_HF_NOISE_CANCEL);
     
     clkBox->addItem("Internal", 0);
     clkBox->addItem("External", 1);
@@ -1355,13 +1698,26 @@ YourClassName::YourClassName(QWidget *parent)
     waterfallWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     
     refreshButton = new QPushButton("Refresh USB Devices", this);
+    markTranslatable(refreshButton, QStringLiteral("refresh_usb"), QStringLiteral("Refresh USB Devices"));
     fobosButton = new QPushButton("Show Fobos Details", this);
+    markTranslatable(fobosButton, QStringLiteral("show_fobos_details"), QStringLiteral("Show Fobos Details"));
     networkButton = new QPushButton("Network", this);
+    markTranslatable(networkButton, QStringLiteral("network"), QStringLiteral("Network"));
+    appSettingsButton = new QPushButton("Settings...", this);
+    markTranslatable(appSettingsButton, QStringLiteral("settings"), QStringLiteral("Settings..."));
+    controlsToggleButton = new QPushButton("Cfg", this);
+    markTranslatable(controlsToggleButton, QStringLiteral("settings_short"), QStringLiteral("Cfg"));
+    controlsToggleButton->setCheckable(true);
+    controlsToggleButton->setChecked(true);
+    controlsToggleButton->setFixedWidth(44);
+    controlsToggleButton->setToolTip("Show or hide the settings panel");
     digitalToggleButton = new QPushButton("Digital Audio", this);
+    markTranslatable(digitalToggleButton, QStringLiteral("digital_audio"), QStringLiteral("Digital Audio"));
     digitalToggleButton->setCheckable(true);
     digitalToggleButton->setMaximumWidth(120);
     digitalToggleButton->setToolTip("Show or hide the digital audio decoder panel");
     videoToggleButton = new QPushButton("Video", this);
+    markTranslatable(videoToggleButton, QStringLiteral("video"), QStringLiteral("Video"));
     videoToggleButton->setCheckable(true);
     videoToggleButton->setMaximumWidth(80);
     videoToggleButton->setToolTip("Show or hide the video/image decoder panel");
@@ -1369,17 +1725,24 @@ YourClassName::YourClassName(QWidget *parent)
     recordingModeCombo->addItem("Audio WAV", static_cast<int>(RecordingManager::Mode::AudioWav));
     recordingModeCombo->addItem("Channel IQ WAV", static_cast<int>(RecordingManager::Mode::ChannelIqWav));
     recordButton = new QPushButton("Record", this);
+    markTranslatable(recordButton, QStringLiteral("record"), QStringLiteral("Record"));
     recordButton->setCheckable(true);
     recordButton->setToolTip("Start/stop recording. Hold F9 for momentary recording.");
-    recordingStatusLabel = new QLabel("Recording: idle", this);
-    playbackStatusLabel = new QLabel("Playback: idle", this);
+    recordingStatusLabel = new QLabel(localizedStatusText(QStringLiteral("Recording: idle")), this);
+    recordingStatusLabel->setProperty("statusRawText", QStringLiteral("Recording: idle"));
+    playbackStatusLabel = new QLabel(localizedStatusText(QStringLiteral("Playback: idle")), this);
+    playbackStatusLabel->setProperty("statusRawText", QStringLiteral("Playback: idle"));
     playbackFileCombo = new QComboBox(this);
     playbackFileCombo->setMinimumContentsLength(24);
     playbackRefreshButton = new QPushButton("Refresh Playback", this);
+    markTranslatable(playbackRefreshButton, QStringLiteral("refresh_playback"), QStringLiteral("Refresh Playback"));
     playbackButton = new QPushButton("Play", this);
+    markTranslatable(playbackButton, QStringLiteral("play"), QStringLiteral("Play"));
     playbackButton->setCheckable(true);
     startButton = new QPushButton("Start", this);
+    markTranslatable(startButton, QStringLiteral("start"), QStringLiteral("Start"));
     stopButton = new QPushButton("Stop", this);
+    markTranslatable(stopButton, QStringLiteral("stop"), QStringLiteral("Stop"));
     
     contrastSlider = new QSlider(Qt::Horizontal, this);
     contrastSlider->setRange(1, 15);
@@ -1400,6 +1763,29 @@ YourClassName::YourClassName(QWidget *parent)
     levelMaxSlider->setRange(MIN_LEVEL_SLIDER_VALUE, MAX_LEVEL_SLIDER_VALUE);
     levelMaxSlider->setValue(levelToSliderValue(displayLevelMax));
     levelMaxLabel = new QLabel(levelLabelText("Max", displayLevelMax), this);
+
+    fineTuneLabel = new QLabel(this);
+    fineTuneLabel->setAlignment(Qt::AlignCenter);
+    fineTuneLabel->setWordWrap(false);
+    fineTuneLabel->setToolTip("Relative fine tuning for the listening frequency");
+    fineTuneDial = new QDial(this);
+    fineTuneDial->setRange(FINE_TUNE_DIAL_MIN, FINE_TUNE_DIAL_MAX);
+    fineTuneDial->setValue(0);
+    fineTuneDial->setNotchesVisible(true);
+    fineTuneDial->setWrapping(false);
+    fineTuneDial->setFixedSize(74, 74);
+    fineTuneDial->setToolTip("Drag or wheel to nudge the listening frequency. It returns to center on release.");
+    fineTuneScaleWidget = new FineTuneScaleWidget(this);
+    fineTuneScaleWidget->setMinimumWidth(240);
+    fineTuneScaleModeButton = new QToolButton(this);
+    fineTuneScaleModeButton->setCheckable(true);
+    fineTuneScaleModeButton->setAutoRaise(true);
+    fineTuneScaleModeButton->setFixedSize(18, 18);
+    fineTuneScaleModeButton->setToolTip("Fine tune scale mode");
+    fineTuneStack = new QStackedWidget(this);
+    fineTuneStack->setMinimumWidth(240);
+    fineTuneStack->setFixedHeight(58);
+    updateFineTuneLabel();
     
     sensLayout->addWidget(sensitivityLabel);
     sensLayout->addWidget(sensitivitySlider);
@@ -1411,18 +1797,74 @@ YourClassName::YourClassName(QWidget *parent)
     levelMaxLayout->addWidget(levelMaxSlider);
     
     QLabel *centralFrequencyLabel = new QLabel("Central Frequency:", this);
+    markTranslatable(centralFrequencyLabel, QStringLiteral("central_frequency"), QStringLiteral("Central Frequency:"));
     frequencyControl = new FrequencyControl(this);
     frequencyControl->setRangeHz(0.0, 6000000000.0);
     frequencyControl->setValueHz(100000000.0);
     
     QLabel *listeningFrequencyLabel = new QLabel("Listening Frequency:", this);
+    markTranslatable(listeningFrequencyLabel, QStringLiteral("listening_frequency"), QStringLiteral("Listening Frequency:"));
     listeningFrequencyControl = new FrequencyControl(this);
     listeningFrequencyControl->setRangeHz(0.0, 6000000000.0);
     listeningFrequencyControl->setValueHz(100000000.0);
+
+    presetManagerButton = new QPushButton("Presets...", this);
+    markTranslatable(presetManagerButton, QStringLiteral("presets"), QStringLiteral("Presets..."));
     
-    QLabel *fftLabel = new QLabel("FFT Length", this);
+    QLabel *clockSourceLabel = new QLabel("Clock:", this);
+    markTranslatable(clockSourceLabel, QStringLiteral("clock"), QStringLiteral("Clock:"));
+    clockSourceLabel->setToolTip("Receiver clock source");
+    QLabel *inputModeLabel = new QLabel("Mode:", this);
+    markTranslatable(inputModeLabel, QStringLiteral("mode"), QStringLiteral("Mode:"));
+    inputModeLabel->setToolTip("Receiver input mode");
+    QLabel *sampleRateLabel = new QLabel("Sample:", this);
+    markTranslatable(sampleRateLabel, QStringLiteral("sample"), QStringLiteral("Sample:"));
+    sampleRateLabel->setToolTip("ADC sample rate");
+    QLabel *fftLabel = new QLabel("FFT:", this);
+    markTranslatable(fftLabel, QStringLiteral("fft"), QStringLiteral("FFT:"));
+    fftLabel->setToolTip("Spectrum FFT length");
+
+    QGroupBox *agileScanBox = new QGroupBox("Agile scan", this);
+    markTranslatable(agileScanBox, QStringLiteral("agile_scan"), QStringLiteral("Agile scan"));
+    agileScanCheckbox = new QCheckBox("Enable scan", agileScanBox);
+    markTranslatable(agileScanCheckbox, QStringLiteral("enable_scan"), QStringLiteral("Enable scan"));
+    agileScanPresetCombo = new QComboBox(agileScanBox);
+    agileScanPresetCombo->setEditable(true);
+    agileScanPresetCombo->setMinimumContentsLength(12);
+    agileScanRangesEdit = new QLineEdit(agileScanRangesMhz, agileScanBox);
+    agileScanRangesEdit->setPlaceholderText(QStringLiteral("430-470, 600-900\\1100-1300"));
+    agileScanStepSpin = new QDoubleSpinBox(agileScanBox);
+    agileScanStepSpin->setRange(AGILE_SCAN_MIN_STEP_MHZ, AGILE_SCAN_MAX_STEP_MHZ);
+    agileScanStepSpin->setDecimals(4);
+    agileScanStepSpin->setSingleStep(0.0125);
+    agileScanStepSpin->setSuffix(QStringLiteral(" MHz"));
+    agileScanStepSpin->setValue(agileScanStepMhz);
+    agileScanSavePresetButton = new QPushButton("Save", agileScanBox);
+    markTranslatable(agileScanSavePresetButton, QStringLiteral("save"), QStringLiteral("Save"));
+    agileScanDeletePresetButton = new QPushButton("Del", agileScanBox);
+    markTranslatable(agileScanDeletePresetButton, QStringLiteral("delete_short"), QStringLiteral("Del"));
+    agileScanStatusLabel = new QLabel("Agile scan: off", agileScanBox);
+    QVBoxLayout *agileScanLayout = new QVBoxLayout(agileScanBox);
+    QHBoxLayout *agileScanPresetLayout = new QHBoxLayout();
+    QHBoxLayout *agileScanRangeLayout = new QHBoxLayout();
+    agileScanPresetLayout->addWidget(agileScanCheckbox);
+    agileScanPresetLayout->addWidget(agileScanPresetCombo, 1);
+    agileScanPresetLayout->addWidget(agileScanSavePresetButton);
+    agileScanPresetLayout->addWidget(agileScanDeletePresetButton);
+    QLabel *agileScanRangeLabel = new QLabel("Ranges MHz:", agileScanBox);
+    markTranslatable(agileScanRangeLabel, QStringLiteral("ranges_mhz"), QStringLiteral("Ranges MHz:"));
+    QLabel *agileScanStepLabel = new QLabel("Step:", agileScanBox);
+    markTranslatable(agileScanStepLabel, QStringLiteral("step"), QStringLiteral("Step:"));
+    agileScanRangeLayout->addWidget(agileScanRangeLabel);
+    agileScanRangeLayout->addWidget(agileScanRangesEdit, 1);
+    agileScanRangeLayout->addWidget(agileScanStepLabel);
+    agileScanRangeLayout->addWidget(agileScanStepSpin);
+    agileScanLayout->addLayout(agileScanPresetLayout);
+    agileScanLayout->addLayout(agileScanRangeLayout);
+    agileScanLayout->addWidget(agileScanStatusLabel);
     
     QLabel *bandwidthLabel = new QLabel("Audio Bandwidth:", this);
+    markTranslatable(bandwidthLabel, QStringLiteral("audio_bandwidth"), QStringLiteral("Audio Bandwidth:"));
     bandwidthControl = new FrequencyControl(this);
     bandwidthControl->setRangeHz(10.0, 5000000.0);
     bandwidthControl->setStepPresets({
@@ -1436,21 +1878,8 @@ YourClassName::YourClassName(QWidget *parent)
         {"25 kHz", 25000.0},
         {"100 kHz", 100000.0},
     });
-    bandwidthControl->setValuePresets({
-        {"CW 500 Hz", 500.0},
-        {"SSB 2.7 kHz", 2700.0},
-        {"FT8 3 kHz", 3000.0},
-        {"AM 6 kHz", 6000.0},
-        {"AM 10 kHz", 10000.0},
-        {"NFM 12.5 kHz", 12500.0},
-        {"DMR 12.5 kHz", 12500.0},
-        {"WFM 200 kHz", 200000.0},
-        {"SSTV 3 kHz", 3000.0},
-        {"NOAA APT 40 kHz", 40000.0},
-        {"WEFAX 3 kHz", 3000.0},
-        {"LRPT 140 kHz", 140000.0},
-        {"ATV 5 MHz", 5000000.0},
-    });
+    ensureDefaultFrequencyPresets();
+    updateFrequencyPresetControls();
     bandwidthControl->setValueHz(defaultBandwidthForModulation(MOD_AM));
    
     QStringList modulationNames = {"AM", "NFM", "SAM", "USB", "LSB", "DSB", "CW", "WFM"};
@@ -1460,16 +1889,20 @@ YourClassName::YourClassName(QWidget *parent)
     QHBoxLayout* row1 = new QHBoxLayout();
     QHBoxLayout* row2 = new QHBoxLayout();
     
+    QVBoxLayout *controlsToggleLayout = new QVBoxLayout();
+    controlsToggleLayout->addStretch();
+    controlsToggleLayout->addWidget(controlsToggleButton);
+
+    scaleLayout->addLayout(controlsToggleLayout);
     scaleLayout->addLayout(contrastLayout);
     scaleLayout->addLayout(sensLayout);
     scaleLayout->addLayout(levelMinLayout);
     scaleLayout->addLayout(levelMaxLayout);
-    
-    graphToolLayout->addStretch();
+    scaleLayout->addLayout(graphToolLayout);
+
     graphToolLayout->addWidget(digitalToggleButton);
     graphToolLayout->addWidget(videoToggleButton);
 
-    graphLayout->addLayout(graphToolLayout);
     graphLayout->addWidget(graphWidget);
     graphLayout->addWidget(scaleWidget); 
     graphLayout->addWidget(waterfallWidget);
@@ -1489,11 +1922,30 @@ YourClassName::YourClassName(QWidget *parent)
     QHBoxLayout *deviceButtonLayout = new QHBoxLayout();
     deviceButtonLayout->addWidget(refreshButton);
     deviceButtonLayout->addWidget(fobosButton);
+    deviceButtonLayout->addWidget(networkButton);
+    deviceButtonLayout->addWidget(presetManagerButton);
+    deviceButtonLayout->addWidget(appSettingsButton);
 
-    QHBoxLayout *networkLnaLayout = new QHBoxLayout();
-    networkLnaLayout->addWidget(networkButton);
-    networkLnaLayout->addWidget(lnaGainLabel);
-    networkLnaLayout->addWidget(lnaGainSlider);
+    QHBoxLayout *gainLabelLayout = new QHBoxLayout();
+    lnaGainLabel->setAlignment(Qt::AlignCenter);
+    vgaGainLabel->setAlignment(Qt::AlignCenter);
+    gainLabelLayout->addWidget(lnaGainLabel, 1);
+    gainLabelLayout->addWidget(vgaGainLabel, 4);
+
+    QHBoxLayout *gainSliderLayout = new QHBoxLayout();
+    gainSliderLayout->addWidget(lnaGainSlider, 1);
+    gainSliderLayout->addWidget(vgaGainSlider, 4);
+
+    QGridLayout *hfNoiseCancelLayout = new QGridLayout();
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthLabel, 0, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthSlider, 0, 1);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelFreezeCheckbox, 0, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainLabel, 1, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainSlider, 1, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelayLabel, 2, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelaySlider, 2, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltLabel, 3, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltSlider, 3, 1, 1, 2);
 
     QHBoxLayout *recordingLayout = new QHBoxLayout();
     recordingLayout->addWidget(recordingModeCombo);
@@ -1503,51 +1955,97 @@ YourClassName::YourClassName(QWidget *parent)
     playbackButtonLayout->addWidget(playbackRefreshButton);
     playbackButtonLayout->addWidget(playbackButton);
 
+    QHBoxLayout *clockModeLayout = new QHBoxLayout();
+    clockModeLayout->addWidget(clockSourceLabel);
+    clockModeLayout->addWidget(clkBox, 1);
+    clockModeLayout->addWidget(inputModeLabel);
+    clockModeLayout->addWidget(modeBox, 1);
+
+    QHBoxLayout *fftSampleLayout = new QHBoxLayout();
+    fftSampleLayout->addWidget(fftLabel);
+    fftSampleLayout->addWidget(fftComboBox, 1);
+    fftSampleLayout->addWidget(sampleRateLabel);
+    fftSampleLayout->addWidget(sampleBox, 1);
+
+    QVBoxLayout *receiverRowsLayout = new QVBoxLayout();
+    receiverRowsLayout->setSpacing(4);
+    receiverRowsLayout->addLayout(clockModeLayout);
+    receiverRowsLayout->addLayout(fftSampleLayout);
+
+    QVBoxLayout *fineTuneLayout = new QVBoxLayout();
+    fineTuneLayout->setSpacing(2);
+    QWidget *fineTuneDialPage = new QWidget(this);
+    QVBoxLayout *fineTuneDialPageLayout = new QVBoxLayout(fineTuneDialPage);
+    fineTuneDialPageLayout->setContentsMargins(0, 0, 0, 0);
+    fineTuneDialPageLayout->addWidget(fineTuneDial, 0, Qt::AlignHCenter);
+    QWidget *fineTuneScalePage = new QWidget(this);
+    QVBoxLayout *fineTuneScalePageLayout = new QVBoxLayout(fineTuneScalePage);
+    fineTuneScalePageLayout->setContentsMargins(0, 0, 0, 0);
+    fineTuneScalePageLayout->addWidget(fineTuneScaleWidget);
+    fineTuneStack->addWidget(fineTuneScalePage);
+    fineTuneStack->addWidget(fineTuneDialPage);
+    QHBoxLayout *fineTuneHeaderLayout = new QHBoxLayout();
+    fineTuneHeaderLayout->setContentsMargins(0, 0, 0, 0);
+    fineTuneHeaderLayout->setSpacing(4);
+    fineTuneHeaderLayout->addWidget(fineTuneLabel, 1);
+    fineTuneHeaderLayout->addWidget(fineTuneScaleModeButton, 0, Qt::AlignRight | Qt::AlignVCenter);
+    fineTuneLayout->addLayout(fineTuneHeaderLayout);
+    fineTuneLayout->addWidget(fineTuneStack);
+
+    QHBoxLayout *receiverControlLayout = new QHBoxLayout();
+    receiverControlLayout->addLayout(receiverRowsLayout, 1);
+    receiverControlLayout->addLayout(fineTuneLayout, 0);
+
+    QHBoxLayout *startStopLayout = new QHBoxLayout();
+    startStopLayout->addWidget(startButton, 2);
+    startStopLayout->addWidget(stopButton, 1);
+
+    QHBoxLayout *centralFrequencyHeaderLayout = new QHBoxLayout();
+    centralFrequencyHeaderLayout->addWidget(centralFrequencyLabel);
+    centralFrequencyHeaderLayout->addStretch();
+
+    QHBoxLayout *listeningFrequencyHeaderLayout = new QHBoxLayout();
+    listeningFrequencyHeaderLayout->addWidget(listeningFrequencyLabel);
+    listeningFrequencyHeaderLayout->addStretch();
+
     layout->addLayout(deviceButtonLayout);
     layout->addWidget(comboBox);
-    layout->addWidget(clkBox);
-    layout->addWidget(modeBox);
-    layout->addWidget(sampleBox);
-    layout->addLayout(checkboxLayout);
-    layout->addWidget(centralFrequencyLabel);
+    layout->addLayout(receiverControlLayout);
+    layout->addWidget(agileScanBox);
+    layout->addLayout(hfNoiseCancelLayout);
+    layout->addLayout(centralFrequencyHeaderLayout);
     layout->addWidget(frequencyControl);
-    layout->addWidget(listeningFrequencyLabel);
+    layout->addLayout(listeningFrequencyHeaderLayout);
     layout->addWidget(listeningFrequencyControl);
-    layout->addWidget(fftLabel);
-    layout->addWidget(fftComboBox);
     layout->addWidget(scaleLabel);
     layout->addWidget(scaleSlider);
-    layout->addLayout(networkLnaLayout);
-    layout->addWidget(startButton);
-    layout->addWidget(stopButton);
-    layout->addWidget(vgaGainLabel);
-    layout->addWidget(vgaGainSlider);
+    layout->addLayout(gainLabelLayout);
+    layout->addLayout(gainSliderLayout);
+    layout->addLayout(startStopLayout);
     layout->addWidget(volumeLabel);
     layout->addWidget(volumeSlider);
     layout->addWidget(audioLowPassLabel);
     layout->addWidget(audioLowPassSlider);
     layout->addWidget(audioHighPassLabel);
     layout->addWidget(audioHighPassSlider);
+    layout->addWidget(bandwidthLabel);
+    layout->addWidget(bandwidthControl);
+    layout->addLayout(row1);
+    layout->addLayout(row2);
+    layout->addWidget(audioDeviceComboBox);
     layout->addWidget(recordingStatusLabel);
     layout->addLayout(recordingLayout);
     layout->addWidget(playbackStatusLabel);
     layout->addWidget(playbackFileCombo);
     layout->addLayout(playbackButtonLayout);
-    layout->addLayout(chckbox);
-    layout->addWidget(audioDeviceComboBox);
-    layout->addWidget(bandwidthLabel);
-    layout->addWidget(bandwidthControl);
-    layout->addLayout(row1);
-    layout->addLayout(row2);
-    
+    layout->addLayout(checkboxLayout);
+
     controlsWidget->setLayout(layout);
     centralWidget->setLayout(graphLayout);
     graphLayout->setStretch(0, 2);
-    graphLayout->setStretch(0, 0);
-    graphLayout->setStretch(1, 2);
-    graphLayout->setStretch(2, 0);
-    graphLayout->setStretch(3, 5);
-    graphLayout->setStretch(4, 0);
+    graphLayout->setStretch(1, 0);
+    graphLayout->setStretch(2, 5);
+    graphLayout->setStretch(3, 0);
     
     scaleWidget->setTuning(listeningFrequency, globalFrequency, globalBandwidth, globalModulationType);
     scaleWidget->setMarkerPosition(0.5);
@@ -1585,6 +2083,24 @@ YourClassName::YourClassName(QWidget *parent)
     connect(sensitivitySlider, &QSlider::valueChanged, this, &YourClassName::onSensitivityChanged);
     connect(levelMinSlider, &QSlider::valueChanged, this, &YourClassName::onLevelMinChanged);
     connect(levelMaxSlider, &QSlider::valueChanged, this, &YourClassName::onLevelMaxChanged);
+    connect(fineTuneDial, &QDial::valueChanged, this, &YourClassName::onFineTuneDialChanged);
+    connect(fineTuneDial, &QDial::sliderReleased, this, &YourClassName::onFineTuneDialReleased);
+    connect(fineTuneScaleWidget, &FineTuneScaleWidget::fineTuneDelta, this, [this](double deltaHz) {
+        applyListeningFrequencyDelta(deltaHz, 60);
+    });
+    connect(fineTuneScaleWidget, &FineTuneScaleWidget::holdOffsetModeChanged, this, [this](bool enabled) {
+        fineTuneScaleHoldMode = enabled;
+        updateFineTuneScaleModeButton();
+        savePersistentSettings();
+    });
+    connect(fineTuneScaleModeButton, &QToolButton::toggled, this, [this](bool checked) {
+        fineTuneScaleHoldMode = checked;
+        if (fineTuneScaleWidget) {
+            fineTuneScaleWidget->setHoldOffsetMode(checked);
+        }
+        updateFineTuneScaleModeButton();
+        savePersistentSettings();
+    });
     connect(scaleSlider, &QSlider::sliderReleased, this, [this]() {
         if (isNetworkClientMode() && !isFullIqProcessingMode()) {
             scheduleRemoteSettingsCommand();
@@ -1592,7 +2108,7 @@ YourClassName::YourClassName(QWidget *parent)
     });
     connect(volumeSlider, &QSlider::valueChanged, this, [this](int value) {
         volumePercent = value;
-        volumeLabel->setText(QString("Volume: %1%").arg(value));
+        volumeLabel->setText(QStringLiteral("%1: %2%").arg(uiText(QStringLiteral("volume"), QStringLiteral("Volume"))).arg(value));
 
         const float volume = value / 100.0f;
 
@@ -1620,6 +2136,49 @@ YourClassName::YourClassName(QWidget *parent)
             scheduleRemoteSettingsCommand();
         }
     });
+    auto applyHfNoiseCancelControls = [this]() {
+        if (hfNoiseCancelDepthSlider) {
+            pendingSettings.hfNoiseCancelDepth =
+                hfNoiseCancelSliderValueToDepth(hfNoiseCancelDepthSlider->value());
+        }
+        if (hfNoiseCancelRefGainSlider) {
+            pendingSettings.hfNoiseCancelRefGainDb =
+                hfNoiseCancelSliderValueToRefGainDb(hfNoiseCancelRefGainSlider->value());
+        }
+        if (hfNoiseCancelRefDelaySlider) {
+            pendingSettings.hfNoiseCancelRefDelayNs =
+                hfNoiseCancelSliderValueToRefDelayNs(hfNoiseCancelRefDelaySlider->value());
+        }
+        if (hfNoiseCancelRefTiltSlider) {
+            pendingSettings.hfNoiseCancelRefTiltDb =
+                hfNoiseCancelSliderValueToRefTiltDb(hfNoiseCancelRefTiltSlider->value());
+        }
+        if (hfNoiseCancelFreezeCheckbox) {
+            pendingSettings.hfNoiseCancelFreeze = hfNoiseCancelFreezeCheckbox->isChecked();
+        }
+        updateHfNoiseCancelControls();
+        if (fftResult) {
+            fftResult->resetHfNoiseCancelState();
+        }
+        if (audioProcessor) {
+            audioProcessor->resetHfNoiseCancelState();
+        }
+        publishSettingsToGlobals();
+        if (audioProcessor) {
+            audioProcessor->configure(audioProcessorSettings());
+        }
+        if (processor && processor->isRunning()) {
+            updateIqFrameProducerSettings();
+        }
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+        }
+    };
+    connect(hfNoiseCancelDepthSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
+    connect(hfNoiseCancelRefGainSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
+    connect(hfNoiseCancelRefDelaySlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
+    connect(hfNoiseCancelRefTiltSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
+    connect(hfNoiseCancelFreezeCheckbox, &QCheckBox::toggled, this, applyHfNoiseCancelControls);
     connect(startButton, &QPushButton::clicked, this, &YourClassName::startFobosProcessing);
     connect(stopButton, &QPushButton::clicked, this, &YourClassName::stopFobosProcessing);
     connect(modeBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onDirectSamplingChanged);
@@ -1707,8 +2266,25 @@ YourClassName::YourClassName(QWidget *parent)
     });
     connect(networkController, &NetworkController::controlCommandReceived, this, &YourClassName::onNetworkControlCommandReceived);
     connect(networkController, &NetworkController::binaryCommandReceived, this, [this](const QJsonObject &command, const QByteArray &payload) {
-        if (networkMode == NetworkMode::Client && command.value("type").toString() == QStringLiteral("iqbin")) {
+        if (networkMode != NetworkMode::Client) {
+            return;
+        }
+        const QString type = command.value("type").toString();
+        if (type == QStringLiteral("iqbin")) {
             receiveNetworkIqFrameBinary(command, payload);
+        } else if (type == QStringLiteral("spectrumbin")) {
+            displayNetworkSpectrumFrameBinary(command, payload);
+        }
+    });
+    connect(controlsToggleButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (controlsDock) {
+            controlsDock->setVisible(checked);
+        }
+    });
+    connect(controlsDock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (controlsToggleButton && controlsToggleButton->isChecked() != visible) {
+            QSignalBlocker blocker(controlsToggleButton);
+            controlsToggleButton->setChecked(visible);
         }
     });
     connect(digitalClearButton, &QPushButton::clicked, this, [this]() {
@@ -1873,7 +2449,67 @@ YourClassName::YourClassName(QWidget *parent)
             Qt::QueuedConnection);
     connect(audioCheckbox, &QCheckBox::toggled,
             this, &YourClassName::onAudioEnabledChanged);
+    connect(languageComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (!languageComboBox || index < 0) {
+            return;
+        }
+        const QString nextLanguage = languageComboBox->itemData(index).toString();
+        if (nextLanguage.isEmpty() || nextLanguage == uiLanguage) {
+            return;
+        }
+        uiLanguage = nextLanguage == QStringLiteral("uk") ? QStringLiteral("uk") : QStringLiteral("en");
+        applyUiLanguage();
+        savePersistentSettings();
+    });
     connect(sampleBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onSampleRateChanged);
+    auto applyAgileScanUiChange = [this](bool applyNow) {
+        const bool previousAgileScanEnabled = agileScanEnabled;
+        refreshSettingsFromUi();
+        updateAgileScanControls();
+        publishSettingsToGlobals();
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+            return;
+        }
+        if (applyNow && !isIdle() && hasActiveFobosDevice()) {
+            if (activeFobosApiKind == FobosApiKind::Agile &&
+                previousAgileScanEnabled != agileScanEnabled) {
+                restartStreamForHardwareChange();
+            } else {
+                applyAgileScanSettings(false);
+            }
+        }
+    };
+    connect(agileScanCheckbox, &QCheckBox::toggled, this, [applyAgileScanUiChange](bool) {
+        applyAgileScanUiChange(true);
+    });
+    connect(agileScanRangesEdit, &QLineEdit::editingFinished, this, [applyAgileScanUiChange]() {
+        applyAgileScanUiChange(true);
+    });
+    connect(agileScanStepSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [applyAgileScanUiChange](double) {
+        applyAgileScanUiChange(false);
+    });
+    connect(agileScanStepSpin, &QDoubleSpinBox::editingFinished, this, [applyAgileScanUiChange]() {
+        applyAgileScanUiChange(true);
+    });
+    connect(agileScanPresetCombo, QOverload<int>::of(&QComboBox::activated), this, [this, applyAgileScanUiChange](int index) {
+        const QString name = agileScanPresetCombo ? agileScanPresetCombo->itemData(index).toString() : QString();
+        if (name.isEmpty() || !agileScanPresets.contains(name)) {
+            return;
+        }
+        const QString spec = agileScanPresets.value(name);
+        if (agileScanRangesEdit) {
+            agileScanRangesEdit->setText(agileScanPresetRanges(spec, agileScanRangesMhz));
+        }
+        if (agileScanStepSpin) {
+            agileScanStepSpin->setValue(agileScanPresetStepMhz(spec, agileScanStepMhz));
+        }
+        applyAgileScanUiChange(true);
+    });
+    connect(agileScanSavePresetButton, &QPushButton::clicked, this, &YourClassName::saveAgileScanPreset);
+    connect(agileScanDeletePresetButton, &QPushButton::clicked, this, &YourClassName::deleteAgileScanPreset);
+    connect(presetManagerButton, &QPushButton::clicked, this, &YourClassName::openPresetManager);
+    connect(appSettingsButton, &QPushButton::clicked, this, &YourClassName::openApplicationSettings);
     connect(bandwidthControl, &FrequencyControl::valueCommitted, this, [this](double) {
         onBandwidthChanged();
     });
@@ -1888,6 +2524,8 @@ YourClassName::YourClassName(QWidget *parent)
     connect(graphWidget, &MyGraphWidget::scaleChanged, this, &YourClassName::onWaterfallScaleChanged);
     connect(graphWidget, &MyGraphWidget::tuneContextRequested, this, &YourClassName::showTuneContextMenu);
     connect(waterfallWidget, &MyWaterfallWidget::tuneContextRequested, this, &YourClassName::showTuneContextMenu);
+    connect(graphWidget, &MyGraphWidget::autoTuneRequested, this, &YourClassName::tuneSignalCenterAt);
+    connect(waterfallWidget, &MyWaterfallWidget::autoTuneRequested, this, &YourClassName::tuneSignalCenterAt);
     onFrequencyEntered();
     onVgaGainChanged(3);
     onLnaGainChanged(1);
@@ -1895,7 +2533,10 @@ YourClassName::YourClassName(QWidget *parent)
     populateAudioDevices();
     refreshSettingsFromUi();
     loadPersistentSettings();
+    updateFineTuneControlMode();
     updateUiFromPendingSettings();
+    updateGraphBandMarkers();
+    updateAgileScanControls();
     publishSettingsToGlobals();
     updateDigitalDecoderMode();
     updateVideoProcessorMode();
@@ -1996,6 +2637,10 @@ YourClassName::~YourClassName() {
         device = nullptr;
     }
     if (agileDevice) {
+        if (agileScanRunning) {
+            stopFobosAgileScanSafely(agileDevice);
+            agileScanRunning = false;
+        }
         closeFobosAgileDeviceSafely(agileDevice);
         agileDevice = nullptr;
     }
@@ -2115,7 +2760,8 @@ bool YourClassName::restartStreamForHardwareChange() {
                                pendingSettings.syncEnabled,
                                pendingSettings.sampleRate,
                                queueAudioBlocks,
-                               serverIqStreaming || channelIqRecording);
+                               serverIqStreaming || channelIqRecording,
+                               agileScanEnabled && activeFobosApiKind == FobosApiKind::Agile);
 
     deviceOpened = true;
 
@@ -2143,6 +2789,737 @@ uint8_t YourClassName::currentGpoValue() const {
         }
     }
     return value;
+}
+
+QVector<double> YourClassName::agileScanFrequencyList(QString *error) const {
+    const QString ranges = agileScanRangesEdit
+                               ? agileScanRangesEdit->text().trimmed()
+                               : agileScanRangesMhz.trimmed();
+    const double step = agileScanStepSpin
+                            ? agileScanStepSpin->value()
+                            : agileScanStepMhz;
+    return parseAgileScanFrequenciesMhz(ranges, step, error);
+}
+
+void YourClassName::updateAgileScanControls() {
+    if (agileScanPresetCombo) {
+        const QString currentText = agileScanPresetCombo->currentText();
+        QSignalBlocker blocker(agileScanPresetCombo);
+        agileScanPresetCombo->clear();
+        for (auto it = agileScanPresets.constBegin(); it != agileScanPresets.constEnd(); ++it) {
+            agileScanPresetCombo->addItem(it.key(), it.key());
+        }
+        agileScanPresetCombo->setEditText(currentText);
+    }
+
+    const bool scanChecked = agileScanCheckbox && agileScanCheckbox->isChecked();
+    if (agileScanRangesEdit) {
+        agileScanRangesEdit->setEnabled(scanChecked);
+    }
+    if (agileScanStepSpin) {
+        agileScanStepSpin->setEnabled(scanChecked);
+    }
+    if (agileScanPresetCombo) {
+        agileScanPresetCombo->setEnabled(true);
+    }
+
+    QString error;
+    const QVector<double> frequencies = agileScanFrequencyList(&error);
+    if (agileScanStatusLabel) {
+        if (!error.isEmpty()) {
+            agileScanStatusLabel->setText(error);
+        } else if (scanChecked) {
+            agileScanStatusLabel->setText(QStringLiteral("Scan list: %1 points").arg(frequencies.size()));
+        } else {
+            agileScanStatusLabel->setText(QStringLiteral("Agile scan: off"));
+        }
+    }
+}
+
+void YourClassName::saveAgileScanPreset() {
+    if (!agileScanPresetCombo) {
+        return;
+    }
+    QString name = agileScanPresetCombo->currentText().trimmed();
+    if (name.isEmpty()) {
+        name = QStringLiteral("Preset %1").arg(agileScanPresets.size() + 1);
+    }
+    refreshSettingsFromUi();
+    agileScanPresets[name] = agileScanPresetSpec(agileScanRangesMhz, agileScanStepMhz);
+    agileScanPresetCombo->setEditText(name);
+    updateAgileScanControls();
+    savePersistentSettings();
+}
+
+void YourClassName::deleteAgileScanPreset() {
+    if (!agileScanPresetCombo) {
+        return;
+    }
+    const QString name = agileScanPresetCombo->currentText().trimmed();
+    if (!name.isEmpty()) {
+        agileScanPresets.remove(name);
+    }
+    updateAgileScanControls();
+    savePersistentSettings();
+}
+
+void YourClassName::ensureDefaultFrequencyPresets() {
+    if (centerFrequencyPresets.isEmpty()) {
+        centerFrequencyPresets[QStringLiteral("FM broadcast 100 MHz")] = 100000000.0;
+        centerFrequencyPresets[QStringLiteral("Airband 125 MHz")] = 125000000.0;
+        centerFrequencyPresets[QStringLiteral("VHF 145 MHz")] = 145000000.0;
+        centerFrequencyPresets[QStringLiteral("UHF 433 MHz")] = 433000000.0;
+        centerFrequencyPresets[QStringLiteral("GSM/LTE 900 MHz")] = 900000000.0;
+        centerFrequencyPresets[QStringLiteral("FPV 1.2 GHz")] = 1200000000.0;
+        centerFrequencyPresets[QStringLiteral("FPV 2.4 GHz")] = 2400000000.0;
+    }
+    if (listeningFrequencyPresets.isEmpty()) {
+        listeningFrequencyPresets[QStringLiteral("HF center 0 Hz")] = 0.0;
+        listeningFrequencyPresets[QStringLiteral("HF 500 kHz")] = 500000.0;
+        listeningFrequencyPresets[QStringLiteral("HF 1.25 MHz")] = 1250000.0;
+        listeningFrequencyPresets[QStringLiteral("80 m 3.65 MHz")] = 3650000.0;
+        listeningFrequencyPresets[QStringLiteral("40 m 7.05 MHz")] = 7050000.0;
+        listeningFrequencyPresets[QStringLiteral("20 m FT8 14.074 MHz")] = 14074000.0;
+        listeningFrequencyPresets[QStringLiteral("VHF 145 MHz")] = 145000000.0;
+        listeningFrequencyPresets[QStringLiteral("UHF 433 MHz")] = 433000000.0;
+    }
+    if (bandwidthValuePresets.isEmpty()) {
+        bandwidthValuePresets[QStringLiteral("CW 500 Hz")] = 500.0;
+        bandwidthValuePresets[QStringLiteral("SSB 2.7 kHz")] = 2700.0;
+        bandwidthValuePresets[QStringLiteral("FT8 3 kHz")] = 3000.0;
+        bandwidthValuePresets[QStringLiteral("AM 6 kHz")] = 6000.0;
+        bandwidthValuePresets[QStringLiteral("AM 10 kHz")] = 10000.0;
+        bandwidthValuePresets[QStringLiteral("NFM 12.5 kHz")] = 12500.0;
+        bandwidthValuePresets[QStringLiteral("DMR 12.5 kHz")] = 12500.0;
+        bandwidthValuePresets[QStringLiteral("WFM 200 kHz")] = 200000.0;
+        bandwidthValuePresets[QStringLiteral("SSTV 3 kHz")] = 3000.0;
+        bandwidthValuePresets[QStringLiteral("NOAA APT 40 kHz")] = 40000.0;
+        bandwidthValuePresets[QStringLiteral("WEFAX 3 kHz")] = 3000.0;
+        bandwidthValuePresets[QStringLiteral("LRPT 140 kHz")] = 140000.0;
+        bandwidthValuePresets[QStringLiteral("ATV 5 MHz")] = 5000000.0;
+    }
+}
+
+void YourClassName::ensureDefaultBandMarkers() {
+    if (bandMarkersCustomized || !bandMarkers.isEmpty()) {
+        return;
+    }
+
+    auto addMhz = [this](const char *label, double startMhz, double endMhz, bool amateur) {
+        GraphBandMarker marker;
+        marker.startHz = startMhz * 1000000.0;
+        marker.endHz = endMhz * 1000000.0;
+        marker.label = QString::fromLatin1(label);
+        marker.amateur = amateur;
+        bandMarkers.append(marker);
+    };
+
+    addMhz("MW BC", 0.5265, 1.705, false);
+    addMhz("SW 49m", 5.9, 6.2, false);
+    addMhz("SW 41m", 7.2, 7.45, false);
+    addMhz("SW 31m", 9.4, 9.9, false);
+    addMhz("SW 25m", 11.6, 12.1, false);
+    addMhz("SW 19m", 15.1, 15.8, false);
+    addMhz("CB", 26.965, 27.405, false);
+    addMhz("FM BC", 87.5, 108.0, false);
+    addMhz("Air", 118.0, 137.0, false);
+    addMhz("WX Sat", 137.0, 138.0, false);
+    addMhz("Marine", 156.0, 162.05, false);
+    addMhz("UHF Satcom", 240.0, 270.0, false);
+    addMhz("TETRA", 380.0, 430.0, false);
+    addMhz("PMR446", 446.0, 446.2, false);
+    addMhz("ADS-B", 1089.5, 1090.5, false);
+    addMhz("L-band Sat", 1525.0, 1660.5, false);
+    addMhz("GNSS L1", 1559.0, 1610.0, false);
+    addMhz("ISM 2.4", 2400.0, 2483.5, false);
+    addMhz("FPV 5.8", 5650.0, 5925.0, false);
+
+    addMhz("2200m", 0.1357, 0.1378, true);
+    addMhz("630m", 0.472, 0.479, true);
+    addMhz("160m", 1.81, 2.0, true);
+    addMhz("80m", 3.5, 3.8, true);
+    addMhz("60m", 5.3515, 5.3665, true);
+    addMhz("40m", 7.0, 7.2, true);
+    addMhz("30m", 10.1, 10.15, true);
+    addMhz("20m", 14.0, 14.35, true);
+    addMhz("17m", 18.068, 18.168, true);
+    addMhz("15m", 21.0, 21.45, true);
+    addMhz("12m", 24.89, 24.99, true);
+    addMhz("10m", 28.0, 29.7, true);
+    addMhz("6m", 50.0, 52.0, true);
+    addMhz("4m", 70.0, 70.5, true);
+    addMhz("2m", 144.0, 146.0, true);
+    addMhz("70cm", 430.0, 440.0, true);
+    addMhz("23cm", 1240.0, 1300.0, true);
+    addMhz("13cm", 2300.0, 2450.0, true);
+    addMhz("6cm", 5650.0, 5850.0, true);
+}
+
+QVector<QPair<QString, double>> YourClassName::presetMapToVector(const QMap<QString, double> &presets) const {
+    QVector<QPair<QString, double>> values;
+    values.reserve(presets.size());
+    for (auto it = presets.constBegin(); it != presets.constEnd(); ++it) {
+        if (!it.key().trimmed().isEmpty() && std::isfinite(it.value())) {
+            values.append(qMakePair(it.key(), it.value()));
+        }
+    }
+    return values;
+}
+
+void YourClassName::updateFrequencyPresetControls() {
+    ensureDefaultFrequencyPresets();
+    if (frequencyControl) {
+        frequencyControl->setValuePresets(presetMapToVector(centerFrequencyPresets));
+    }
+    if (listeningFrequencyControl) {
+        listeningFrequencyControl->setValuePresets(presetMapToVector(listeningFrequencyPresets));
+    }
+    if (bandwidthControl) {
+        bandwidthControl->setValuePresets(presetMapToVector(bandwidthValuePresets));
+    }
+    updateAgileScanControls();
+}
+
+void YourClassName::updateGraphBandMarkers() {
+    if (!graphWidget) {
+        return;
+    }
+    graphWidget->setBandMarkers(bandMarkers);
+    graphWidget->setBandMarkersEnabled(showGeneralBandMarkers, showAmateurBandMarkers);
+    graphWidget->setBandMarkersCompact(compactBandMarkers);
+}
+
+void YourClassName::openPresetManager() {
+    ensureDefaultFrequencyPresets();
+    ensureDefaultBandMarkers();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Preset Manager"));
+    dialog.resize(720, 520);
+
+    QVBoxLayout *rootLayout = new QVBoxLayout(&dialog);
+    QTabWidget *tabs = new QTabWidget(&dialog);
+
+    auto makeNumericTab = [this, &dialog](const QMap<QString, double> &presets,
+                                          const QString &valueHeader,
+                                          double minimum,
+                                          double maximum) -> QTableWidget * {
+        QWidget *page = new QWidget(&dialog);
+        QVBoxLayout *pageLayout = new QVBoxLayout(page);
+        QTableWidget *table = new QTableWidget(page);
+        table->setColumnCount(2);
+        table->setHorizontalHeaderLabels({QStringLiteral("Name"), valueHeader});
+        table->horizontalHeader()->setStretchLastSection(true);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table->setSelectionMode(QAbstractItemView::SingleSelection);
+        table->setRowCount(presets.size());
+        int row = 0;
+        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
+            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+            table->setItem(row, 1, new QTableWidgetItem(QString::number(it.value(), 'f', 3)));
+        }
+
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *addButton = new QPushButton(QStringLiteral("Add"), page);
+        QPushButton *removeButton = new QPushButton(QStringLiteral("Remove"), page);
+        buttonLayout->addWidget(addButton);
+        buttonLayout->addWidget(removeButton);
+        buttonLayout->addStretch();
+        pageLayout->addWidget(table);
+        pageLayout->addLayout(buttonLayout);
+
+        QObject::connect(addButton, &QPushButton::clicked, table, [this, table, minimum]() {
+            const int row = table->rowCount();
+            table->insertRow(row);
+            table->setItem(row, 0, new QTableWidgetItem(QStringLiteral("New preset")));
+            table->setItem(row, 1, new QTableWidgetItem(QString::number((std::max)(0.0, minimum), 'f', 3)));
+            table->setCurrentCell(row, 0);
+            table->editItem(table->item(row, 0));
+        });
+        QObject::connect(removeButton, &QPushButton::clicked, table, [this, table]() {
+            const int row = table->currentRow();
+            if (row >= 0) {
+                table->removeRow(row);
+            }
+        });
+
+        table->setProperty("minimumValue", minimum);
+        table->setProperty("maximumValue", maximum);
+        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
+        return table;
+    };
+
+    auto makeAgileTab = [this, &dialog](const QMap<QString, QString> &presets) -> QTableWidget * {
+        QWidget *page = new QWidget(&dialog);
+        QVBoxLayout *pageLayout = new QVBoxLayout(page);
+        QTableWidget *table = new QTableWidget(page);
+        table->setColumnCount(3);
+        table->setHorizontalHeaderLabels({QStringLiteral("Name"), QStringLiteral("Ranges MHz"), QStringLiteral("Step MHz")});
+        table->horizontalHeader()->setStretchLastSection(true);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table->setSelectionMode(QAbstractItemView::SingleSelection);
+        table->setRowCount(presets.size());
+        int row = 0;
+        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
+            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+            table->setItem(row, 1, new QTableWidgetItem(agileScanPresetRanges(it.value())));
+            table->setItem(row, 2, new QTableWidgetItem(QString::number(agileScanPresetStepMhz(it.value(), 0.0125), 'f', 6)));
+        }
+
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *addButton = new QPushButton(QStringLiteral("Add"), page);
+        QPushButton *removeButton = new QPushButton(QStringLiteral("Remove"), page);
+        buttonLayout->addWidget(addButton);
+        buttonLayout->addWidget(removeButton);
+        buttonLayout->addStretch();
+        pageLayout->addWidget(table);
+        pageLayout->addLayout(buttonLayout);
+
+        QObject::connect(addButton, &QPushButton::clicked, table, [this, table]() {
+            const int row = table->rowCount();
+            table->insertRow(row);
+            table->setItem(row, 0, new QTableWidgetItem(QStringLiteral("New scan preset")));
+            table->setItem(row, 1, new QTableWidgetItem(QStringLiteral("430-432")));
+            table->setItem(row, 2, new QTableWidgetItem(QStringLiteral("0.0125")));
+            table->setCurrentCell(row, 0);
+            table->editItem(table->item(row, 0));
+        });
+        QObject::connect(removeButton, &QPushButton::clicked, table, [this, table]() {
+            const int row = table->currentRow();
+            if (row >= 0) {
+                table->removeRow(row);
+            }
+        });
+
+        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
+        return table;
+    };
+
+    auto makeBandMarkerTab = [this, &dialog](const QVector<GraphBandMarker> &markers) -> QTableWidget * {
+        QWidget *page = new QWidget(&dialog);
+        QVBoxLayout *pageLayout = new QVBoxLayout(page);
+        QTableWidget *table = new QTableWidget(page);
+        table->setColumnCount(4);
+        table->setHorizontalHeaderLabels({QStringLiteral("Layer"),
+                                          QStringLiteral("Label"),
+                                          QStringLiteral("Start MHz"),
+                                          QStringLiteral("End MHz")});
+        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table->setSelectionMode(QAbstractItemView::SingleSelection);
+
+        auto setLayerCell = [table](int row, bool amateur) {
+            QComboBox *layerCombo = new QComboBox(table);
+            layerCombo->addItem(QStringLiteral("Common"), QStringLiteral("general"));
+            layerCombo->addItem(QStringLiteral("HAM"), QStringLiteral("amateur"));
+            layerCombo->setCurrentIndex(amateur ? 1 : 0);
+            table->setCellWidget(row, 0, layerCombo);
+        };
+        auto setBandRow = [table, setLayerCell](int row, const GraphBandMarker &marker) {
+            setLayerCell(row, marker.amateur);
+            table->setItem(row, 1, new QTableWidgetItem(marker.label));
+            table->setItem(row, 2, new QTableWidgetItem(QString::number(marker.startHz / 1000000.0, 'f', 6)));
+            table->setItem(row, 3, new QTableWidgetItem(QString::number(marker.endHz / 1000000.0, 'f', 6)));
+        };
+
+        table->setRowCount(markers.size());
+        for (int row = 0; row < markers.size(); ++row) {
+            setBandRow(row, markers.at(row));
+        }
+
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *addCommonButton = new QPushButton(QStringLiteral("Add common"), page);
+        QPushButton *addHamButton = new QPushButton(QStringLiteral("Add HAM"), page);
+        QPushButton *removeButton = new QPushButton(QStringLiteral("Remove"), page);
+        buttonLayout->addWidget(addCommonButton);
+        buttonLayout->addWidget(addHamButton);
+        buttonLayout->addWidget(removeButton);
+        buttonLayout->addStretch();
+        pageLayout->addWidget(table);
+        pageLayout->addLayout(buttonLayout);
+
+        auto addBandRow = [table, setBandRow](bool amateur) {
+            const int row = table->rowCount();
+            table->insertRow(row);
+            GraphBandMarker marker;
+            marker.label = amateur ? QStringLiteral("New HAM band") : QStringLiteral("New band");
+            marker.startHz = amateur ? 144000000.0 : 118000000.0;
+            marker.endHz = amateur ? 146000000.0 : 137000000.0;
+            marker.amateur = amateur;
+            setBandRow(row, marker);
+            table->setCurrentCell(row, 1);
+            table->editItem(table->item(row, 1));
+        };
+        QObject::connect(addCommonButton, &QPushButton::clicked, table, [addBandRow]() {
+            addBandRow(false);
+        });
+        QObject::connect(addHamButton, &QPushButton::clicked, table, [addBandRow]() {
+            addBandRow(true);
+        });
+        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
+            const int row = table->currentRow();
+            if (row >= 0) {
+                table->removeRow(row);
+            }
+        });
+
+        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
+        return table;
+    };
+
+    QTableWidget *centerTable = makeNumericTab(centerFrequencyPresets, QStringLiteral("Frequency Hz"), 0.0, 6000000000.0);
+    QTableWidget *listeningTable = makeNumericTab(listeningFrequencyPresets, QStringLiteral("Frequency Hz"), -6000000000.0, 6000000000.0);
+    QTableWidget *bandwidthTable = makeNumericTab(bandwidthValuePresets, QStringLiteral("Bandwidth Hz"), 1.0, 5000000.0);
+    QTableWidget *agileTable = makeAgileTab(agileScanPresets);
+    QTableWidget *bandMarkerTable = makeBandMarkerTab(bandMarkers);
+
+    tabs->addTab(static_cast<QWidget*>(centerTable->property("pageWidget").value<void*>()), QStringLiteral("Center"));
+    tabs->addTab(static_cast<QWidget*>(listeningTable->property("pageWidget").value<void*>()), QStringLiteral("Listen"));
+    tabs->addTab(static_cast<QWidget*>(bandwidthTable->property("pageWidget").value<void*>()), QStringLiteral("Audio BW"));
+    tabs->addTab(static_cast<QWidget*>(agileTable->property("pageWidget").value<void*>()), QStringLiteral("Agile scan"));
+    tabs->addTab(static_cast<QWidget*>(bandMarkerTable->property("pageWidget").value<void*>()), QStringLiteral("Band markers"));
+
+    QLabel *hintLabel = new QLabel(QStringLiteral("Values are stored in Hz for frequency/audio presets. Agile scan and band-marker ranges are edited in MHz. HAM defaults are Region-1-style hints; edit them for local rules."), &dialog);
+    hintLabel->setWordWrap(true);
+    QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    rootLayout->addWidget(tabs);
+    rootLayout->addWidget(hintLabel);
+    rootLayout->addWidget(buttonBox);
+
+    auto readNumericTable = [](QTableWidget *table, QMap<QString, double> &target, QString *error) {
+        QMap<QString, double> next;
+        const double minimum = table->property("minimumValue").toDouble();
+        const double maximum = table->property("maximumValue").toDouble();
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
+            const QString valueText = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
+            if (name.isEmpty() && valueText.isEmpty()) {
+                continue;
+            }
+            bool ok = false;
+            const double value = valueText.toDouble(&ok);
+            if (name.isEmpty() || !ok || !std::isfinite(value) || value < minimum || value > maximum) {
+                if (error) {
+                    *error = QStringLiteral("Bad numeric preset at row %1").arg(row + 1);
+                }
+                return false;
+            }
+            next[name] = value;
+        }
+        target = next;
+        return true;
+    };
+
+    auto readAgileTable = [](QTableWidget *table, QMap<QString, QString> &target, QString *error) {
+        QMap<QString, QString> next;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
+            const QString ranges = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
+            const QString stepText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
+            if (name.isEmpty() && ranges.isEmpty() && stepText.isEmpty()) {
+                continue;
+            }
+            bool ok = false;
+            const double step = stepText.toDouble(&ok);
+            if (name.isEmpty() || ranges.isEmpty() || !ok ||
+                !std::isfinite(step) ||
+                step < AGILE_SCAN_MIN_STEP_MHZ ||
+                step > AGILE_SCAN_MAX_STEP_MHZ) {
+                if (error) {
+                    *error = QStringLiteral("Bad Agile scan preset at row %1").arg(row + 1);
+                }
+                return false;
+            }
+            QString parseError;
+            parseAgileScanFrequenciesMhz(ranges, step, &parseError);
+            if (!parseError.isEmpty()) {
+                if (error) {
+                    *error = QStringLiteral("%1: %2").arg(name, parseError);
+                }
+                return false;
+            }
+            next[name] = agileScanPresetSpec(ranges, step);
+        }
+        target = next;
+        return true;
+    };
+
+    auto readBandMarkerTable = [](QTableWidget *table, QVector<GraphBandMarker> &target, QString *error) {
+        QVector<GraphBandMarker> next;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            QComboBox *layerCombo = qobject_cast<QComboBox*>(table->cellWidget(row, 0));
+            const QString layer = layerCombo ? layerCombo->currentData().toString() : QStringLiteral("general");
+            const QString label = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
+            const QString startText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
+            const QString endText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
+            if (label.isEmpty() && startText.isEmpty() && endText.isEmpty()) {
+                continue;
+            }
+
+            bool startOk = false;
+            bool endOk = false;
+            const double startMhz = startText.toDouble(&startOk);
+            const double endMhz = endText.toDouble(&endOk);
+            if (label.isEmpty() ||
+                !startOk ||
+                !endOk ||
+                !std::isfinite(startMhz) ||
+                !std::isfinite(endMhz) ||
+                startMhz < 0.0 ||
+                endMhz <= startMhz ||
+                endMhz > 100000.0) {
+                if (error) {
+                    *error = QStringLiteral("Bad band marker at row %1").arg(row + 1);
+                }
+                return false;
+            }
+
+            GraphBandMarker marker;
+            marker.startHz = startMhz * 1000000.0;
+            marker.endHz = endMhz * 1000000.0;
+            marker.label = label;
+            marker.amateur = layer == QStringLiteral("amateur");
+            next.append(marker);
+        }
+        target = next;
+        return true;
+    };
+
+    connect(buttonBox, &QDialogButtonBox::accepted, &dialog, [&]() {
+        QString error;
+        QMap<QString, double> nextCenter = centerFrequencyPresets;
+        QMap<QString, double> nextListening = listeningFrequencyPresets;
+        QMap<QString, double> nextBandwidth = bandwidthValuePresets;
+        QMap<QString, QString> nextAgile = agileScanPresets;
+        QVector<GraphBandMarker> nextBandMarkers = bandMarkers;
+        if (!readNumericTable(centerTable, nextCenter, &error) ||
+            !readNumericTable(listeningTable, nextListening, &error) ||
+            !readNumericTable(bandwidthTable, nextBandwidth, &error) ||
+            !readAgileTable(agileTable, nextAgile, &error) ||
+            !readBandMarkerTable(bandMarkerTable, nextBandMarkers, &error)) {
+            QMessageBox::warning(&dialog, QStringLiteral("Preset Manager"), error);
+            return;
+        }
+        centerFrequencyPresets = nextCenter;
+        listeningFrequencyPresets = nextListening;
+        bandwidthValuePresets = nextBandwidth;
+        agileScanPresets = nextAgile;
+        bandMarkers = nextBandMarkers;
+        bandMarkersCustomized = true;
+        updateFrequencyPresetControls();
+        updateGraphBandMarkers();
+        savePersistentSettings();
+        dialog.accept();
+    });
+    connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    dialog.exec();
+}
+
+void YourClassName::openApplicationSettings() {
+    QDialog dialog(this);
+    dialog.setWindowTitle(uiText(QStringLiteral("settings"), QStringLiteral("Settings...")));
+    dialog.setMinimumWidth(420);
+
+    QVBoxLayout *rootLayout = new QVBoxLayout(&dialog);
+
+    QFormLayout *generalLayout = new QFormLayout();
+    QComboBox *languageCombo = new QComboBox(&dialog);
+    languageCombo->addItem(QStringLiteral("English"), QStringLiteral("en"));
+    languageCombo->addItem(QString::fromUtf8("Українська"), QStringLiteral("uk"));
+    languageCombo->setCurrentIndex(languageCombo->findData(uiLanguage));
+    if (languageCombo->currentIndex() < 0) {
+        languageCombo->setCurrentIndex(0);
+    }
+
+    QComboBox *fineTuneModeCombo = new QComboBox(&dialog);
+    fineTuneModeCombo->addItem(uiText(QStringLiteral("fine_tune_scale"), QStringLiteral("Horizontal scale (mouse wheel)")),
+                               FINE_TUNE_MODE_SCALE);
+    fineTuneModeCombo->addItem(uiText(QStringLiteral("fine_tune_dial"), QStringLiteral("Round dial")),
+                               FINE_TUNE_MODE_DIAL);
+    const int fineTuneIndex = fineTuneModeCombo->findData(fineTuneControlMode);
+    fineTuneModeCombo->setCurrentIndex(fineTuneIndex >= 0 ? fineTuneIndex : 0);
+
+    generalLayout->addRow(uiText(QStringLiteral("language"), QStringLiteral("Lang:")), languageCombo);
+    generalLayout->addRow(uiText(QStringLiteral("fine_tune"), QStringLiteral("Fine tune")), fineTuneModeCombo);
+    rootLayout->addLayout(generalLayout);
+
+    QGroupBox *quickOptionsBox = new QGroupBox(uiText(QStringLiteral("quick_options"), QStringLiteral("Quick options")), &dialog);
+    QGridLayout *quickOptionsLayout = new QGridLayout(quickOptionsBox);
+    QCheckBox *audioOption = new QCheckBox(uiText(QStringLiteral("audio"), QStringLiteral("Audio")), quickOptionsBox);
+    QCheckBox *syncOption = new QCheckBox(uiText(QStringLiteral("sync"), QStringLiteral("Sync")), quickOptionsBox);
+    QCheckBox *spectrum2Option = new QCheckBox(uiText(QStringLiteral("spectrum2"), QStringLiteral("Spectr 2")), quickOptionsBox);
+    QCheckBox *colorOption = new QCheckBox(uiText(QStringLiteral("colorful"), QStringLiteral("Colorful")), quickOptionsBox);
+    QCheckBox *generalBandMarkersOption = new QCheckBox(uiText(QStringLiteral("general_band_markers"), QStringLiteral("Band markers")), quickOptionsBox);
+    QCheckBox *amateurBandMarkersOption = new QCheckBox(uiText(QStringLiteral("amateur_band_markers"), QStringLiteral("HAM bands")), quickOptionsBox);
+    QCheckBox *compactBandMarkersOption = new QCheckBox(uiText(QStringLiteral("compact_band_markers"), QStringLiteral("Collapsed")), quickOptionsBox);
+    audioOption->setChecked(audioCheckbox && audioCheckbox->isChecked());
+    syncOption->setChecked(syncCheckbox && syncCheckbox->isChecked());
+    syncOption->setEnabled(false);
+    syncOption->setToolTip(syncCheckbox ? syncCheckbox->toolTip() : QString());
+    spectrum2Option->setChecked(graphCheckbox && graphCheckbox->isChecked());
+    colorOption->setChecked(colorCheckbox && colorCheckbox->isChecked());
+    generalBandMarkersOption->setChecked(showGeneralBandMarkers);
+    amateurBandMarkersOption->setChecked(showAmateurBandMarkers);
+    compactBandMarkersOption->setChecked(compactBandMarkers);
+    quickOptionsLayout->addWidget(audioOption, 0, 0);
+    quickOptionsLayout->addWidget(syncOption, 0, 1);
+    quickOptionsLayout->addWidget(spectrum2Option, 1, 0);
+    quickOptionsLayout->addWidget(colorOption, 1, 1);
+    quickOptionsLayout->addWidget(generalBandMarkersOption, 2, 0);
+    quickOptionsLayout->addWidget(amateurBandMarkersOption, 2, 1);
+    quickOptionsLayout->addWidget(compactBandMarkersOption, 2, 2);
+    rootLayout->addWidget(quickOptionsBox);
+
+    auto applyLanguage = [this, languageCombo]() {
+        const QString nextLanguage = languageCombo->currentData().toString();
+        uiLanguage = nextLanguage == QStringLiteral("uk") ? QStringLiteral("uk") : QStringLiteral("en");
+        applyUiLanguage();
+        savePersistentSettings();
+    };
+    auto applyFineTuneMode = [this, fineTuneModeCombo]() {
+        fineTuneControlMode = fineTuneModeCombo->currentData().toInt();
+        if (fineTuneControlMode != FINE_TUNE_MODE_DIAL) {
+            fineTuneControlMode = FINE_TUNE_MODE_SCALE;
+        }
+        updateFineTuneControlMode();
+        savePersistentSettings();
+    };
+
+    connect(languageCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [applyLanguage](int) {
+        applyLanguage();
+    });
+    connect(fineTuneModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [applyFineTuneMode](int) {
+        applyFineTuneMode();
+    });
+    connect(audioOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        if (audioCheckbox) {
+            audioCheckbox->setChecked(checked);
+        }
+        savePersistentSettings();
+    });
+    connect(spectrum2Option, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        if (graphCheckbox) {
+            graphCheckbox->setChecked(checked);
+        }
+        savePersistentSettings();
+    });
+    connect(colorOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        if (colorCheckbox) {
+            colorCheckbox->setChecked(checked);
+        }
+        savePersistentSettings();
+    });
+    connect(generalBandMarkersOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        showGeneralBandMarkers = checked;
+        updateGraphBandMarkers();
+        savePersistentSettings();
+    });
+    connect(amateurBandMarkersOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        showAmateurBandMarkers = checked;
+        updateGraphBandMarkers();
+        savePersistentSettings();
+    });
+    connect(compactBandMarkersOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        compactBandMarkers = checked;
+        updateGraphBandMarkers();
+        savePersistentSettings();
+    });
+
+    QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    rootLayout->addWidget(buttonBox);
+
+    connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    dialog.exec();
+}
+
+bool YourClassName::applyAgileScanSettings(bool forceStop) {
+    if (forceStop || !agileScanEnabled) {
+        if (activeFobosApiKind == FobosApiKind::Agile && agileDevice && agileScanRunning) {
+            const int result = stopFobosAgileScanSafely(agileDevice);
+            qDebug() << "[AgileScan] stop" << "result" << result;
+            agileScanRunning = false;
+            if (result != FOBOS_ERR_OK) {
+                return false;
+            }
+        }
+        if (agileScanStatusLabel) {
+            agileScanStatusLabel->setText(QStringLiteral("Agile scan: off"));
+        }
+        return true;
+    }
+
+    if (activeFobosApiKind != FobosApiKind::Agile || !agileDevice) {
+        if (agileScanStatusLabel) {
+            agileScanStatusLabel->setText(QStringLiteral("Agile receiver required"));
+        }
+        return true;
+    }
+
+    if (pendingSettings.inputMode != INPUT_RF) {
+        if (agileScanRunning) {
+            const int result = stopFobosAgileScanSafely(agileDevice);
+            qDebug() << "[AgileScan] stopped outside RF mode" << "result" << result;
+            agileScanRunning = false;
+        }
+        if (agileScanStatusLabel) {
+            agileScanStatusLabel->setText(QStringLiteral("Agile scan works in RF mode"));
+        }
+        return true;
+    }
+
+    QString error;
+    QVector<double> frequencies = agileScanFrequencyList(&error);
+    if (!error.isEmpty() || frequencies.isEmpty()) {
+        if (agileScanStatusLabel) {
+            agileScanStatusLabel->setText(error.isEmpty() ? QStringLiteral("Bad Agile scan list") : error);
+        }
+        qDebug() << "[AgileScan] invalid scan list" << error;
+        return false;
+    }
+
+    if (agileScanRunning) {
+        const int stopResult = stopFobosAgileScanSafely(agileDevice);
+        qDebug() << "[AgileScan] restart stop" << "result" << stopResult;
+        agileScanRunning = false;
+        if (stopResult != FOBOS_ERR_OK) {
+            if (agileScanStatusLabel) {
+                agileScanStatusLabel->setText(QStringLiteral("Scan stop failed: %1").arg(stopResult));
+            }
+            return false;
+        }
+    }
+
+    pendingSettings.centerFrequency = frequencies.first();
+    pendingSettings.actualFrequency = frequencies.first();
+    if (pendingSettings.listeningFrequency < pendingSettings.centerFrequency - pendingSettings.sampleRate / 2.0 ||
+        pendingSettings.listeningFrequency > pendingSettings.centerFrequency + pendingSettings.sampleRate / 2.0) {
+        pendingSettings.listeningFrequency = pendingSettings.centerFrequency;
+    }
+
+    const int result = startFobosAgileScanSafely(agileDevice,
+                                                frequencies.data(),
+                                                static_cast<unsigned int>(frequencies.size()));
+    const int scanning = result == FOBOS_ERR_OK ? isFobosAgileScanningSafely(agileDevice) : result;
+    const int index = result == FOBOS_ERR_OK ? getFobosAgileScanIndexSafely(agileDevice) : -1;
+    qDebug() << "[AgileScan] start"
+             << "result" << result
+             << "points" << frequencies.size()
+             << "firstHz" << frequencies.first()
+             << "lastHz" << frequencies.last()
+             << "isScanning" << scanning
+             << "index" << index;
+    agileScanRunning = result == FOBOS_ERR_OK;
+    if (agileScanStatusLabel) {
+        agileScanStatusLabel->setText(result == FOBOS_ERR_OK
+                                          ? QStringLiteral("Scan active: %1 points").arg(frequencies.size())
+                                          : QStringLiteral("Scan start failed: %1").arg(result));
+    }
+    return result == FOBOS_ERR_OK;
 }
 
 bool YourClassName::isIdle() const {
@@ -2174,10 +3551,10 @@ void YourClassName::refreshSettingsFromUi() {
     }
     if (frequencyControl) {
         double frequency = frequencyControl->valueHz();
-        if (pendingSettings.inputMode == 0 && frequency < 50000000.0) {
+        if (pendingSettings.inputMode == INPUT_RF && frequency < 50000000.0) {
             frequency = 50000000.0;
         }
-        pendingSettings.centerFrequency = pendingSettings.inputMode == 0 ? frequency : 0.0;
+        pendingSettings.centerFrequency = pendingSettings.inputMode == INPUT_RF ? frequency : 0.0;
     }
     if (listeningFrequencyControl) {
         pendingSettings.listeningFrequency = listeningFrequencyControl->valueHz();
@@ -2209,6 +3586,25 @@ void YourClassName::refreshSettingsFromUi() {
     if (audioHighPassSlider) {
         pendingSettings.audioHighPassHz = audioHighPassSliderValueToHz(audioHighPassSlider->value());
     }
+    if (hfNoiseCancelDepthSlider) {
+        pendingSettings.hfNoiseCancelDepth =
+            hfNoiseCancelSliderValueToDepth(hfNoiseCancelDepthSlider->value());
+    }
+    if (hfNoiseCancelRefGainSlider) {
+        pendingSettings.hfNoiseCancelRefGainDb =
+            hfNoiseCancelSliderValueToRefGainDb(hfNoiseCancelRefGainSlider->value());
+    }
+    if (hfNoiseCancelRefDelaySlider) {
+        pendingSettings.hfNoiseCancelRefDelayNs =
+            hfNoiseCancelSliderValueToRefDelayNs(hfNoiseCancelRefDelaySlider->value());
+    }
+    if (hfNoiseCancelRefTiltSlider) {
+        pendingSettings.hfNoiseCancelRefTiltDb =
+            hfNoiseCancelSliderValueToRefTiltDb(hfNoiseCancelRefTiltSlider->value());
+    }
+    if (hfNoiseCancelFreezeCheckbox) {
+        pendingSettings.hfNoiseCancelFreeze = hfNoiseCancelFreezeCheckbox->isChecked();
+    }
     if (audioCheckbox) {
         pendingSettings.audioEnabled = audioCheckbox->isChecked();
     }
@@ -2219,6 +3615,17 @@ void YourClassName::refreshSettingsFromUi() {
             syncCheckbox->blockSignals(false);
         }
         pendingSettings.syncEnabled = false;
+    }
+    if (agileScanCheckbox) {
+        agileScanEnabled = agileScanCheckbox->isChecked();
+    }
+    if (agileScanRangesEdit) {
+        agileScanRangesMhz = agileScanRangesEdit->text().trimmed();
+    }
+    if (agileScanStepSpin) {
+        agileScanStepMhz = (std::clamp)(agileScanStepSpin->value(),
+                                        AGILE_SCAN_MIN_STEP_MHZ,
+                                        AGILE_SCAN_MAX_STEP_MHZ);
     }
     pendingSettings.gpoValue = currentGpoValue();
     normalizeTuning(pendingSettings);
@@ -2344,7 +3751,8 @@ void YourClassName::updateIqFrameProducerSettings() {
 
 void YourClassName::updateRecordingStatus(const QString &status) {
     if (recordingStatusLabel) {
-        recordingStatusLabel->setText(status);
+        recordingStatusLabel->setProperty("statusRawText", status);
+        recordingStatusLabel->setText(localizedStatusText(status));
     }
 }
 
@@ -2358,6 +3766,7 @@ QString YourClassName::selectedPlaybackFilePath() const {
 void YourClassName::appendNetworkState(QJsonObject &command) const {
     command["processingMode"] = static_cast<int>(networkProcessingMode);
     command["serverDisableLocalVisualAudio"] = serverDisableLocalVisualAudio;
+    command["fullResolutionSpectrumFrames"] = networkFullResolutionSpectrumFrames;
 }
 
 void YourClassName::applyNetworkStateFromCommand(const QJsonObject &command) {
@@ -2368,13 +3777,86 @@ void YourClassName::applyNetworkStateFromCommand(const QJsonObject &command) {
     if (command.contains("serverDisableLocalVisualAudio")) {
         serverDisableLocalVisualAudio = command.value("serverDisableLocalVisualAudio").toBool(serverDisableLocalVisualAudio);
     }
+    if (command.contains("fullResolutionSpectrumFrames")) {
+        networkFullResolutionSpectrumFrames =
+            command.value("fullResolutionSpectrumFrames").toBool(networkFullResolutionSpectrumFrames);
+    }
     onNetworkStatusChanged(networkController ? networkController->statusText() : QString());
+}
+
+void YourClassName::handleDataProcessorFailure(int errorCode, bool stoppedByRequest) {
+    qDebug() << "[FobosLifecycle] DataProcessor reader failure"
+             << "error" << errorCode
+             << "stoppedByRequest" << stoppedByRequest
+             << "state" << runStateName(runState)
+             << "deviceOpened" << deviceOpened
+             << "processorRunning" << (processor && processor->isRunning())
+             << "device" << activeFobosDevice()
+             << "apiKind" << fobosApiKindName(activeFobosApiKind)
+             << "sampleRate" << pendingSettings.sampleRate
+             << "inputMode" << pendingSettings.inputMode;
+
+    if (stoppedByRequest || isNetworkClientMode()) {
+        return;
+    }
+
+    restartAfterStartupWatchdog = false;
+    automaticStreamRestart = false;
+    pendingAudioStartAfterStreamReady = false;
+    if (streamWatchdogTimer) {
+        streamWatchdogTimer->stop();
+    }
+
+    if (runState == RadioRunState::Stopping) {
+        return;
+    }
+
+    if (runState == RadioRunState::Idle && !deviceOpened && !hasActiveFobosDevice()) {
+        return;
+    }
+
+    qDebug() << "[FobosLifecycle] recovering from reader failure; closing Fobos session";
+    if (updateTimer) {
+        updateTimer->stop();
+    }
+    if (audioProcessor) {
+        audioProcessor->stopDemodulation();
+    }
+
+    runState = RadioRunState::Stopping;
+    updateUiForRunState();
+
+    if (processor && processor->isRunning()) {
+        stopCancelRetryCount = 0;
+        processor->requestStop();
+        stopElapsedTimer.restart();
+        if (stopPollTimer) {
+            stopPollTimer->start();
+        }
+        return;
+    }
+
+    finishFobosStop(false);
 }
 
 void YourClassName::connectDataProcessorSignals() {
     if (!processor) {
         return;
     }
+
+    DataProcessor *connectedProcessor = processor;
+    connect(processor,
+            &DataProcessor::readerFailed,
+            this,
+            [this, connectedProcessor](int errorCode, bool stoppedByRequest) {
+                if (connectedProcessor != processor) {
+                    qDebug() << "[FobosLifecycle] ignoring stale DataProcessor reader failure"
+                             << "error" << errorCode;
+                    return;
+                }
+                handleDataProcessorFailure(errorCode, stoppedByRequest);
+            },
+            Qt::QueuedConnection);
 
     connect(processor,
             &DataProcessor::iqFrameReady,
@@ -2425,7 +3907,7 @@ void YourClassName::applyServerLocalOutputPolicy() {
 
 bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings,
                                                            const char *reason) {
-    if (pendingSettings.inputMode != 0 ||
+    if (pendingSettings.inputMode != INPUT_RF ||
         isIdle() ||
         !hasActiveFobosDevice() ||
         std::abs(previousSettings.centerFrequency - pendingSettings.centerFrequency) <= 0.5) {
@@ -2564,10 +4046,18 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["vgaGain"] = pendingSettings.vgaGain;
     settings["audioLowPassHz"] = pendingSettings.audioLowPassHz;
     settings["audioHighPassHz"] = pendingSettings.audioHighPassHz;
+    settings["hfNoiseCancelDepth"] = pendingSettings.hfNoiseCancelDepth;
+    settings["hfNoiseCancelRefGainDb"] = pendingSettings.hfNoiseCancelRefGainDb;
+    settings["hfNoiseCancelRefDelayNs"] = pendingSettings.hfNoiseCancelRefDelayNs;
+    settings["hfNoiseCancelRefTiltDb"] = pendingSettings.hfNoiseCancelRefTiltDb;
+    settings["hfNoiseCancelFreeze"] = pendingSettings.hfNoiseCancelFreeze;
     settings["audioEnabled"] = pendingSettings.audioEnabled;
     settings["syncEnabled"] = false;
     settings["gpoValue"] = static_cast<int>(pendingSettings.gpoValue);
     settings["scalePercent"] = currentScale;
+    settings["agileScanEnabled"] = agileScanEnabled;
+    settings["agileScanRangesMhz"] = agileScanRangesMhz;
+    settings["agileScanStepMhz"] = agileScanStepMhz;
     return settings;
 }
 
@@ -2657,7 +4147,9 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
 
     pendingSettings.deviceIndex = readInt("deviceIndex", pendingSettings.deviceIndex);
     pendingSettings.clockSource = readInt("clockSource", pendingSettings.clockSource);
-    pendingSettings.inputMode = readInt("inputMode", pendingSettings.inputMode);
+    pendingSettings.inputMode = (std::clamp)(readInt("inputMode", pendingSettings.inputMode),
+                                             static_cast<int>(INPUT_RF),
+                                             static_cast<int>(INPUT_HF_NOISE_CANCEL));
     pendingSettings.centerFrequency = readDouble("centerFrequency", pendingSettings.centerFrequency);
     pendingSettings.actualFrequency = readDouble("actualFrequency", pendingSettings.actualFrequency);
     pendingSettings.listeningFrequency = readDouble("listeningFrequency", pendingSettings.listeningFrequency);
@@ -2669,11 +4161,425 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
     pendingSettings.vgaGain = readInt("vgaGain", pendingSettings.vgaGain);
     pendingSettings.audioLowPassHz = clampAudioLowPassHz(readDouble("audioLowPassHz", pendingSettings.audioLowPassHz));
     pendingSettings.audioHighPassHz = clampAudioHighPassHz(readDouble("audioHighPassHz", pendingSettings.audioHighPassHz));
+    pendingSettings.hfNoiseCancelDepth = clampHfNoiseCancelDepth(readDouble("hfNoiseCancelDepth", pendingSettings.hfNoiseCancelDepth));
+    pendingSettings.hfNoiseCancelRefGainDb =
+        clampHfNoiseCancelRefGainDb(readDouble("hfNoiseCancelRefGainDb", pendingSettings.hfNoiseCancelRefGainDb));
+    pendingSettings.hfNoiseCancelRefDelayNs =
+        clampHfNoiseCancelRefDelayNs(readDouble("hfNoiseCancelRefDelayNs", pendingSettings.hfNoiseCancelRefDelayNs));
+    pendingSettings.hfNoiseCancelRefTiltDb =
+        clampHfNoiseCancelRefTiltDb(readDouble("hfNoiseCancelRefTiltDb", pendingSettings.hfNoiseCancelRefTiltDb));
+    pendingSettings.hfNoiseCancelFreeze = readBool("hfNoiseCancelFreeze", pendingSettings.hfNoiseCancelFreeze);
     pendingSettings.audioEnabled = readBool("audioEnabled", pendingSettings.audioEnabled);
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>(readInt("gpoValue", pendingSettings.gpoValue));
     currentScale = readDouble("scalePercent", currentScale);
+    agileScanEnabled = readBool("agileScanEnabled", agileScanEnabled);
+    agileScanRangesMhz = settingsJson.value("agileScanRangesMhz").toString(agileScanRangesMhz).trimmed();
+    agileScanStepMhz = (std::clamp)(readDouble("agileScanStepMhz", agileScanStepMhz),
+                                    AGILE_SCAN_MIN_STEP_MHZ,
+                                    AGILE_SCAN_MAX_STEP_MHZ);
     normalizeTuning(pendingSettings);
+}
+
+void YourClassName::loadUiTranslations() {
+    auto baseLanguage = [](std::initializer_list<std::pair<const char *, const char *>> entries) {
+        QJsonObject object;
+        for (const auto &entry : entries) {
+            object[QString::fromLatin1(entry.first)] = QString::fromUtf8(entry.second);
+        }
+        return object;
+    };
+
+    uiTranslations = QJsonObject();
+    uiTranslations[QStringLiteral("en")] = baseLanguage({
+        {"controls", "Controls"},
+        {"digital_audio", "Digital Audio"},
+        {"video", "Video"},
+        {"settings_short", "Cfg"},
+        {"settings", "Settings..."},
+        {"decode", "Decode"},
+        {"dmr_lab", "DMR Lab"},
+        {"clear", "Clear"},
+        {"invert", "Invert"},
+        {"test", "Test"},
+        {"refresh_usb", "Refresh USB"},
+        {"refresh_usb_devices", "Refresh USB Devices"},
+        {"show_fobos_details", "Show Fobos Details"},
+        {"language", "Lang:"},
+        {"clock", "Clock:"},
+        {"mode", "Mode:"},
+        {"sample", "Sample:"},
+        {"fft", "FFT:"},
+        {"central_frequency", "Central Frequency:"},
+        {"listening_frequency", "Listening Frequency:"},
+        {"presets", "Presets..."},
+        {"audio_bandwidth", "Audio Bandwidth:"},
+        {"network", "Network"},
+        {"recording_idle", "Recording: idle"},
+        {"playback_idle", "Playback: idle"},
+        {"audio_wav", "Audio WAV"},
+        {"channel_iq_wav", "Channel IQ WAV"},
+        {"no_wav_recordings_found", "No WAV recordings found"},
+        {"recording_blocked_channel_iq_full_iq", "Recording blocked: Channel IQ cannot run during Full IQ streaming"},
+        {"recording_stopped_channel_iq_full_iq", "Recording stopped: Channel IQ cannot run during Full IQ streaming"},
+        {"recording_failed", "Recording failed"},
+        {"recording_audio", "Recording audio"},
+        {"recording_channel_iq_waiting", "Recording channel IQ: waiting for IQ frames"},
+        {"recording_channel_iq", "Recording channel IQ"},
+        {"iq_recording_failed", "IQ recording failed"},
+        {"recording_saved", "Recording saved"},
+        {"recording_stopped_no_data", "Recording stopped: no data"},
+        {"playback_blocked_stop_receiver", "Playback blocked: stop receiver first"},
+        {"playback_blocked_stop_recording", "Playback blocked: stop recording first"},
+        {"playback_no_file_selected", "Playback: no file selected"},
+        {"playback_failed", "Playback failed"},
+        {"playback_audio_wav_mono", "Playback failed: audio WAV must be mono 48 kHz"},
+        {"playback_stopped", "Playback: stopped"},
+        {"playback", "Playback"},
+        {"record", "Record"},
+        {"hold_f9", "Hold F9"},
+        {"stop_rec", "Stop Rec"},
+        {"refresh_playback", "Refresh Playback"},
+        {"play", "Play"},
+        {"stop_play", "Stop Play"},
+        {"start", "Start"},
+        {"stop", "Stop"},
+        {"audio", "Audio"},
+        {"sync", "Sync"},
+        {"spectrum2", "Spectr 2"},
+        {"colorful", "Colorful"},
+        {"general_band_markers", "Band markers"},
+        {"amateur_band_markers", "HAM bands"},
+        {"compact_band_markers", "Collapsed"},
+        {"internal", "Internal"},
+        {"external", "External"},
+        {"hf_cancel_lab", "HF1 - HF2 cancel lab"},
+        {"volume", "Volume"},
+        {"lna_gain", "LNA Gain"},
+        {"vga_gain", "VGA Gain"},
+        {"scale", "Scale"},
+        {"contrast", "Contrast"},
+        {"sensitivity", "Sensitivity"},
+        {"min", "Min"},
+        {"max", "Max"},
+        {"fine_tune", "Fine tune"},
+        {"fine_tune_scale", "Horizontal scale (mouse wheel)"},
+        {"fine_tune_dial", "Round dial"},
+        {"quick_options", "Quick options"},
+        {"audio_lpf", "Audio LPF"},
+        {"audio_hpf", "Audio HPF"},
+        {"auto", "Auto"},
+        {"off", "Off"},
+        {"hf_cancel", "HF cancel"},
+        {"ref_gain", "Ref gain"},
+        {"ref_delay", "Ref delay"},
+        {"ref_tilt", "Ref tilt"},
+        {"freeze", "Freeze"},
+        {"agile_scan", "Agile scan"},
+        {"enable_scan", "Enable scan"},
+        {"save", "Save"},
+        {"delete_short", "Del"},
+        {"ranges_mhz", "Ranges MHz:"},
+        {"step", "Step:"}
+    });
+    uiTranslations[QStringLiteral("uk")] = baseLanguage({
+        {"controls", "Керування"},
+        {"digital_audio", "Цифрове аудіо"},
+        {"video", "Відео"},
+        {"settings_short", "Cfg"},
+        {"decode", "Декод"},
+        {"dmr_lab", "DMR Lab"},
+        {"clear", "Очистити"},
+        {"invert", "Інверсія"},
+        {"test", "Тест"},
+        {"refresh_usb", "Оновити USB"},
+        {"refresh_usb_devices", "Оновити USB-пристрої"},
+        {"show_fobos_details", "Деталі Fobos"},
+        {"language", "Мова:"},
+        {"clock", "Такт:"},
+        {"mode", "Режим:"},
+        {"sample", "Семпл:"},
+        {"fft", "FFT:"},
+        {"central_frequency", "Центральна частота:"},
+        {"listening_frequency", "Частота прослух.:"},
+        {"audio_bandwidth", "Смуга аудіо:"},
+        {"network", "Мережа"},
+        {"recording_idle", "Recording: idle"},
+        {"playback_idle", "Playback: idle"},
+        {"audio_wav", "Audio WAV"},
+        {"channel_iq_wav", "Channel IQ WAV"},
+        {"no_wav_recordings_found", "No WAV recordings found"},
+        {"recording_blocked_channel_iq_full_iq", "Recording blocked: Channel IQ cannot run during Full IQ streaming"},
+        {"recording_stopped_channel_iq_full_iq", "Recording stopped: Channel IQ cannot run during Full IQ streaming"},
+        {"recording_failed", "Recording failed"},
+        {"recording_audio", "Recording audio"},
+        {"recording_channel_iq_waiting", "Recording channel IQ: waiting for IQ frames"},
+        {"recording_channel_iq", "Recording channel IQ"},
+        {"iq_recording_failed", "IQ recording failed"},
+        {"recording_saved", "Recording saved"},
+        {"recording_stopped_no_data", "Recording stopped: no data"},
+        {"playback_blocked_stop_receiver", "Playback blocked: stop receiver first"},
+        {"playback_blocked_stop_recording", "Playback blocked: stop recording first"},
+        {"playback_no_file_selected", "Playback: no file selected"},
+        {"playback_failed", "Playback failed"},
+        {"playback_audio_wav_mono", "Playback failed: audio WAV must be mono 48 kHz"},
+        {"playback_stopped", "Playback: stopped"},
+        {"playback", "Playback"},
+        {"record", "Запис"},
+        {"hold_f9", "F9 утрим."},
+        {"stop_rec", "Стоп запис"},
+        {"refresh_playback", "Оновити записи"},
+        {"play", "Відтворити"},
+        {"stop_play", "Стоп плей"},
+        {"start", "Старт"},
+        {"stop", "Стоп"},
+        {"audio", "Аудіо"},
+        {"sync", "Синхр."},
+        {"spectrum2", "Спектр 2"},
+        {"colorful", "Колір"},
+        {"internal", "Внутр."},
+        {"external", "Зовн."},
+        {"hf_cancel_lab", "HF1 - HF2 лаб."},
+        {"volume", "Гучність"},
+        {"lna_gain", "LNA"},
+        {"vga_gain", "VGA"},
+        {"scale", "Масштаб"},
+        {"contrast", "Контраст"},
+        {"sensitivity", "Чутливість"},
+        {"min", "Мін"},
+        {"max", "Макс"},
+        {"audio_lpf", "Аудіо ФНЧ"},
+        {"audio_hpf", "Аудіо ФВЧ"},
+        {"auto", "Авто"},
+        {"off", "Викл."},
+        {"hf_cancel", "HF компенсація"},
+        {"ref_gain", "Опора"},
+        {"ref_delay", "Затримка"},
+        {"ref_tilt", "Нахил"},
+        {"freeze", "Фікс."}
+    });
+
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        QDir(appDir).absoluteFilePath(QStringLiteral("translations.json")),
+        QDir::current().absoluteFilePath(QStringLiteral("translations.json")),
+        QDir(appDir).absoluteFilePath(QStringLiteral("../../translations.json"))
+    };
+
+    for (const QString &path : candidates) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            continue;
+        }
+        QJsonParseError parseError;
+        const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            qDebug() << "[Translations] failed to parse" << path << parseError.errorString();
+            continue;
+        }
+        const QJsonObject externalRoot = document.object();
+        for (const QString &language : {QStringLiteral("en"), QStringLiteral("uk")}) {
+            QJsonObject merged = uiTranslations.value(language).toObject();
+            const QJsonObject externalLanguage = externalRoot.value(language).toObject();
+            for (auto it = externalLanguage.constBegin(); it != externalLanguage.constEnd(); ++it) {
+                merged[it.key()] = it.value();
+            }
+            uiTranslations[language] = merged;
+        }
+        qDebug() << "[Translations] loaded" << path;
+        break;
+    }
+}
+
+QString YourClassName::uiText(const QString &key, const QString &fallback) const {
+    const QJsonObject language = uiTranslations.value(uiLanguage).toObject();
+    const QString translated = language.value(key).toString();
+    if (!translated.isEmpty()) {
+        return translated;
+    }
+    const QString english = uiTranslations.value(QStringLiteral("en")).toObject().value(key).toString();
+    return english.isEmpty() ? fallback : english;
+}
+
+QString YourClassName::localizedStatusText(const QString &status) const {
+    const auto prefixStatus = [this, &status](const QString &prefix,
+                                             const QString &key,
+                                             const QString &fallback,
+                                             const QString &separator) -> QString {
+        if (!status.startsWith(prefix)) {
+            return QString();
+        }
+        const QString base = uiText(key, fallback);
+        const QString suffix = status.mid(prefix.size());
+        return suffix.isEmpty() ? base : QStringLiteral("%1%2%3").arg(base, separator, suffix);
+    };
+
+    if (status == QStringLiteral("Recording: idle")) {
+        return uiText(QStringLiteral("recording_idle"), status);
+    }
+    if (status == QStringLiteral("Playback: idle")) {
+        return uiText(QStringLiteral("playback_idle"), status);
+    }
+    if (status == QStringLiteral("Recording blocked: Channel IQ cannot run during Full IQ streaming")) {
+        return uiText(QStringLiteral("recording_blocked_channel_iq_full_iq"), status);
+    }
+    if (status == QStringLiteral("Recording stopped: Channel IQ cannot run during Full IQ streaming")) {
+        return uiText(QStringLiteral("recording_stopped_channel_iq_full_iq"), status);
+    }
+    if (status == QStringLiteral("Recording stopped: no data")) {
+        return uiText(QStringLiteral("recording_stopped_no_data"), status);
+    }
+    if (status == QStringLiteral("Playback blocked: stop receiver first")) {
+        return uiText(QStringLiteral("playback_blocked_stop_receiver"), status);
+    }
+    if (status == QStringLiteral("Playback blocked: stop recording first")) {
+        return uiText(QStringLiteral("playback_blocked_stop_recording"), status);
+    }
+    if (status == QStringLiteral("Playback: no file selected")) {
+        return uiText(QStringLiteral("playback_no_file_selected"), status);
+    }
+    if (status == QStringLiteral("Playback failed: audio WAV must be mono 48 kHz")) {
+        return uiText(QStringLiteral("playback_audio_wav_mono"), status);
+    }
+    if (status == QStringLiteral("Playback: stopped")) {
+        return uiText(QStringLiteral("playback_stopped"), status);
+    }
+
+    const QStringList prefixTranslations = {
+        prefixStatus(QStringLiteral("Recording failed: "), QStringLiteral("recording_failed"), QStringLiteral("Recording failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Recording audio: "), QStringLiteral("recording_audio"), QStringLiteral("Recording audio"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Recording channel IQ: waiting for IQ frames"),
+                     QStringLiteral("recording_channel_iq_waiting"),
+                     QStringLiteral("Recording channel IQ: waiting for IQ frames"),
+                     QString()),
+        prefixStatus(QStringLiteral("Recording channel IQ: "), QStringLiteral("recording_channel_iq"), QStringLiteral("Recording channel IQ"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("IQ recording failed: "), QStringLiteral("iq_recording_failed"), QStringLiteral("IQ recording failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Recording saved: "), QStringLiteral("recording_saved"), QStringLiteral("Recording saved"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Playback failed: "), QStringLiteral("playback_failed"), QStringLiteral("Playback failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Playback: "), QStringLiteral("playback"), QStringLiteral("Playback"), QStringLiteral(": "))
+    };
+
+    for (const QString &translated : prefixTranslations) {
+        if (!translated.isEmpty()) {
+            return translated;
+        }
+    }
+    return status;
+}
+
+void YourClassName::markTranslatable(QWidget *widget, const QString &key, const QString &fallback) {
+    if (!widget) {
+        return;
+    }
+    widget->setProperty("i18nKey", key);
+    widget->setProperty("i18nFallback", fallback);
+    const QString text = uiText(key, fallback);
+    if (auto *label = qobject_cast<QLabel*>(widget)) {
+        label->setText(text);
+    } else if (auto *button = qobject_cast<QAbstractButton*>(widget)) {
+        button->setText(text);
+    } else if (auto *group = qobject_cast<QGroupBox*>(widget)) {
+        group->setTitle(text);
+    } else if (auto *dock = qobject_cast<QDockWidget*>(widget)) {
+        dock->setWindowTitle(text);
+    }
+}
+
+void YourClassName::setComboItemText(QComboBox *combo,
+                                     const QVariant &data,
+                                     const QString &key,
+                                     const QString &fallback) {
+    if (!combo) {
+        return;
+    }
+    const int index = combo->findData(data);
+    if (index >= 0) {
+        combo->setItemText(index, uiText(key, fallback));
+    }
+}
+
+void YourClassName::applyUiLanguage() {
+    const auto widgets = findChildren<QWidget*>();
+    for (QWidget *widget : widgets) {
+        const QString key = widget->property("i18nKey").toString();
+        if (key.isEmpty()) {
+            continue;
+        }
+        markTranslatable(widget, key, widget->property("i18nFallback").toString());
+    }
+
+    if (languageComboBox) {
+        QSignalBlocker blocker(languageComboBox);
+        const int index = languageComboBox->findData(uiLanguage);
+        if (index >= 0) {
+            languageComboBox->setCurrentIndex(index);
+        }
+    }
+
+    setComboItemText(clkBox, 0, QStringLiteral("internal"), QStringLiteral("Internal"));
+    setComboItemText(clkBox, 1, QStringLiteral("external"), QStringLiteral("External"));
+    setComboItemText(modeBox, static_cast<int>(INPUT_HF_NOISE_CANCEL),
+                     QStringLiteral("hf_cancel_lab"),
+                     QStringLiteral("HF1 - HF2 cancel lab"));
+    setComboItemText(recordingModeCombo,
+                     static_cast<int>(RecordingManager::Mode::AudioWav),
+                     QStringLiteral("audio_wav"),
+                     QStringLiteral("Audio WAV"));
+    setComboItemText(recordingModeCombo,
+                     static_cast<int>(RecordingManager::Mode::ChannelIqWav),
+                     QStringLiteral("channel_iq_wav"),
+                     QStringLiteral("Channel IQ WAV"));
+    if (playbackFileCombo &&
+        playbackFileCombo->count() == 1 &&
+        playbackFileCombo->itemData(0).toString().isEmpty()) {
+        playbackFileCombo->setItemText(0,
+                                       uiText(QStringLiteral("no_wav_recordings_found"),
+                                              QStringLiteral("No WAV recordings found")));
+    }
+
+    if (volumeLabel) {
+        volumeLabel->setText(QStringLiteral("%1: %2%").arg(uiText(QStringLiteral("volume"), QStringLiteral("Volume"))).arg(volumePercent));
+    }
+    if (lnaGainLabel) {
+        lnaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("lna_gain"), QStringLiteral("LNA Gain"))).arg(pendingSettings.lnaGain));
+    }
+    if (vgaGainLabel) {
+        vgaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("vga_gain"), QStringLiteral("VGA Gain"))).arg(pendingSettings.vgaGain));
+    }
+    if (scaleLabel) {
+        scaleLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("scale"), QStringLiteral("Scale")),
+                                                        formatScalePercent(currentScale)));
+    }
+    if (contrastLabel) {
+        contrastLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("contrast"), QStringLiteral("Contrast"))).arg(contrast));
+    }
+    if (sensitivityLabel) {
+        sensitivityLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("sensitivity"), QStringLiteral("Sensitivity"))).arg(sensitivity));
+    }
+    if (levelMinLabel) {
+        levelMinLabel->setText(levelLabelText(uiText(QStringLiteral("min"), QStringLiteral("Min")), displayLevelMin));
+    }
+    if (levelMaxLabel) {
+        levelMaxLabel->setText(levelLabelText(uiText(QStringLiteral("max"), QStringLiteral("Max")), displayLevelMax));
+    }
+    updateFineTuneLabel();
+    if (recordingStatusLabel) {
+        const QString rawStatus = recordingStatusLabel->property("statusRawText").toString();
+        recordingStatusLabel->setText(localizedStatusText(rawStatus.isEmpty()
+                                                              ? QStringLiteral("Recording: idle")
+                                                              : rawStatus));
+    }
+    if (playbackStatusLabel) {
+        const QString rawStatus = playbackStatusLabel->property("statusRawText").toString();
+        playbackStatusLabel->setText(localizedStatusText(rawStatus.isEmpty()
+                                                             ? QStringLiteral("Playback: idle")
+                                                             : rawStatus));
+    }
+
+    updateAudioFilterLabels();
+    updateHfNoiseCancelControls();
+    updateAgileScanControls();
+    updateNetworkButtonText();
 }
 
 void YourClassName::updateUiFromPendingSettings() {
@@ -2730,7 +4636,7 @@ void YourClassName::updateUiFromPendingSettings() {
     }
     if (listeningFrequencyControl) {
         QSignalBlocker blocker(listeningFrequencyControl);
-        if (pendingSettings.inputMode == 0) {
+        if (pendingSettings.inputMode == INPUT_RF) {
             listeningFrequencyControl->setRangeHz(RF_MIN_LISTENING_FREQUENCY, 6000000000.0);
         } else {
             listeningFrequencyControl->setRangeHz(directMinFrequencyForMode(pendingSettings.inputMode,
@@ -2762,7 +4668,7 @@ void YourClassName::updateUiFromPendingSettings() {
         lnaGainSlider->blockSignals(false);
     }
     if (lnaGainLabel) {
-        lnaGainLabel->setText(QString("LNA Gain: %1").arg(pendingSettings.lnaGain));
+        lnaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("lna_gain"), QStringLiteral("LNA Gain"))).arg(pendingSettings.lnaGain));
     }
     if (vgaGainSlider) {
         vgaGainSlider->blockSignals(true);
@@ -2770,7 +4676,7 @@ void YourClassName::updateUiFromPendingSettings() {
         vgaGainSlider->blockSignals(false);
     }
     if (vgaGainLabel) {
-        vgaGainLabel->setText(QString("VGA Gain: %1").arg(pendingSettings.vgaGain));
+        vgaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("vga_gain"), QStringLiteral("VGA Gain"))).arg(pendingSettings.vgaGain));
     }
     if (audioCheckbox) {
         audioCheckbox->blockSignals(true);
@@ -2804,7 +4710,8 @@ void YourClassName::updateUiFromPendingSettings() {
         scaleSlider->blockSignals(false);
     }
     if (scaleLabel) {
-        scaleLabel->setText(scaleLabelText(currentScale));
+        scaleLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("scale"), QStringLiteral("Scale")),
+                                                        formatScalePercent(currentScale)));
     }
     if (contrastSlider) {
         contrastSlider->blockSignals(true);
@@ -2812,7 +4719,7 @@ void YourClassName::updateUiFromPendingSettings() {
         contrastSlider->blockSignals(false);
     }
     if (contrastLabel) {
-        contrastLabel->setText(QString("Contrast: %1").arg(contrast));
+        contrastLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("contrast"), QStringLiteral("Contrast"))).arg(contrast));
     }
     if (sensitivitySlider) {
         sensitivitySlider->blockSignals(true);
@@ -2820,7 +4727,7 @@ void YourClassName::updateUiFromPendingSettings() {
         sensitivitySlider->blockSignals(false);
     }
     if (sensitivityLabel) {
-        sensitivityLabel->setText(QString("Sensitivity: %1").arg(sensitivity));
+        sensitivityLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("sensitivity"), QStringLiteral("Sensitivity"))).arg(sensitivity));
     }
     if (levelMinSlider) {
         levelMinSlider->blockSignals(true);
@@ -2833,10 +4740,10 @@ void YourClassName::updateUiFromPendingSettings() {
         levelMaxSlider->blockSignals(false);
     }
     if (levelMinLabel) {
-        levelMinLabel->setText(levelLabelText("Min", displayLevelMin));
+        levelMinLabel->setText(levelLabelText(uiText(QStringLiteral("min"), QStringLiteral("Min")), displayLevelMin));
     }
     if (levelMaxLabel) {
-        levelMaxLabel->setText(levelLabelText("Max", displayLevelMax));
+        levelMaxLabel->setText(levelLabelText(uiText(QStringLiteral("max"), QStringLiteral("Max")), displayLevelMax));
     }
     if (graphCheckbox) {
         graphCheckbox->blockSignals(true);
@@ -2854,7 +4761,7 @@ void YourClassName::updateUiFromPendingSettings() {
         volumeSlider->blockSignals(false);
     }
     if (volumeLabel) {
-        volumeLabel->setText(QString("Volume: %1%").arg(volumePercent));
+        volumeLabel->setText(QStringLiteral("%1: %2%").arg(uiText(QStringLiteral("volume"), QStringLiteral("Volume"))).arg(volumePercent));
     }
     if (audioLowPassSlider) {
         audioLowPassSlider->blockSignals(true);
@@ -2866,7 +4773,46 @@ void YourClassName::updateUiFromPendingSettings() {
         audioHighPassSlider->setValue(audioHighPassHzToSliderValue(pendingSettings.audioHighPassHz));
         audioHighPassSlider->blockSignals(false);
     }
+    if (hfNoiseCancelDepthSlider) {
+        hfNoiseCancelDepthSlider->blockSignals(true);
+        hfNoiseCancelDepthSlider->setValue(hfNoiseCancelDepthToSliderValue(pendingSettings.hfNoiseCancelDepth));
+        hfNoiseCancelDepthSlider->blockSignals(false);
+    }
+    if (hfNoiseCancelRefGainSlider) {
+        hfNoiseCancelRefGainSlider->blockSignals(true);
+        hfNoiseCancelRefGainSlider->setValue(hfNoiseCancelRefGainToSliderValue(pendingSettings.hfNoiseCancelRefGainDb));
+        hfNoiseCancelRefGainSlider->blockSignals(false);
+    }
+    if (hfNoiseCancelRefDelaySlider) {
+        hfNoiseCancelRefDelaySlider->blockSignals(true);
+        hfNoiseCancelRefDelaySlider->setValue(hfNoiseCancelRefDelayToSliderValue(pendingSettings.hfNoiseCancelRefDelayNs));
+        hfNoiseCancelRefDelaySlider->blockSignals(false);
+    }
+    if (hfNoiseCancelRefTiltSlider) {
+        hfNoiseCancelRefTiltSlider->blockSignals(true);
+        hfNoiseCancelRefTiltSlider->setValue(hfNoiseCancelRefTiltToSliderValue(pendingSettings.hfNoiseCancelRefTiltDb));
+        hfNoiseCancelRefTiltSlider->blockSignals(false);
+    }
+    if (hfNoiseCancelFreezeCheckbox) {
+        hfNoiseCancelFreezeCheckbox->blockSignals(true);
+        hfNoiseCancelFreezeCheckbox->setChecked(pendingSettings.hfNoiseCancelFreeze);
+        hfNoiseCancelFreezeCheckbox->blockSignals(false);
+    }
+    if (agileScanCheckbox) {
+        QSignalBlocker blocker(agileScanCheckbox);
+        agileScanCheckbox->setChecked(agileScanEnabled);
+    }
+    if (agileScanRangesEdit) {
+        QSignalBlocker blocker(agileScanRangesEdit);
+        agileScanRangesEdit->setText(agileScanRangesMhz);
+    }
+    if (agileScanStepSpin) {
+        QSignalBlocker blocker(agileScanStepSpin);
+        agileScanStepSpin->setValue(agileScanStepMhz);
+    }
+    updateAgileScanControls();
     updateAudioFilterLabels();
+    updateHfNoiseCancelControls();
     if (digitalDecodeCheckbox) {
         digitalDecodeCheckbox->blockSignals(true);
         digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
@@ -2890,6 +4836,7 @@ void YourClassName::updateUiFromPendingSettings() {
     if (waterfallWidget) {
         waterfallWidget->setLevelRange(displayLevelMin, displayLevelMax);
     }
+    applyUiLanguage();
     updateSpectrumTimerInterval();
     settingRange();
     updateDigitalDecoderMode();
@@ -2908,7 +4855,9 @@ void YourClassName::loadPersistentSettings() {
 
     pendingSettings.deviceIndex = (std::max)(0, settings.value("receiver/deviceIndex", pendingSettings.deviceIndex).toInt());
     pendingSettings.clockSource = settings.value("receiver/clockSource", pendingSettings.clockSource).toInt();
-    pendingSettings.inputMode = settings.value("receiver/inputMode", pendingSettings.inputMode).toInt();
+    pendingSettings.inputMode = (std::clamp)(settings.value("receiver/inputMode", pendingSettings.inputMode).toInt(),
+                                             static_cast<int>(INPUT_RF),
+                                             static_cast<int>(INPUT_HF_NOISE_CANCEL));
     pendingSettings.centerFrequency = settings.value("receiver/centerFrequency", pendingSettings.centerFrequency).toDouble();
     pendingSettings.actualFrequency = settings.value("receiver/actualFrequency", pendingSettings.actualFrequency).toDouble();
     pendingSettings.listeningFrequency = settings.value("receiver/listeningFrequency", pendingSettings.listeningFrequency).toDouble();
@@ -2921,9 +4870,87 @@ void YourClassName::loadPersistentSettings() {
     pendingSettings.audioDeviceId = (std::max)(0, settings.value("receiver/audioDeviceId", pendingSettings.audioDeviceId).toInt());
     pendingSettings.audioLowPassHz = clampAudioLowPassHz(settings.value("audio/lowPassHz", pendingSettings.audioLowPassHz).toDouble());
     pendingSettings.audioHighPassHz = clampAudioHighPassHz(settings.value("audio/highPassHz", pendingSettings.audioHighPassHz).toDouble());
+    pendingSettings.hfNoiseCancelDepth = clampHfNoiseCancelDepth(settings.value("hfNoiseCancel/depth", pendingSettings.hfNoiseCancelDepth).toDouble());
+    pendingSettings.hfNoiseCancelRefGainDb =
+        clampHfNoiseCancelRefGainDb(settings.value("hfNoiseCancel/refGainDb", pendingSettings.hfNoiseCancelRefGainDb).toDouble());
+    pendingSettings.hfNoiseCancelRefDelayNs =
+        clampHfNoiseCancelRefDelayNs(settings.value("hfNoiseCancel/refDelayNs", pendingSettings.hfNoiseCancelRefDelayNs).toDouble());
+    pendingSettings.hfNoiseCancelRefTiltDb =
+        clampHfNoiseCancelRefTiltDb(settings.value("hfNoiseCancel/refTiltDb", pendingSettings.hfNoiseCancelRefTiltDb).toDouble());
+    pendingSettings.hfNoiseCancelFreeze = settings.value("hfNoiseCancel/freeze", pendingSettings.hfNoiseCancelFreeze).toBool();
     pendingSettings.audioEnabled = settings.value("receiver/audioEnabled", pendingSettings.audioEnabled).toBool();
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>((std::clamp)(settings.value("receiver/gpoValue", static_cast<int>(pendingSettings.gpoValue)).toInt(), 0, 255));
+    agileScanEnabled = settings.value("agileScan/enabled", agileScanEnabled).toBool();
+    agileScanRangesMhz = settings.value("agileScan/rangesMhz", agileScanRangesMhz).toString().trimmed();
+    agileScanStepMhz = (std::clamp)(settings.value("agileScan/stepMhz", agileScanStepMhz).toDouble(),
+                                    AGILE_SCAN_MIN_STEP_MHZ,
+                                    AGILE_SCAN_MAX_STEP_MHZ);
+    agileScanPresets.clear();
+    const int scanPresetCount = settings.beginReadArray("agileScan/presets");
+    for (int i = 0; i < scanPresetCount; ++i) {
+        settings.setArrayIndex(i);
+        const QString name = settings.value("name").toString().trimmed();
+        const QString ranges = settings.value("rangesMhz").toString().trimmed();
+        const double step = (std::clamp)(settings.value("stepMhz", agileScanStepMhz).toDouble(),
+                                         AGILE_SCAN_MIN_STEP_MHZ,
+                                         AGILE_SCAN_MAX_STEP_MHZ);
+        if (!name.isEmpty() && !ranges.isEmpty()) {
+            agileScanPresets[name] = agileScanPresetSpec(ranges, step);
+        }
+    }
+    settings.endArray();
+    if (agileScanPresets.isEmpty()) {
+        agileScanPresets[QStringLiteral("Narrow DMR example")] =
+            agileScanPresetSpec(QStringLiteral("430-432"), 0.0125);
+        agileScanPresets[QStringLiteral("VHF DMR 160-174 coarse")] =
+            agileScanPresetSpec(QStringLiteral("160-174"), 0.1);
+        agileScanPresets[QStringLiteral("UHF DMR 400-470 coarse")] =
+            agileScanPresetSpec(QStringLiteral("400-470"), 0.5);
+        agileScanPresets[QStringLiteral("FPV 1.2/2.4 sparse")] =
+            agileScanPresetSpec(QStringLiteral("1080-1360\\2300-2500"), 5.0);
+    }
+
+    auto readFrequencyPresetArray = [&settings](const char *path, QMap<QString, double> &target) {
+        target.clear();
+        const int count = settings.beginReadArray(QString::fromLatin1(path));
+        for (int i = 0; i < count; ++i) {
+            settings.setArrayIndex(i);
+            const QString name = settings.value("name").toString().trimmed();
+            bool ok = false;
+            const double value = settings.value("valueHz").toDouble(&ok);
+            if (!name.isEmpty() && ok && std::isfinite(value)) {
+                target[name] = value;
+            }
+        }
+        settings.endArray();
+    };
+    readFrequencyPresetArray("frequencyPresets/center", centerFrequencyPresets);
+    readFrequencyPresetArray("frequencyPresets/listening", listeningFrequencyPresets);
+    readFrequencyPresetArray("frequencyPresets/bandwidth", bandwidthValuePresets);
+    ensureDefaultFrequencyPresets();
+
+    bandMarkers.clear();
+    bandMarkersCustomized = settings.contains(QStringLiteral("bandMarkers/size"));
+    const int bandMarkerCount = settings.beginReadArray(QStringLiteral("bandMarkers"));
+    for (int i = 0; i < bandMarkerCount; ++i) {
+        settings.setArrayIndex(i);
+        GraphBandMarker marker;
+        marker.startHz = settings.value(QStringLiteral("startHz")).toDouble();
+        marker.endHz = settings.value(QStringLiteral("endHz")).toDouble();
+        marker.label = settings.value(QStringLiteral("label")).toString().trimmed();
+        marker.amateur = settings.value(QStringLiteral("amateur")).toBool();
+        if (!marker.label.isEmpty() &&
+            std::isfinite(marker.startHz) &&
+            std::isfinite(marker.endHz) &&
+            marker.endHz > marker.startHz) {
+            bandMarkers.append(marker);
+        }
+    }
+    settings.endArray();
+    if (!bandMarkersCustomized) {
+        ensureDefaultBandMarkers();
+    }
 
     currentScale = (std::clamp)(settings.value("display/scalePercent", currentScale).toDouble(),
                                 MIN_SCALE_PERCENT,
@@ -2937,7 +4964,17 @@ void YourClassName::loadPersistentSettings() {
     }
     secondGraph = settings.value("display/secondGraph", secondGraph).toBool();
     colorf = settings.value("display/color", colorf).toBool();
+    showGeneralBandMarkers = settings.value("display/generalBandMarkers", showGeneralBandMarkers).toBool();
+    showAmateurBandMarkers = settings.value("display/amateurBandMarkers", showAmateurBandMarkers).toBool();
+    compactBandMarkers = settings.value("display/compactBandMarkers", compactBandMarkers).toBool();
     volumePercent = (std::clamp)(settings.value("audio/volumePercent", volumePercent).toInt(), 0, 200);
+    uiLanguage = settings.value("ui/language", uiLanguage).toString() == QStringLiteral("uk")
+                     ? QStringLiteral("uk")
+                     : QStringLiteral("en");
+    fineTuneControlMode = (std::clamp)(settings.value("ui/fineTuneControlMode", fineTuneControlMode).toInt(),
+                                       FINE_TUNE_MODE_SCALE,
+                                       FINE_TUNE_MODE_DIAL);
+    fineTuneScaleHoldMode = settings.value("ui/fineTuneScaleHoldMode", fineTuneScaleHoldMode).toBool();
 
     networkMode = NetworkMode::Disabled;
     const int processingModeValue = (std::clamp)(settings.value("network/processingMode", static_cast<int>(networkProcessingMode)).toInt(),
@@ -2948,6 +4985,8 @@ void YourClassName::loadPersistentSettings() {
     networkBindAddress = settings.value("network/bindAddress", networkBindAddress).toString();
     networkControlPort = static_cast<quint16>((std::clamp)(settings.value("network/controlPort", static_cast<int>(networkControlPort)).toInt(), 1, 65535));
     serverDisableLocalVisualAudio = settings.value("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio).toBool();
+    networkFullResolutionSpectrumFrames =
+        settings.value("network/fullResolutionSpectrumFrames", networkFullResolutionSpectrumFrames).toBool();
     audioRelayTransmitEnabled = settings.value("audioRelay/transmitEnabled", audioRelayTransmitEnabled).toBool();
     audioRelayHost = settings.value("audioRelay/host", audioRelayHost).toString();
     audioRelayPort = static_cast<quint16>((std::clamp)(settings.value("audioRelay/port", static_cast<int>(audioRelayPort)).toInt(), 1, 65535));
@@ -3008,6 +5047,7 @@ void YourClassName::loadPersistentSettings() {
     }
 
     normalizeTuning(pendingSettings);
+    updateFrequencyPresetControls();
     qDebug() << (settingsFileExists ? "[Settings] loaded" : "[Settings] using defaults; settings file will be created on clean exit")
              << settingsPath
              << "sampleRate" << pendingSettings.sampleRate
@@ -3033,6 +5073,52 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("receiver/audioDeviceId", pendingSettings.audioDeviceId);
     settings.setValue("receiver/audioEnabled", pendingSettings.audioEnabled);
     settings.setValue("receiver/gpoValue", static_cast<int>(pendingSettings.gpoValue));
+    settings.setValue("agileScan/enabled", agileScanEnabled);
+    settings.setValue("agileScan/rangesMhz", agileScanRangesMhz);
+    settings.setValue("agileScan/stepMhz", agileScanStepMhz);
+    settings.beginWriteArray("agileScan/presets");
+    int scanPresetIndex = 0;
+    for (auto it = agileScanPresets.constBegin(); it != agileScanPresets.constEnd(); ++it) {
+        settings.setArrayIndex(scanPresetIndex++);
+        settings.setValue("name", it.key());
+        settings.setValue("rangesMhz", agileScanPresetRanges(it.value()));
+        settings.setValue("stepMhz", agileScanPresetStepMhz(it.value(), agileScanStepMhz));
+    }
+    settings.endArray();
+
+    auto writeFrequencyPresetArray = [&settings](const char *path, const QMap<QString, double> &presets) {
+        settings.beginWriteArray(QString::fromLatin1(path));
+        int index = 0;
+        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it) {
+            if (it.key().trimmed().isEmpty() || !std::isfinite(it.value())) {
+                continue;
+            }
+            settings.setArrayIndex(index++);
+            settings.setValue("name", it.key());
+            settings.setValue("valueHz", it.value());
+        }
+        settings.endArray();
+    };
+    writeFrequencyPresetArray("frequencyPresets/center", centerFrequencyPresets);
+    writeFrequencyPresetArray("frequencyPresets/listening", listeningFrequencyPresets);
+    writeFrequencyPresetArray("frequencyPresets/bandwidth", bandwidthValuePresets);
+
+    settings.beginWriteArray(QStringLiteral("bandMarkers"));
+    int bandMarkerIndex = 0;
+    for (const GraphBandMarker &marker : std::as_const(bandMarkers)) {
+        if (marker.label.trimmed().isEmpty() ||
+            !std::isfinite(marker.startHz) ||
+            !std::isfinite(marker.endHz) ||
+            marker.endHz <= marker.startHz) {
+            continue;
+        }
+        settings.setArrayIndex(bandMarkerIndex++);
+        settings.setValue(QStringLiteral("label"), marker.label.trimmed());
+        settings.setValue(QStringLiteral("startHz"), marker.startHz);
+        settings.setValue(QStringLiteral("endHz"), marker.endHz);
+        settings.setValue(QStringLiteral("amateur"), marker.amateur);
+    }
+    settings.endArray();
 
     settings.setValue("display/scalePercent", currentScale);
     settings.setValue("display/contrast", contrast);
@@ -3041,15 +5127,27 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("display/levelMax", displayLevelMax);
     settings.setValue("display/secondGraph", secondGraph);
     settings.setValue("display/color", colorf);
+    settings.setValue("display/generalBandMarkers", showGeneralBandMarkers);
+    settings.setValue("display/amateurBandMarkers", showAmateurBandMarkers);
+    settings.setValue("display/compactBandMarkers", compactBandMarkers);
     settings.setValue("audio/volumePercent", volumePercent);
+    settings.setValue("ui/language", uiLanguage);
+    settings.setValue("ui/fineTuneControlMode", fineTuneControlMode);
+    settings.setValue("ui/fineTuneScaleHoldMode", fineTuneScaleHoldMode);
     settings.setValue("audio/lowPassHz", pendingSettings.audioLowPassHz);
     settings.setValue("audio/highPassHz", pendingSettings.audioHighPassHz);
+    settings.setValue("hfNoiseCancel/depth", pendingSettings.hfNoiseCancelDepth);
+    settings.setValue("hfNoiseCancel/refGainDb", pendingSettings.hfNoiseCancelRefGainDb);
+    settings.setValue("hfNoiseCancel/refDelayNs", pendingSettings.hfNoiseCancelRefDelayNs);
+    settings.setValue("hfNoiseCancel/refTiltDb", pendingSettings.hfNoiseCancelRefTiltDb);
+    settings.setValue("hfNoiseCancel/freeze", pendingSettings.hfNoiseCancelFreeze);
 
     settings.setValue("network/serverAddress", networkServerAddress);
     settings.setValue("network/bindAddress", networkBindAddress);
     settings.setValue("network/controlPort", static_cast<int>(networkControlPort));
     settings.setValue("network/processingMode", static_cast<int>(networkProcessingMode));
     settings.setValue("network/serverDisableLocalVisualAudio", serverDisableLocalVisualAudio);
+    settings.setValue("network/fullResolutionSpectrumFrames", networkFullResolutionSpectrumFrames);
     settings.setValue("audioRelay/transmitEnabled", audioRelayTransmitEnabled);
     settings.setValue("audioRelay/host", audioRelayHost);
     settings.setValue("audioRelay/port", static_cast<int>(audioRelayPort));
@@ -3285,6 +5383,9 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
 
     if (action == "settings" || action == "start") {
         const RadioSettings previousSettings = pendingSettings;
+        const bool previousAgileScanEnabled = agileScanEnabled;
+        const QString previousAgileScanRangesMhz = agileScanRangesMhz;
+        const double previousAgileScanStepMhz = agileScanStepMhz;
         applySettingsFromJson(settingsJson);
         publishSettingsToGlobals();
         updateUiFromPendingSettings();
@@ -3297,6 +5398,10 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             previousProcessingMode != networkProcessingMode;
         const bool fullIqServerAudioPathChanged =
             audioChanged && isFullIqProcessingMode();
+        const bool agileScanChanged =
+            previousAgileScanEnabled != agileScanEnabled ||
+            previousAgileScanRangesMhz != agileScanRangesMhz ||
+            std::abs(previousAgileScanStepMhz - agileScanStepMhz) > 0.0000001;
 
         if (fftChanged) {
             applyFftLengthChange(pendingSettings.fftLength, false);
@@ -3318,6 +5423,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             std::abs(previousSettings.sampleRate - pendingSettings.sampleRate) > 0.5 ||
             previousSettings.inputMode != pendingSettings.inputMode ||
             previousSettings.clockSource != pendingSettings.clockSource ||
+            agileScanChanged ||
             streamModeChanged ||
             fullIqServerAudioPathChanged;
 
@@ -3343,7 +5449,9 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
     }
 }
 
-void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequencies, const std::vector<float> &magnitudes) {
+void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequencies,
+                                             const std::vector<float> &magnitudes,
+                                             const std::vector<float> &referenceMagnitudes) {
     if (networkMode != NetworkMode::Server ||
         isFullIqProcessingMode() ||
         !networkController ||
@@ -3357,23 +5465,21 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
     if (dataCount <= 0) {
         return;
     }
-    if (isChannelIqProcessingMode() &&
+    if ((isChannelIqProcessingMode() || networkFullResolutionSpectrumFrames) &&
         networkController->pendingBytes() > NETWORK_SPECTRUM_MAX_PENDING_BYTES) {
         return;
     }
 
-    const int minIntervalMs = isChannelIqProcessingMode()
-                                  ? NETWORK_CHANNEL_SPECTRUM_INTERVAL_MS
-                                  : NETWORK_SPECTRUM_INTERVAL_MS;
+    const int minIntervalMs = networkFullResolutionSpectrumFrames
+                                  ? NETWORK_FULL_RESOLUTION_SPECTRUM_INTERVAL_MS
+                                  : (isChannelIqProcessingMode()
+                                         ? NETWORK_CHANNEL_SPECTRUM_INTERVAL_MS
+                                         : NETWORK_SPECTRUM_INTERVAL_MS);
     if (networkSpectrumFrameTimer.isValid() &&
         networkSpectrumFrameTimer.elapsed() < minIntervalMs) {
         return;
     }
     networkSpectrumFrameTimer.restart();
-
-    const int maxBins = isChannelIqProcessingMode()
-                            ? NETWORK_CHANNEL_SPECTRUM_MAX_BINS
-                            : NETWORK_SPECTRUM_MAX_BINS;
 
     double frameMinFrequency = minFrequency;
     double frameMaxFrequency = maxFrequency;
@@ -3398,15 +5504,27 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
     }
 
     const int sourceCount = sourceEnd - sourceStart;
-    const int targetCount = (std::min)(maxBins, sourceCount);
+    const int maxBins = isChannelIqProcessingMode()
+                            ? NETWORK_CHANNEL_SPECTRUM_MAX_BINS
+                            : NETWORK_SPECTRUM_MAX_BINS;
+    const int targetCount = networkFullResolutionSpectrumFrames
+                                ? sourceCount
+                                : (std::min)(maxBins, sourceCount);
     if (targetCount <= 0) {
         return;
     }
     const double step = static_cast<double>(sourceCount) / static_cast<double>(targetCount);
     QJsonArray frequencyArray;
     QJsonArray magnitudeArray;
+    QJsonArray referenceMagnitudeArray;
     std::vector<float> resampledMagnitudes(static_cast<std::size_t>(targetCount),
                                            -160.0f);
+    std::vector<float> resampledReferenceMagnitudes(static_cast<std::size_t>(targetCount),
+                                                    -160.0f);
+    const bool haveReferenceMagnitudes =
+        static_cast<int>(referenceMagnitudes.size()) >= dataCount &&
+        pendingSettings.inputMode == INPUT_HF_NOISE_CANCEL;
+    const bool useBinarySpectrumFrame = networkFullResolutionSpectrumFrames;
 
     for (int i = 0; i < targetCount; ++i) {
         const int index = (std::min)(sourceEnd - 1,
@@ -3415,13 +5533,26 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
         if (!std::isfinite(frequencies[index]) || !std::isfinite(magnitudes[magnitudeIndex])) {
             continue;
         }
-        frequencyArray.append(frequencies[index]);
+        if (!useBinarySpectrumFrame) {
+            frequencyArray.append(frequencies[index]);
+        }
         resampledMagnitudes[static_cast<std::size_t>((i + targetCount / 2) % targetCount)] =
             magnitudes[magnitudeIndex];
+        if (haveReferenceMagnitudes && std::isfinite(referenceMagnitudes[magnitudeIndex])) {
+            resampledReferenceMagnitudes[static_cast<std::size_t>((i + targetCount / 2) % targetCount)] =
+                referenceMagnitudes[magnitudeIndex];
+        }
     }
 
-    for (const float value : resampledMagnitudes) {
-        magnitudeArray.append(std::isfinite(value) ? value : -160.0f);
+    if (!useBinarySpectrumFrame) {
+        for (const float value : resampledMagnitudes) {
+            magnitudeArray.append(std::isfinite(value) ? value : -160.0f);
+        }
+        if (haveReferenceMagnitudes) {
+            for (const float value : resampledReferenceMagnitudes) {
+                referenceMagnitudeArray.append(std::isfinite(value) ? value : -160.0f);
+            }
+        }
     }
 
     QJsonObject frame;
@@ -3435,10 +5566,32 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
     frame["inputMode"] = pendingSettings.inputMode;
     frame["fftLength"] = targetCount;
     frame["sourceFftLength"] = dataCount;
+    frame["fullResolution"] = networkFullResolutionSpectrumFrames;
     frame["minFrequency"] = frameMinFrequency;
     frame["maxFrequency"] = frameMaxFrequency;
+    if (useBinarySpectrumFrame) {
+        frame["type"] = "spectrumbin";
+        frame["binFormat"] = "f32le";
+        frame["hasReferenceMagnitudes"] = haveReferenceMagnitudes;
+        frame["frequencyLayout"] = "linear-min-max";
+
+        QByteArray payload;
+        payload.reserve(static_cast<int>(targetCount * static_cast<int>(sizeof(float)) *
+                                         (haveReferenceMagnitudes ? 2 : 1)));
+        payload.append(reinterpret_cast<const char*>(resampledMagnitudes.data()),
+                       targetCount * static_cast<int>(sizeof(float)));
+        if (haveReferenceMagnitudes) {
+            payload.append(reinterpret_cast<const char*>(resampledReferenceMagnitudes.data()),
+                           targetCount * static_cast<int>(sizeof(float)));
+        }
+        networkController->sendBinaryCommand(frame, payload);
+        return;
+    }
     frame["frequencies"] = frequencyArray;
     frame["magnitudes"] = magnitudeArray;
+    if (haveReferenceMagnitudes) {
+        frame["referenceMagnitudes"] = referenceMagnitudeArray;
+    }
 
     networkController->sendControlCommand(frame);
 }
@@ -3454,6 +5607,7 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
 
     const QJsonArray frequencyArray = frame.value("frequencies").toArray();
     const QJsonArray magnitudeArray = frame.value("magnitudes").toArray();
+    const QJsonArray referenceMagnitudeArray = frame.value("referenceMagnitudes").toArray();
     const int dataCount = (std::min)(frequencyArray.size(), magnitudeArray.size());
     if (dataCount <= 0) {
         return;
@@ -3461,8 +5615,12 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
 
     std::vector<float> frequencies;
     std::vector<float> magnitudes;
+    std::vector<float> referenceMagnitudes;
     frequencies.reserve(dataCount);
     magnitudes.reserve(dataCount);
+    if (referenceMagnitudeArray.size() >= dataCount) {
+        referenceMagnitudes.reserve(dataCount);
+    }
 
     for (int i = 0; i < dataCount; ++i) {
         const double frequency = frequencyArray.at(i).toDouble(std::numeric_limits<double>::quiet_NaN());
@@ -3472,6 +5630,13 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
         }
         frequencies.push_back(static_cast<float>(frequency));
         magnitudes.push_back(static_cast<float>(magnitude));
+        if (referenceMagnitudeArray.size() >= dataCount) {
+            const double referenceMagnitude =
+                referenceMagnitudeArray.at(i).toDouble(std::numeric_limits<double>::quiet_NaN());
+            referenceMagnitudes.push_back(std::isfinite(referenceMagnitude)
+                                              ? static_cast<float>(referenceMagnitude)
+                                              : -160.0f);
+        }
     }
 
     if (frequencies.empty() || magnitudes.empty()) {
@@ -3482,23 +5647,67 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
     const double frameMaxFrequency = frame.value("maxFrequency").toDouble(maxFrequency);
     const double frameCenterFrequency = frame.value("centerFrequency").toDouble(pendingSettings.centerFrequency);
     const double frameListeningFrequency = frame.value("listeningFrequency").toDouble(pendingSettings.listeningFrequency);
+    const double frameSampleRate = frame.value("sampleRate").toDouble(pendingSettings.sampleRate);
     const double frameBandwidth = frame.value("bandwidth").toDouble(pendingSettings.bandwidth);
     const int frameModulationType = frame.value("modulationType").toInt(pendingSettings.modulationType);
+    const int frameInputMode = (std::clamp)(frame.value("inputMode").toInt(pendingSettings.inputMode),
+                                            static_cast<int>(INPUT_RF),
+                                            static_cast<int>(INPUT_HF_NOISE_CANCEL));
 
-    if (!isChannelIqProcessingMode()) {
-        pendingSettings.centerFrequency = frameCenterFrequency;
-        pendingSettings.listeningFrequency = frameListeningFrequency;
-        pendingSettings.sampleRate = frame.value("sampleRate").toDouble(pendingSettings.sampleRate);
-        pendingSettings.bandwidth = frameBandwidth;
-        pendingSettings.modulationType = frameModulationType;
+    const bool protectLocalControlSettings =
+        networkController &&
+        networkController->clientHasControl() &&
+        networkClientSettingsGuardTimer.isValid() &&
+        networkClientSettingsGuardTimer.elapsed() < NETWORK_CLIENT_SETTINGS_GUARD_MS;
+
+    double displayCenterFrequency = frameCenterFrequency;
+    double displayListeningFrequency = frameListeningFrequency;
+    double displayBandwidth = frameBandwidth;
+    int displayModulationType = frameModulationType;
+
+    if (protectLocalControlSettings) {
+        displayCenterFrequency = pendingSettings.centerFrequency;
+        displayListeningFrequency = pendingSettings.listeningFrequency;
+        displayBandwidth = pendingSettings.bandwidth;
+        displayModulationType = pendingSettings.modulationType;
+    } else {
+        bool settingsChanged = false;
+        auto updateDouble = [&settingsChanged](double &target, double value) {
+            if (std::isfinite(value) && std::abs(target - value) > 0.5) {
+                target = value;
+                settingsChanged = true;
+            }
+        };
+        auto updateInt = [&settingsChanged](int &target, int value) {
+            if (target != value) {
+                target = value;
+                settingsChanged = true;
+            }
+        };
+
+        updateDouble(pendingSettings.centerFrequency, frameCenterFrequency);
+        updateDouble(pendingSettings.listeningFrequency, frameListeningFrequency);
+        updateDouble(pendingSettings.sampleRate, frameSampleRate);
+        updateDouble(pendingSettings.bandwidth, frameBandwidth);
+        updateInt(pendingSettings.modulationType, frameModulationType);
+        updateInt(pendingSettings.inputMode, frameInputMode);
+
+        if (settingsChanged) {
+            normalizeTuning(pendingSettings);
+            displayCenterFrequency = pendingSettings.centerFrequency;
+            displayListeningFrequency = pendingSettings.listeningFrequency;
+            displayBandwidth = pendingSettings.bandwidth;
+            displayModulationType = pendingSettings.modulationType;
+            updateUiFromPendingSettings();
+        }
         publishSettingsToGlobals();
     }
 
     if (scaleWidget) {
-        scaleWidget->setTuning(frameListeningFrequency,
-                               frameCenterFrequency,
-                               frameBandwidth,
-                               frameModulationType);
+        scaleWidget->setTuning(displayListeningFrequency,
+                               displayCenterFrequency,
+                               displayBandwidth,
+                               displayModulationType);
         scaleWidget->setRange(frameMinFrequency, frameMaxFrequency);
     }
 
@@ -3519,9 +5728,264 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
         networkSpectrumFrameFftLength = frameFftLength;
     }
 
+    const double frequencyStep =
+        frameFftLength > 1
+            ? (frameMaxFrequency - frameMinFrequency) / static_cast<double>(frameFftLength - 1)
+            : 0.0;
+    const bool haveReferenceMagnitudes =
+        static_cast<int>(referenceMagnitudes.size()) == frameFftLength;
+
     if (graphWidget) {
+        const int graphTargetCount =
+            (std::min)(frameFftLength,
+                       (std::max)(512, graphWidget->width() > 0 ? graphWidget->width() * 2 : 2048));
+        std::vector<float> graphFrequencies(static_cast<std::size_t>(graphTargetCount), 0.0f);
+        std::vector<float> graphMagnitudes(static_cast<std::size_t>(graphTargetCount), -160.0f);
+        std::vector<float> graphReferenceMagnitudes;
+        if (haveReferenceMagnitudes) {
+            graphReferenceMagnitudes.assign(static_cast<std::size_t>(graphTargetCount), -160.0f);
+        }
+
+        const double pointsPerGraphBin =
+            static_cast<double>(frameFftLength) / static_cast<double>((std::max)(1, graphTargetCount));
+        for (int i = 0; i < graphTargetCount; ++i) {
+            const int sourceBegin =
+                (std::clamp)(static_cast<int>(std::floor(i * pointsPerGraphBin)), 0, frameFftLength - 1);
+            const int sourceEnd =
+                (std::clamp)(static_cast<int>(std::ceil((i + 1) * pointsPerGraphBin)), sourceBegin + 1, frameFftLength);
+            float peakMagnitude = -160.0f;
+            float peakReferenceMagnitude = -160.0f;
+            for (int sourceIndex = sourceBegin; sourceIndex < sourceEnd; ++sourceIndex) {
+                const int shiftedIndex = (sourceIndex + frameFftLength / 2) % frameFftLength;
+                const float value = magnitudes[static_cast<std::size_t>(shiftedIndex)];
+                if (std::isfinite(value)) {
+                    peakMagnitude = (std::max)(peakMagnitude, value);
+                }
+                if (haveReferenceMagnitudes) {
+                    const float referenceValue = referenceMagnitudes[static_cast<std::size_t>(shiftedIndex)];
+                    if (std::isfinite(referenceValue)) {
+                        peakReferenceMagnitude = (std::max)(peakReferenceMagnitude, referenceValue);
+                    }
+                }
+            }
+            const double centerSourceIndex = (sourceBegin + sourceEnd - 1) * 0.5;
+            graphFrequencies[static_cast<std::size_t>(i)] =
+                static_cast<float>(frameMinFrequency + frequencyStep * centerSourceIndex);
+            graphMagnitudes[static_cast<std::size_t>((i + graphTargetCount / 2) % graphTargetCount)] =
+                peakMagnitude;
+            if (haveReferenceMagnitudes) {
+                graphReferenceMagnitudes[static_cast<std::size_t>((i + graphTargetCount / 2) % graphTargetCount)] =
+                    peakReferenceMagnitude;
+            }
+        }
+
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
-        graphWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength, colorf);
+        graphWidget->setData(graphFrequencies,
+                             graphMagnitudes,
+                             frameMinFrequency,
+                             frameMaxFrequency,
+                             graphTargetCount,
+                             colorf);
+        graphWidget->setOverlayData(graphReferenceMagnitudes,
+                                    static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
+    }
+    if (waterfallWidget) {
+        waterfallWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength,
+                                 secondGraph, contrast, sensitivity, displayLevelMin, displayLevelMax);
+    }
+}
+
+void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, const QByteArray &payload) {
+    if (networkMode == NetworkMode::Client &&
+        runState == RadioRunState::Idle &&
+        networkController &&
+        !networkController->clientHasControl()) {
+        runState = RadioRunState::Running;
+        updateUiForRunState();
+    }
+
+    const int frameFftLength = frame.value("fftLength").toInt();
+    const double frameMinFrequency = frame.value("minFrequency").toDouble(minFrequency);
+    const double frameMaxFrequency = frame.value("maxFrequency").toDouble(maxFrequency);
+    if (frameFftLength <= 0 ||
+        payload.size() < frameFftLength * static_cast<int>(sizeof(float)) ||
+        !std::isfinite(frameMinFrequency) ||
+        !std::isfinite(frameMaxFrequency) ||
+        frameMaxFrequency <= frameMinFrequency) {
+        qDebug() << "[NetworkSpectrum] invalid binary spectrum frame"
+                 << "bins" << frameFftLength
+                 << "payload" << payload.size()
+                 << "min" << frameMinFrequency
+                 << "max" << frameMaxFrequency;
+        return;
+    }
+
+    std::vector<float> frequencies(static_cast<std::size_t>(frameFftLength), 0.0f);
+    std::vector<float> magnitudes(static_cast<std::size_t>(frameFftLength), -160.0f);
+    std::memcpy(magnitudes.data(), payload.constData(), frameFftLength * sizeof(float));
+
+    const bool haveReferenceMagnitudes =
+        frame.value("hasReferenceMagnitudes").toBool(false) &&
+        payload.size() >= frameFftLength * static_cast<int>(sizeof(float)) * 2;
+    std::vector<float> referenceMagnitudes;
+    if (haveReferenceMagnitudes) {
+        referenceMagnitudes.resize(static_cast<std::size_t>(frameFftLength), -160.0f);
+        std::memcpy(referenceMagnitudes.data(),
+                    payload.constData() + frameFftLength * static_cast<int>(sizeof(float)),
+                    frameFftLength * sizeof(float));
+    }
+
+    const double frequencyStep =
+        frameFftLength > 1
+            ? (frameMaxFrequency - frameMinFrequency) / static_cast<double>(frameFftLength - 1)
+            : 0.0;
+    for (int i = 0; i < frameFftLength; ++i) {
+        frequencies[static_cast<std::size_t>(i)] =
+            static_cast<float>(frameMinFrequency + frequencyStep * static_cast<double>(i));
+        if (!std::isfinite(magnitudes[static_cast<std::size_t>(i)])) {
+            magnitudes[static_cast<std::size_t>(i)] = -160.0f;
+        }
+        if (haveReferenceMagnitudes &&
+            !std::isfinite(referenceMagnitudes[static_cast<std::size_t>(i)])) {
+            referenceMagnitudes[static_cast<std::size_t>(i)] = -160.0f;
+        }
+    }
+
+    const double frameCenterFrequency = frame.value("centerFrequency").toDouble(pendingSettings.centerFrequency);
+    const double frameListeningFrequency = frame.value("listeningFrequency").toDouble(pendingSettings.listeningFrequency);
+    const double frameSampleRate = frame.value("sampleRate").toDouble(pendingSettings.sampleRate);
+    const double frameBandwidth = frame.value("bandwidth").toDouble(pendingSettings.bandwidth);
+    const int frameModulationType = frame.value("modulationType").toInt(pendingSettings.modulationType);
+    const int frameInputMode = (std::clamp)(frame.value("inputMode").toInt(pendingSettings.inputMode),
+                                            static_cast<int>(INPUT_RF),
+                                            static_cast<int>(INPUT_HF_NOISE_CANCEL));
+
+    const bool protectLocalControlSettings =
+        networkController &&
+        networkController->clientHasControl() &&
+        networkClientSettingsGuardTimer.isValid() &&
+        networkClientSettingsGuardTimer.elapsed() < NETWORK_CLIENT_SETTINGS_GUARD_MS;
+
+    double displayCenterFrequency = frameCenterFrequency;
+    double displayListeningFrequency = frameListeningFrequency;
+    double displayBandwidth = frameBandwidth;
+    int displayModulationType = frameModulationType;
+
+    if (protectLocalControlSettings) {
+        displayCenterFrequency = pendingSettings.centerFrequency;
+        displayListeningFrequency = pendingSettings.listeningFrequency;
+        displayBandwidth = pendingSettings.bandwidth;
+        displayModulationType = pendingSettings.modulationType;
+    } else {
+        bool settingsChanged = false;
+        auto updateDouble = [&settingsChanged](double &target, double value) {
+            if (std::isfinite(value) && std::abs(target - value) > 0.5) {
+                target = value;
+                settingsChanged = true;
+            }
+        };
+        auto updateInt = [&settingsChanged](int &target, int value) {
+            if (target != value) {
+                target = value;
+                settingsChanged = true;
+            }
+        };
+
+        updateDouble(pendingSettings.centerFrequency, frameCenterFrequency);
+        updateDouble(pendingSettings.listeningFrequency, frameListeningFrequency);
+        updateDouble(pendingSettings.sampleRate, frameSampleRate);
+        updateDouble(pendingSettings.bandwidth, frameBandwidth);
+        updateInt(pendingSettings.modulationType, frameModulationType);
+        updateInt(pendingSettings.inputMode, frameInputMode);
+
+        if (settingsChanged) {
+            normalizeTuning(pendingSettings);
+            displayCenterFrequency = pendingSettings.centerFrequency;
+            displayListeningFrequency = pendingSettings.listeningFrequency;
+            displayBandwidth = pendingSettings.bandwidth;
+            displayModulationType = pendingSettings.modulationType;
+            updateUiFromPendingSettings();
+        }
+        publishSettingsToGlobals();
+    }
+
+    if (scaleWidget) {
+        scaleWidget->setTuning(displayListeningFrequency,
+                               displayCenterFrequency,
+                               displayBandwidth,
+                               displayModulationType);
+        scaleWidget->setRange(frameMinFrequency, frameMaxFrequency);
+    }
+
+    const bool spectrumShapeChanged =
+        !networkSpectrumFrameMetadataValid ||
+        std::abs(networkSpectrumFrameMinFrequency - frameMinFrequency) > 0.5 ||
+        std::abs(networkSpectrumFrameMaxFrequency - frameMaxFrequency) > 0.5 ||
+        networkSpectrumFrameFftLength != frameFftLength;
+    if (spectrumShapeChanged) {
+        qDebug() << "[NetworkSpectrum] binary frame range changed; preserving waterfall history"
+                 << "min" << frameMinFrequency
+                 << "max" << frameMaxFrequency
+                 << "bins" << frameFftLength;
+        networkSpectrumFrameMetadataValid = true;
+        networkSpectrumFrameMinFrequency = frameMinFrequency;
+        networkSpectrumFrameMaxFrequency = frameMaxFrequency;
+        networkSpectrumFrameFftLength = frameFftLength;
+    }
+
+    if (graphWidget) {
+        const int graphTargetCount =
+            (std::min)(frameFftLength,
+                       (std::max)(512, graphWidget->width() > 0 ? graphWidget->width() * 2 : 2048));
+        std::vector<float> graphFrequencies(static_cast<std::size_t>(graphTargetCount), 0.0f);
+        std::vector<float> graphMagnitudes(static_cast<std::size_t>(graphTargetCount), -160.0f);
+        std::vector<float> graphReferenceMagnitudes;
+        if (haveReferenceMagnitudes) {
+            graphReferenceMagnitudes.assign(static_cast<std::size_t>(graphTargetCount), -160.0f);
+        }
+
+        const double pointsPerGraphBin =
+            static_cast<double>(frameFftLength) / static_cast<double>((std::max)(1, graphTargetCount));
+        for (int i = 0; i < graphTargetCount; ++i) {
+            const int sourceBegin =
+                (std::clamp)(static_cast<int>(std::floor(i * pointsPerGraphBin)), 0, frameFftLength - 1);
+            const int sourceEnd =
+                (std::clamp)(static_cast<int>(std::ceil((i + 1) * pointsPerGraphBin)), sourceBegin + 1, frameFftLength);
+            float peakMagnitude = -160.0f;
+            float peakReferenceMagnitude = -160.0f;
+            for (int sourceIndex = sourceBegin; sourceIndex < sourceEnd; ++sourceIndex) {
+                const int shiftedIndex = (sourceIndex + frameFftLength / 2) % frameFftLength;
+                const float value = magnitudes[static_cast<std::size_t>(shiftedIndex)];
+                if (std::isfinite(value)) {
+                    peakMagnitude = (std::max)(peakMagnitude, value);
+                }
+                if (haveReferenceMagnitudes) {
+                    const float referenceValue = referenceMagnitudes[static_cast<std::size_t>(shiftedIndex)];
+                    if (std::isfinite(referenceValue)) {
+                        peakReferenceMagnitude = (std::max)(peakReferenceMagnitude, referenceValue);
+                    }
+                }
+            }
+            const double centerSourceIndex = (sourceBegin + sourceEnd - 1) * 0.5;
+            graphFrequencies[static_cast<std::size_t>(i)] =
+                static_cast<float>(frameMinFrequency + frequencyStep * centerSourceIndex);
+            graphMagnitudes[static_cast<std::size_t>((i + graphTargetCount / 2) % graphTargetCount)] =
+                peakMagnitude;
+            if (haveReferenceMagnitudes) {
+                graphReferenceMagnitudes[static_cast<std::size_t>((i + graphTargetCount / 2) % graphTargetCount)] =
+                    peakReferenceMagnitude;
+            }
+        }
+
+        graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
+        graphWidget->setData(graphFrequencies,
+                             graphMagnitudes,
+                             frameMinFrequency,
+                             frameMaxFrequency,
+                             graphTargetCount,
+                             colorf);
+        graphWidget->setOverlayData(graphReferenceMagnitudes,
+                                    static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
     }
     if (waterfallWidget) {
         waterfallWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength,
@@ -4194,7 +6658,7 @@ RadioSettings YourClassName::audioProcessorSettings() const {
         settings.sampleRate = offlineIqPlaybackSampleRate;
         settings.centerFrequency = pendingSettings.listeningFrequency;
         settings.actualFrequency = pendingSettings.listeningFrequency;
-        settings.inputMode = 0;
+        settings.inputMode = INPUT_RF;
     }
     return settings;
 }
@@ -4205,7 +6669,7 @@ RadioSettings YourClassName::spectrumProcessingSettings() const {
         settings.sampleRate = offlineIqPlaybackSampleRate;
         settings.centerFrequency = pendingSettings.listeningFrequency;
         settings.actualFrequency = pendingSettings.listeningFrequency;
-        settings.inputMode = 0;
+        settings.inputMode = INPUT_RF;
     }
     return settings;
 }
@@ -4230,7 +6694,7 @@ void YourClassName::startRecording(bool momentary) {
         if (recordButton) {
             QSignalBlocker blocker(recordButton);
             recordButton->setChecked(false);
-            recordButton->setText(QStringLiteral("Record"));
+            recordButton->setText(uiText(QStringLiteral("record"), QStringLiteral("Record")));
         }
         momentaryRecordingActive = false;
         return;
@@ -4244,7 +6708,7 @@ void YourClassName::startRecording(bool momentary) {
         if (recordButton) {
             QSignalBlocker blocker(recordButton);
             recordButton->setChecked(false);
-            recordButton->setText(QStringLiteral("Record"));
+            recordButton->setText(uiText(QStringLiteral("record"), QStringLiteral("Record")));
         }
         momentaryRecordingActive = false;
         return;
@@ -4254,7 +6718,9 @@ void YourClassName::startRecording(bool momentary) {
     if (recordButton) {
         QSignalBlocker blocker(recordButton);
         recordButton->setChecked(true);
-        recordButton->setText(momentary ? QStringLiteral("Hold F9") : QStringLiteral("Stop Rec"));
+        recordButton->setText(momentary
+                                  ? uiText(QStringLiteral("hold_f9"), QStringLiteral("Hold F9"))
+                                  : uiText(QStringLiteral("stop_rec"), QStringLiteral("Stop Rec")));
     }
     if (recordingModeCombo) {
         recordingModeCombo->setEnabled(false);
@@ -4278,7 +6744,7 @@ void YourClassName::stopRecording(bool momentaryRelease) {
     if (recordButton) {
         QSignalBlocker blocker(recordButton);
         recordButton->setChecked(false);
-        recordButton->setText(QStringLiteral("Record"));
+        recordButton->setText(uiText(QStringLiteral("record"), QStringLiteral("Record")));
     }
     if (recordingModeCombo) {
         recordingModeCombo->setEnabled(true);
@@ -4321,7 +6787,9 @@ void YourClassName::refreshPlaybackFiles() {
     }
 
     if (playbackFileCombo->count() == 0) {
-        playbackFileCombo->addItem(QStringLiteral("No WAV recordings found"), QString());
+        playbackFileCombo->addItem(uiText(QStringLiteral("no_wav_recordings_found"),
+                                          QStringLiteral("No WAV recordings found")),
+                                   QString());
         playbackFileCombo->setEnabled(false);
         if (playbackButton) {
             playbackButton->setEnabled(false);
@@ -4410,7 +6878,7 @@ void YourClassName::stopPlayback() {
     if (playbackButton && playbackButton->isChecked()) {
         QSignalBlocker blocker(playbackButton);
         playbackButton->setChecked(false);
-        playbackButton->setText(QStringLiteral("Play"));
+        playbackButton->setText(uiText(QStringLiteral("play"), QStringLiteral("Play")));
     }
 }
 
@@ -4419,7 +6887,7 @@ void YourClassName::onPlaybackStarted(const QString &filePath, PlaybackManager::
     if (playbackButton) {
         QSignalBlocker blocker(playbackButton);
         playbackButton->setChecked(true);
-        playbackButton->setText(QStringLiteral("Stop Play"));
+        playbackButton->setText(uiText(QStringLiteral("stop_play"), QStringLiteral("Stop Play")));
     }
     if (playbackFileCombo) {
         playbackFileCombo->setEnabled(false);
@@ -4470,7 +6938,7 @@ void YourClassName::onPlaybackStarted(const QString &filePath, PlaybackManager::
             pendingSettings.sampleRate = info.sampleRate;
             pendingSettings.centerFrequency = pendingSettings.listeningFrequency;
             pendingSettings.actualFrequency = pendingSettings.listeningFrequency;
-            pendingSettings.inputMode = 0;
+            pendingSettings.inputMode = INPUT_RF;
         }
         pendingSettings.audioEnabled = audioEnabledBeforePlayback;
         pendingSettings.audioDeviceId = audioDeviceBeforePlayback;
@@ -4531,7 +6999,7 @@ void YourClassName::onPlaybackStopped() {
     if (playbackButton) {
         QSignalBlocker blocker(playbackButton);
         playbackButton->setChecked(false);
-        playbackButton->setText(QStringLiteral("Play"));
+        playbackButton->setText(uiText(QStringLiteral("play"), QStringLiteral("Play")));
     }
     if (playbackFileCombo) {
         playbackFileCombo->setEnabled(playbackFileCombo->count() > 0 && !selectedPlaybackFilePath().isEmpty());
@@ -4544,7 +7012,8 @@ void YourClassName::onPlaybackStopped() {
 
 void YourClassName::onPlaybackStatusChanged(const QString &status) {
     if (playbackStatusLabel) {
-        playbackStatusLabel->setText(status);
+        playbackStatusLabel->setProperty("statusRawText", status);
+        playbackStatusLabel->setText(localizedStatusText(status));
     }
 }
 
@@ -4717,7 +7186,7 @@ void YourClassName::handleNetworkIqPayload(const QJsonObject &frame, QByteArray 
     iqSettings.inputMode = frame.value("inputMode").toInt(iqSettings.inputMode);
 
     if (channelizedFrame) {
-        iqSettings.inputMode = 0;
+        iqSettings.inputMode = INPUT_RF;
         iqSettings.centerFrequency = iqSettings.listeningFrequency;
         iqSettings.actualFrequency = iqSettings.listeningFrequency;
         if (audioProcessor) {
@@ -5060,6 +7529,7 @@ bool YourClassName::openFobosSession() {
         qDebug() << "Failed to open Fobos device, error code:" << ret;
         device = nullptr;
         agileDevice = nullptr;
+        agileScanRunning = false;
         activeFobosApiKind = FobosApiKind::Standard;
         openedDeviceIndex = -1;
         openedNativeDeviceIndex = -1;
@@ -5102,6 +7572,12 @@ bool YourClassName::closeFobosSession(bool clearIq) {
         device = nullptr;
     }
     if (agileDevice) {
+        if (agileScanRunning) {
+            qDebug() << "[FobosLifecycle] stopping Agile scan before close";
+            const int scanStopResult = stopFobosAgileScanSafely(agileDevice);
+            qDebug() << "[FobosLifecycle] fobos_sdr_stop_scan end" << "result" << scanStopResult;
+            agileScanRunning = false;
+        }
         qDebug() << "[FobosLifecycle] fobos_sdr_close begin" << agileDevice;
         const int closeResult = closeFobosAgileDeviceSafely(agileDevice);
         qDebug() << "[FobosLifecycle] fobos_sdr_close end" << "result" << closeResult;
@@ -5161,7 +7637,7 @@ bool YourClassName::applyFobosSettings() {
         qDebug() << "[FobosLifecycle] fobos_rx_set_clk_source skipped unchanged";
     }
 
-    const int libfobosMode = (pendingSettings.inputMode == 0) ? 0 : 1;
+    const int libfobosMode = (pendingSettings.inputMode == INPUT_RF) ? 0 : 1;
     if (firstApply || appliedHardwareSettings.inputMode != pendingSettings.inputMode) {
         qDebug() << "[FobosLifecycle] set direct sampling begin" << "libfobosMode" << libfobosMode;
         result = setActiveDirectSamplingSafely(static_cast<unsigned int>(libfobosMode));
@@ -5198,7 +7674,7 @@ bool YourClassName::applyFobosSettings() {
         }
     }
 
-    if (pendingSettings.inputMode == 0) {
+    if (pendingSettings.inputMode == INPUT_RF) {
         if (firstApply ||
             appliedHardwareSettings.inputMode != pendingSettings.inputMode ||
             changedDouble(appliedHardwareSettings.centerFrequency, pendingSettings.centerFrequency)) {
@@ -5254,6 +7730,11 @@ bool YourClassName::applyFobosSettings() {
         qDebug() << "[FobosLifecycle] fobos_rx_set_user_gpo skipped unchanged";
     }
 
+    if (!applyAgileScanSettings(false)) {
+        qDebug() << "[FobosLifecycle] Agile scan settings failed";
+        return false;
+    }
+
     appliedHardwareSettings = pendingSettings;
     appliedHardwareSettings.sampleRate = globalSampleRate;
     appliedHardwareSettings.actualFrequency = pendingSettings.actualFrequency;
@@ -5281,7 +7762,7 @@ void YourClassName::updateFrequency() {
 }
 
 void YourClassName::updateCentralFrequency() {
-   if (pendingSettings.inputMode != 0) {
+   if (pendingSettings.inputMode != INPUT_RF) {
        normalizeTuning(pendingSettings);
        if (scaleWidget) {
            scaleWidget->setTuning(pendingSettings.listeningFrequency,
@@ -5467,19 +7948,20 @@ void YourClassName::onVideoStatusChanged(const QString &status) {
 void YourClassName::onScaleChanged(int value) {
     currentScale = sliderValueToScalePercent(value);
 
-    scaleLabel->setText(scaleLabelText(currentScale));
+    scaleLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("scale"), QStringLiteral("Scale")),
+                                                    formatScalePercent(currentScale)));
     settingRange();
 }
 
 void YourClassName::onSensitivityChanged(int value) {
     sensitivity = value;
-    sensitivityLabel->setText(QString("Sensitivity: %1").arg(value));
+    sensitivityLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("sensitivity"), QStringLiteral("Sensitivity"))).arg(value));
     settingRange();
 }
 
 void YourClassName::onContrastChanged(int value) {
     contrast = value;
-    contrastLabel->setText(QString("Contrast: %1").arg(value));
+    contrastLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("contrast"), QStringLiteral("Contrast"))).arg(value));
     settingRange();
 }
 
@@ -5494,10 +7976,10 @@ void YourClassName::onLevelMinChanged(int value) {
         }
     }
     if (levelMinLabel) {
-        levelMinLabel->setText(levelLabelText("Min", displayLevelMin));
+        levelMinLabel->setText(levelLabelText(uiText(QStringLiteral("min"), QStringLiteral("Min")), displayLevelMin));
     }
     if (levelMaxLabel) {
-        levelMaxLabel->setText(levelLabelText("Max", displayLevelMax));
+        levelMaxLabel->setText(levelLabelText(uiText(QStringLiteral("max"), QStringLiteral("Max")), displayLevelMax));
     }
     if (graphWidget) {
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
@@ -5518,10 +8000,10 @@ void YourClassName::onLevelMaxChanged(int value) {
         }
     }
     if (levelMinLabel) {
-        levelMinLabel->setText(levelLabelText("Min", displayLevelMin));
+        levelMinLabel->setText(levelLabelText(uiText(QStringLiteral("min"), QStringLiteral("Min")), displayLevelMin));
     }
     if (levelMaxLabel) {
-        levelMaxLabel->setText(levelLabelText("Max", displayLevelMax));
+        levelMaxLabel->setText(levelLabelText(uiText(QStringLiteral("max"), QStringLiteral("Max")), displayLevelMax));
     }
     if (graphWidget) {
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
@@ -5724,6 +8206,9 @@ void YourClassName::openNetworkSettingsDialog() {
     QCheckBox *serverDisableLocalUiCheck = new QCheckBox("Disable local visual/audio on server when streaming is implemented", &dialog);
     serverDisableLocalUiCheck->setChecked(serverDisableLocalVisualAudio);
 
+    QCheckBox *fullResolutionSpectrumCheck = new QCheckBox("Send full-resolution spectrum/waterfall frames (heavy LAN only)", &dialog);
+    fullResolutionSpectrumCheck->setChecked(networkFullResolutionSpectrumFrames);
+
     QCheckBox *audioRelayTransmitCheck = new QCheckBox("Send ready audio by UDP", &dialog);
     audioRelayTransmitCheck->setChecked(audioRelayTransmitEnabled);
 
@@ -5757,6 +8242,7 @@ void YourClassName::openNetworkSettingsDialog() {
     formLayout->addRow("Bind address:", bindAddressEdit);
     formLayout->addRow("Control port:", portSpin);
     formLayout->addRow("", serverDisableLocalUiCheck);
+    formLayout->addRow("Visual frames:", fullResolutionSpectrumCheck);
     formLayout->addRow("Audio relay TX:", audioRelayTransmitCheck);
     formLayout->addRow("Relay target IP:", audioRelayHostEdit);
     formLayout->addRow("Relay target port:", audioRelayPortSpin);
@@ -5785,6 +8271,7 @@ void YourClassName::openNetworkSettingsDialog() {
         serverAddressEdit->setEnabled(selectedMode == NetworkMode::Client);
         bindAddressEdit->setEnabled(selectedMode == NetworkMode::Server);
         serverDisableLocalUiCheck->setEnabled(selectedMode != NetworkMode::Disabled);
+        fullResolutionSpectrumCheck->setEnabled(selectedMode != NetworkMode::Disabled);
         processingCombo->setEnabled(selectedMode != NetworkMode::Disabled);
         portSpin->setEnabled(selectedMode != NetworkMode::Disabled);
         requestControlButton->setEnabled(selectedMode == NetworkMode::Client);
@@ -5824,6 +8311,7 @@ void YourClassName::openNetworkSettingsDialog() {
                                  : bindAddressEdit->text().trimmed();
         networkControlPort = static_cast<quint16>(portSpin->value());
         serverDisableLocalVisualAudio = serverDisableLocalUiCheck->isChecked();
+        networkFullResolutionSpectrumFrames = fullResolutionSpectrumCheck->isChecked();
         networkProcessingMode = static_cast<NetworkProcessingMode>(processingCombo->currentData().toInt());
         audioRelayTransmitEnabled = audioRelayTransmitCheck->isChecked();
         audioRelayHost = audioRelayHostEdit->text().trimmed().isEmpty()
@@ -5970,11 +8458,13 @@ void YourClassName::updateNetworkButtonText() {
         return;
     }
 
+    const QString base = uiText(QStringLiteral("network"), QStringLiteral("Network"));
     switch (networkMode) {
     case NetworkMode::Server:
         networkButton->setText(isChannelIqProcessingMode()
-                                   ? "Network: Server ChIQ"
-                                   : (isFullIqProcessingMode() ? "Network: Server IQ" : "Network: Server"));
+                                   ? QStringLiteral("%1: Server ChIQ").arg(base)
+                                   : (isFullIqProcessingMode() ? QStringLiteral("%1: Server IQ").arg(base)
+                                                               : QStringLiteral("%1: Server").arg(base)));
         break;
     case NetworkMode::Client: {
         const QString roleSuffix =
@@ -5982,13 +8472,14 @@ void YourClassName::updateNetworkButtonText() {
                 ? (networkController->clientHasControl() ? QStringLiteral(" Ctrl") : QStringLiteral(" Obs"))
                 : QString();
         networkButton->setText((isChannelIqProcessingMode()
-                                    ? "Network: Client ChIQ"
-                                    : (isFullIqProcessingMode() ? "Network: Client IQ" : "Network: Client")) + roleSuffix);
+                                    ? QStringLiteral("%1: Client ChIQ").arg(base)
+                                    : (isFullIqProcessingMode() ? QStringLiteral("%1: Client IQ").arg(base)
+                                                                : QStringLiteral("%1: Client").arg(base))) + roleSuffix);
         break;
     }
     case NetworkMode::Disabled:
     default:
-        networkButton->setText("Network");
+        networkButton->setText(base);
         break;
     }
 }
@@ -6002,14 +8493,64 @@ void YourClassName::updateAudioFilterLabels() {
     if (audioLowPassLabel) {
         const QString value = pendingSettings.audioLowPassHz > 0.0
                                   ? audioFilterFrequencyText(pendingSettings.audioLowPassHz)
-                                  : QStringLiteral("Auto");
-        audioLowPassLabel->setText(QStringLiteral("Audio LPF: %1").arg(value));
+                                  : uiText(QStringLiteral("auto"), QStringLiteral("Auto"));
+        audioLowPassLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("audio_lpf"), QStringLiteral("Audio LPF")), value));
     }
     if (audioHighPassLabel) {
         const QString value = pendingSettings.audioHighPassHz > 0.0
                                   ? audioFilterFrequencyText(pendingSettings.audioHighPassHz)
-                                  : QStringLiteral("Off");
-        audioHighPassLabel->setText(QStringLiteral("Audio HPF: %1").arg(value));
+                                  : uiText(QStringLiteral("off"), QStringLiteral("Off"));
+        audioHighPassLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("audio_hpf"), QStringLiteral("Audio HPF")), value));
+    }
+}
+
+void YourClassName::updateHfNoiseCancelControls() {
+    const bool enabled = pendingSettings.inputMode == INPUT_HF_NOISE_CANCEL;
+
+    if (hfNoiseCancelDepthLabel) {
+        hfNoiseCancelDepthLabel->setText(QStringLiteral("%1: %2%").arg(uiText(QStringLiteral("hf_cancel"), QStringLiteral("HF cancel")))
+                                             .arg(hfNoiseCancelDepthToSliderValue(pendingSettings.hfNoiseCancelDepth)));
+        hfNoiseCancelDepthLabel->setEnabled(enabled);
+    }
+    if (hfNoiseCancelRefGainLabel) {
+        hfNoiseCancelRefGainLabel->setText(QStringLiteral("%1: %2 dB").arg(uiText(QStringLiteral("ref_gain"), QStringLiteral("Ref gain")))
+                                               .arg(clampHfNoiseCancelRefGainDb(pendingSettings.hfNoiseCancelRefGainDb), 0, 'f', 1));
+        hfNoiseCancelRefGainLabel->setEnabled(enabled);
+    }
+    if (hfNoiseCancelRefDelayLabel) {
+        hfNoiseCancelRefDelayLabel->setText(QStringLiteral("%1: %2 ns").arg(uiText(QStringLiteral("ref_delay"), QStringLiteral("Ref delay")))
+                                                .arg(static_cast<int>(std::lround(clampHfNoiseCancelRefDelayNs(pendingSettings.hfNoiseCancelRefDelayNs)))));
+        hfNoiseCancelRefDelayLabel->setEnabled(enabled);
+    }
+    if (hfNoiseCancelRefTiltLabel) {
+        hfNoiseCancelRefTiltLabel->setText(QStringLiteral("%1: %2 dB").arg(uiText(QStringLiteral("ref_tilt"), QStringLiteral("Ref tilt")))
+                                               .arg(clampHfNoiseCancelRefTiltDb(pendingSettings.hfNoiseCancelRefTiltDb), 0, 'f', 1));
+        hfNoiseCancelRefTiltLabel->setEnabled(enabled);
+    }
+    if (hfNoiseCancelDepthSlider) {
+        hfNoiseCancelDepthSlider->setEnabled(enabled);
+        hfNoiseCancelDepthSlider->setToolTip(
+            QStringLiteral("Subtract the part of HF2 that stays correlated with HF1. 0% = HF1 only, 100% = normal cancellation."));
+    }
+    if (hfNoiseCancelRefGainSlider) {
+        hfNoiseCancelRefGainSlider->setEnabled(enabled);
+        hfNoiseCancelRefGainSlider->setToolTip(
+            QStringLiteral("Manual HF2 reference level before subtraction."));
+    }
+    if (hfNoiseCancelRefDelaySlider) {
+        hfNoiseCancelRefDelaySlider->setEnabled(enabled);
+        hfNoiseCancelRefDelaySlider->setToolTip(
+            QStringLiteral("Manual HF2 reference delay/phase correction before subtraction."));
+    }
+    if (hfNoiseCancelRefTiltSlider) {
+        hfNoiseCancelRefTiltSlider->setEnabled(enabled);
+        hfNoiseCancelRefTiltSlider->setToolTip(
+            QStringLiteral("Manual HF2 reference slope across the visible HF band."));
+    }
+    if (hfNoiseCancelFreezeCheckbox) {
+        hfNoiseCancelFreezeCheckbox->setEnabled(enabled);
+        hfNoiseCancelFreezeCheckbox->setToolTip(
+            QStringLiteral("Hold the small adaptive trim added on top of the manual HF2 reference"));
     }
 }
 
@@ -6191,10 +8732,14 @@ void YourClassName::updateSpectrum() {
         //}
     std::vector<float> spectrumFrequencies;
     std::vector<float> spectrumMagnitudes;
+    std::vector<float> referenceMagnitudes;
     bool haveSpectrum = false;
     try {
         const RadioSettings spectrumSettings = spectrumProcessingSettings();
-        haveSpectrum = fftResult->storeFFTResults(spectrumSettings, spectrumFrequencies, spectrumMagnitudes);
+        haveSpectrum = fftResult->storeFFTResults(spectrumSettings,
+                                                  spectrumFrequencies,
+                                                  spectrumMagnitudes,
+                                                  &referenceMagnitudes);
     } catch (const std::bad_alloc &error) {
         qCritical() << "[Spectrum] bad_alloc" << error.what()
                     << "sampleRate" << pendingSettings.sampleRate
@@ -6230,6 +8775,9 @@ void YourClassName::updateSpectrum() {
     if (!suppressLocalVisual) {
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
         graphWidget->setData(spectrumFrequencies, spectrumMagnitudes, minFrequency, maxFrequency, pendingSettings.fftLength, colorf);
+        graphWidget->setOverlayData(referenceMagnitudes,
+                                    pendingSettings.inputMode == INPUT_HF_NOISE_CANCEL &&
+                                        !referenceMagnitudes.empty());
         if (traceFrame) {
             qDebug() << "[Spectrum] before waterfall" << "elapsedMs" << traceTimer.elapsed();
         }
@@ -6237,7 +8785,7 @@ void YourClassName::updateSpectrum() {
     } else if (traceFrame) {
         qDebug() << "[Spectrum] local server visual update skipped" << "elapsedMs" << traceTimer.elapsed();
     }
-    sendNetworkSpectrumFrame(spectrumFrequencies, spectrumMagnitudes);
+    sendNetworkSpectrumFrame(spectrumFrequencies, spectrumMagnitudes, referenceMagnitudes);
     finishTrace("end", spectrumFrequencies, spectrumMagnitudes);
     //waterfallWidget->setData(fftFrequencies, fftMagnitudes, minFrequency, maxFrequency, fftLength, secondGraph, contrast, sensitivity);
     //qDebug() << "all took" << timer.elapsed() << "milliseconds";
@@ -6307,6 +8855,130 @@ void YourClassName::onSampleRateChanged(int index) {
     qDebug() << "Sample rate will be applied on the next start.";
 }
 
+double YourClassName::fineTuneRangeHz() const {
+    double visibleSpan = maxFrequency - minFrequency;
+    if (!std::isfinite(visibleSpan) || visibleSpan <= 0.0) {
+        visibleSpan = pendingSettings.sampleRate * (currentScale / 100.0);
+    }
+    if (!std::isfinite(visibleSpan) || visibleSpan <= 0.0) {
+        visibleSpan = 100000.0;
+    }
+    return (std::clamp)(visibleSpan / FINE_TUNE_VISIBLE_RANGE_DIVISOR,
+                        FINE_TUNE_MIN_RANGE_HZ,
+                        FINE_TUNE_MAX_RANGE_HZ);
+}
+
+double YourClassName::fineTuneStepHz() const {
+    return fineTuneRangeHz() /
+           static_cast<double>((std::max)(std::abs(FINE_TUNE_DIAL_MIN),
+                                          std::abs(FINE_TUNE_DIAL_MAX)));
+}
+
+void YourClassName::updateFineTuneLabel() {
+    if (!fineTuneLabel) {
+        return;
+    }
+    const double range = fineTuneRangeHz();
+    if (fineTuneScaleWidget) {
+        fineTuneScaleWidget->setRangeHz(range);
+    }
+    fineTuneLabel->setText(QStringLiteral("%1 +/- %2")
+                               .arg(uiText(QStringLiteral("fine_tune"), QStringLiteral("Fine tune")),
+                                    audioFilterFrequencyText(range)));
+}
+
+void YourClassName::updateFineTuneControlMode() {
+    if (!fineTuneStack) {
+        return;
+    }
+    fineTuneControlMode = fineTuneControlMode == FINE_TUNE_MODE_DIAL
+                              ? FINE_TUNE_MODE_DIAL
+                              : FINE_TUNE_MODE_SCALE;
+    if (fineTuneScaleWidget && fineTuneScaleWidget->holdOffsetMode() != fineTuneScaleHoldMode) {
+        QSignalBlocker blocker(fineTuneScaleWidget);
+        fineTuneScaleWidget->setHoldOffsetMode(fineTuneScaleHoldMode);
+    }
+    fineTuneStack->setFixedHeight(fineTuneControlMode == FINE_TUNE_MODE_DIAL ? 78 : 58);
+    fineTuneStack->setCurrentIndex(fineTuneControlMode == FINE_TUNE_MODE_DIAL ? 1 : 0);
+    updateFineTuneScaleModeButton();
+    onFineTuneDialReleased();
+    updateFineTuneLabel();
+}
+
+void YourClassName::updateFineTuneScaleModeButton() {
+    if (!fineTuneScaleModeButton) {
+        return;
+    }
+
+    const bool holdMode = fineTuneScaleWidget ? fineTuneScaleWidget->holdOffsetMode()
+                                              : fineTuneScaleHoldMode;
+    fineTuneScaleHoldMode = holdMode;
+    {
+        QSignalBlocker blocker(fineTuneScaleModeButton);
+        fineTuneScaleModeButton->setChecked(holdMode);
+    }
+    fineTuneScaleModeButton->setVisible(fineTuneControlMode == FINE_TUNE_MODE_SCALE);
+    fineTuneScaleModeButton->setToolTip(holdMode
+                                            ? QStringLiteral("Held fine tune offset. Double-click the scale or click here for temporary mode.")
+                                            : QStringLiteral("Temporary fine tune. Double-click the scale or click here for held offset mode."));
+    fineTuneScaleModeButton->setStyleSheet(holdMode
+                                               ? QStringLiteral("QToolButton { background: #d65050; border: 1px solid #ff9a9a; border-radius: 8px; }"
+                                                                "QToolButton:hover { background: #ec6969; }")
+                                               : QStringLiteral("QToolButton { background: #3dbb68; border: 1px solid #8af0a8; border-radius: 8px; }"
+                                                                "QToolButton:hover { background: #50d47a; }"));
+}
+
+void YourClassName::applyListeningFrequencyDelta(double deltaHz, int networkDelayMs) {
+    if (!std::isfinite(deltaHz) || std::abs(deltaHz) < 0.01) {
+        return;
+    }
+
+    const RadioSettings previousSettings = pendingSettings;
+    pendingSettings.listeningFrequency += deltaHz;
+    normalizeTuning(pendingSettings);
+    applyCenterFrequencyToHardwareIfNeeded(previousSettings, "fine tune");
+    publishSettingsToGlobals();
+
+    if (frequencyControl) {
+        QSignalBlocker blocker(frequencyControl);
+        frequencyControl->setValueHz(pendingSettings.centerFrequency);
+    }
+    if (listeningFrequencyControl) {
+        QSignalBlocker blocker(listeningFrequencyControl);
+        listeningFrequencyControl->setValueHz(pendingSettings.listeningFrequency);
+    }
+
+    settingRange();
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand(networkDelayMs);
+    }
+}
+
+void YourClassName::onFineTuneDialChanged(int value) {
+    const int deltaSteps = value - fineTuneDialLastValue;
+    fineTuneDialLastValue = value;
+    if (deltaSteps == 0) {
+        return;
+    }
+
+    applyListeningFrequencyDelta(deltaSteps * fineTuneStepHz(), 80);
+
+    if (fineTuneDial && !fineTuneDial->isSliderDown()) {
+        QTimer::singleShot(120, this, [this]() {
+            onFineTuneDialReleased();
+        });
+    }
+}
+
+void YourClassName::onFineTuneDialReleased() {
+    if (!fineTuneDial) {
+        return;
+    }
+    QSignalBlocker blocker(fineTuneDial);
+    fineTuneDial->setValue(0);
+    fineTuneDialLastValue = 0;
+}
+
 void YourClassName::onListeningFrequencyEntered() {
     if (!listeningFrequencyControl) {
         return;
@@ -6334,7 +9006,7 @@ void YourClassName::onListeningFrequencyEntered() {
     
 void YourClassName::onFrequencyEntered() {
     const RadioSettings previousSettings = pendingSettings;
-    if (pendingSettings.inputMode == 0) {
+    if (pendingSettings.inputMode == INPUT_RF) {
         if (frequencyControl) {
             pendingSettings.centerFrequency = frequencyControl->valueHz();
             normalizeTuning(pendingSettings, true);
@@ -6484,7 +9156,8 @@ QStringList YourClassName::getFobosDevices() {
         deviceList << info.label;
     }
     if (deviceList.isEmpty()) {
-        deviceList << "No Fobos devices detected";
+        deviceList << uiText(QStringLiteral("no_fobos_devices_detected"),
+                             QStringLiteral("No Fobos devices detected"));
     }
     return deviceList;
 }
@@ -6555,9 +9228,9 @@ void YourClassName::onDirectSamplingChanged(int index) {
 
     pendingSettings.inputMode = value;
 
-    if (value != 0) {
+    if (value != INPUT_RF) {
         pendingSettings.centerFrequency = 0;
-        pendingSettings.listeningFrequency = value == 1 ? 0 : 1250000;
+        pendingSettings.listeningFrequency = value == INPUT_HF_COMBINED ? 0 : 1250000;
     } else {
         pendingSettings.centerFrequency = 100000000;
         pendingSettings.listeningFrequency = 100000000;
@@ -6577,6 +9250,7 @@ void YourClassName::onDirectSamplingChanged(int index) {
 
     publishSettingsToGlobals();
     settingRange();
+    updateHfNoiseCancelControls();
 
     if (isNetworkClientMode()) {
         scheduleRemoteSettingsCommand();
@@ -6602,7 +9276,7 @@ void YourClassName::settingRange() {
     if (offlineIqPlaybackActive && !offlineIqPlaybackHasMetadata) {
         overallMin = globalFrequency - globalSampleRate / 2.0;
         overallMax = globalFrequency + globalSampleRate / 2.0;
-    } else if (globalMode == 0) {
+    } else if (globalMode == INPUT_RF) {
         overallMin = (std::max)(RF_MIN_LISTENING_FREQUENCY,
                                 globalFrequency - globalSampleRate / 2.0);
         overallMax = (std::max)(overallMin,
@@ -6610,8 +9284,8 @@ void YourClassName::settingRange() {
     }
 
     if (listeningFrequencyControl) {
-        const double controlMin = globalMode == 0 ? RF_MIN_LISTENING_FREQUENCY : overallMin;
-        const double controlMax = globalMode == 0 ? 6000000000.0 : overallMax;
+        const double controlMin = globalMode == INPUT_RF ? RF_MIN_LISTENING_FREQUENCY : overallMin;
+        const double controlMax = globalMode == INPUT_RF ? 6000000000.0 : overallMax;
         QSignalBlocker blocker(listeningFrequencyControl);
         listeningFrequencyControl->setRangeHz(controlMin, controlMax);
         listeningFrequencyControl->setValueHz((std::clamp)(listeningFrequency, controlMin, controlMax));
@@ -6628,6 +9302,7 @@ void YourClassName::settingRange() {
     maxFrequency = newMax;
     scaleWidget->setTuning(clampedListening, globalFrequency, globalBandwidth, globalModulationType);
     scaleWidget->setRange(minFrequency, maxFrequency);
+    updateFineTuneLabel();
 }
 
 void YourClassName::onCheckboxStateChanged(int state) {
@@ -6653,7 +9328,7 @@ void YourClassName::onCheckboxStateChanged(int state) {
 
 void YourClassName::onLnaGainChanged(int value) {
     pendingSettings.lnaGain = value;
-    lnaGainLabel->setText(QString("LNA Gain: %1").arg(value));
+    lnaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("lna_gain"), QStringLiteral("LNA Gain"))).arg(value));
 
     if (hasActiveFobosDevice() && !isIdle() && hardwareSettingsApplied) {
         const int result = setActiveLnaGainSafely(static_cast<unsigned int>(value));
@@ -6671,7 +9346,7 @@ void YourClassName::onLnaGainChanged(int value) {
 
 void YourClassName::onVgaGainChanged(int value) {
     pendingSettings.vgaGain = value;
-    vgaGainLabel->setText(QString("VGA Gain: %1").arg(value));
+    vgaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("vga_gain"), QStringLiteral("VGA Gain"))).arg(value));
 
     if (hasActiveFobosDevice() && !isIdle() && hardwareSettingsApplied) {
         const int result = setActiveVgaGainSafely(static_cast<unsigned int>(value));
@@ -6771,6 +9446,7 @@ void YourClassName::startFobosProcessing() {
                      << activeFobosDevice();
             device = nullptr;
             agileDevice = nullptr;
+            agileScanRunning = false;
             activeFobosApiKind = FobosApiKind::Standard;
             openedDeviceIndex = -1;
             openedNativeDeviceIndex = -1;
@@ -6857,7 +9533,8 @@ void YourClassName::startFobosProcessing() {
                                pendingSettings.syncEnabled,
                                pendingSettings.sampleRate,
                                queueAudioBlocks,
-                               serverIqStreaming || channelIqRecording);
+                               serverIqStreaming || channelIqRecording,
+                               agileScanEnabled && activeFobosApiKind == FobosApiKind::Agile);
     pendingAudioStartAfterStreamReady = serverLocalAudioEnabled;
     streamStartCallbackCount = processor ? processor->callbackCount() : 0;
     streamStartElapsedTimer.restart();
@@ -6930,6 +9607,7 @@ void YourClassName::finishFobosStop(bool forcedRecovery) {
                  << "apiKind" << fobosApiKindName(activeFobosApiKind);
         device = nullptr;
         agileDevice = nullptr;
+        agileScanRunning = false;
         activeFobosApiKind = FobosApiKind::Standard;
         openedDeviceIndex = -1;
         openedNativeDeviceIndex = -1;
@@ -7017,11 +9695,15 @@ void YourClassName::checkStreamStartup() {
     }
     pendingAudioStartAfterStreamReady = false;
 
-    if (streamStartupRetryCount < 1) {
+    const bool directSamplingStartup = pendingSettings.inputMode != INPUT_RF;
+    if (streamStartupRetryCount < 1 && !directSamplingStartup) {
         ++streamStartupRetryCount;
         restartAfterStartupWatchdog = true;
         qDebug() << "[FobosLifecycle] stream startup watchdog will retry once"
                  << "retryCount" << streamStartupRetryCount;
+    } else if (directSamplingStartup) {
+        restartAfterStartupWatchdog = false;
+        qDebug() << "[FobosLifecycle] stream startup watchdog retry skipped for direct sampling mode";
     } else {
         restartAfterStartupWatchdog = false;
         qDebug() << "[FobosLifecycle] stream startup watchdog retry already used; leaving receiver stopped";

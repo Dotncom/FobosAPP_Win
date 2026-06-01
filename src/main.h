@@ -10,7 +10,11 @@
 #include <QPushButton>
 #include <QLineEdit>
 #include <QSlider>
+#include <QDial>
 #include <QLabel>
+#include <QDoubleSpinBox>
+#include <QGroupBox>
+#include <QMap>
 #include <memory>
 #include <QScrollArea>
 #include <QCheckBox>
@@ -84,6 +88,9 @@ extern double maxFrequency;
 extern float sensitivity;
 extern float contrast;
 class FFTResult;
+class FineTuneScaleWidget;
+class QStackedWidget;
+class QToolButton;
 extern int deviceID;
 
 class YourClassName : public QMainWindow {
@@ -103,6 +110,8 @@ public:
     void onContrastChanged(int value);
     void onLevelMinChanged(int value);
     void onLevelMaxChanged(int value);
+    void onFineTuneDialChanged(int value);
+    void onFineTuneDialReleased();
     void populateSampleRates();
     void populateAudioDevices();
 private slots:
@@ -177,6 +186,24 @@ private:
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
     bool applyFobosSettings();
+    bool applyAgileScanSettings(bool forceStop = false);
+    QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
+    void updateAgileScanControls();
+    void saveAgileScanPreset();
+    void deleteAgileScanPreset();
+    void ensureDefaultFrequencyPresets();
+    void ensureDefaultBandMarkers();
+    void updateFrequencyPresetControls();
+    void updateGraphBandMarkers();
+    QVector<QPair<QString, double>> presetMapToVector(const QMap<QString, double> &presets) const;
+    void openPresetManager();
+    void openApplicationSettings();
+    double fineTuneRangeHz() const;
+    double fineTuneStepHz() const;
+    void updateFineTuneLabel();
+    void updateFineTuneControlMode();
+    void updateFineTuneScaleModeButton();
+    void applyListeningFrequencyDelta(double deltaHz, int networkDelayMs = 80);
     void refreshSettingsFromUi();
     void publishSettingsToGlobals();
     bool isIdle() const;
@@ -200,9 +227,17 @@ private:
     QJsonObject settingsToJson() const;
     void applySettingsFromJson(const QJsonObject &settingsJson);
     void updateUiFromPendingSettings();
+    void loadUiTranslations();
+    QString uiText(const QString &key, const QString &fallback) const;
+    QString localizedStatusText(const QString &status) const;
+    void markTranslatable(QWidget *widget, const QString &key, const QString &fallback);
+    void applyUiLanguage();
+    void setComboItemText(QComboBox *combo, const QVariant &data, const QString &key, const QString &fallback);
     void updateNetworkButtonText();
     void updateAudioFilterLabels();
+    void updateHfNoiseCancelControls();
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
+    void handleDataProcessorFailure(int errorCode, bool stoppedByRequest);
     void connectDataProcessorSignals();
     void applyServerLocalOutputPolicy();
     bool applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings, const char *reason);
@@ -211,8 +246,11 @@ private:
     void savePersistentSettings();
     void startNetworkClientProcessing();
     void stopNetworkClientProcessing();
-    void sendNetworkSpectrumFrame(const std::vector<float> &frequencies, const std::vector<float> &magnitudes);
+    void sendNetworkSpectrumFrame(const std::vector<float> &frequencies,
+                                  const std::vector<float> &magnitudes,
+                                  const std::vector<float> &referenceMagnitudes = {});
     void displayNetworkSpectrumFrame(const QJsonObject &frame);
+    void displayNetworkSpectrumFrameBinary(const QJsonObject &frame, const QByteArray &payload);
     void sendNetworkAudioFrame(const QByteArray &pcmData);
     void playNetworkAudioFrame(const QJsonObject &frame);
     void updateAudioRelaySocket();
@@ -259,6 +297,8 @@ private:
     QComboBox *audioDeviceComboBox = nullptr;
     QComboBox *recordingModeCombo = nullptr;
     QComboBox *playbackFileCombo = nullptr;
+    QComboBox *languageComboBox = nullptr;
+    QComboBox *agileScanPresetCombo = nullptr;
     QComboBox *videoDemodCombo = nullptr;
     QComboBox *videoStandardCombo = nullptr;
     QComboBox *dmrLabColorCodeCombo = nullptr;
@@ -269,6 +309,9 @@ private:
     QPushButton *refreshButton = nullptr;
     QPushButton *fobosButton = nullptr;
     QPushButton *networkButton = nullptr;
+    QPushButton *presetManagerButton = nullptr;
+    QPushButton *appSettingsButton = nullptr;
+    QPushButton *controlsToggleButton = nullptr;
     QPushButton *digitalToggleButton = nullptr;
     QPushButton *videoToggleButton = nullptr;
     QPushButton *recordButton = nullptr;
@@ -289,6 +332,8 @@ private:
     QCheckBox *videoHSyncCheckbox = nullptr;
     QCheckBox *videoVSyncCheckbox = nullptr;
     QCheckBox *videoTestPatternCheckbox = nullptr;
+    QCheckBox *hfNoiseCancelFreezeCheckbox = nullptr;
+    QCheckBox *agileScanCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
@@ -298,13 +343,25 @@ private:
     QSlider *sensitivitySlider = nullptr;
     QSlider *levelMinSlider = nullptr;
     QSlider *levelMaxSlider = nullptr;
+    QDial *fineTuneDial = nullptr;
+    FineTuneScaleWidget *fineTuneScaleWidget = nullptr;
+    QStackedWidget *fineTuneStack = nullptr;
+    QToolButton *fineTuneScaleModeButton = nullptr;
     QSlider *volumeSlider = nullptr;
     QSlider *audioLowPassSlider = nullptr;
     QSlider *audioHighPassSlider = nullptr;
+    QSlider *hfNoiseCancelDepthSlider = nullptr;
+    QSlider *hfNoiseCancelRefGainSlider = nullptr;
+    QSlider *hfNoiseCancelRefDelaySlider = nullptr;
+    QSlider *hfNoiseCancelRefTiltSlider = nullptr;
 
     QLabel *volumeLabel = nullptr;
     QLabel *audioLowPassLabel = nullptr;
     QLabel *audioHighPassLabel = nullptr;
+    QLabel *hfNoiseCancelDepthLabel = nullptr;
+    QLabel *hfNoiseCancelRefGainLabel = nullptr;
+    QLabel *hfNoiseCancelRefDelayLabel = nullptr;
+    QLabel *hfNoiseCancelRefTiltLabel = nullptr;
     QLabel *lnaGainLabel = nullptr;
     QLabel *centralFrequencyLabel = nullptr;
     QLabel *listeningFrequencyLabel = nullptr;
@@ -313,17 +370,26 @@ private:
     QLabel *sensitivityLabel = nullptr;
     QLabel *levelMinLabel = nullptr;
     QLabel *levelMaxLabel = nullptr;
+    QLabel *fineTuneLabel = nullptr;
     QLabel *vgaGainLabel = nullptr;
     QLabel *scaleLabel = nullptr;
     QLabel *digitalStatusLabel = nullptr;
     QLabel *videoStatusLabel = nullptr;
     QLabel *recordingStatusLabel = nullptr;
     QLabel *playbackStatusLabel = nullptr;
+
+    QJsonObject uiTranslations;
+    QString uiLanguage = QStringLiteral("en");
        
     QLineEdit *dmrLabSourceIdEdit = nullptr;
     QLineEdit *dmrLabTargetIdEdit = nullptr;
     QLineEdit *dmrLabRadioEdit = nullptr;
     QLineEdit *dmrLabNotesEdit = nullptr;
+    QLineEdit *agileScanRangesEdit = nullptr;
+    QDoubleSpinBox *agileScanStepSpin = nullptr;
+    QPushButton *agileScanSavePresetButton = nullptr;
+    QPushButton *agileScanDeletePresetButton = nullptr;
+    QLabel *agileScanStatusLabel = nullptr;
 
     FrequencyControl *frequencyControl = nullptr;
     FrequencyControl *listeningFrequencyControl = nullptr;
@@ -394,9 +460,26 @@ private:
     QString networkServerAddress = "127.0.0.1";
     QString networkBindAddress = "0.0.0.0";
     quint16 networkControlPort = 21090;
+    bool networkFullResolutionSpectrumFrames = false;
+    int fineTuneDialLastValue = 0;
+    int fineTuneControlMode = 0;
+    bool fineTuneScaleHoldMode = false;
     bool serverDisableLocalVisualAudio = true;
     bool digitalDecodeEnabled = true;
     bool videoDecodeEnabled = false;
+    bool agileScanEnabled = false;
+    bool agileScanRunning = false;
+    QString agileScanRangesMhz = QStringLiteral("430-432");
+    double agileScanStepMhz = 0.0125;
+    QMap<QString, QString> agileScanPresets;
+    QMap<QString, double> centerFrequencyPresets;
+    QMap<QString, double> listeningFrequencyPresets;
+    QMap<QString, double> bandwidthValuePresets;
+    QVector<GraphBandMarker> bandMarkers;
+    bool bandMarkersCustomized = false;
+    bool showGeneralBandMarkers = false;
+    bool showAmateurBandMarkers = false;
+    bool compactBandMarkers = false;
     std::atomic_bool videoIqFramePending{false};
     bool momentaryRecordingActive = false;
     bool offlineIqPlaybackActive = false;

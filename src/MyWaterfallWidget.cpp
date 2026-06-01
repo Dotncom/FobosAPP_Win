@@ -6,6 +6,17 @@
 
 bool changebit=false;
 
+namespace {
+constexpr double AUTO_TUNE_WINDOW_FRACTION = 1.0 / 80.0;
+constexpr double AUTO_TUNE_MIN_WINDOW_HZ = 300.0;
+constexpr double AUTO_TUNE_MAX_WINDOW_HZ = 500000.0;
+
+struct SignalSample {
+    double frequency = 0.0;
+    float level = 0.0f;
+};
+}
+
 MyWaterfallWidget::MyWaterfallWidget(QWidget *parent)
     : QOpenGLWidget(parent), xMin(60000000), xMax(140000000), yMin(-120), yMax(0), contrast(10), sensitivity(10),
       levelMin(-120), levelMax(0), fftLength(32768), initialized(false), secondGraph(false) {
@@ -34,7 +45,21 @@ void MyWaterfallWidget::mousePressEvent(QMouseEvent *event) {
         event->accept();
         return;
     }
+    if (event->button() == Qt::MiddleButton) {
+        emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
+        event->accept();
+        return;
+    }
     QOpenGLWidget::mousePressEvent(event);
+}
+
+void MyWaterfallWidget::mouseDoubleClickEvent(QMouseEvent *event) {
+    if (event->button() == Qt::LeftButton) {
+        emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::mouseDoubleClickEvent(event);
 }
 
 double MyWaterfallWidget::frequencyAtX(int x) const {
@@ -43,6 +68,82 @@ double MyWaterfallWidget::frequencyAtX(int x) const {
     }
     const double normalized = std::clamp(static_cast<double>(x) / (std::max)(1, width()), 0.0, 1.0);
     return xMin + normalized * (xMax - xMin);
+}
+
+double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
+    QMutexLocker locker(&mutex);
+    if (!std::isfinite(frequency) || qFuzzyCompare(xMin, xMax) || xData.empty() || yData.empty() || fftLength <= 0) {
+        return frequency;
+    }
+
+    const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
+    if (dataCount <= 0) {
+        return frequency;
+    }
+
+    const double visibleSpan = std::abs(xMax - xMin);
+    const double halfWindow = (std::clamp)(visibleSpan * AUTO_TUNE_WINDOW_FRACTION,
+                                           AUTO_TUNE_MIN_WINDOW_HZ,
+                                           AUTO_TUNE_MAX_WINDOW_HZ);
+    std::vector<SignalSample> samples;
+    samples.reserve(256);
+    std::vector<float> levels;
+    levels.reserve(256);
+    for (int i = 0; i < dataCount; ++i) {
+        const double sampleFrequency = xData[i];
+        if (!std::isfinite(sampleFrequency) || std::abs(sampleFrequency - frequency) > halfWindow) {
+            continue;
+        }
+        const float level = yData[(i + dataCount / 2) % dataCount];
+        if (!std::isfinite(level)) {
+            continue;
+        }
+        samples.push_back({sampleFrequency, level});
+        levels.push_back(level);
+    }
+    if (samples.empty()) {
+        return frequency;
+    }
+
+    std::sort(samples.begin(), samples.end(), [](const SignalSample &a, const SignalSample &b) {
+        return a.frequency < b.frequency;
+    });
+    std::sort(levels.begin(), levels.end());
+    const float baseline = levels[levels.size() / 4];
+
+    int peakIndex = 0;
+    for (int i = 1; i < static_cast<int>(samples.size()); ++i) {
+        if (samples[i].level > samples[peakIndex].level) {
+            peakIndex = i;
+        }
+    }
+    const float peakLevel = samples[peakIndex].level;
+    const double dynamicRange = (std::max)(0.0, static_cast<double>(peakLevel - baseline));
+    if (dynamicRange < 2.0) {
+        return samples[peakIndex].frequency;
+    }
+
+    const float threshold = baseline + static_cast<float>((std::max)(3.0, dynamicRange * 0.35));
+    int left = peakIndex;
+    while (left > 0 && samples[left - 1].level >= threshold) {
+        --left;
+    }
+    int right = peakIndex;
+    while (right + 1 < static_cast<int>(samples.size()) && samples[right + 1].level >= threshold) {
+        ++right;
+    }
+
+    double weightedFrequency = 0.0;
+    double weightSum = 0.0;
+    for (int i = left; i <= right; ++i) {
+        const double weight = std::pow(10.0, (samples[i].level - threshold) / 20.0);
+        weightedFrequency += samples[i].frequency * weight;
+        weightSum += weight;
+    }
+    if (weightSum <= 0.0 || !std::isfinite(weightedFrequency)) {
+        return samples[peakIndex].frequency;
+    }
+    return weightedFrequency / weightSum;
 }
 
 void MyWaterfallWidget::ensureLineBuffer() {

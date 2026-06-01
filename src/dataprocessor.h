@@ -36,7 +36,8 @@ public:
                          bool syncEnabled,
                          double sampleRate,
                          bool queueAudioBlocks,
-                         bool emitIqFrames = false);
+                         bool emitIqFrames = false,
+                         bool agileScanEnabled = false);
     void requestStop();
     void finalizeStopped();
     bool forceStop(int timeoutMs = 1000);
@@ -46,6 +47,7 @@ public:
     void configureNetworkIqStreaming(const RadioSettings &settings, bool emitFrames, bool channelizeFrames);
 signals:
     void iqFrameReady(const QByteArray &iqData, double sampleRate, int sampleCount);
+    void readerFailed(int errorCode, bool stoppedByRequest);
 
 private:
     void emitIqFrame(const float *samples, std::size_t floatCount);
@@ -62,6 +64,7 @@ private:
     std::atomic<bool> requestedQueueAudioBlocks;
     std::atomic<bool> requestedEmitIqFrames;
     std::atomic<bool> requestedChannelizeIqFrames;
+    std::atomic<bool> requestedAgileScanEnabled;
     std::atomic<bool> networkIqResetRequested;
     std::atomic<double> requestedSampleRate;
     std::atomic<void*> activeDevice;
@@ -73,6 +76,8 @@ private:
     int networkIqDecimationCount = 0;
     std::complex<float> networkIqLowPassState = {0.0f, 0.0f};
     float networkIqAgcLevel = 0.01f;
+    std::complex<float> networkHfNoiseCancelCoeff = {0.0f, 0.0f};
+    std::complex<float> networkHfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
     QByteArray networkIqFrameBuffer;
     double networkIqFrameSampleRate = 0.0;
     QElapsedTimer asyncRateTimer;

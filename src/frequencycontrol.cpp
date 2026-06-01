@@ -155,7 +155,7 @@ void FrequencyControl::setValuePresets(const QVector<QPair<QString, double>> &va
     presetCombo->clear();
     presetCombo->addItem("Preset", QVariant());
     for (const auto &preset : valuesHz) {
-        if (preset.second > 0.0) {
+        if (std::isfinite(preset.second)) {
             presetCombo->addItem(preset.first, preset.second);
         }
     }

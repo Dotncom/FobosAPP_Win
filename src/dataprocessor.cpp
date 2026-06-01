@@ -25,6 +25,7 @@ constexpr uint32_t MAX_ASYNC_BLOCK_SAMPLES = 262144;
 constexpr int NETWORK_CHANNEL_FRAME_SAMPLES = 8192;
 constexpr float NETWORK_IQ_QUANTIZE_GAIN = 1.0f;
 constexpr float NETWORK_CHANNEL_IQ_TARGET_LEVEL = 0.45f;
+constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
 
 double clampDouble(double value, double low, double high) {
     return (std::max)(low, (std::min)(value, high));
@@ -116,6 +117,55 @@ void appendInt16Le(QByteArray &buffer, float sample) {
     const auto value = static_cast<qint16>(std::lrint(clamped * 32767.0f));
     buffer.append(static_cast<char>(value & 0xff));
     buffer.append(static_cast<char>((value >> 8) & 0xff));
+}
+
+float estimateHfNoiseCancelCoefficient(const float *samples, std::size_t iqSamples) {
+    if (!samples || iqSamples <= 8) {
+        return 0.0f;
+    }
+
+    double sumMain = 0.0;
+    double sumRef = 0.0;
+    double sumCross = 0.0;
+    double sumRefSquared = 0.0;
+    std::size_t count = 0;
+
+    for (std::size_t n = 0; n < iqSamples; ++n) {
+        const float mainSample = samples[2 * n];
+        const float refSample = samples[2 * n + 1];
+        if (!std::isfinite(mainSample) || !std::isfinite(refSample)) {
+            continue;
+        }
+        sumMain += mainSample;
+        sumRef += refSample;
+        sumCross += static_cast<double>(mainSample) * refSample;
+        sumRefSquared += static_cast<double>(refSample) * refSample;
+        ++count;
+    }
+
+    if (count <= 8) {
+        return 0.0f;
+    }
+
+    const double meanMain = sumMain / static_cast<double>(count);
+    const double meanRef = sumRef / static_cast<double>(count);
+    const double covariance = sumCross - static_cast<double>(count) * meanMain * meanRef;
+    const double refVariance = sumRefSquared - static_cast<double>(count) * meanRef * meanRef;
+    if (!std::isfinite(covariance) || !std::isfinite(refVariance) || refVariance <= 1.0e-12) {
+        return 0.0f;
+    }
+
+    return (std::clamp)(static_cast<float>(covariance / refVariance),
+                        -HF_NOISE_CANCEL_MAX_COEFF,
+                        HF_NOISE_CANCEL_MAX_COEFF);
+}
+
+std::complex<float> clampComplexMagnitude(std::complex<float> value, float maxMagnitude) {
+    const float magnitude = std::abs(value);
+    if (!std::isfinite(magnitude) || magnitude <= maxMagnitude || magnitude <= 0.0f) {
+        return value;
+    }
+    return value * (maxMagnitude / magnitude);
 }
 
 uint32_t syncBlockSamplesForRate(double sampleRate) {
@@ -278,6 +328,7 @@ DataProcessor::DataProcessor(QObject *parent)
       requestedQueueAudioBlocks(false),
       requestedEmitIqFrames(false),
       requestedChannelizeIqFrames(false),
+      requestedAgileScanEnabled(false),
       networkIqResetRequested(false),
       requestedSampleRate(0.0),
       activeDevice(nullptr),
@@ -295,7 +346,8 @@ void DataProcessor::startProcessing(void *device,
                                     bool syncEnabled,
                                     double sampleRate,
                                     bool queueAudioBlocks,
-                                    bool emitIqFrames) {
+                                    bool emitIqFrames,
+                                    bool agileScanEnabled) {
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] startProcessing enter"
                  << "device" << device
@@ -304,6 +356,7 @@ void DataProcessor::startProcessing(void *device,
                  << "sampleRate" << sampleRate
                  << "queueAudioBlocks" << queueAudioBlocks
                  << "emitIqFrames" << emitIqFrames
+                 << "agileScanEnabled" << agileScanEnabled
                  << "threadRunning" << QThread::isRunning()
                  << "runningFlag" << running.load();
     }
@@ -321,6 +374,7 @@ void DataProcessor::startProcessing(void *device,
     requestedSampleRate = sampleRate;
     requestedQueueAudioBlocks = queueAudioBlocks;
     requestedEmitIqFrames = emitIqFrames;
+    requestedAgileScanEnabled = agileScanEnabled;
     networkIqResetRequested = true;
     requestedSyncMode = useSyncReader;
     activeSyncMode = useSyncReader;
@@ -361,6 +415,7 @@ void DataProcessor::run() {
                  << "requestedSyncMode" << requestedSyncMode.load()
                  << "queueAudioBlocks" << requestedQueueAudioBlocks.load()
                  << "emitIqFrames" << requestedEmitIqFrames.load()
+                 << "agileScanEnabled" << requestedAgileScanEnabled.load()
                  << "requestedSampleRate" << requestedSampleRate.load();
     }
     if (!running.load() || !readerDevice) {
@@ -371,9 +426,12 @@ void DataProcessor::run() {
     IqBuffer::clear();
     const bool useSyncReader = FORCE_SYNC_READER || requestedSyncMode.load();
     const double sampleRate = requestedSampleRate.load();
-    const uint32_t readBlockSamples = useSyncReader
-                                          ? syncBlockSamplesForRate(sampleRate)
-                                          : asyncBlockSamplesForRate(sampleRate);
+    uint32_t readBlockSamples = useSyncReader
+                                    ? syncBlockSamplesForRate(sampleRate)
+                                    : asyncBlockSamplesForRate(sampleRate);
+    if (readerApiKind == FobosApiKind::Agile && requestedAgileScanEnabled.load()) {
+        readBlockSamples = (std::max)(readBlockSamples, MIN_SYNC_BLOCK_SAMPLES);
+    }
     const uint32_t asyncBufferCount = asyncBufferCountForRate(sampleRate);
     activeSyncMode = useSyncReader;
     if (fobosVerboseLoggingEnabled()) {
@@ -381,7 +439,8 @@ void DataProcessor::run() {
                  << "useSyncReader" << useSyncReader
                  << "forceSync" << FORCE_SYNC_READER
                  << "buffers" << asyncBufferCount
-                 << "readBlockSamples" << readBlockSamples;
+                 << "readBlockSamples" << readBlockSamples
+                 << "agileScanEnabled" << requestedAgileScanEnabled.load();
     }
 
     if (!useSyncReader) {
@@ -419,8 +478,9 @@ void DataProcessor::run() {
         qDebug() << "[DataProcessor] fobos_rx_read_async end"
                  << "result" << ret
                  << "stoppedByRequest" << stoppedByRequest;
-        if (ret != FOBOS_ERR_OK && running.load()) {
+        if (ret != FOBOS_ERR_OK && !stoppedByRequest) {
             qDebug() << "Failed to start async read, error code:" << ret;
+            emit readerFailed(ret, stoppedByRequest);
         } else if (ret != FOBOS_ERR_OK && stoppedByRequest && fobosVerboseLoggingEnabled()) {
             qDebug() << "Async read stopped after cancel, result:" << ret;
         }
@@ -440,9 +500,13 @@ void DataProcessor::run() {
                       : startSyncSafely(static_cast<fobos_dev_t*>(readerDevice), readBlockSamples);
         qDebug() << "[DataProcessor] fobos_rx_start_sync end" << "result" << ret;
         if (ret != FOBOS_ERR_OK) {
+            const bool stoppedByRequest = !running.load();
             qDebug() << "Failed to start sync mode, error code:" << ret;
+            if (!stoppedByRequest) {
+                emit readerFailed(ret, stoppedByRequest);
+            }
             running = false;
-
+            return;
         }
         std::vector<float> syncBuffer(static_cast<size_t>(readBlockSamples) * FLOATS_PER_IQ_SAMPLE);
         IqBuffer::setSampleRateEstimate(sampleRate);
@@ -473,8 +537,10 @@ void DataProcessor::run() {
                          << "actual_buf_length" << actual_buf_length;
             }
             if (ret != FOBOS_ERR_OK) {
-                if (running.load()) {
+                const bool stoppedByRequest = !running.load();
+                if (!stoppedByRequest) {
                     qDebug() << "Failed to read sync data, error code:" << ret;
+                    emit readerFailed(ret, stoppedByRequest);
                 } else {
                     qDebug() << "Sync read stopped after stop request, result:" << ret;
                 }
@@ -581,6 +647,8 @@ void DataProcessor::resetNetworkIqState() {
     networkIqDecimationCount = 0;
     networkIqLowPassState = std::complex<float>(0.0f, 0.0f);
     networkIqAgcLevel = 0.01f;
+    networkHfNoiseCancelCoeff = {0.0f, 0.0f};
+    networkHfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
     networkIqFrameBuffer.clear();
     networkIqFrameSampleRate = 0.0;
 }
@@ -655,6 +723,19 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
     std::complex<float> decimationSum = networkIqDecimationSum;
     int decimationCount = networkIqDecimationCount;
     std::complex<float> lowPass = networkIqLowPassState;
+    const bool adaptiveNoiseCancel = settings.inputMode == INPUT_HF_NOISE_CANCEL;
+    std::complex<float> refDecimationSum = networkHfNoiseCancelRefDecimationSum;
+    std::complex<float> adaptiveCoeff = networkHfNoiseCancelCoeff;
+    if (!adaptiveNoiseCancel) {
+        networkHfNoiseCancelCoeff = {0.0f, 0.0f};
+        networkHfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+    }
+    const float noiseCancelDepth =
+        static_cast<float>((std::clamp)(settings.hfNoiseCancelDepth, 0.0, 2.0));
+    const std::complex<float> manualRefCoeff =
+        hfNoiseCancelReferenceCoefficient(settings, settings.listeningFrequency);
+    constexpr float adaptiveMu = 0.035f;
+    constexpr float adaptiveEpsilon = 1.0e-8f;
 
     for (std::size_t n = 0; n < iqSamples; ++n) {
         float iSample = samples[2 * n];
@@ -665,23 +746,29 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
         if (!std::isfinite(qSample)) {
             qSample = 0.0f;
         }
-        if (settings.inputMode == 1) {
-            if (fShift < 0.0) {
+
+        if (adaptiveNoiseCancel) {
+            const std::complex<float> oscillator(rotI, rotQ);
+            decimationSum += iSample * oscillator;
+            refDecimationSum += qSample * oscillator;
+        } else {
+            if (settings.inputMode == INPUT_HF_COMBINED) {
+                if (fShift < 0.0) {
+                    qSample = 0.0f;
+                } else {
+                    iSample = qSample;
+                    qSample = 0.0f;
+                }
+            } else if (settings.inputMode == INPUT_HF1) {
                 qSample = 0.0f;
-            } else {
+            } else if (settings.inputMode == INPUT_HF2) {
                 iSample = qSample;
                 qSample = 0.0f;
             }
-        } else if (settings.inputMode == 2) {
-            qSample = 0.0f;
-        } else if (settings.inputMode == 3) {
-            iSample = qSample;
-            qSample = 0.0f;
+            const float mixedI = iSample * rotI - qSample * rotQ;
+            const float mixedQ = iSample * rotQ + qSample * rotI;
+            decimationSum += std::complex<float>(mixedI, mixedQ);
         }
-
-        const float mixedI = iSample * rotI - qSample * rotQ;
-        const float mixedQ = iSample * rotQ + qSample * rotI;
-        decimationSum += std::complex<float>(mixedI, mixedQ);
         ++decimationCount;
 
         const float nextRotI = rotI * rotStepI - rotQ * rotStepQ;
@@ -702,6 +789,22 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
 
         const float invCount = 1.0f / static_cast<float>(decimationCount);
         std::complex<float> channelSample = decimationSum * invCount;
+        if (adaptiveNoiseCancel) {
+            const std::complex<float> refSample = manualRefCoeff * refDecimationSum * invCount;
+            if (!settings.hfNoiseCancelFreeze) {
+                const float refPower = std::norm(refSample);
+                if (std::isfinite(refPower) && refPower > adaptiveEpsilon) {
+                    const std::complex<float> prediction = adaptiveCoeff * refSample;
+                    const std::complex<float> error = channelSample - prediction;
+                    adaptiveCoeff += adaptiveMu * error * std::conj(refSample) /
+                                     (refPower + adaptiveEpsilon);
+                    adaptiveCoeff = clampComplexMagnitude(adaptiveCoeff, HF_NOISE_CANCEL_MAX_COEFF);
+                    networkHfNoiseCancelCoeff = adaptiveCoeff;
+                }
+            }
+            channelSample -= noiseCancelDepth * adaptiveCoeff * refSample;
+            refDecimationSum = {0.0f, 0.0f};
+        }
         decimationSum = std::complex<float>(0.0f, 0.0f);
         decimationCount = 0;
 
@@ -724,6 +827,8 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
 
     networkIqDecimationSum = decimationSum;
     networkIqDecimationCount = decimationCount;
+    networkHfNoiseCancelRefDecimationSum =
+        adaptiveNoiseCancel ? refDecimationSum : std::complex<float>(0.0f, 0.0f);
     networkIqLowPassState = lowPass;
     networkIqNcoPhase = std::remainder(networkIqNcoPhase + phaseIncrement * static_cast<double>(iqSamples), TWO_PI);
 }

@@ -140,7 +140,7 @@ void SpectrumWindow::updateSpectrum() {
         for (int ii = 0; ii < fftLeng; ++ii) {
             int shiftedIndex = (ii + fftLeng / 2) % fftLeng;
             double frequency = fftFrequencies[ii];
-            if ((globalMode == 2 || globalMode == 3) && frequency < globalFrequency) {
+            if (isSinglePositiveHfInputMode(globalMode) && frequency < globalFrequency) {
                 continue;
             }
             series->append(frequency, fftMagnitudes[shiftedIndex]);

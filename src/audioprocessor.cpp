@@ -28,6 +28,7 @@ constexpr size_t MAX_AUDIO_BUFFER_SAMPLES = BUFFER_SIZE * 10;
 constexpr double SSB_LOW_CUT_HZ = 250.0;
 constexpr double SSB_MAX_AUDIO_HZ = 3600.0;
 constexpr double SAM_LOCK_RANGE_HZ = 1500.0;
+constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
 
 double clampDouble(double value, double low, double high) {
     return (std::max)(low, (std::min)(value, high));
@@ -35,6 +36,56 @@ double clampDouble(double value, double low, double high) {
 
 double wrapRadians(double phase) {
     return std::remainder(phase, TWO_PI);
+}
+
+float estimateHfNoiseCancelCoefficient(const std::vector<float> &iqBlock) {
+    const size_t iqSamples = iqBlock.size() / 2;
+    if (iqSamples <= 8) {
+        return 0.0f;
+    }
+
+    double sumMain = 0.0;
+    double sumRef = 0.0;
+    double sumCross = 0.0;
+    double sumRefSquared = 0.0;
+    size_t count = 0;
+
+    for (size_t n = 0; n < iqSamples; ++n) {
+        const float mainSample = iqBlock[2 * n];
+        const float refSample = iqBlock[2 * n + 1];
+        if (!std::isfinite(mainSample) || !std::isfinite(refSample)) {
+            continue;
+        }
+        sumMain += mainSample;
+        sumRef += refSample;
+        sumCross += static_cast<double>(mainSample) * refSample;
+        sumRefSquared += static_cast<double>(refSample) * refSample;
+        ++count;
+    }
+
+    if (count <= 8) {
+        return 0.0f;
+    }
+
+    const double meanMain = sumMain / static_cast<double>(count);
+    const double meanRef = sumRef / static_cast<double>(count);
+    const double covariance = sumCross - static_cast<double>(count) * meanMain * meanRef;
+    const double refVariance = sumRefSquared - static_cast<double>(count) * meanRef * meanRef;
+    if (!std::isfinite(covariance) || !std::isfinite(refVariance) || refVariance <= 1.0e-12) {
+        return 0.0f;
+    }
+
+    return (std::clamp)(static_cast<float>(covariance / refVariance),
+                        -HF_NOISE_CANCEL_MAX_COEFF,
+                        HF_NOISE_CANCEL_MAX_COEFF);
+}
+
+std::complex<float> clampComplexMagnitude(std::complex<float> value, float maxMagnitude) {
+    const float magnitude = std::abs(value);
+    if (!std::isfinite(magnitude) || magnitude <= maxMagnitude || magnitude <= 0.0f) {
+        return value;
+    }
+    return value * (maxMagnitude / magnitude);
 }
 
 double channelCutoffForMode(int modulationType, double bandwidth) {
@@ -179,8 +230,22 @@ AudioProcessor::~AudioProcessor() {
 
 void AudioProcessor::configure(const RadioSettings &settings) {
     std::lock_guard<std::mutex> lock(settingsMutex);
+    const bool resetNoiseCancel =
+        audioSettings.inputMode != settings.inputMode ||
+        std::abs(audioSettings.listeningFrequency - settings.listeningFrequency) > 0.5 ||
+        std::abs(audioSettings.sampleRate - settings.sampleRate) > 0.5 ||
+        std::abs(audioSettings.hfNoiseCancelRefGainDb - settings.hfNoiseCancelRefGainDb) > 0.001 ||
+        std::abs(audioSettings.hfNoiseCancelRefDelayNs - settings.hfNoiseCancelRefDelayNs) > 0.001 ||
+        std::abs(audioSettings.hfNoiseCancelRefTiltDb - settings.hfNoiseCancelRefTiltDb) > 0.001;
     audioSettings = settings;
     selectedAudioDeviceID = settings.audioDeviceId;
+    if (resetNoiseCancel) {
+        hfNoiseCancelResetRequested = true;
+    }
+}
+
+void AudioProcessor::resetHfNoiseCancelState() {
+    hfNoiseCancelResetRequested = true;
 }
 
 void AudioProcessor::setAudioDevice(int deviceID) {
@@ -446,6 +511,8 @@ void AudioProcessor::resetDemodulatorState() {
     cwTonePhase = 0.0;
     amDcEstimate = 0.0f;
     amAgcLevel = 0.05f;
+    hfNoiseCancelCoeff = {0.0f, 0.0f};
+    hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
 }
 
 size_t AudioProcessor::queuedAudioSamples() const {
@@ -571,6 +638,25 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     const float fmDeemphasisAlpha = static_cast<float>(
         1.0 - std::exp(-1.0 / ((std::max)(1.0, rfChannelRate) * fmDeemphasisSeconds))
         );
+    const bool adaptiveNoiseCancel = inputMode == INPUT_HF_NOISE_CANCEL;
+    std::complex<float> refChannelSum = hfNoiseCancelRefDecimationSum;
+    std::complex<float> adaptiveCoeff = hfNoiseCancelCoeff;
+    if (hfNoiseCancelResetRequested.exchange(false)) {
+        refChannelSum = {0.0f, 0.0f};
+        adaptiveCoeff = {0.0f, 0.0f};
+        hfNoiseCancelCoeff = {0.0f, 0.0f};
+        hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+    }
+    if (!adaptiveNoiseCancel) {
+        hfNoiseCancelCoeff = {0.0f, 0.0f};
+        hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+    }
+    const float noiseCancelDepth =
+        static_cast<float>((std::clamp)(settings.hfNoiseCancelDepth, 0.0, 2.0));
+    const std::complex<float> manualRefCoeff =
+        hfNoiseCancelReferenceCoefficient(settings, settings.listeningFrequency);
+    constexpr float adaptiveMu = 0.035f;
+    constexpr float adaptiveEpsilon = 1.0e-8f;
 
     for (size_t n = 0; n < iqSamples; ++n) {
         float iSample = iqBlock[2 * n];
@@ -581,23 +667,31 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         if (!std::isfinite(qSample)) {
             qSample = 0.0f;
         }
-        if (inputMode == 1) {
-            if (fShift < 0.0) {
+
+        if (adaptiveNoiseCancel) {
+            const std::complex<float> oscillator(rotI, rotQ);
+            channelSumI += std::real(iSample * oscillator);
+            channelSumQ += std::imag(iSample * oscillator);
+            refChannelSum += qSample * oscillator;
+        } else {
+            if (inputMode == INPUT_HF_COMBINED) {
+                if (fShift < 0.0) {
+                    qSample = 0.0f;
+                } else {
+                    iSample = qSample;
+                    qSample = 0.0f;
+                }
+            } else if (inputMode == INPUT_HF1) {
                 qSample = 0.0f;
-            } else {
+            } else if (inputMode == INPUT_HF2) {
                 iSample = qSample;
                 qSample = 0.0f;
             }
-        } else if (inputMode == 2) {
-            qSample = 0.0f;
-        } else if (inputMode == 3) {
-            iSample = qSample;
-            qSample = 0.0f;
+            const float mixedI = iSample * rotI - qSample * rotQ;
+            const float mixedQ = iSample * rotQ + qSample * rotI;
+            channelSumI += mixedI;
+            channelSumQ += mixedQ;
         }
-        const float mixedI = iSample * rotI - qSample * rotQ;
-        const float mixedQ = iSample * rotQ + qSample * rotI;
-        channelSumI += mixedI;
-        channelSumQ += mixedQ;
         ++decimationCount;
 
         const float nextRotI = rotI * rotStepI - rotQ * rotStepQ;
@@ -618,8 +712,26 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         }
 
         const float invDecimationCount = 1.0f / static_cast<float>(decimationCount);
-        const float channelI = channelSumI * invDecimationCount;
-        const float channelQ = channelSumQ * invDecimationCount;
+        std::complex<float> channelSample(channelSumI * invDecimationCount,
+                                          channelSumQ * invDecimationCount);
+        if (adaptiveNoiseCancel) {
+            const std::complex<float> refSample = manualRefCoeff * refChannelSum * invDecimationCount;
+            if (!settings.hfNoiseCancelFreeze) {
+                const float refPower = std::norm(refSample);
+                if (std::isfinite(refPower) && refPower > adaptiveEpsilon) {
+                    const std::complex<float> prediction = adaptiveCoeff * refSample;
+                    const std::complex<float> error = channelSample - prediction;
+                    adaptiveCoeff += adaptiveMu * error * std::conj(refSample) /
+                                     (refPower + adaptiveEpsilon);
+                    adaptiveCoeff = clampComplexMagnitude(adaptiveCoeff, HF_NOISE_CANCEL_MAX_COEFF);
+                    hfNoiseCancelCoeff = adaptiveCoeff;
+                }
+            }
+            channelSample -= noiseCancelDepth * adaptiveCoeff * refSample;
+            refChannelSum = {0.0f, 0.0f};
+        }
+        const float channelI = std::real(channelSample);
+        const float channelQ = std::imag(channelSample);
         channelSumI = 0.0f;
         channelSumQ = 0.0f;
         decimationCount = 0;
@@ -757,6 +869,7 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
 
     channelDecimationSum = std::complex<float>(channelSumI, channelSumQ);
     channelDecimationCount = decimationCount;
+    hfNoiseCancelRefDecimationSum = adaptiveNoiseCancel ? refChannelSum : std::complex<float>(0.0f, 0.0f);
     amLowPassState = std::complex<float>(lowPassI, lowPassQ);
     sidebandLowPassStates = sidebandStates;
     fmPreviousSample = std::complex<float>(fmPrevI, fmPrevQ);

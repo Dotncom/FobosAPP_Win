@@ -1,6 +1,9 @@
 #ifndef RADIOSETTINGS_H
 #define RADIOSETTINGS_H
 
+#include <algorithm>
+#include <cmath>
+#include <complex>
 #include <cstdint>
 
 enum class RadioRunState {
@@ -35,6 +38,24 @@ enum ModulationMode {
     MOD_LRPT = 16,
     MOD_DMR = 17
 };
+
+enum InputMode {
+    INPUT_RF = 0,
+    INPUT_HF_COMBINED = 1,
+    INPUT_HF1 = 2,
+    INPUT_HF2 = 3,
+    INPUT_HF_NOISE_CANCEL = 4
+};
+
+inline bool isDirectInputMode(int inputMode) {
+    return inputMode != INPUT_RF;
+}
+
+inline bool isSinglePositiveHfInputMode(int inputMode) {
+    return inputMode == INPUT_HF1 ||
+           inputMode == INPUT_HF2 ||
+           inputMode == INPUT_HF_NOISE_CANCEL;
+}
 
 inline bool isUpperSidebandMode(int modulationType) {
     return modulationType == MOD_USB ||
@@ -74,9 +95,42 @@ struct RadioSettings {
     int audioDeviceId = 0;
     double audioLowPassHz = 0.0;
     double audioHighPassHz = 0.0;
+    double hfNoiseCancelDepth = 1.0;
+    double hfNoiseCancelRefGainDb = 0.0;
+    double hfNoiseCancelRefDelayNs = 0.0;
+    double hfNoiseCancelRefTiltDb = 0.0;
+    bool hfNoiseCancelFreeze = false;
     bool audioEnabled = false;
     bool syncEnabled = false;
     std::uint8_t gpoValue = 0;
 };
+
+inline double hfNoiseCancelFrequencyForShaping(const RadioSettings &settings, double frequencyHz) {
+    const double maxFrequency = (std::max)(1.0, settings.sampleRate * 0.5);
+    if (!std::isfinite(frequencyHz)) {
+        frequencyHz = settings.listeningFrequency;
+    }
+    return (std::clamp)(std::abs(frequencyHz), 1.0, maxFrequency);
+}
+
+inline double hfNoiseCancelReferenceGainDbAt(const RadioSettings &settings, double frequencyHz) {
+    const double maxFrequency = (std::max)(1.0, settings.sampleRate * 0.5);
+    const double shapedFrequency = hfNoiseCancelFrequencyForShaping(settings, frequencyHz);
+    const double normalized = (std::clamp)(shapedFrequency / maxFrequency, 0.0, 1.0);
+    const double tiltDb = settings.hfNoiseCancelRefTiltDb * (normalized - 0.5);
+    return settings.hfNoiseCancelRefGainDb + tiltDb;
+}
+
+inline std::complex<float> hfNoiseCancelReferenceCoefficient(const RadioSettings &settings,
+                                                             double frequencyHz) {
+    constexpr double twoPi = 6.28318530717958647692;
+    const double shapedFrequency = hfNoiseCancelFrequencyForShaping(settings, frequencyHz);
+    const double gainDb = hfNoiseCancelReferenceGainDbAt(settings, shapedFrequency);
+    const double gain = std::pow(10.0, gainDb / 20.0);
+    const double delaySeconds = settings.hfNoiseCancelRefDelayNs * 1.0e-9;
+    const double phase = -twoPi * shapedFrequency * delaySeconds;
+    return std::complex<float>(static_cast<float>(gain * std::cos(phase)),
+                               static_cast<float>(gain * std::sin(phase)));
+}
 
 #endif // RADIOSETTINGS_H
