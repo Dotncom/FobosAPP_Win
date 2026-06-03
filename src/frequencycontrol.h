@@ -4,6 +4,7 @@
 #include <QWidget>
 #include <QVector>
 #include <QPair>
+#include <QString>
 
 class QComboBox;
 class QDoubleSpinBox;
@@ -17,9 +18,16 @@ public:
 
     double valueHz() const;
     void setValueHz(double valueHz);
+    void commitPendingValue();
     void setRangeHz(double minimumHz, double maximumHz);
     void setStepPresets(const QVector<QPair<QString, double>> &stepsHz);
     void setValuePresets(const QVector<QPair<QString, double>> &valuesHz);
+    int selectedUnitIndex() const;
+    void setSelectedUnitIndex(int index);
+    QString selectedStepName() const;
+    void setSelectedStepName(const QString &name);
+    QString selectedValuePresetName() const;
+    void setSelectedValuePresetName(const QString &name);
 
 signals:
     void valueCommitted(double valueHz);
@@ -41,8 +49,9 @@ private:
 
     double currentValueHz = 0.0;
     double minimumValueHz = 0.0;
-    double maximumValueHz = 6000000000.0;
+    double maximumValueHz = 7750000000.0;
     bool updatingUi = false;
+    bool unitSelectionLocked = false;
 };
 
 #endif // FREQUENCYCONTROL_H

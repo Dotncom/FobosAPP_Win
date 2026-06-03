@@ -1,5 +1,48 @@
 # Changelog
 
+## 3.6 - 2026-06-04
+
+### Added
+
+- Added agile scan measurement tools for broad coverage checks, including
+  peak/baseline tracking, CSV export, and graph overlay support.
+- Added calibrated spur suppression for stable receiver spurs, with a 50 ohm
+  load calibration flow and persisted spur masks.
+- Added spectrum hover readout and drag bandwidth measurement on the desktop
+  graph.
+- Added experimental extended RF tuning range up to 7.75 GHz for receivers and
+  firmware that expose useful operation above the official range.
+- Added Android network-client controls for FFT length, full/truncated spectrum
+  frames, presets editing, fine tuning, and band markers.
+
+### Changed
+
+- Improved DMR laboratory monitoring using controlled Motorola test captures,
+  stronger burst/CACH/EMB reporting, and more conservative sync diagnostics.
+- Improved auto-center tuning so middle-click/double-click lands on sensible
+  rounded frequency steps instead of raw Hz-level estimates.
+- Improved desktop persistence for center/listening frequency widgets, unit
+  selections, frequency steps, presets, and waterfall/graph level sliders.
+- Improved Raspberry Pi/Linux operation with safer Fobos USB refresh/recovery
+  behavior and source packaging that excludes the Android project.
+- Reworked desktop controls into collapsible sections and refined compact band
+  marker display.
+
+### Fixed
+
+- Fixed listening-frequency resets caused by startup/UI refresh paths and
+  direct-sampling mode changes.
+- Fixed zoomed spectrum/waterfall frame ranges so network/server-side FFT views
+  follow the selected visible span.
+- Fixed graph/waterfall alignment issues caused by the right-side graph margin.
+
+### Known Issues
+
+- DMR remains a beta sync/activity monitor, not a complete DMR voice decoder.
+- Video/image modes remain beta-quality and still need real-signal validation.
+- Android is still network-client focused; direct Android USB/OTG receiver
+  operation is not production-ready.
+
 ## 3.5 - 2026-06-01
 
 ### Added

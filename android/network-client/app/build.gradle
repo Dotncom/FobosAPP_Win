@@ -16,8 +16,8 @@ android {
         applicationId 'com.fobosapp.networkclient'
         minSdk 26
         targetSdk 35
-        versionCode 3
-        versionName '3.5-network'
+        versionCode 4
+        versionName '3.6-network'
     }
 
     compileOptions {

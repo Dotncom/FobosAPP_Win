@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QString>
 
+#include <array>
 #include <deque>
 #include <vector>
 
@@ -56,6 +57,9 @@ private:
         int dataType = -1;
         int correctedErrors = 0;
         QString dataTypeName;
+        int timingOffset = 0;
+        double slicerRatio = 0.0;
+        QString mapName;
     };
 
     struct EmbInfo {
@@ -66,13 +70,51 @@ private:
         int correctedErrors = 0;
         int variantIndex = -1;
         int timingOffset = 0;
+        bool inverted = false;
     };
 
     struct PendingEmb {
+        quint64 anchorSample = 0;
         quint64 absoluteSample = 0;
+        int burstIndex = 0;
         bool inverted = false;
         float minLevel = 0.0f;
         float maxLevel = 0.0f;
+    };
+
+    struct VoiceEmbeddedBits {
+        bool decoded = false;
+        QString hex;
+    };
+
+    struct VoicePayloadBits {
+        bool decoded = false;
+        QString leftHex;
+        QString rightHex;
+        QString combinedHex;
+    };
+
+    struct VoiceEmbeddedFrame {
+        quint64 anchorSample = 0;
+        bool reportedLc = false;
+        std::array<bool, 6> present = {};
+        std::array<int, 6> colorCode = {};
+        std::array<int, 6> correctedErrors = {};
+        std::array<int, 6> lcss = {};
+        std::array<int, 6> timing = {};
+        std::array<QString, 6> emb32 = {};
+    };
+
+    struct VoiceLcSequence {
+        int colorCode = -1;
+        int nextStage = 0;
+        quint64 startSample = 0;
+        quint64 lastSample = 0;
+        std::array<QString, 4> emb32 = {};
+        std::array<int, 4> burstIndex = {};
+        std::array<int, 4> correctedErrors = {};
+        std::array<int, 4> lcss = {};
+        std::array<int, 4> timing = {};
     };
 
     void appendSamples(const QByteArray &pcmData);
@@ -83,6 +125,16 @@ private:
     void processPendingVoiceEmb();
     bool measureSyncLevels(const SyncHit &hit, float &minLevel, float &maxLevel) const;
     EmbInfo decodeVoiceEmbAt(const PendingEmb &pending) const;
+    VoiceEmbeddedBits decodeVoiceEmbeddedFragmentAt(const PendingEmb &pending, bool inverted, int timingOffset) const;
+    VoicePayloadBits decodeVoicePayloadAt(const PendingEmb &pending, bool inverted, int timingOffset) const;
+    void recordVoiceEmbeddedFragment(const PendingEmb &pending,
+                                     const EmbInfo &emb,
+                                     const VoiceEmbeddedBits &fragment);
+    void recordVoiceLcSequenceFragment(const PendingEmb &pending,
+                                       const EmbInfo &emb,
+                                       const VoiceEmbeddedBits &fragment);
+    void reportVoiceLcSequence(const VoiceLcSequence &sequence);
+    QString voiceLcRawSummaryText() const;
     QString formatHit(const SyncHit &hit) const;
     QString idleStatus() const;
 
@@ -100,6 +152,7 @@ private:
     double lockedRfFrequencyHz = 0.0;
     int confirmedSyncsSinceReport = 0;
     int candidateSyncsSinceReport = 0;
+    int polarityFlipsSinceReport = 0;
     int bestScoreSinceReport = 0;
     int bestPhaseSinceReport = 0;
     double bestQualitySinceReport = 0.0;
@@ -146,6 +199,9 @@ private:
     quint64 lastVoiceEmbAnchorSample = 0;
     std::deque<float> sampleBuffer;
     std::deque<PendingEmb> pendingVoiceEmb;
+    std::deque<VoiceEmbeddedFrame> voiceEmbeddedFrames;
+    std::deque<VoiceLcSequence> voiceLcSequences;
+    std::vector<QString> voiceLcRawSinceReport;
 };
 
 #endif // DMRDECODER_H

@@ -26,6 +26,11 @@ New-Item -ItemType Directory -Path $Stage | Out-Null
 
 $files = git -C $Workspace ls-files --cached --others --exclude-standard
 foreach ($file in $files) {
+    $normalized = $file -replace "\\", "/"
+    if ($normalized.StartsWith("android/", [System.StringComparison]::OrdinalIgnoreCase)) {
+        continue
+    }
+
     $source = Join-Path $Workspace $file
     $dest = Join-Path $Stage $file
     $destDir = Split-Path -Parent $dest

@@ -85,6 +85,7 @@ FrequencyControl::FrequencyControl(QWidget *parent)
         }
     });
     connect(unitCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        unitSelectionLocked = true;
         updateSpinRange();
         updateDisplayedValue();
     });
@@ -117,13 +118,27 @@ double FrequencyControl::valueHz() const {
 
 void FrequencyControl::setValueHz(double valueHz) {
     currentValueHz = (std::clamp)(valueHz, minimumValueHz, maximumValueHz);
-    const int preferredUnit = unitIndexForValue(currentValueHz);
+    const int preferredUnit = unitSelectionLocked ? unitCombo->currentIndex()
+                                                  : unitIndexForValue(currentValueHz);
     if (unitCombo->currentIndex() != preferredUnit) {
         QSignalBlocker unitBlocker(unitCombo);
         unitCombo->setCurrentIndex(preferredUnit);
         updateSpinRange();
     }
     updateDisplayedValue();
+}
+
+void FrequencyControl::commitPendingValue() {
+    if (!valueSpin) {
+        return;
+    }
+
+    const bool wasUpdatingUi = updatingUi;
+    updatingUi = true;
+    valueSpin->interpretText();
+    currentValueHz = (std::clamp)(valueSpin->value() * unitFactor(), minimumValueHz, maximumValueHz);
+    updateDisplayedValue();
+    updatingUi = wasUpdatingUi;
 }
 
 void FrequencyControl::setRangeHz(double minimumHz, double maximumHz) {
@@ -160,6 +175,61 @@ void FrequencyControl::setValuePresets(const QVector<QPair<QString, double>> &va
         }
     }
     presetCombo->setEnabled(presetCombo->count() > 1);
+}
+
+int FrequencyControl::selectedUnitIndex() const {
+    return unitCombo ? unitCombo->currentIndex() : 0;
+}
+
+void FrequencyControl::setSelectedUnitIndex(int index) {
+    if (!unitCombo) {
+        return;
+    }
+    const int clampedIndex = (std::clamp)(index, 0, unitCombo->count() - 1);
+    if (unitCombo->currentIndex() == clampedIndex) {
+        return;
+    }
+    QSignalBlocker blocker(unitCombo);
+    unitCombo->setCurrentIndex(clampedIndex);
+    unitSelectionLocked = true;
+    updateSpinRange();
+    updateDisplayedValue();
+}
+
+QString FrequencyControl::selectedStepName() const {
+    return stepCombo ? stepCombo->currentText() : QString();
+}
+
+void FrequencyControl::setSelectedStepName(const QString &name) {
+    if (!stepCombo || name.trimmed().isEmpty()) {
+        return;
+    }
+    const int index = stepCombo->findText(name);
+    if (index < 0) {
+        return;
+    }
+    QSignalBlocker blocker(stepCombo);
+    stepCombo->setCurrentIndex(index);
+    updateSpinRange();
+}
+
+QString FrequencyControl::selectedValuePresetName() const {
+    if (!presetCombo || !presetCombo->currentData().isValid()) {
+        return QString();
+    }
+    return presetCombo->currentText();
+}
+
+void FrequencyControl::setSelectedValuePresetName(const QString &name) {
+    if (!presetCombo || name.trimmed().isEmpty()) {
+        return;
+    }
+    const int index = presetCombo->findText(name);
+    if (index < 0) {
+        return;
+    }
+    QSignalBlocker blocker(presetCombo);
+    presetCombo->setCurrentIndex(index);
 }
 
 double FrequencyControl::unitFactor() const {

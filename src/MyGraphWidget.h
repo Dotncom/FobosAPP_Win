@@ -44,15 +44,32 @@ protected:
     void resizeGL(int w, int h) override;
     void paintGL() override;
     void wheelEvent(QWheelEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
 
 private:
+    struct CursorPeak {
+        bool valid = false;
+        double frequency = 0.0;
+        float level = 0.0f;
+        int x = 0;
+        int y = 0;
+    };
+
     void drawBandMarkers(QPainter &painter) const;
     void drawYAxis(QPainter &painter) const;
+    void drawBandwidthMeasurement(QPainter &painter) const;
+    void drawHoverCursor(QPainter &painter) const;
     float normalizedLevel(float value) const;
     int bottomMargin() const;
     double frequencyAtX(int x) const;
+    int xForFrequency(double frequency) const;
+    CursorPeak cursorPeakAtX(int x) const;
+    QString formatFrequencyLabel(double frequencyHz) const;
+    QString formatFrequencySpanLabel(double spanHz) const;
     double signalCenterNearFrequency(double frequency) const;
 
     double xMin, xMax, yMin, yMax;
@@ -65,6 +82,12 @@ private:
     bool generalBandMarkersEnabled = false;
     bool amateurBandMarkersEnabled = false;
     bool compactBandMarkersEnabled = false;
+    bool hoverCursorVisible = false;
+    QPoint hoverCursorPos;
+    bool bandwidthMeasurementActive = false;
+    bool bandwidthMeasurementVisible = false;
+    QPoint bandwidthMeasureStartPos;
+    QPoint bandwidthMeasureEndPos;
     QVector<GraphBandMarker> bandMarkers;
     QColor valueToColor(float value);
 };

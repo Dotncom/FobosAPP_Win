@@ -2,10 +2,10 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android network-client support work. Version 3.5 keeps the stable
-real-device, network, and video/image work from the 2.x line, adds the first DMR
-laboratory monitoring tools, expands Raspberry Pi/network operation, and adds a
-usable Android remote client.
+and Android network-client support work. Version 3.6 keeps the stable
+real-device, network, and video/image work from the 2.x line, expands the DMR
+laboratory monitor, improves scan/measurement tooling, and adds more practical
+desktop, Raspberry Pi, and Android tuning controls.
 
 ## Windows Release Package
 

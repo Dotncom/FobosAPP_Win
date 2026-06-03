@@ -41,6 +41,7 @@
 #include <cmath>
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <QRadioButton>
 #include <QButtonGroup>
 #include <QElapsedTimer>
@@ -179,7 +180,7 @@ private:
 
     QWidget *centralWidget;
     QStringList getFobosDevices();
-    void refreshFobosDeviceList();
+    void refreshFobosDeviceList(bool recoverUsb = false);
     QString formatFobosDeviceLabel(const FobosDeviceInfo &info) const;
     FobosDeviceInfo selectedFobosDeviceInfo() const;
     bool restartStreamForHardwareChange();
@@ -188,13 +189,33 @@ private:
     bool applyFobosSettings();
     bool applyAgileScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
+    double currentAgileScanCenterFrequencyHz() const;
     void updateAgileScanControls();
     void saveAgileScanPreset();
     void deleteAgileScanPreset();
+    void updateScanMeasurement(const std::vector<float> &frequencies,
+                               const std::vector<float> &magnitudes);
+    std::vector<float> scanMeasurementOverlay(const std::vector<float> &frequencies,
+                                              int dataCount) const;
+    void updateScanMeasurementStatus();
+    void resetScanMeasurementPeaks();
+    void clearScanMeasurement();
+    void exportScanMeasurementCsv();
+    void startSpurCalibration();
+    void clearSpurMask();
+    void updateSpurCalibration(const std::vector<float> &frequencies,
+                               const std::vector<float> &magnitudes,
+                               double centerFrequency);
+    void finishSpurCalibration();
+    void applySpurSuppression(const std::vector<float> &frequencies,
+                              std::vector<float> &magnitudes,
+                              double centerFrequency) const;
+    void updateSpurSuppressionStatus();
     void ensureDefaultFrequencyPresets();
     void ensureDefaultBandMarkers();
     void updateFrequencyPresetControls();
     void updateGraphBandMarkers();
+    void setControlsPanelVisible(bool visible);
     QVector<QPair<QString, double>> presetMapToVector(const QMap<QString, double> &presets) const;
     void openPresetManager();
     void openApplicationSettings();
@@ -248,7 +269,10 @@ private:
     void stopNetworkClientProcessing();
     void sendNetworkSpectrumFrame(const std::vector<float> &frequencies,
                                   const std::vector<float> &magnitudes,
-                                  const std::vector<float> &referenceMagnitudes = {});
+                                  const std::vector<float> &referenceMagnitudes = {},
+                                  double frameCenterFrequency = std::numeric_limits<double>::quiet_NaN(),
+                                  double frameMinFrequency = std::numeric_limits<double>::quiet_NaN(),
+                                  double frameMaxFrequency = std::numeric_limits<double>::quiet_NaN());
     void displayNetworkSpectrumFrame(const QJsonObject &frame);
     void displayNetworkSpectrumFrameBinary(const QJsonObject &frame, const QByteArray &payload);
     void sendNetworkAudioFrame(const QByteArray &pcmData);
@@ -334,6 +358,8 @@ private:
     QCheckBox *videoTestPatternCheckbox = nullptr;
     QCheckBox *hfNoiseCancelFreezeCheckbox = nullptr;
     QCheckBox *agileScanCheckbox = nullptr;
+    QCheckBox *scanMeasurementCheckbox = nullptr;
+    QCheckBox *spurSuppressionCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
@@ -387,9 +413,17 @@ private:
     QLineEdit *dmrLabNotesEdit = nullptr;
     QLineEdit *agileScanRangesEdit = nullptr;
     QDoubleSpinBox *agileScanStepSpin = nullptr;
+    QDoubleSpinBox *scanMeasurementBinSpin = nullptr;
     QPushButton *agileScanSavePresetButton = nullptr;
     QPushButton *agileScanDeletePresetButton = nullptr;
+    QPushButton *scanMeasurementBaselineButton = nullptr;
+    QPushButton *scanMeasurementResetPeakButton = nullptr;
+    QPushButton *scanMeasurementExportButton = nullptr;
+    QPushButton *spurCalibrateButton = nullptr;
+    QPushButton *spurClearButton = nullptr;
     QLabel *agileScanStatusLabel = nullptr;
+    QLabel *scanMeasurementStatusLabel = nullptr;
+    QLabel *spurSuppressionStatusLabel = nullptr;
 
     FrequencyControl *frequencyControl = nullptr;
     FrequencyControl *listeningFrequencyControl = nullptr;
@@ -471,10 +505,56 @@ private:
     bool agileScanRunning = false;
     QString agileScanRangesMhz = QStringLiteral("430-432");
     double agileScanStepMhz = 0.0125;
+    bool scanMeasurementEnabled = false;
+    bool scanMeasurementBaselineRecording = false;
+    double scanMeasurementBinMhz = 0.1;
     QMap<QString, QString> agileScanPresets;
+    QVector<double> activeAgileScanFrequencies;
+
+    struct ScanMeasurementBin {
+        double frequencyHz = 0.0;
+        float currentDb = -160.0f;
+        float peakDb = -160.0f;
+        float baselineDb = -160.0f;
+        int baselineCount = 0;
+        int seenCount = 0;
+        uint64_t lastSequence = 0;
+    };
+    QMap<qint64, ScanMeasurementBin> scanMeasurementBins;
+    uint64_t scanMeasurementSequence = 0;
+
+    struct SpurMaskEntry {
+        double offsetHz = 0.0;
+        double widthHz = 0.0;
+        float prominenceDb = 0.0f;
+        int hits = 0;
+    };
+    struct SpurCalibrationBin {
+        double offsetWeightedSum = 0.0;
+        double weightSum = 0.0;
+        float maxProminenceDb = 0.0f;
+        int hits = 0;
+    };
+    QVector<SpurMaskEntry> spurMaskEntries;
+    QMap<qint64, SpurCalibrationBin> spurCalibrationBins;
+    bool spurSuppressionEnabled = false;
+    bool spurCalibrationActive = false;
+    int spurCalibrationFramesDone = 0;
+    int spurCalibrationTargetFrames = 32;
+    double spurCalibrationBinHz = 0.0;
     QMap<QString, double> centerFrequencyPresets;
     QMap<QString, double> listeningFrequencyPresets;
     QMap<QString, double> bandwidthValuePresets;
+    int centerFrequencyUnitIndex = 2;
+    int listeningFrequencyUnitIndex = 2;
+    int bandwidthUnitIndex = 1;
+    QString centerFrequencyStepName = QStringLiteral("1 MHz");
+    QString listeningFrequencyStepName = QStringLiteral("1 kHz");
+    QString bandwidthStepName = QStringLiteral("1 kHz");
+    QString centerFrequencyPresetName;
+    QString listeningFrequencyPresetName;
+    QString bandwidthPresetName;
+    bool frequencyControlUiStateRestorePending = false;
     QVector<GraphBandMarker> bandMarkers;
     bool bandMarkersCustomized = false;
     bool showGeneralBandMarkers = false;
@@ -507,6 +587,7 @@ private:
     QList<QTcpSocket *> audioHttpClients;
     float displayLevelMin = -120.0f;
     float displayLevelMax = 0.0f;
+    bool persistentSettingsReady = false;
     int minScale = 1;
     int maxScale = 1000;
 };

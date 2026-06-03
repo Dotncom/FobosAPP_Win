@@ -1135,7 +1135,7 @@ const fobos_rx_band_param_t fobos_rx_bands[] =
     {
         .idx = 10,
         .freq_mhz_min = 4800,
-        .freq_mhz_max = 6900,
+        .freq_mhz_max = 7750,
         .preselect = FOBOS_PRESELECT_HIGHPASS,
         .if_filter = FOBOS_IF_FILTER_LOW,
         .if_freq_mhz = FOBOS_IF_FREQ_2350,

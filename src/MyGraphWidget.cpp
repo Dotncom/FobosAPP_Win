@@ -2,10 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
 constexpr int GRAPH_LEFT_MARGIN = 0;
-constexpr int GRAPH_RIGHT_MARGIN = 8;
+constexpr int GRAPH_RIGHT_MARGIN = 0;
 constexpr int GRAPH_TOP_MARGIN = 8;
 constexpr int GRAPH_BOTTOM_MARGIN = 20;
 constexpr int GRAPH_COMPACT_BAND_BOTTOM_MARGIN = 30;
@@ -22,6 +23,7 @@ struct SignalSample {
 
 MyGraphWidget::MyGraphWidget(QWidget *parent)
     : QOpenGLWidget(parent), xMin(60e6), xMax(140e6), yMin(-120), yMax(0), fftLength(32768), initialized(false) {
+    setMouseTracking(true);
 }
 
 MyGraphWidget::~MyGraphWidget() {
@@ -169,6 +171,8 @@ void MyGraphWidget::paintGL() {
     painter.endNativePainting();
     drawBandMarkers(painter);
     drawYAxis(painter);
+    drawBandwidthMeasurement(painter);
+    drawHoverCursor(painter);
 }
 
 void MyGraphWidget::wheelEvent(QWheelEvent *event) {
@@ -176,7 +180,32 @@ void MyGraphWidget::wheelEvent(QWheelEvent *event) {
     event->accept();
 }
 
+void MyGraphWidget::mouseMoveEvent(QMouseEvent *event) {
+    hoverCursorVisible = true;
+    hoverCursorPos = event->pos();
+    if (bandwidthMeasurementActive) {
+        bandwidthMeasurementVisible = true;
+        bandwidthMeasureEndPos = event->pos();
+        update();
+        event->accept();
+        return;
+    }
+    update();
+    QOpenGLWidget::mouseMoveEvent(event);
+}
+
 void MyGraphWidget::mousePressEvent(QMouseEvent *event) {
+    if (event->button() == Qt::LeftButton) {
+        bandwidthMeasurementActive = true;
+        bandwidthMeasurementVisible = true;
+        bandwidthMeasureStartPos = event->pos();
+        bandwidthMeasureEndPos = event->pos();
+        hoverCursorVisible = true;
+        hoverCursorPos = event->pos();
+        update();
+        event->accept();
+        return;
+    }
     if (event->button() == Qt::RightButton) {
         emit tuneContextRequested(frequencyAtX(event->x()), event->globalPos());
         event->accept();
@@ -190,13 +219,36 @@ void MyGraphWidget::mousePressEvent(QMouseEvent *event) {
     QOpenGLWidget::mousePressEvent(event);
 }
 
+void MyGraphWidget::mouseReleaseEvent(QMouseEvent *event) {
+    if (event->button() == Qt::LeftButton && bandwidthMeasurementActive) {
+        bandwidthMeasureEndPos = event->pos();
+        bandwidthMeasurementActive = false;
+        if (std::abs(bandwidthMeasureEndPos.x() - bandwidthMeasureStartPos.x()) < 4) {
+            bandwidthMeasurementVisible = false;
+        }
+        update();
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::mouseReleaseEvent(event);
+}
+
 void MyGraphWidget::mouseDoubleClickEvent(QMouseEvent *event) {
     if (event->button() == Qt::LeftButton) {
+        bandwidthMeasurementActive = false;
+        bandwidthMeasurementVisible = false;
         emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
+        update();
         event->accept();
         return;
     }
     QOpenGLWidget::mouseDoubleClickEvent(event);
+}
+
+void MyGraphWidget::leaveEvent(QEvent *event) {
+    hoverCursorVisible = false;
+    update();
+    QOpenGLWidget::leaveEvent(event);
 }
 
 double MyGraphWidget::frequencyAtX(int x) const {
@@ -207,6 +259,117 @@ double MyGraphWidget::frequencyAtX(int x) const {
     const double plotWidth = (std::max)(1, width() - GRAPH_LEFT_MARGIN - GRAPH_RIGHT_MARGIN);
     const double normalized = std::clamp((static_cast<double>(x) - plotLeft) / plotWidth, 0.0, 1.0);
     return xMin + normalized * (xMax - xMin);
+}
+
+int MyGraphWidget::xForFrequency(double frequency) const {
+    if (!std::isfinite(frequency) || width() <= 0 || qFuzzyCompare(xMin, xMax)) {
+        return GRAPH_LEFT_MARGIN;
+    }
+    const double plotLeft = GRAPH_LEFT_MARGIN;
+    const double plotWidth = (std::max)(1, width() - GRAPH_LEFT_MARGIN - GRAPH_RIGHT_MARGIN);
+    const double normalized = std::clamp((frequency - xMin) / (xMax - xMin), 0.0, 1.0);
+    return static_cast<int>(std::round(plotLeft + normalized * plotWidth));
+}
+
+MyGraphWidget::CursorPeak MyGraphWidget::cursorPeakAtX(int x) const {
+    CursorPeak peak;
+    if (width() <= 0 || height() <= 0 || qFuzzyCompare(xMin, xMax) ||
+        xData.empty() || yData.empty() || fftLength <= 0) {
+        return peak;
+    }
+
+    const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
+    if (dataCount <= 0) {
+        return peak;
+    }
+
+    const double cursorFrequency = frequencyAtX(x);
+    const double plotWidth = (std::max)(1, width() - GRAPH_LEFT_MARGIN - GRAPH_RIGHT_MARGIN);
+    const double hzPerPixel = std::abs(xMax - xMin) / plotWidth;
+    const double binSpanHz = std::abs(xMax - xMin) / (std::max)(1, dataCount);
+    const double halfWindowHz = (std::max)(hzPerPixel * 5.0, binSpanHz * 2.0);
+
+    auto considerLevel = [&](double frequency, float level) {
+        if (!std::isfinite(frequency) || !std::isfinite(level) ||
+            std::abs(frequency - cursorFrequency) > halfWindowHz) {
+            return;
+        }
+        if (!peak.valid || level > peak.level) {
+            peak.valid = true;
+            peak.frequency = frequency;
+            peak.level = level;
+        }
+    };
+
+    for (int i = 0; i < dataCount; ++i) {
+        const double frequency = xData[static_cast<std::size_t>(i)];
+        const float level = yData[static_cast<std::size_t>((i + dataCount / 2) % dataCount)];
+        considerLevel(frequency, level);
+        if (overlayEnabled && static_cast<int>(overlayYData.size()) >= dataCount) {
+            const float overlayLevel = overlayYData[static_cast<std::size_t>((i + dataCount / 2) % dataCount)];
+            if (overlayLevel > yMin + 0.5f) {
+                considerLevel(frequency, overlayLevel);
+            }
+        }
+    }
+
+    if (!peak.valid) {
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < dataCount; ++i) {
+            const double frequency = xData[static_cast<std::size_t>(i)];
+            const float level = yData[static_cast<std::size_t>((i + dataCount / 2) % dataCount)];
+            if (!std::isfinite(frequency) || !std::isfinite(level)) {
+                continue;
+            }
+            const double distance = std::abs(frequency - cursorFrequency);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                peak.valid = true;
+                peak.frequency = frequency;
+                peak.level = level;
+            }
+        }
+    }
+
+    if (!peak.valid) {
+        return peak;
+    }
+
+    const int plotTop = GRAPH_TOP_MARGIN;
+    const int plotBottom = (std::max)(plotTop + 1, height() - bottomMargin());
+    const int plotHeight = plotBottom - plotTop;
+    peak.x = xForFrequency(peak.frequency);
+    peak.y = plotBottom - static_cast<int>(std::round(normalizedLevel(peak.level) * plotHeight));
+    peak.y = (std::clamp)(peak.y, plotTop, plotBottom);
+    return peak;
+}
+
+QString MyGraphWidget::formatFrequencyLabel(double frequencyHz) const {
+    const double absFrequency = std::abs(frequencyHz);
+    if (absFrequency >= 1000000000.0) {
+        return QStringLiteral("%1 GHz").arg(frequencyHz / 1000000000.0, 0, 'f', 6);
+    }
+    if (absFrequency >= 1000000.0) {
+        return QStringLiteral("%1 MHz").arg(frequencyHz / 1000000.0, 0, 'f', 6);
+    }
+    if (absFrequency >= 1000.0) {
+        return QStringLiteral("%1 kHz").arg(frequencyHz / 1000.0, 0, 'f', 3);
+    }
+    return QStringLiteral("%1 Hz").arg(frequencyHz, 0, 'f', 0);
+}
+
+QString MyGraphWidget::formatFrequencySpanLabel(double spanHz) const {
+    const double absSpan = std::abs(spanHz);
+    if (absSpan >= 1000000000.0) {
+        return QStringLiteral("%1 GHz").arg(absSpan / 1000000000.0, 0, 'f', 6);
+    }
+    if (absSpan >= 1000000.0) {
+        return QStringLiteral("%1 MHz").arg(absSpan / 1000000.0, 0, 'f', 3);
+    }
+    if (absSpan >= 1000.0) {
+        return QStringLiteral("%1 kHz").arg(absSpan / 1000.0, 0, 'f', 3);
+    }
+    return QStringLiteral("%1 Hz").arg(absSpan, 0, 'f', 0);
 }
 
 double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
@@ -225,8 +388,6 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
                                            AUTO_TUNE_MAX_WINDOW_HZ);
     std::vector<SignalSample> samples;
     samples.reserve(256);
-    std::vector<float> levels;
-    levels.reserve(256);
     for (int i = 0; i < dataCount; ++i) {
         const double sampleFrequency = xData[i];
         if (!std::isfinite(sampleFrequency) || std::abs(sampleFrequency - frequency) > halfWindow) {
@@ -237,7 +398,6 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
             continue;
         }
         samples.push_back({sampleFrequency, level});
-        levels.push_back(level);
     }
     if (samples.empty()) {
         return frequency;
@@ -246,42 +406,80 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
     std::sort(samples.begin(), samples.end(), [](const SignalSample &a, const SignalSample &b) {
         return a.frequency < b.frequency;
     });
-    std::sort(levels.begin(), levels.end());
-    const float baseline = levels[levels.size() / 4];
+
+    const int sampleCount = static_cast<int>(samples.size());
+    const int smoothRadius = (std::clamp)(sampleCount / 160, 1, 6);
+    std::vector<float> smoothedLevels(static_cast<std::size_t>(sampleCount), -160.0f);
+    std::vector<float> sortedSmoothedLevels;
+    sortedSmoothedLevels.reserve(static_cast<std::size_t>(sampleCount));
+    for (int i = 0; i < sampleCount; ++i) {
+        double sum = 0.0;
+        int count = 0;
+        for (int j = (std::max)(0, i - smoothRadius);
+             j <= (std::min)(sampleCount - 1, i + smoothRadius);
+             ++j) {
+            sum += samples[j].level;
+            ++count;
+        }
+        smoothedLevels[static_cast<std::size_t>(i)] =
+            count > 0 ? static_cast<float>(sum / count) : samples[i].level;
+        sortedSmoothedLevels.push_back(smoothedLevels[static_cast<std::size_t>(i)]);
+    }
+    std::sort(sortedSmoothedLevels.begin(), sortedSmoothedLevels.end());
+    const float baseline = sortedSmoothedLevels[sortedSmoothedLevels.size() / 4];
 
     int peakIndex = 0;
-    for (int i = 1; i < static_cast<int>(samples.size()); ++i) {
-        if (samples[i].level > samples[peakIndex].level) {
+    double bestScore = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < sampleCount; ++i) {
+        const double distanceRatio = std::abs(samples[i].frequency - frequency) /
+                                     (std::max)(1.0, halfWindow);
+        const double score = smoothedLevels[static_cast<std::size_t>(i)] - distanceRatio * 8.0;
+        if (score > bestScore) {
+            bestScore = score;
             peakIndex = i;
         }
     }
-    const float peakLevel = samples[peakIndex].level;
+    const float peakLevel = smoothedLevels[static_cast<std::size_t>(peakIndex)];
     const double dynamicRange = (std::max)(0.0, static_cast<double>(peakLevel - baseline));
     if (dynamicRange < 2.0) {
         return samples[peakIndex].frequency;
     }
 
-    const float threshold = baseline + static_cast<float>((std::max)(3.0, dynamicRange * 0.35));
+    const float threshold = (std::max)(baseline + 3.0f,
+                                       peakLevel - static_cast<float>((std::clamp)(dynamicRange * 0.42, 4.0, 10.0)));
     int left = peakIndex;
-    while (left > 0 && samples[left - 1].level >= threshold) {
+    while (left > 0 && smoothedLevels[static_cast<std::size_t>(left - 1)] >= threshold) {
         --left;
     }
     int right = peakIndex;
-    while (right + 1 < static_cast<int>(samples.size()) && samples[right + 1].level >= threshold) {
+    while (right + 1 < sampleCount && smoothedLevels[static_cast<std::size_t>(right + 1)] >= threshold) {
         ++right;
     }
 
-    double weightedFrequency = 0.0;
-    double weightSum = 0.0;
-    for (int i = left; i <= right; ++i) {
-        const double weight = std::pow(10.0, (samples[i].level - threshold) / 20.0);
-        weightedFrequency += samples[i].frequency * weight;
-        weightSum += weight;
-    }
-    if (weightSum <= 0.0 || !std::isfinite(weightedFrequency)) {
+    if (right <= left) {
         return samples[peakIndex].frequency;
     }
-    return weightedFrequency / weightSum;
+
+    auto interpolatedEdge = [&](int inside, int outside) {
+        if (outside < 0 || outside >= sampleCount) {
+            return samples[inside].frequency;
+        }
+        const double insideLevel = smoothedLevels[static_cast<std::size_t>(inside)];
+        const double outsideLevel = smoothedLevels[static_cast<std::size_t>(outside)];
+        const double denom = insideLevel - outsideLevel;
+        if (std::abs(denom) < 0.0001) {
+            return samples[inside].frequency;
+        }
+        const double ratio = (insideLevel - threshold) / denom;
+        return samples[inside].frequency +
+               (samples[outside].frequency - samples[inside].frequency) *
+                   (std::clamp)(ratio, 0.0, 1.0);
+    };
+
+    const double leftFrequency = interpolatedEdge(left, left - 1);
+    const double rightFrequency = interpolatedEdge(right, right + 1);
+    const double centerFrequency = (leftFrequency + rightFrequency) * 0.5;
+    return std::isfinite(centerFrequency) ? centerFrequency : samples[peakIndex].frequency;
 }
 
 QColor MyGraphWidget::valueToColor(float value) {
@@ -437,6 +635,135 @@ void MyGraphWidget::drawBandMarkers(QPainter &painter) const {
     painter.setClipRect(QRect(plotLeft, markerTop, plotRight - plotLeft, markerHeight));
     drawLayer(false);
     drawLayer(true);
+    painter.restore();
+}
+
+void MyGraphWidget::drawBandwidthMeasurement(QPainter &painter) const {
+    if (!bandwidthMeasurementVisible || qFuzzyCompare(xMin, xMax)) {
+        return;
+    }
+
+    const int plotLeft = GRAPH_LEFT_MARGIN;
+    const int plotRight = (std::max)(plotLeft + 1, width() - GRAPH_RIGHT_MARGIN);
+    const int plotTop = GRAPH_TOP_MARGIN;
+    const int plotBottom = (std::max)(plotTop + 1, height() - bottomMargin());
+    int x1 = (std::clamp)(bandwidthMeasureStartPos.x(), plotLeft, plotRight);
+    int x2 = (std::clamp)(bandwidthMeasureEndPos.x(), plotLeft, plotRight);
+    if (std::abs(x2 - x1) < 4) {
+        return;
+    }
+    if (x2 < x1) {
+        std::swap(x1, x2);
+    }
+
+    const double f1 = frequencyAtX(x1);
+    const double f2 = frequencyAtX(x2);
+    const double lowFrequency = (std::min)(f1, f2);
+    const double highFrequency = (std::max)(f1, f2);
+    const double spanHz = highFrequency - lowFrequency;
+    const QRect selectionRect(x1, plotTop, x2 - x1, plotBottom - plotTop);
+    const QString label = QStringLiteral("BW %1  %2 - %3")
+                              .arg(formatFrequencySpanLabel(spanHz))
+                              .arg(formatFrequencyLabel(lowFrequency))
+                              .arg(formatFrequencyLabel(highFrequency));
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.fillRect(selectionRect, QColor(70, 135, 255, 48));
+    painter.setPen(QPen(QColor(105, 175, 255, 210), 1, Qt::SolidLine));
+    painter.drawRect(selectionRect.adjusted(0, 0, -1, -1));
+    painter.setPen(QPen(QColor(180, 225, 255, 230), 1, Qt::DashLine));
+    painter.drawLine(x1, plotTop, x1, plotBottom);
+    painter.drawLine(x2, plotTop, x2, plotBottom);
+
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QFontMetrics metrics = painter.fontMetrics();
+    const int paddingX = 8;
+    const int labelWidth = metrics.horizontalAdvance(label) + paddingX * 2;
+    const int labelHeight = metrics.height() + 8;
+    int labelX = x1 + ((x2 - x1) - labelWidth) / 2;
+    labelX = (std::clamp)(labelX, plotLeft + 2, (std::max)(plotLeft + 2, plotRight - labelWidth - 2));
+    int labelY = plotTop + 6;
+    if (bandwidthMeasureStartPos.y() < plotTop + labelHeight + 16 ||
+        bandwidthMeasureEndPos.y() < plotTop + labelHeight + 16) {
+        labelY = plotBottom - labelHeight - 6;
+    }
+    labelY = (std::clamp)(labelY, plotTop + 2, (std::max)(plotTop + 2, plotBottom - labelHeight - 2));
+    const QRect labelRect(labelX, labelY, labelWidth, labelHeight);
+    painter.setPen(QColor(125, 190, 255, 190));
+    painter.setBrush(QColor(4, 12, 24, 224));
+    painter.drawRoundedRect(labelRect, 4, 4);
+    painter.setPen(QColor(220, 238, 255, 245));
+    painter.drawText(labelRect.adjusted(paddingX, 0, -paddingX, 0),
+                     Qt::AlignVCenter | Qt::AlignLeft,
+                     label);
+    painter.restore();
+}
+
+void MyGraphWidget::drawHoverCursor(QPainter &painter) const {
+    if (!hoverCursorVisible) {
+        return;
+    }
+
+    const int plotLeft = GRAPH_LEFT_MARGIN;
+    const int plotRight = (std::max)(plotLeft + 1, width() - GRAPH_RIGHT_MARGIN);
+    const int plotTop = GRAPH_TOP_MARGIN;
+    const int plotBottom = (std::max)(plotTop + 1, height() - bottomMargin());
+    if (hoverCursorPos.x() < plotLeft ||
+        hoverCursorPos.x() > plotRight ||
+        hoverCursorPos.y() < plotTop ||
+        hoverCursorPos.y() > plotBottom) {
+        return;
+    }
+
+    const CursorPeak peak = cursorPeakAtX(hoverCursorPos.x());
+    if (!peak.valid) {
+        return;
+    }
+
+    const QColor lineColor(255, 236, 170, 210);
+    const QColor markerColor(255, 214, 92, 240);
+    const QColor textColor(238, 246, 230, 245);
+    const QColor fillColor(5, 12, 10, 222);
+    const QColor borderColor(255, 236, 170, 170);
+    const QString label = QStringLiteral("%1  %2 dB")
+                              .arg(formatFrequencyLabel(peak.frequency))
+                              .arg(peak.level, 0, 'f', 1);
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(QPen(lineColor, 1, Qt::SolidLine));
+    painter.drawLine(peak.x, plotTop, peak.x, plotBottom);
+    painter.drawLine((std::max)(plotLeft, peak.x - 4), peak.y,
+                     (std::min)(plotRight, peak.x + 4), peak.y);
+
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setBrush(markerColor);
+    painter.setPen(Qt::NoPen);
+    painter.drawEllipse(QPoint(peak.x, peak.y), 3, 3);
+
+    const QFontMetrics metrics = painter.fontMetrics();
+    const int paddingX = 7;
+    const int labelWidth = metrics.horizontalAdvance(label) + paddingX * 2;
+    const int labelHeight = metrics.height() + 7;
+    int labelX = peak.x + 8;
+    if (labelX + labelWidth > plotRight - 2) {
+        labelX = peak.x - labelWidth - 8;
+    }
+    labelX = (std::clamp)(labelX, plotLeft + 2, (std::max)(plotLeft + 2, plotRight - labelWidth - 2));
+    int labelY = peak.y - labelHeight - 8;
+    if (labelY < plotTop + 2) {
+        labelY = peak.y + 8;
+    }
+    labelY = (std::clamp)(labelY, plotTop + 2, (std::max)(plotTop + 2, plotBottom - labelHeight - 2));
+    const QRect labelRect(labelX, labelY, labelWidth, labelHeight);
+    painter.setPen(borderColor);
+    painter.setBrush(fillColor);
+    painter.drawRoundedRect(labelRect, 4, 4);
+    painter.setPen(textColor);
+    painter.drawText(labelRect.adjusted(paddingX, 0, -paddingX, 0),
+                     Qt::AlignVCenter | Qt::AlignLeft,
+                     label);
     painter.restore();
 }
 

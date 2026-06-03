@@ -20,8 +20,10 @@ constexpr int DMR_CANDIDATE_SYNC_SCORE = 23;
 constexpr int DMR_CONFIRMED_SYNC_SCORE = 24;
 constexpr int DMR_CANDIDATE_OUTER_SCORE = 14;
 constexpr int DMR_CONFIRMED_OUTER_SCORE = 16;
+constexpr int DMR_REPORTABLE_CANDIDATE_OUTER_SCORE = 20;
 constexpr int DMR_TRUSTED_VOICE_OUTER_SCORE = 17;
 constexpr int DMR_STRONG_ANCHOR_OUTER_SCORE = 18;
+constexpr int DMR_LOCKED_POLARITY_OUTER_MARGIN = 3;
 constexpr int DMR_MAX_BUFFER_SYMBOLS = 500;
 constexpr double DMR_REPORT_INTERVAL_SECONDS = 1.0;
 constexpr double DMR_LOCK_TIMEOUT_SECONDS = 1.5;
@@ -78,6 +80,28 @@ double syncQualityDb(int score) {
     return 10.0 * std::log10(good / bad);
 }
 
+float averagedSymbolSample(const std::deque<float> &samples, int centerIndex, int samplesPerSymbol) {
+    if (centerIndex < 0 || centerIndex >= static_cast<int>(samples.size())) {
+        return 0.0f;
+    }
+
+    const int radius = (std::max)(1, (std::min)(2, samplesPerSymbol / 5));
+    double sum = 0.0;
+    double weightSum = 0.0;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const int index = centerIndex + offset;
+        if (index < 0 || index >= static_cast<int>(samples.size())) {
+            continue;
+        }
+        const double weight = 1.0 / (1.0 + std::abs(offset));
+        sum += weight * samples[static_cast<std::size_t>(index)];
+        weightSum += weight;
+    }
+    return weightSum > 0.0
+               ? static_cast<float>(sum / weightSum)
+               : samples[static_cast<std::size_t>(centerIndex)];
+}
+
 int scoreSyncSymbols(const std::deque<float> &samples,
                      int startIndex,
                      int samplesPerSymbol,
@@ -92,8 +116,8 @@ int scoreSyncSymbols(const std::deque<float> &samples,
         if (sampleIndex < 0 || sampleIndex >= static_cast<int>(samples.size())) {
             return 0;
         }
-        const float corrected = inverted ? -samples[static_cast<std::size_t>(sampleIndex)]
-                                         : samples[static_cast<std::size_t>(sampleIndex)];
+        const float sample = averagedSymbolSample(samples, sampleIndex, samplesPerSymbol);
+        const float corrected = inverted ? -sample : sample;
         symbolSamples[i] = corrected;
         minLevel = (std::min)(minLevel, corrected);
         maxLevel = (std::max)(maxLevel, corrected);
@@ -380,11 +404,81 @@ void appendDibitBits(int dibit, bool etsiMap, bool *rawBits, int bitIndex) {
     rawBits[bitIndex + 1] = bit1;
 }
 
+QString bitsToHex(const bool *bits, int bitCount) {
+    QString out;
+    out.reserve((bitCount + 3) / 4);
+    for (int i = 0; i < bitCount; i += 4) {
+        int value = 0;
+        for (int bit = 0; bit < 4; ++bit) {
+            const int index = i + bit;
+            value = (value << 1) | (index < bitCount && bits[index] ? 1 : 0);
+        }
+        out.append(QLatin1Char(value < 10 ? static_cast<char>('0' + value)
+                                           : static_cast<char>('A' + value - 10)));
+    }
+    return out;
+}
+
+int hexNibbleValue(QChar ch) {
+    const ushort value = ch.unicode();
+    if (value >= '0' && value <= '9') {
+        return static_cast<int>(value - '0');
+    }
+    if (value >= 'A' && value <= 'F') {
+        return static_cast<int>(10 + value - 'A');
+    }
+    if (value >= 'a' && value <= 'f') {
+        return static_cast<int>(10 + value - 'a');
+    }
+    return -1;
+}
+
+QString embeddedLc72HexFromBptcRaw(const QString &emb128) {
+    if (emb128.size() != 32) {
+        return QString();
+    }
+
+    std::array<bool, 128> txBits = {};
+    for (int hexIndex = 0; hexIndex < emb128.size(); ++hexIndex) {
+        const int value = hexNibbleValue(emb128.at(hexIndex));
+        if (value < 0) {
+            return QString();
+        }
+        for (int bit = 0; bit < 4; ++bit) {
+            txBits[static_cast<std::size_t>(hexIndex * 4 + bit)] =
+                ((value >> (3 - bit)) & 0x1) != 0;
+        }
+    }
+
+    bool matrix[8][16] = {};
+    for (int txIndex = 0; txIndex < 128; ++txIndex) {
+        const int column = txIndex / 8;
+        const int row = txIndex % 8;
+        matrix[row][column] = txBits[static_cast<std::size_t>(txIndex)];
+    }
+
+    bool lcBits[72] = {};
+    int out = 0;
+    for (int row = 0; row < 6; ++row) {
+        for (int column = 0; column < 11; ++column) {
+            lcBits[out++] = matrix[row][column];
+        }
+    }
+    for (int column = 0; column < 6; ++column) {
+        lcBits[out++] = matrix[6][column];
+    }
+
+    return bitsToHex(lcBits, static_cast<int>(std::size(lcBits)));
+}
+
 } // namespace
 
 void DmrDecoder::reset() {
     sampleBuffer.clear();
     pendingVoiceEmb.clear();
+    voiceEmbeddedFrames.clear();
+    voiceLcSequences.clear();
+    voiceLcRawSinceReport.clear();
     dcEstimate = 0.0;
     averageMagnitude = 0.0;
     totalSamples = 0;
@@ -397,6 +491,7 @@ void DmrDecoder::reset() {
     lockedRfFrequencyHz = 0.0;
     confirmedSyncsSinceReport = 0;
     candidateSyncsSinceReport = 0;
+    polarityFlipsSinceReport = 0;
     bestScoreSinceReport = 0;
     bestPhaseSinceReport = 0;
     bestQualitySinceReport = 0.0;
@@ -512,6 +607,7 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
             lockedRfFrequencyHz = 0.0;
             confirmedSyncsSinceReport = 0;
             candidateSyncsSinceReport = 0;
+            polarityFlipsSinceReport = 0;
             bestScoreSinceReport = 0;
             bestPhaseSinceReport = 0;
             bestQualitySinceReport = 0.0;
@@ -544,6 +640,9 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
             embCorrectedErrors = 0;
             lastVoiceEmbAnchorSample = 0;
             pendingVoiceEmb.clear();
+            voiceEmbeddedFrames.clear();
+            voiceLcSequences.clear();
+            voiceLcRawSinceReport.clear();
             lastCachText.clear();
         }
         return result;
@@ -556,6 +655,27 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
     if (hit.score < DMR_CONFIRMED_SYNC_SCORE ||
         hit.outerScore < DMR_CONFIRMED_OUTER_SCORE) {
         ++candidateSyncsSinceReport;
+        const quint64 reportIntervalSamples =
+            static_cast<quint64>(std::lround(DMR_REPORT_INTERVAL_SECONDS * activeSampleRate));
+        const bool reportDue =
+            lastReportSample == 0 ||
+            hit.absoluteSample >= lastReportSample + reportIntervalSamples;
+        if (reportDue &&
+            hit.score >= DMR_CANDIDATE_SYNC_SCORE &&
+            hit.outerScore >= DMR_REPORTABLE_CANDIDATE_OUTER_SCORE) {
+            lastReportSample = hit.absoluteSample;
+            const QString patternName = QString::fromLatin1(hit.pattern->name);
+            result.decodedText =
+                QStringLiteral("[DMR%1] strong sync candidate: %2, sync %3/24, outer %4/24, phase %5, polarity %6, quality %7 dB\n")
+                    .arg(frequencySuffix)
+                    .arg(patternName)
+                    .arg(hit.score)
+                    .arg(hit.outerScore)
+                    .arg(hit.phase)
+                    .arg(hit.inverted ? QStringLiteral("inverted") : QStringLiteral("normal"))
+                    .arg(hit.qualityDb, 0, 'f', 1);
+            qDebug().noquote() << result.decodedText.trimmed();
+        }
         return result;
     }
 
@@ -580,13 +700,18 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
         lockedRfFrequencyHz > 0.0 &&
         rfFrequencyHz > 0.0 &&
         std::abs(lockedRfFrequencyHz - rfFrequencyHz) > 100.0;
+    const bool polarityChangedWithinLock =
+        haveLock &&
+        lockedPatternName == patternName &&
+        lockedPolarityInverted != hit.inverted &&
+        !lockFrequencyChanged;
     const bool newLock = !haveLock ||
                          lockedPatternName != patternName ||
-                         lockedPolarityInverted != hit.inverted ||
                          lockFrequencyChanged;
     if (newLock) {
         confirmedSyncsSinceReport = 0;
         candidateSyncsSinceReport = 0;
+        polarityFlipsSinceReport = 0;
         bestScoreSinceReport = 0;
         bestPhaseSinceReport = 0;
         bestQualitySinceReport = 0.0;
@@ -619,12 +744,18 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
         embCorrectedErrors = 0;
         lastVoiceEmbAnchorSample = 0;
         pendingVoiceEmb.clear();
+        voiceEmbeddedFrames.clear();
+        voiceLcSequences.clear();
+        voiceLcRawSinceReport.clear();
         lastCachText.clear();
+    }
+    if (polarityChangedWithinLock) {
+        ++polarityFlipsSinceReport;
     }
     haveLock = true;
     lockedPatternName = patternName;
-    lockedPolarityInverted = hit.inverted;
     if (newLock) {
+        lockedPolarityInverted = hit.inverted;
         lockedRfFrequencyHz = rfFrequencyHz;
     }
     lastPatternName = patternName;
@@ -684,6 +815,14 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
 
     const SlotTypeInfo slotType = decodeSlotTypeAroundSync(hit);
     if (slotType.decoded) {
+        qDebug() << "[DMR] slot type"
+                 << hit.pattern->name
+                 << "cc" << slotType.colorCode
+                 << "dataType" << slotType.dataTypeName
+                 << "errors" << slotType.correctedErrors
+                 << "timing" << slotType.timingOffset
+                 << "slicer" << slotType.slicerRatio
+                 << "map" << slotType.mapName;
         ++slotTypeOkSinceReport;
         if (slotType.colorCode >= 0 && slotType.colorCode < static_cast<int>(std::size(colorCodeHistogram))) {
             ++colorCodeHistogram[slotType.colorCode];
@@ -940,6 +1079,11 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
                              .arg(embAnchorsSinceReport)
                              .arg(embFailSinceReport)
                        : QString()));
+        const QString polarityFlipText =
+            polarityFlipsSinceReport > 0
+                ? QStringLiteral(", polarity flips %1").arg(polarityFlipsSinceReport)
+                : QString();
+        const QString voiceLcRawText = voiceLcRawSummaryText();
 
         lastReportSample = hit.absoluteSample;
         const QString intervalText =
@@ -980,7 +1124,7 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
                            ? QStringLiteral(", EMB 0/%1 ok").arg(embFailSinceReport)
                            : QString());
             result.decodedText =
-                QStringLiteral("[DMR%1] short %2 burst: %3 accepted sync, %4 candidates, phase %5, polarity %6, best %7/24 %8 dB%9%10\n")
+                QStringLiteral("[DMR%1] short %2 burst: %3 accepted sync, %4 candidates, phase %5, polarity %6, best %7/24 %8 dB%9%10%11%12\n")
                     .arg(lockedFrequencySuffix())
                     .arg(patternName)
                     .arg(confirmedSyncsSinceReport)
@@ -989,11 +1133,13 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
                     .arg(bestPolarityInvertedSinceReport ? QStringLiteral("inverted") : QStringLiteral("normal"))
                     .arg(bestScoreSinceReport)
                     .arg(bestQualitySinceReport, 0, 'f', 1)
+                    .arg(polarityFlipText)
                     .arg(cachText)
-                    .arg(embBriefText);
+                    .arg(embBriefText)
+                    .arg(voiceLcRawText);
         } else {
             result.decodedText =
-                QStringLiteral("[DMR%1] %2: %3 accepted syncs, %4 candidates, dominant phase %5, locked phase %6, polarity %7, best %8/24 %9 dB%10%11%12%13\n")
+                QStringLiteral("[DMR%1] %2: %3 accepted syncs, %4 candidates, dominant phase %5, locked phase %6, polarity %7, best %8/24 %9 dB%10%11%12%13%14%15\n")
                     .arg(lockedFrequencySuffix())
                     .arg(patternName)
                     .arg(confirmedSyncsSinceReport)
@@ -1006,7 +1152,9 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
                     .arg(intervalText)
                     .arg(cachText)
                     .arg(slotTypeText)
-                    .arg(embText);
+                    .arg(embText)
+                    .arg(voiceLcRawText)
+                    .arg(polarityFlipText);
         }
     }
 
@@ -1022,6 +1170,7 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
                  << "qualityDb" << hit.qualityDb;
         confirmedSyncsSinceReport = 0;
         candidateSyncsSinceReport = 0;
+        polarityFlipsSinceReport = 0;
         bestScoreSinceReport = 0;
         bestPhaseSinceReport = 0;
         bestQualitySinceReport = 0.0;
@@ -1059,9 +1208,39 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
         std::fill(std::begin(embWeakColorCodeHistogram), std::end(embWeakColorCodeHistogram), 0);
         std::fill(std::begin(embTimingOffsetHistogram), std::end(embTimingOffsetHistogram), 0);
         std::fill(std::begin(embWeakTimingOffsetHistogram), std::end(embWeakTimingOffsetHistogram), 0);
+        voiceLcRawSinceReport.clear();
     }
 
     return result;
+}
+
+QString DmrDecoder::voiceLcRawSummaryText() const {
+    if (voiceLcRawSinceReport.empty()) {
+        return QString();
+    }
+
+    QString dominantRaw;
+    int dominantCount = 0;
+    for (const QString &candidate : voiceLcRawSinceReport) {
+        int count = 0;
+        for (const QString &other : voiceLcRawSinceReport) {
+            if (other == candidate) {
+                ++count;
+            }
+        }
+        if (count > dominantCount) {
+            dominantRaw = candidate;
+            dominantCount = count;
+        }
+    }
+
+    return QStringLiteral(", LC raw %1 (%2/%3)")
+        .arg(dominantRaw)
+        .arg(dominantCount)
+        .arg(static_cast<int>(voiceLcRawSinceReport.size())) +
+        (embeddedLc72HexFromBptcRaw(dominantRaw).isEmpty()
+             ? QString()
+             : QStringLiteral(", LC72 %1").arg(embeddedLc72HexFromBptcRaw(dominantRaw)));
 }
 
 void DmrDecoder::appendSamples(const QByteArray &pcmData) {
@@ -1138,24 +1317,52 @@ bool DmrDecoder::findBestSync(SyncHit &hit, quint64 minimumAbsoluteSample) const
                     candidate.absoluteSample = absoluteSample;
                     const bool candidateVoice = std::strcmp(candidate.pattern->kind, "voice") == 0;
                     const bool bestVoice = best.pattern && std::strcmp(best.pattern->kind, "voice") == 0;
+                    const bool candidateMatchesLockedPolarity =
+                        haveLock &&
+                        lockedPatternName == QString::fromLatin1(candidate.pattern->name) &&
+                        candidate.inverted == lockedPolarityInverted;
+                    const bool bestMatchesLockedPolarity =
+                        haveLock &&
+                        best.pattern &&
+                        lockedPatternName == QString::fromLatin1(best.pattern->name) &&
+                        best.inverted == lockedPolarityInverted;
+                    const bool lockedPolarityWithinMargin =
+                        best.pattern &&
+                        candidate.score == best.score &&
+                        candidateVoice == bestVoice &&
+                        candidateMatchesLockedPolarity &&
+                        !bestMatchesLockedPolarity &&
+                        candidate.outerScore + DMR_LOCKED_POLARITY_OUTER_MARGIN >= best.outerScore;
+                    const bool outerScoreWins =
+                        best.pattern &&
+                        candidate.score == best.score &&
+                        candidate.outerScore > best.outerScore &&
+                        !(bestMatchesLockedPolarity &&
+                          !candidateMatchesLockedPolarity &&
+                          best.outerScore + DMR_LOCKED_POLARITY_OUTER_MARGIN >= candidate.outerScore);
                     const bool preferCandidate =
                         !best.pattern ||
                         candidate.score > best.score ||
-                        (candidate.score == best.score &&
-                         candidate.outerScore > best.outerScore) ||
+                        lockedPolarityWithinMargin ||
+                        outerScoreWins ||
                         (candidate.score == best.score &&
                          candidate.outerScore == best.outerScore &&
+                        candidateVoice &&
+                        !bestVoice) ||
+                        (candidate.score == best.score &&
+                         candidate.outerScore == best.outerScore &&
+                         candidateVoice == bestVoice &&
+                         candidateMatchesLockedPolarity &&
+                         !bestMatchesLockedPolarity) ||
+                        (candidate.score == best.score &&
+                         candidate.outerScore == best.outerScore &&
+                         candidateVoice == bestVoice &&
                          !candidate.inverted &&
                          best.inverted) ||
                         (candidate.score == best.score &&
                          candidate.outerScore == best.outerScore &&
-                         candidate.inverted == best.inverted &&
-                         candidateVoice &&
-                         !bestVoice) ||
-                        (candidate.score == best.score &&
-                         candidate.outerScore == best.outerScore &&
-                         candidate.inverted == best.inverted &&
                          candidateVoice == bestVoice &&
+                         candidate.inverted == best.inverted &&
                          candidate.absoluteSample > best.absoluteSample);
 
                     if (preferCandidate) {
@@ -1199,7 +1406,7 @@ DmrDecoder::CachInfo DmrDecoder::decodeCachBeforeSync(const SyncHit &hit, bool a
         if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
             return info;
         }
-        const float sample = sampleBuffer[static_cast<std::size_t>(sampleIndex)];
+        const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
         minSync = (std::min)(minSync, sample);
         maxSync = (std::max)(maxSync, sample);
     }
@@ -1251,9 +1458,9 @@ DmrDecoder::CachInfo DmrDecoder::decodeCachBeforeSync(const SyncHit &hit, bool a
                     if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
                         return info;
                     }
+                    const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
                     const int dibit =
-                        (std::clamp)(sampleToDibit(sampleBuffer[static_cast<std::size_t>(sampleIndex)],
-                                                   slicerRatio),
+                        (std::clamp)(sampleToDibit(sample, slicerRatio),
                                      0,
                                      3);
                     appendDibitBits(dibit, etsiMap, rawBits, i * 2);
@@ -1316,7 +1523,7 @@ DmrDecoder::SlotTypeInfo DmrDecoder::decodeSlotTypeAroundSync(const SyncHit &hit
         if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
             return info;
         }
-        const float sample = sampleBuffer[static_cast<std::size_t>(sampleIndex)];
+        const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
         minSync = (std::min)(minSync, sample);
         maxSync = (std::max)(maxSync, sample);
     }
@@ -1325,8 +1532,7 @@ DmrDecoder::SlotTypeInfo DmrDecoder::decodeSlotTypeAroundSync(const SyncHit &hit
     }
 
     const float center = 0.5f * (maxSync + minSync);
-    const float thresholdRatio = 0.625f;
-    const auto sampleToDibit = [&](float sample) -> int {
+    const auto sampleToDibit = [&](float sample, float thresholdRatio) -> int {
         const float upperMid = center + thresholdRatio * (maxSync - center);
         const float lowerMid = center + thresholdRatio * (minSync - center);
         const float corrected = hit.inverted ? -sample : sample;
@@ -1339,37 +1545,102 @@ DmrDecoder::SlotTypeInfo DmrDecoder::decodeSlotTypeAroundSync(const SyncHit &hit
         return corrected < correctedLower ? 1 : 0;
     };
 
-    bool slotBitsRaw[20] = {};
-    for (int i = 0; i < 5; ++i) {
-        const int sampleIndex =
-            firstSlotTypeSampleIndex + i * samplesPerSymbol + samplesPerSymbol / 2;
-        const int dibit =
-            (std::clamp)(sampleToDibit(sampleBuffer[static_cast<std::size_t>(sampleIndex)]),
-                         0,
-                         3);
-        appendDibitBits(dibit, true, slotBitsRaw, i * 2);
-    }
-    for (int i = 0; i < 5; ++i) {
-        const int sampleIndex =
-            secondSlotTypeSampleIndex + i * samplesPerSymbol + samplesPerSymbol / 2;
-        const int dibit =
-            (std::clamp)(sampleToDibit(sampleBuffer[static_cast<std::size_t>(sampleIndex)]),
-                         0,
-                         3);
-        appendDibitBits(dibit, true, slotBitsRaw, 10 + i * 2);
-    }
-
-    std::array<bool, 20> received = {};
-    std::copy(std::begin(slotBitsRaw), std::end(slotBitsRaw), received.begin());
-
     int bestData = 0;
     int bestErrors = 21;
-    for (int data = 0; data < 256; ++data) {
-        const std::array<bool, 20> candidate = golay208Codeword(data);
-        const int errors = bitDistance(received, candidate);
-        if (errors < bestErrors) {
-            bestErrors = errors;
-            bestData = data;
+    int bestTimingOffset = 0;
+    int bestTimingDistance = 99;
+    int bestMapPenalty = 99;
+    int bestSlicerPenalty = 99;
+    float bestSlicerRatio = 0.0f;
+    QString bestMapName;
+    const std::array<int, 5> timingOffsets = {
+        samplesPerSymbol / 2,
+        (std::max)(0, samplesPerSymbol / 2 - 1),
+        (std::min)(samplesPerSymbol - 1, samplesPerSymbol / 2 + 1),
+        (std::max)(0, samplesPerSymbol / 2 - 2),
+        (std::min)(samplesPerSymbol - 1, samplesPerSymbol / 2 + 2)
+    };
+    const std::array<float, 3> slicerRatios = {0.625f, 0.55f, 0.70f};
+    const std::array<bool, 2> mapVariants = {true, false};
+
+    for (int timingOffset : timingOffsets) {
+        const int relativeTimingOffset = timingOffset - samplesPerSymbol / 2;
+        const int timingDistance = std::abs(relativeTimingOffset);
+        for (int slicerIndex = 0; slicerIndex < static_cast<int>(slicerRatios.size()); ++slicerIndex) {
+            const float slicerRatio = slicerRatios[static_cast<std::size_t>(slicerIndex)];
+            for (bool etsiMap : mapVariants) {
+                bool slotBitsRaw[20] = {};
+                bool inRange = true;
+                for (int i = 0; i < 5; ++i) {
+                    const int sampleIndex = firstSlotTypeSampleIndex + i * samplesPerSymbol + timingOffset;
+                    if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
+                        inRange = false;
+                        break;
+                    }
+                    const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+                    const int dibit =
+                        (std::clamp)(sampleToDibit(sample, slicerRatio),
+                                     0,
+                                     3);
+                    appendDibitBits(dibit, etsiMap, slotBitsRaw, i * 2);
+                }
+                if (!inRange) {
+                    continue;
+                }
+                for (int i = 0; i < 5; ++i) {
+                    const int sampleIndex = secondSlotTypeSampleIndex + i * samplesPerSymbol + timingOffset;
+                    if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
+                        inRange = false;
+                        break;
+                    }
+                    const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+                    const int dibit =
+                        (std::clamp)(sampleToDibit(sample, slicerRatio),
+                                     0,
+                                     3);
+                    appendDibitBits(dibit, etsiMap, slotBitsRaw, 10 + i * 2);
+                }
+                if (!inRange) {
+                    continue;
+                }
+
+                std::array<bool, 20> received = {};
+                std::copy(std::begin(slotBitsRaw), std::end(slotBitsRaw), received.begin());
+
+                int localBestData = 0;
+                int localBestErrors = 21;
+                for (int data = 0; data < 256; ++data) {
+                    const std::array<bool, 20> candidate = golay208Codeword(data);
+                    const int errors = bitDistance(received, candidate);
+                    if (errors < localBestErrors) {
+                        localBestErrors = errors;
+                        localBestData = data;
+                    }
+                }
+
+                const int mapPenalty = etsiMap ? 0 : 1;
+                const int slicerPenalty = slicerIndex == 0 ? 0 : 1;
+                const bool prefer =
+                    localBestErrors < bestErrors ||
+                    (localBestErrors == bestErrors && timingDistance < bestTimingDistance) ||
+                    (localBestErrors == bestErrors &&
+                     timingDistance == bestTimingDistance &&
+                     mapPenalty < bestMapPenalty) ||
+                    (localBestErrors == bestErrors &&
+                     timingDistance == bestTimingDistance &&
+                     mapPenalty == bestMapPenalty &&
+                     slicerPenalty < bestSlicerPenalty);
+                if (prefer) {
+                    bestErrors = localBestErrors;
+                    bestData = localBestData;
+                    bestTimingOffset = relativeTimingOffset;
+                    bestTimingDistance = timingDistance;
+                    bestMapPenalty = mapPenalty;
+                    bestSlicerPenalty = slicerPenalty;
+                    bestSlicerRatio = slicerRatio;
+                    bestMapName = etsiMap ? QStringLiteral("ETSI") : QStringLiteral("legacy");
+                }
+            }
         }
     }
 
@@ -1382,6 +1653,9 @@ DmrDecoder::SlotTypeInfo DmrDecoder::decodeSlotTypeAroundSync(const SyncHit &hit
     info.dataType = bestData & 0x0f;
     info.correctedErrors = bestErrors;
     info.dataTypeName = dmrDataTypeName(info.dataType);
+    info.timingOffset = bestTimingOffset;
+    info.slicerRatio = bestSlicerRatio;
+    info.mapName = bestMapName;
     return info;
 }
 
@@ -1395,7 +1669,7 @@ bool DmrDecoder::measureSyncLevels(const SyncHit &hit, float &minLevel, float &m
         if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
             return false;
         }
-        const float sample = sampleBuffer[static_cast<std::size_t>(sampleIndex)];
+        const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
         minLevel = (std::min)(minLevel, sample);
         maxLevel = (std::max)(maxLevel, sample);
     }
@@ -1404,10 +1678,12 @@ bool DmrDecoder::measureSyncLevels(const SyncHit &hit, float &minLevel, float &m
 
 void DmrDecoder::scheduleVoiceEmbBursts(const SyncHit &hit, const CachInfo &anchorCach) {
     if (!hit.pattern ||
-        std::strcmp(hit.pattern->source, "base station") != 0 ||
         std::strcmp(hit.pattern->kind, "voice") != 0 ||
-        hit.score < DMR_CONFIRMED_SYNC_SCORE ||
-        (hit.outerScore < DMR_STRONG_ANCHOR_OUTER_SCORE && !anchorCach.decoded)) {
+        hit.score < DMR_CONFIRMED_SYNC_SCORE) {
+        return;
+    }
+    const bool baseStation = std::strcmp(hit.pattern->source, "base station") == 0;
+    if (hit.outerScore < DMR_STRONG_ANCHOR_OUTER_SCORE && !(baseStation && anchorCach.decoded)) {
         return;
     }
 
@@ -1431,9 +1707,11 @@ void DmrDecoder::scheduleVoiceEmbBursts(const SyncHit &hit, const CachInfo &anch
     constexpr int sameTimeslotStepSymbols = 288;
     for (int i = 1; i <= voiceEmbBurstsAfterSync; ++i) {
         PendingEmb pending;
+        pending.anchorSample = hit.absoluteSample;
         pending.absoluteSample =
             hit.absoluteSample +
             static_cast<quint64>(i * sameTimeslotStepSymbols * samplesPerSymbol);
+        pending.burstIndex = i;
         pending.inverted = hit.inverted;
         pending.minLevel = minLevel;
         pending.maxLevel = maxLevel;
@@ -1483,6 +1761,15 @@ void DmrDecoder::processPendingVoiceEmb() {
             ++embFailSinceReport;
             continue;
         }
+        const VoiceEmbeddedBits fragment =
+            decodeVoiceEmbeddedFragmentAt(pending, emb.inverted, emb.timingOffset);
+        const bool reliableEmbForLc =
+            fragment.decoded &&
+            emb.colorCode >= 0 &&
+            emb.correctedErrors <= 1;
+        if (reliableEmbForLc) {
+            recordVoiceEmbeddedFragment(pending, emb, fragment);
+        }
 
         if (emb.correctedErrors <= 1) {
             ++embOkSinceReport;
@@ -1525,6 +1812,403 @@ void DmrDecoder::processPendingVoiceEmb() {
     }
 }
 
+void DmrDecoder::recordVoiceEmbeddedFragment(const PendingEmb &pending,
+                                             const EmbInfo &emb,
+                                             const VoiceEmbeddedBits &fragment) {
+    if (!fragment.decoded || pending.burstIndex < 1 || pending.burstIndex > 5) {
+        return;
+    }
+
+    const double anchorMs = activeSampleRate > 0
+                                ? static_cast<double>(pending.anchorSample) * 1000.0 /
+                                      static_cast<double>(activeSampleRate)
+                                : 0.0;
+    qDebug() << "[DMR] voice emb"
+             << "anchorMs" << anchorMs
+             << "burst" << pending.burstIndex
+             << "cc" << emb.colorCode
+             << "lcss" << cachLcssText(emb.lcss)
+             << "qrErrors" << emb.correctedErrors
+             << "polarity" << (emb.inverted ? "inverted" : "normal")
+             << "timing" << emb.timingOffset
+             << "variant" << embVariantName(emb.variantIndex)
+             << "emb32" << fragment.hex;
+
+    recordVoiceLcSequenceFragment(pending, emb, fragment);
+
+    auto frameIt = std::find_if(voiceEmbeddedFrames.begin(),
+                                voiceEmbeddedFrames.end(),
+                                [&](const VoiceEmbeddedFrame &frame) {
+                                    return frame.anchorSample == pending.anchorSample;
+                                });
+    if (frameIt == voiceEmbeddedFrames.end()) {
+        VoiceEmbeddedFrame frame;
+        frame.anchorSample = pending.anchorSample;
+        voiceEmbeddedFrames.push_back(frame);
+        frameIt = std::prev(voiceEmbeddedFrames.end());
+    }
+
+    VoiceEmbeddedFrame &frame = *frameIt;
+    const int burst = pending.burstIndex;
+    frame.present[static_cast<std::size_t>(burst)] = true;
+    frame.colorCode[static_cast<std::size_t>(burst)] = emb.colorCode;
+    frame.correctedErrors[static_cast<std::size_t>(burst)] = emb.correctedErrors;
+    frame.lcss[static_cast<std::size_t>(burst)] = emb.lcss;
+    frame.timing[static_cast<std::size_t>(burst)] = emb.timingOffset;
+    frame.emb32[static_cast<std::size_t>(burst)] = fragment.hex;
+
+    const bool hasEmbeddedLc =
+        frame.present[1] &&
+        frame.present[2] &&
+        frame.present[3] &&
+        frame.present[4] &&
+        frame.lcss[1] == 1 &&
+        frame.lcss[2] == 3 &&
+        frame.lcss[3] == 3 &&
+        frame.lcss[4] == 2;
+    const bool embeddedLcColorCodeConsistent =
+        frame.colorCode[1] == frame.colorCode[2] &&
+        frame.colorCode[1] == frame.colorCode[3] &&
+        frame.colorCode[1] == frame.colorCode[4];
+    if (hasEmbeddedLc && !frame.reportedLc && embeddedLcColorCodeConsistent) {
+        const QString emb128 =
+            frame.emb32[1] +
+            frame.emb32[2] +
+            frame.emb32[3] +
+            frame.emb32[4];
+        const QString lc72 = embeddedLc72HexFromBptcRaw(emb128);
+        qDebug() << "[DMR] voice lc raw"
+                 << "anchorMs" << anchorMs
+                 << "b1" << frame.emb32[1]
+                 << "b2" << frame.emb32[2]
+                 << "b3" << frame.emb32[3]
+                 << "b4" << frame.emb32[4]
+                 << "cc"
+                 << QStringLiteral("%1/%2/%3/%4")
+                        .arg(frame.colorCode[1])
+                        .arg(frame.colorCode[2])
+                        .arg(frame.colorCode[3])
+                        .arg(frame.colorCode[4])
+                 << "qrErrors"
+                 << QStringLiteral("%1/%2/%3/%4")
+                        .arg(frame.correctedErrors[1])
+                        .arg(frame.correctedErrors[2])
+                        .arg(frame.correctedErrors[3])
+                        .arg(frame.correctedErrors[4])
+                 << "timing"
+                 << QStringLiteral("%1/%2/%3/%4")
+                        .arg(frame.timing[1])
+                        .arg(frame.timing[2])
+                        .arg(frame.timing[3])
+                        .arg(frame.timing[4])
+                 << "emb128" << emb128
+                 << "lc72" << lc72;
+        frame.reportedLc = true;
+    } else if (hasEmbeddedLc && !frame.reportedLc) {
+        qDebug() << "[DMR] voice lc candidate rejected"
+                 << "anchorMs" << anchorMs
+                 << "reason" << "mixed color code"
+                 << "cc"
+                 << QStringLiteral("%1/%2/%3/%4")
+                        .arg(frame.colorCode[1])
+                        .arg(frame.colorCode[2])
+                        .arg(frame.colorCode[3])
+                        .arg(frame.colorCode[4])
+                 << "qrErrors"
+                 << QStringLiteral("%1/%2/%3/%4")
+                        .arg(frame.correctedErrors[1])
+                        .arg(frame.correctedErrors[2])
+                        .arg(frame.correctedErrors[3])
+                        .arg(frame.correctedErrors[4])
+                 << "timing"
+                 << QStringLiteral("%1/%2/%3/%4")
+                        .arg(frame.timing[1])
+                        .arg(frame.timing[2])
+                        .arg(frame.timing[3])
+                        .arg(frame.timing[4]);
+        frame.reportedLc = true;
+    }
+
+    while (voiceEmbeddedFrames.size() > 16) {
+        voiceEmbeddedFrames.pop_front();
+    }
+}
+
+void DmrDecoder::recordVoiceLcSequenceFragment(const PendingEmb &pending,
+                                               const EmbInfo &emb,
+                                               const VoiceEmbeddedBits &fragment) {
+    if (!fragment.decoded || emb.colorCode < 0 || emb.lcss < 1 || emb.lcss > 3) {
+        return;
+    }
+
+    const quint64 maxSequenceSpanSamples =
+        static_cast<quint64>(std::lround(0.30 * activeSampleRate));
+    const quint64 minFragmentGapSamples =
+        static_cast<quint64>(std::lround(0.035 * activeSampleRate));
+    const quint64 maxFragmentGapSamples =
+        static_cast<quint64>(std::lround(0.095 * activeSampleRate));
+    voiceLcSequences.erase(
+        std::remove_if(voiceLcSequences.begin(),
+                       voiceLcSequences.end(),
+                       [&](const VoiceLcSequence &sequence) {
+                           return pending.absoluteSample > sequence.startSample + maxSequenceSpanSamples;
+                       }),
+        voiceLcSequences.end());
+
+    const auto storeStage = [&](VoiceLcSequence &sequence, int stage) {
+        sequence.emb32[static_cast<std::size_t>(stage)] = fragment.hex;
+        sequence.burstIndex[static_cast<std::size_t>(stage)] = pending.burstIndex;
+        sequence.correctedErrors[static_cast<std::size_t>(stage)] = emb.correctedErrors;
+        sequence.lcss[static_cast<std::size_t>(stage)] = emb.lcss;
+        sequence.timing[static_cast<std::size_t>(stage)] = emb.timingOffset;
+        sequence.lastSample = pending.absoluteSample;
+    };
+
+    if (emb.lcss == 1) {
+        if (pending.burstIndex != 1) {
+            return;
+        }
+
+        VoiceLcSequence sequence;
+        sequence.colorCode = emb.colorCode;
+        sequence.nextStage = 1;
+        sequence.startSample = pending.absoluteSample;
+        sequence.lastSample = pending.absoluteSample;
+        storeStage(sequence, 0);
+        voiceLcSequences.push_back(sequence);
+        while (voiceLcSequences.size() > 32) {
+            voiceLcSequences.pop_front();
+        }
+        return;
+    }
+
+    bool completedSequence = false;
+    if (emb.lcss == 2 || emb.lcss == 3) {
+        for (auto it = voiceLcSequences.begin(); it != voiceLcSequences.end();) {
+            VoiceLcSequence &sequence = *it;
+            const bool sampleAfterLast = pending.absoluteSample > sequence.lastSample;
+            const quint64 fragmentGap =
+                sampleAfterLast ? pending.absoluteSample - sequence.lastSample : 0;
+            if (sequence.colorCode == emb.colorCode &&
+                sequence.nextStage == 3 &&
+                pending.burstIndex == 4 &&
+                sampleAfterLast &&
+                fragmentGap >= minFragmentGapSamples &&
+                fragmentGap <= maxFragmentGapSamples &&
+                pending.absoluteSample <= sequence.startSample + maxSequenceSpanSamples) {
+                storeStage(sequence, 3);
+                reportVoiceLcSequence(sequence);
+                it = voiceLcSequences.erase(it);
+                completedSequence = true;
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (completedSequence) {
+        return;
+    }
+
+    if (emb.lcss == 3) {
+        for (VoiceLcSequence &sequence : voiceLcSequences) {
+            const int expectedBurst = sequence.nextStage + 1;
+            const bool sampleAfterLast = pending.absoluteSample > sequence.lastSample;
+            const quint64 fragmentGap =
+                sampleAfterLast ? pending.absoluteSample - sequence.lastSample : 0;
+            if (sequence.colorCode != emb.colorCode ||
+                sequence.nextStage < 1 ||
+                sequence.nextStage > 2 ||
+                pending.burstIndex != expectedBurst ||
+                !sampleAfterLast ||
+                fragmentGap < minFragmentGapSamples ||
+                fragmentGap > maxFragmentGapSamples ||
+                pending.absoluteSample > sequence.startSample + maxSequenceSpanSamples) {
+                continue;
+            }
+            storeStage(sequence, sequence.nextStage);
+            ++sequence.nextStage;
+        }
+        return;
+    }
+}
+
+void DmrDecoder::reportVoiceLcSequence(const VoiceLcSequence &sequence) {
+    const QString emb128 =
+        sequence.emb32[0] +
+        sequence.emb32[1] +
+        sequence.emb32[2] +
+        sequence.emb32[3];
+    if (emb128.size() != 32) {
+        return;
+    }
+
+    const QString lc72 = embeddedLc72HexFromBptcRaw(emb128);
+    const double startMs = activeSampleRate > 0
+                               ? static_cast<double>(sequence.startSample) * 1000.0 /
+                                     static_cast<double>(activeSampleRate)
+                               : 0.0;
+    const double spanMs = activeSampleRate > 0
+                              ? static_cast<double>(sequence.lastSample - sequence.startSample) *
+                                    1000.0 / static_cast<double>(activeSampleRate)
+                              : 0.0;
+
+    qDebug() << "[DMR] voice lc stream"
+             << "startMs" << startMs
+             << "spanMs" << spanMs
+             << "cc" << sequence.colorCode
+             << "bursts"
+             << QStringLiteral("%1/%2/%3/%4")
+                    .arg(sequence.burstIndex[0])
+                    .arg(sequence.burstIndex[1])
+                    .arg(sequence.burstIndex[2])
+                    .arg(sequence.burstIndex[3])
+             << "qrErrors"
+             << QStringLiteral("%1/%2/%3/%4")
+                    .arg(sequence.correctedErrors[0])
+                    .arg(sequence.correctedErrors[1])
+                    .arg(sequence.correctedErrors[2])
+                    .arg(sequence.correctedErrors[3])
+             << "lcss"
+             << QStringLiteral("%1/%2/%3/%4")
+                    .arg(sequence.lcss[0])
+                    .arg(sequence.lcss[1])
+                    .arg(sequence.lcss[2])
+                    .arg(sequence.lcss[3])
+             << "timing"
+             << QStringLiteral("%1/%2/%3/%4")
+                    .arg(sequence.timing[0])
+                    .arg(sequence.timing[1])
+                    .arg(sequence.timing[2])
+                    .arg(sequence.timing[3])
+             << "emb128" << emb128
+             << "lc72" << lc72;
+
+    voiceLcRawSinceReport.push_back(emb128);
+    if (voiceLcRawSinceReport.size() > 64) {
+        voiceLcRawSinceReport.erase(voiceLcRawSinceReport.begin());
+    }
+}
+
+DmrDecoder::VoicePayloadBits DmrDecoder::decodeVoicePayloadAt(const PendingEmb &pending,
+                                                              bool inverted,
+                                                              int timingOffset) const {
+    VoicePayloadBits payload;
+    const quint64 bufferStartSample = totalSamples > sampleBuffer.size()
+                                          ? totalSamples - static_cast<quint64>(sampleBuffer.size())
+                                          : 0;
+    if (pending.absoluteSample < bufferStartSample) {
+        return payload;
+    }
+
+    const int centralStartIndex =
+        static_cast<int>(pending.absoluteSample - bufferStartSample);
+    const int sampleOffset = (std::clamp)(samplesPerSymbol / 2 + timingOffset,
+                                          0,
+                                          (std::max)(0, samplesPerSymbol - 1));
+    const int firstPayloadStart = centralStartIndex - DMR_SYMBOLS_BEFORE_SYNC * samplesPerSymbol;
+    const int secondPayloadStart = centralStartIndex + DMR_SYNC_SYMBOLS * samplesPerSymbol;
+    const int lastPayloadSample =
+        secondPayloadStart + (DMR_SYMBOLS_BEFORE_SYNC - 1) * samplesPerSymbol + sampleOffset;
+    if (firstPayloadStart + sampleOffset < 0 ||
+        lastPayloadSample >= static_cast<int>(sampleBuffer.size())) {
+        return payload;
+    }
+
+    const float center = 0.5f * (pending.maxLevel + pending.minLevel);
+    const float thresholdRatio = 0.625f;
+    const float upperMid = center + thresholdRatio * (pending.maxLevel - center);
+    const float lowerMid = center + thresholdRatio * (pending.minLevel - center);
+    const auto sampleToDibit = [&](float sample) -> int {
+        const float corrected = inverted ? -sample : sample;
+        const float correctedCenter = inverted ? -center : center;
+        const float correctedUpper = inverted ? -lowerMid : upperMid;
+        const float correctedLower = inverted ? -upperMid : lowerMid;
+        if (corrected > correctedCenter) {
+            return corrected > correctedUpper ? 3 : 2;
+        }
+        return corrected < correctedLower ? 1 : 0;
+    };
+
+    bool leftBits[DMR_SYMBOLS_BEFORE_SYNC * 2] = {};
+    bool rightBits[DMR_SYMBOLS_BEFORE_SYNC * 2] = {};
+    bool combinedBits[DMR_SYMBOLS_BEFORE_SYNC * 4] = {};
+    for (int i = 0; i < DMR_SYMBOLS_BEFORE_SYNC; ++i) {
+        const int sampleIndex = firstPayloadStart + i * samplesPerSymbol + sampleOffset;
+        const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+        const int dibit = (std::clamp)(sampleToDibit(sample), 0, 3);
+        appendDibitBits(dibit, true, leftBits, i * 2);
+        appendDibitBits(dibit, true, combinedBits, i * 2);
+    }
+    for (int i = 0; i < DMR_SYMBOLS_BEFORE_SYNC; ++i) {
+        const int sampleIndex = secondPayloadStart + i * samplesPerSymbol + sampleOffset;
+        const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+        const int dibit = (std::clamp)(sampleToDibit(sample), 0, 3);
+        appendDibitBits(dibit, true, rightBits, i * 2);
+        appendDibitBits(dibit, true, combinedBits, DMR_SYMBOLS_BEFORE_SYNC * 2 + i * 2);
+    }
+
+    payload.decoded = true;
+    payload.leftHex = bitsToHex(leftBits, DMR_SYMBOLS_BEFORE_SYNC * 2);
+    payload.rightHex = bitsToHex(rightBits, DMR_SYMBOLS_BEFORE_SYNC * 2);
+    payload.combinedHex = bitsToHex(combinedBits, DMR_SYMBOLS_BEFORE_SYNC * 4);
+    return payload;
+}
+
+DmrDecoder::VoiceEmbeddedBits DmrDecoder::decodeVoiceEmbeddedFragmentAt(const PendingEmb &pending,
+                                                                        bool inverted,
+                                                                        int timingOffset) const {
+    VoiceEmbeddedBits fragment;
+    const quint64 bufferStartSample = totalSamples > sampleBuffer.size()
+                                          ? totalSamples - static_cast<quint64>(sampleBuffer.size())
+                                          : 0;
+    if (pending.absoluteSample < bufferStartSample) {
+        return fragment;
+    }
+
+    const int centralStartIndex =
+        static_cast<int>(pending.absoluteSample - bufferStartSample);
+    const int sampleOffset = (std::clamp)(samplesPerSymbol / 2 + timingOffset,
+                                          0,
+                                          (std::max)(0, samplesPerSymbol - 1));
+    const int firstFragmentSymbol = 4;
+    const int fragmentSymbols = 16;
+    const int lastFragmentSample =
+        centralStartIndex + (firstFragmentSymbol + fragmentSymbols - 1) * samplesPerSymbol +
+        sampleOffset;
+    if (centralStartIndex + firstFragmentSymbol * samplesPerSymbol + sampleOffset < 0 ||
+        lastFragmentSample >= static_cast<int>(sampleBuffer.size())) {
+        return fragment;
+    }
+
+    const float center = 0.5f * (pending.maxLevel + pending.minLevel);
+    const float thresholdRatio = 0.625f;
+    const float upperMid = center + thresholdRatio * (pending.maxLevel - center);
+    const float lowerMid = center + thresholdRatio * (pending.minLevel - center);
+    const auto sampleToDibit = [&](float sample) -> int {
+        const float corrected = inverted ? -sample : sample;
+        const float correctedCenter = inverted ? -center : center;
+        const float correctedUpper = inverted ? -lowerMid : upperMid;
+        const float correctedLower = inverted ? -upperMid : lowerMid;
+        if (corrected > correctedCenter) {
+            return corrected > correctedUpper ? 3 : 2;
+        }
+        return corrected < correctedLower ? 1 : 0;
+    };
+
+    bool bits[fragmentSymbols * 2] = {};
+    for (int i = 0; i < fragmentSymbols; ++i) {
+        const int symbol = firstFragmentSymbol + i;
+        const int sampleIndex = centralStartIndex + symbol * samplesPerSymbol + sampleOffset;
+        const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+        const int dibit = (std::clamp)(sampleToDibit(sample), 0, 3);
+        appendDibitBits(dibit, true, bits, i * 2);
+    }
+
+    fragment.decoded = true;
+    fragment.hex = bitsToHex(bits, fragmentSymbols * 2);
+    return fragment;
+}
+
 DmrDecoder::EmbInfo DmrDecoder::decodeVoiceEmbAt(const PendingEmb &pending) const {
     EmbInfo info;
     const quint64 bufferStartSample = totalSamples > sampleBuffer.size()
@@ -1543,13 +2227,13 @@ DmrDecoder::EmbInfo DmrDecoder::decodeVoiceEmbAt(const PendingEmb &pending) cons
     }
 
     const float center = 0.5f * (pending.maxLevel + pending.minLevel);
-    const auto sampleToDibit = [&](float sample, float thresholdRatio) -> int {
+    const auto sampleToDibit = [&](float sample, float thresholdRatio, bool inverted) -> int {
         const float upperMid = center + thresholdRatio * (pending.maxLevel - center);
         const float lowerMid = center + thresholdRatio * (pending.minLevel - center);
-        const float corrected = pending.inverted ? -sample : sample;
-        const float correctedCenter = pending.inverted ? -center : center;
-        const float correctedUpper = pending.inverted ? -lowerMid : upperMid;
-        const float correctedLower = pending.inverted ? -upperMid : lowerMid;
+        const float corrected = inverted ? -sample : sample;
+        const float correctedCenter = inverted ? -center : center;
+        const float correctedUpper = inverted ? -lowerMid : upperMid;
+        const float correctedLower = inverted ? -upperMid : lowerMid;
         if (corrected > correctedCenter) {
             return corrected > correctedUpper ? 3 : 2;
         }
@@ -1561,12 +2245,16 @@ DmrDecoder::EmbInfo DmrDecoder::decodeVoiceEmbAt(const PendingEmb &pending) cons
     int bestVariant = -1;
     int bestTimingOffset = 0;
     int bestTimingDistance = 99;
+    int bestPolarityPenalty = 99;
+    bool bestInverted = pending.inverted;
     int fallbackData = 0;
     int fallbackErrors = 17;
     int fallbackVariant = -1;
     int fallbackTimingOffset = 0;
     int fallbackTimingDistance = 99;
+    int fallbackPolarityPenalty = 99;
     int fallbackVariantPenalty = 99;
+    bool fallbackInverted = pending.inverted;
     const std::array<int, 5> timingOffsets = {
         samplesPerSymbol / 2,
         (std::max)(0, samplesPerSymbol / 2 - 1),
@@ -1575,88 +2263,103 @@ DmrDecoder::EmbInfo DmrDecoder::decodeVoiceEmbAt(const PendingEmb &pending) cons
         (std::min)(samplesPerSymbol - 1, samplesPerSymbol / 2 + 2)
     };
     const std::array<float, 3> slicerRatios = {0.625f, 0.55f, 0.70f};
-    for (int timingOffset : timingOffsets) {
-        const int relativeTimingOffset = timingOffset - samplesPerSymbol / 2;
-        const int timingDistance = std::abs(relativeTimingOffset);
-        for (float slicerRatio : slicerRatios) {
-            bool embRawBits[16] = {};
-            bool inRange = true;
-            for (int i = 0; i < 4; ++i) {
-                const int sampleIndex = centralStartIndex + i * samplesPerSymbol + timingOffset;
-                if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
-                    inRange = false;
-                    break;
+    const std::array<bool, 2> polarityVariants = {pending.inverted, !pending.inverted};
+    for (bool candidateInverted : polarityVariants) {
+        const int polarityPenalty = candidateInverted == pending.inverted ? 0 : 1;
+        for (int timingOffset : timingOffsets) {
+            const int relativeTimingOffset = timingOffset - samplesPerSymbol / 2;
+            const int timingDistance = std::abs(relativeTimingOffset);
+            for (float slicerRatio : slicerRatios) {
+                bool embRawBits[16] = {};
+                bool inRange = true;
+                for (int i = 0; i < 4; ++i) {
+                    const int sampleIndex = centralStartIndex + i * samplesPerSymbol + timingOffset;
+                    if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
+                        inRange = false;
+                        break;
+                    }
+                    const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+                    const int dibit =
+                        (std::clamp)(sampleToDibit(sample, slicerRatio, candidateInverted),
+                                     0,
+                                     3);
+                    appendDibitBits(dibit, true, embRawBits, i * 2);
                 }
-                const int dibit =
-                    (std::clamp)(sampleToDibit(sampleBuffer[static_cast<std::size_t>(sampleIndex)],
-                                               slicerRatio),
-                                 0,
-                                 3);
-                appendDibitBits(dibit, true, embRawBits, i * 2);
-            }
-            if (!inRange) {
-                continue;
-            }
-            for (int i = 0; i < 4; ++i) {
-                const int sampleIndex = centralStartIndex + (20 + i) * samplesPerSymbol + timingOffset;
-                if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
-                    inRange = false;
-                    break;
-                }
-                const int dibit =
-                    (std::clamp)(sampleToDibit(sampleBuffer[static_cast<std::size_t>(sampleIndex)],
-                                               slicerRatio),
-                                 0,
-                                 3);
-                appendDibitBits(dibit, true, embRawBits, 8 + i * 2);
-            }
-            if (!inRange) {
-                continue;
-            }
-
-            std::array<bool, 16> embBits = {};
-            std::copy(std::begin(embRawBits), std::end(embRawBits), embBits.begin());
-
-            for (int variant = 0; variant < DMR_EMB_VARIANT_COUNT; ++variant) {
-                int data = 0;
-                int errors = 0;
-                const std::array<bool, 16> candidateBits = embBitsVariant(embBits, variant);
-                if (!qr1676Decode(candidateBits, data, errors)) {
+                if (!inRange) {
                     continue;
                 }
-                const int variantPenalty = variant == 0 ? 0 : (variant == 1 ? 1 : 2);
-                const bool preferFallback =
-                    errors < fallbackErrors ||
-                    (errors == fallbackErrors && timingDistance < fallbackTimingDistance) ||
-                    (errors == fallbackErrors &&
-                     timingDistance == fallbackTimingDistance &&
-                     variantPenalty < fallbackVariantPenalty);
-                if (preferFallback) {
-                    fallbackErrors = errors;
-                    fallbackData = data;
-                    fallbackVariant = variant;
-                    fallbackTimingOffset = relativeTimingOffset;
-                    fallbackTimingDistance = timingDistance;
-                    fallbackVariantPenalty = variantPenalty;
+                for (int i = 0; i < 4; ++i) {
+                    const int sampleIndex = centralStartIndex + (20 + i) * samplesPerSymbol + timingOffset;
+                    if (sampleIndex < 0 || sampleIndex >= static_cast<int>(sampleBuffer.size())) {
+                        inRange = false;
+                        break;
+                    }
+                    const float sample = averagedSymbolSample(sampleBuffer, sampleIndex, samplesPerSymbol);
+                    const int dibit =
+                        (std::clamp)(sampleToDibit(sample, slicerRatio, candidateInverted),
+                                     0,
+                                     3);
+                    appendDibitBits(dibit, true, embRawBits, 8 + i * 2);
                 }
-                if (variant == 0) {
-                    const bool preferDirect =
+                if (!inRange) {
+                    continue;
+                }
+
+                std::array<bool, 16> embBits = {};
+                std::copy(std::begin(embRawBits), std::end(embRawBits), embBits.begin());
+
+                for (int variant = 0; variant < DMR_EMB_VARIANT_COUNT; ++variant) {
+                    int data = 0;
+                    int errors = 0;
+                    const std::array<bool, 16> candidateBits = embBitsVariant(embBits, variant);
+                    if (!qr1676Decode(candidateBits, data, errors)) {
+                        continue;
+                    }
+                    const int variantPenalty = variant == 0 ? 0 : (variant == 1 ? 1 : 2);
+                    const bool preferFallback =
+                        errors < fallbackErrors ||
+                        (errors == fallbackErrors && timingDistance < fallbackTimingDistance) ||
+                        (errors == fallbackErrors &&
+                         timingDistance == fallbackTimingDistance &&
+                         polarityPenalty < fallbackPolarityPenalty) ||
+                        (errors == fallbackErrors &&
+                         timingDistance == fallbackTimingDistance &&
+                         polarityPenalty == fallbackPolarityPenalty &&
+                         variantPenalty < fallbackVariantPenalty);
+                    if (preferFallback) {
+                        fallbackErrors = errors;
+                        fallbackData = data;
+                        fallbackVariant = variant;
+                        fallbackTimingOffset = relativeTimingOffset;
+                        fallbackTimingDistance = timingDistance;
+                        fallbackPolarityPenalty = polarityPenalty;
+                        fallbackVariantPenalty = variantPenalty;
+                        fallbackInverted = candidateInverted;
+                    }
+                    if (variant == 0) {
+                        const bool preferDirect =
                         errors < bestErrors ||
-                        (errors == bestErrors && timingDistance < bestTimingDistance);
-                    if (preferDirect) {
-                        bestErrors = errors;
-                        bestData = data;
-                        bestVariant = variant;
-                        bestTimingOffset = relativeTimingOffset;
-                        bestTimingDistance = timingDistance;
+                            (errors == bestErrors && timingDistance < bestTimingDistance) ||
+                            (errors == bestErrors &&
+                             timingDistance == bestTimingDistance &&
+                             polarityPenalty < bestPolarityPenalty);
+                        if (preferDirect) {
+                            bestErrors = errors;
+                            bestData = data;
+                            bestVariant = variant;
+                            bestTimingOffset = relativeTimingOffset;
+                            bestTimingDistance = timingDistance;
+                            bestPolarityPenalty = polarityPenalty;
+                            bestInverted = candidateInverted;
+                        }
                     }
                 }
             }
-            if (bestErrors == 0 && bestTimingDistance == 0) {
+            if (bestErrors == 0 && bestTimingDistance == 0 && bestPolarityPenalty == 0) {
                 break;
             }
         }
-        if (bestErrors == 0 && bestTimingDistance == 0) {
+        if (bestErrors == 0 && bestTimingDistance == 0 && bestPolarityPenalty == 0) {
             break;
         }
     }
@@ -1670,12 +2373,16 @@ DmrDecoder::EmbInfo DmrDecoder::decodeVoiceEmbAt(const PendingEmb &pending) cons
         bestVariant = fallbackVariant;
         bestTimingOffset = fallbackTimingOffset;
         bestTimingDistance = fallbackTimingDistance;
+        bestPolarityPenalty = fallbackPolarityPenalty;
+        bestInverted = fallbackInverted;
     } else if (bestErrors > 1 && fallbackVariant >= 0 && fallbackErrors < bestErrors) {
         bestData = fallbackData;
         bestErrors = fallbackErrors;
         bestVariant = fallbackVariant;
         bestTimingOffset = fallbackTimingOffset;
         bestTimingDistance = fallbackTimingDistance;
+        bestPolarityPenalty = fallbackPolarityPenalty;
+        bestInverted = fallbackInverted;
     }
 
     if (bestVariant != 0 && bestErrors < 2) {
@@ -1689,6 +2396,7 @@ DmrDecoder::EmbInfo DmrDecoder::decodeVoiceEmbAt(const PendingEmb &pending) cons
     info.correctedErrors = bestErrors;
     info.variantIndex = bestVariant;
     info.timingOffset = bestTimingOffset;
+    info.inverted = bestInverted;
     return info;
 }
 

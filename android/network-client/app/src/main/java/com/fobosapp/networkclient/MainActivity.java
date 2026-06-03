@@ -41,6 +41,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private static final int LEVEL_DB_MIN = -160;
     private static final int LEVEL_DB_MAX = 0;
     private static final int LEVEL_MIN_GAP_DB = 5;
+    private static final double RF_MIN_CENTER_FREQUENCY = 50_000_000.0;
+    private static final double RF_MIN_LISTENING_FREQUENCY = 25_000_000.0;
+    private static final double RF_EXPERIMENTAL_MAX_FREQUENCY = 7_750_000_000.0;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final RadioSettings settings = new RadioSettings();
@@ -580,8 +583,11 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             settings.centerFrequency =
                     safeDouble(centerEdit.getText().toString(), settings.centerFrequency / 1_000_000.0) *
                             1_000_000.0;
+            settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.centerFrequency));
             settings.actualFrequency = settings.centerFrequency;
-            settings.listeningFrequency = requestedListening;
+            settings.listeningFrequency = Math.max(RF_MIN_LISTENING_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, requestedListening));
         }
         settings.bandwidth = safeDouble(bandwidthEdit.getText().toString(), settings.bandwidth / 1_000.0) * 1_000.0;
         int modulationIndex = modulationSpinner.getSelectedItemPosition();
@@ -950,16 +956,16 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                     settings.sampleRate,
                     settings.listeningFrequency);
         } else {
-            settings.listeningFrequency = Math.max(25_000_000.0,
-                    Math.min(6_000_000_000.0, settings.listeningFrequency));
+            settings.listeningFrequency = Math.max(RF_MIN_LISTENING_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency));
             double halfRate = Math.max(1.0, settings.sampleRate * 0.5);
             if (settings.listeningFrequency < settings.centerFrequency - halfRate) {
-                settings.centerFrequency = Math.max(50_000_000.0,
-                        settings.listeningFrequency + halfRate);
+                settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                        Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency + halfRate));
                 settings.actualFrequency = settings.centerFrequency;
             } else if (settings.listeningFrequency > settings.centerFrequency + halfRate) {
-                settings.centerFrequency = Math.max(50_000_000.0,
-                        settings.listeningFrequency - halfRate);
+                settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                        Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency - halfRate));
                 settings.actualFrequency = settings.centerFrequency;
             }
         }

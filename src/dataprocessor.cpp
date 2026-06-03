@@ -478,8 +478,12 @@ void DataProcessor::run() {
         qDebug() << "[DataProcessor] fobos_rx_read_async end"
                  << "result" << ret
                  << "stoppedByRequest" << stoppedByRequest;
-        if (ret != FOBOS_ERR_OK && !stoppedByRequest) {
-            qDebug() << "Failed to start async read, error code:" << ret;
+        if (!stoppedByRequest) {
+            if (ret == FOBOS_ERR_OK) {
+                qDebug() << "[DataProcessor] async read ended unexpectedly with OK result";
+            } else {
+                qDebug() << "Failed to start async read, error code:" << ret;
+            }
             emit readerFailed(ret, stoppedByRequest);
         } else if (ret != FOBOS_ERR_OK && stoppedByRequest && fobosVerboseLoggingEnabled()) {
             qDebug() << "Async read stopped after cancel, result:" << ret;

@@ -87,8 +87,6 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
                                            AUTO_TUNE_MAX_WINDOW_HZ);
     std::vector<SignalSample> samples;
     samples.reserve(256);
-    std::vector<float> levels;
-    levels.reserve(256);
     for (int i = 0; i < dataCount; ++i) {
         const double sampleFrequency = xData[i];
         if (!std::isfinite(sampleFrequency) || std::abs(sampleFrequency - frequency) > halfWindow) {
@@ -99,7 +97,6 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
             continue;
         }
         samples.push_back({sampleFrequency, level});
-        levels.push_back(level);
     }
     if (samples.empty()) {
         return frequency;
@@ -108,42 +105,80 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
     std::sort(samples.begin(), samples.end(), [](const SignalSample &a, const SignalSample &b) {
         return a.frequency < b.frequency;
     });
-    std::sort(levels.begin(), levels.end());
-    const float baseline = levels[levels.size() / 4];
+
+    const int sampleCount = static_cast<int>(samples.size());
+    const int smoothRadius = (std::clamp)(sampleCount / 160, 1, 6);
+    std::vector<float> smoothedLevels(static_cast<std::size_t>(sampleCount), -160.0f);
+    std::vector<float> sortedSmoothedLevels;
+    sortedSmoothedLevels.reserve(static_cast<std::size_t>(sampleCount));
+    for (int i = 0; i < sampleCount; ++i) {
+        double sum = 0.0;
+        int count = 0;
+        for (int j = (std::max)(0, i - smoothRadius);
+             j <= (std::min)(sampleCount - 1, i + smoothRadius);
+             ++j) {
+            sum += samples[j].level;
+            ++count;
+        }
+        smoothedLevels[static_cast<std::size_t>(i)] =
+            count > 0 ? static_cast<float>(sum / count) : samples[i].level;
+        sortedSmoothedLevels.push_back(smoothedLevels[static_cast<std::size_t>(i)]);
+    }
+    std::sort(sortedSmoothedLevels.begin(), sortedSmoothedLevels.end());
+    const float baseline = sortedSmoothedLevels[sortedSmoothedLevels.size() / 4];
 
     int peakIndex = 0;
-    for (int i = 1; i < static_cast<int>(samples.size()); ++i) {
-        if (samples[i].level > samples[peakIndex].level) {
+    double bestScore = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < sampleCount; ++i) {
+        const double distanceRatio = std::abs(samples[i].frequency - frequency) /
+                                     (std::max)(1.0, halfWindow);
+        const double score = smoothedLevels[static_cast<std::size_t>(i)] - distanceRatio * 8.0;
+        if (score > bestScore) {
+            bestScore = score;
             peakIndex = i;
         }
     }
-    const float peakLevel = samples[peakIndex].level;
+    const float peakLevel = smoothedLevels[static_cast<std::size_t>(peakIndex)];
     const double dynamicRange = (std::max)(0.0, static_cast<double>(peakLevel - baseline));
     if (dynamicRange < 2.0) {
         return samples[peakIndex].frequency;
     }
 
-    const float threshold = baseline + static_cast<float>((std::max)(3.0, dynamicRange * 0.35));
+    const float threshold = (std::max)(baseline + 3.0f,
+                                       peakLevel - static_cast<float>((std::clamp)(dynamicRange * 0.42, 4.0, 10.0)));
     int left = peakIndex;
-    while (left > 0 && samples[left - 1].level >= threshold) {
+    while (left > 0 && smoothedLevels[static_cast<std::size_t>(left - 1)] >= threshold) {
         --left;
     }
     int right = peakIndex;
-    while (right + 1 < static_cast<int>(samples.size()) && samples[right + 1].level >= threshold) {
+    while (right + 1 < sampleCount && smoothedLevels[static_cast<std::size_t>(right + 1)] >= threshold) {
         ++right;
     }
 
-    double weightedFrequency = 0.0;
-    double weightSum = 0.0;
-    for (int i = left; i <= right; ++i) {
-        const double weight = std::pow(10.0, (samples[i].level - threshold) / 20.0);
-        weightedFrequency += samples[i].frequency * weight;
-        weightSum += weight;
-    }
-    if (weightSum <= 0.0 || !std::isfinite(weightedFrequency)) {
+    if (right <= left) {
         return samples[peakIndex].frequency;
     }
-    return weightedFrequency / weightSum;
+
+    auto interpolatedEdge = [&](int inside, int outside) {
+        if (outside < 0 || outside >= sampleCount) {
+            return samples[inside].frequency;
+        }
+        const double insideLevel = smoothedLevels[static_cast<std::size_t>(inside)];
+        const double outsideLevel = smoothedLevels[static_cast<std::size_t>(outside)];
+        const double denom = insideLevel - outsideLevel;
+        if (std::abs(denom) < 0.0001) {
+            return samples[inside].frequency;
+        }
+        const double ratio = (insideLevel - threshold) / denom;
+        return samples[inside].frequency +
+               (samples[outside].frequency - samples[inside].frequency) *
+                   (std::clamp)(ratio, 0.0, 1.0);
+    };
+
+    const double leftFrequency = interpolatedEdge(left, left - 1);
+    const double rightFrequency = interpolatedEdge(right, right + 1);
+    const double centerFrequency = (leftFrequency + rightFrequency) * 0.5;
+    return std::isfinite(centerFrequency) ? centerFrequency : samples[peakIndex].frequency;
 }
 
 void MyWaterfallWidget::ensureLineBuffer() {
