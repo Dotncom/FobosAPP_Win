@@ -528,12 +528,18 @@ int fobos_sdr_set_frequency(struct fobos_sdr_dev_t * dev, double value)
     {
         return result;
     }
-    if (dev->rx_frequency != value)
+    uint64_t freq = (uint64_t)value;
+    result = fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_FREQ, 0, (uint8_t*)&freq, 8);
+    if (result == 8)
     {
-        uint64_t freq = (uint64_t)value;
-        fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_FREQ, 0, (uint8_t*)&freq, 8);
+        dev->rx_frequency = value;
+        return FOBOS_ERR_OK;
     }
-    return result;
+    if (result < 0)
+    {
+        return result;
+    }
+    return FOBOS_ERR_CONTROL;
 }
 //==============================================================================
 int fobos_sdr_start_scan(struct fobos_sdr_dev_t * dev, double *frequencies, unsigned int count)
@@ -670,10 +676,14 @@ int fobos_sdr_set_bandwidth(struct fobos_sdr_dev_t * dev, double value)
     if (dev->rx_bandwidth != value)
     {
         uint64_t val = (uint64_t)value;
-        fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_BW, 0, (uint8_t*)&val, 8);
+        result = fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_BW, 0, (uint8_t*)&val, 8);
+        if (result != 8)
+        {
+            return result < 0 ? result : FOBOS_ERR_CONTROL;
+        }
         dev->rx_bandwidth = value;
     }
-    return result;
+    return FOBOS_ERR_OK;
 }
 //==============================================================================
 int fobos_sdr_set_auto_bandwidth(struct fobos_sdr_dev_t * dev, double value)
@@ -693,10 +703,15 @@ int fobos_sdr_set_auto_bandwidth(struct fobos_sdr_dev_t * dev, double value)
     if (dev->rx_auto_bandwidth != value)
     {
         uint64_t val = (uint64_t)(value*1024.0);
-        fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_AUTOBW, 0, (uint8_t*)&val, 8);
-        dev->rx_bandwidth = value;
+        result = fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_AUTOBW, 0, (uint8_t*)&val, 8);
+        if (result != 8)
+        {
+            return result < 0 ? result : FOBOS_ERR_CONTROL;
+        }
+        dev->rx_auto_bandwidth = value;
+        dev->rx_bandwidth = dev->rx_samplerate * value;
     }
-    return result;
+    return FOBOS_ERR_OK;
 }
 //==============================================================================
 const double fobos30_sample_rates[] =
@@ -768,8 +783,21 @@ int fobos_sdr_set_samplerate(struct fobos_sdr_dev_t * dev, double value)
         return result;
     }
     uint64_t val = (uint64_t)value;
-    fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_SR, 0, (uint8_t*)&val, 8);
-    return result;
+    result = fobos_sdr_ctrl_out(dev, FOBOS_SDR_CMD, CMD_SET_SR, 0, (uint8_t*)&val, 8);
+    if (result == 8)
+    {
+        dev->rx_samplerate = value;
+        if (dev->rx_auto_bandwidth > 0.0)
+        {
+            dev->rx_bandwidth = value * dev->rx_auto_bandwidth;
+        }
+        return FOBOS_ERR_OK;
+    }
+    if (result < 0)
+    {
+        return result;
+    }
+    return FOBOS_ERR_CONTROL;
 }
 //==============================================================================
 int fobos_sdr_set_clk_source(struct fobos_sdr_dev_t * dev, int value)
@@ -1189,6 +1217,9 @@ int fobos_sdr_read_async(struct fobos_sdr_dev_t * dev, fobos_sdr_cb_t cb, void *
     dev->rx_async_status = FOBOS_STARTING;
     dev->rx_async_cancel = 0;
     dev->rx_buff_counter = 0;
+    dev->rx_failures = 0;
+    dev->transfer_errors = 0;
+    dev->dev_lost = 0;
     dev->rx_cb = cb;
     dev->rx_cb_usrer = user;
     dev->rx_avg_re = 0.0f;
@@ -1223,8 +1254,22 @@ int fobos_sdr_read_async(struct fobos_sdr_dev_t * dev, fobos_sdr_cb_t cb, void *
     }
 
     dev->rx_buff = (float*)malloc(buf_length * 2 * sizeof(float));
+    if (!dev->rx_buff)
+    {
+        fobos_sdr_free_buffers(dev);
+        dev->rx_async_status = FOBOS_IDDLE;
+        return FOBOS_ERR_NO_MEM;
+    }
 
-    fobos_sdr_fx3_cmd(dev, FOBOS_SDR_CMD, CMD_START, dev->packs_per_transfer);
+    result = fobos_sdr_fx3_cmd(dev, FOBOS_SDR_CMD, CMD_START, dev->packs_per_transfer);
+    if (result != FOBOS_ERR_OK)
+    {
+        fobos_sdr_free_buffers(dev);
+        free(dev->rx_buff);
+        dev->rx_buff = NULL;
+        dev->rx_async_status = FOBOS_IDDLE;
+        return result < 0 ? result : FOBOS_ERR_CONTROL;
+    }
 
     for (i = 0; i < dev->transfers_count; ++i)
     {
@@ -1304,6 +1349,8 @@ int fobos_sdr_read_async(struct fobos_sdr_dev_t * dev, fobos_sdr_cb_t cb, void *
     fobos_sdr_free_buffers(dev);
     free(dev->rx_buff);
     dev->rx_buff = NULL;
+    dev->rx_cb = NULL;
+    dev->rx_cb_usrer = NULL;
     dev->rx_async_status = FOBOS_IDDLE;
     dev->rx_async_cancel = 0;
     return result;

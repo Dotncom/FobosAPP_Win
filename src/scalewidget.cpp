@@ -1,5 +1,8 @@
 #include "scalewidget.h"
 
+#include <algorithm>
+#include <cmath>
+
 ScaleWidget::ScaleWidget(QWidget *parent)
     : QWidget(parent),
       minValue(0),
@@ -14,9 +17,20 @@ void ScaleWidget::setRange(double min, double max) {
     minValue = min;
     maxValue = max;
     if (maxValue > minValue) {
-        setMarkerPosition((listeningValue - minValue) / (maxValue - minValue));
+        const double displayListening = displayFrequencyForActualFrequency(listeningValue);
+        setMarkerPosition((displayListening - minValue) / (maxValue - minValue));
     }
     update();  
+}
+
+void ScaleWidget::setScanSegments(const QVector<ScanVisualSegment> &segments) {
+    scanSegments = segments;
+    if (maxValue > minValue) {
+        const double displayListening = displayFrequencyForActualFrequency(listeningValue);
+        setMarkerPosition((displayListening - minValue) / (maxValue - minValue));
+    } else {
+        update();
+    }
 }
 
 void ScaleWidget::setMarkerPosition(double position) {
@@ -34,7 +48,8 @@ void ScaleWidget::setTuning(double listeningFrequency, double centerFrequency, d
     bandwidthValue = bandwidth;
     modulationTypeValue = modulationType;
     if (maxValue > minValue) {
-        setMarkerPosition((listeningValue - minValue) / (maxValue - minValue));
+        const double displayListening = displayFrequencyForActualFrequency(listeningValue);
+        setMarkerPosition((displayListening - minValue) / (maxValue - minValue));
     } else {
         update();
     }
@@ -61,11 +76,11 @@ void ScaleWidget::mousePressEvent(QMouseEvent *event) {
     if (event->button() == Qt::LeftButton) {
         double newMarkerPos = static_cast<double>(event->x()) / width();
         setMarkerPosition(newMarkerPos);
-        listeningValue = minValue + markerPosition * (maxValue - minValue);
+        listeningValue = actualFrequencyForDisplayFrequency(displayFrequencyAtPosition(markerPosition));
         emit frequencyChanged(); 
     } else if (event->button() == Qt::RightButton) {
 		double newMPos = static_cast<double>(event->x()) / width();
-        centerValue = minValue + qBound(0.0, newMPos, 1.0) * (maxValue - minValue);
+        centerValue = actualFrequencyForDisplayFrequency(displayFrequencyAtPosition(qBound(0.0, newMPos, 1.0)));
         emit centralFrequencyChanged();
         dragging = true;
         lastMouseX = event->x();
@@ -113,7 +128,8 @@ void ScaleWidget::wheelEvent(QWheelEvent *event) {
     }
 
     listeningValue = proposedListening;
-    setMarkerPosition((listeningValue - minValue) / (maxValue - minValue));
+    const double displayListening = displayFrequencyForActualFrequency(listeningValue);
+    setMarkerPosition((displayListening - minValue) / (maxValue - minValue));
     if (shiftedCenter) {
         emit tuningChanged(listeningValue, centerValue);
     } else {
@@ -121,6 +137,47 @@ void ScaleWidget::wheelEvent(QWheelEvent *event) {
     }
 }
 
+
+double ScaleWidget::displayFrequencyAtPosition(double position) const {
+    return minValue + qBound(0.0, position, 1.0) * (maxValue - minValue);
+}
+
+double ScaleWidget::actualFrequencyForDisplayFrequency(double displayFrequency) const {
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            displayFrequency < segment.startHz ||
+            displayFrequency > segment.endHz) {
+            continue;
+        }
+        const double ratio = (displayFrequency - segment.startHz) / (segment.endHz - segment.startHz);
+        return segment.actualStartHz +
+               std::clamp(ratio, 0.0, 1.0) * (segment.actualEndHz - segment.actualStartHz);
+    }
+    return displayFrequency;
+}
+
+double ScaleWidget::displayFrequencyForActualFrequency(double actualFrequency) const {
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            segment.actualEndHz <= segment.actualStartHz ||
+            actualFrequency < segment.actualStartHz ||
+            actualFrequency > segment.actualEndHz) {
+            continue;
+        }
+        const double ratio = (actualFrequency - segment.actualStartHz) /
+                             (segment.actualEndHz - segment.actualStartHz);
+        return segment.startHz + std::clamp(ratio, 0.0, 1.0) * (segment.endHz - segment.startHz);
+    }
+    return actualFrequency;
+}
 
 void ScaleWidget::paintEvent(QPaintEvent *event) {
     QPainter painter(this);
@@ -134,12 +191,31 @@ void ScaleWidget::paintEvent(QPaintEvent *event) {
     for (int i = 0; i <= numTicks; ++i) {
         double value = minValue + i * (maxValue - minValue) / numTicks;
         double pos = static_cast<double>(i) / numTicks * width;
-        QString label = QString::number(value / 1e6, 'f', 3) + " MHz";
+        const double labelFrequency = actualFrequencyForDisplayFrequency(value);
+        QString label = labelFrequency >= 1000000000.0
+                            ? QString::number(labelFrequency / 1e9, 'f', 3) + " GHz"
+                            : QString::number(labelFrequency / 1e6, 'f', 3) + " MHz";
         painter.drawText(pos - 20, height - 5, label);
         painter.drawLine(pos, height / 2 - 10, pos, height / 2 + 10);
             for (int j = 1; j <= numMinorTicks; ++j) {
             double minorPos = pos + j * width / (numTicks * (numMinorTicks + 1));
             painter.drawLine(minorPos, height / 2 - 3, minorPos, height / 2 + 3);
+        }
+    }
+    if (!scanSegments.isEmpty() && maxValue > minValue) {
+        QPen segmentPen(QColor(120, 175, 235, 170));
+        painter.setPen(segmentPen);
+        for (const ScanVisualSegment &segment : scanSegments) {
+            if (!std::isfinite(segment.startHz) || !std::isfinite(segment.endHz)) {
+                continue;
+            }
+            const int left = static_cast<int>(std::round((segment.startHz - minValue) * width / (maxValue - minValue)));
+            const int right = static_cast<int>(std::round((segment.endHz - minValue) * width / (maxValue - minValue)));
+            if (right < 0 || left > width || right <= left) {
+                continue;
+            }
+            painter.drawLine(left, 0, left, height);
+            painter.drawLine(right, 0, right, height);
         }
     }
     int markerX = static_cast<int>(markerPosition * width);

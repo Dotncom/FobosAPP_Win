@@ -62,12 +62,53 @@ void MyWaterfallWidget::mouseDoubleClickEvent(QMouseEvent *event) {
     QOpenGLWidget::mouseDoubleClickEvent(event);
 }
 
-double MyWaterfallWidget::frequencyAtX(int x) const {
+double MyWaterfallWidget::displayFrequencyAtX(int x) const {
     if (width() <= 0 || qFuzzyCompare(xMin, xMax)) {
         return xMin;
     }
     const double normalized = std::clamp(static_cast<double>(x) / (std::max)(1, width()), 0.0, 1.0);
     return xMin + normalized * (xMax - xMin);
+}
+
+double MyWaterfallWidget::actualFrequencyForDisplayFrequency(double displayFrequency) const {
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            displayFrequency < segment.startHz ||
+            displayFrequency > segment.endHz) {
+            continue;
+        }
+        const double ratio = (displayFrequency - segment.startHz) / (segment.endHz - segment.startHz);
+        return segment.actualStartHz +
+               std::clamp(ratio, 0.0, 1.0) * (segment.actualEndHz - segment.actualStartHz);
+    }
+    return displayFrequency;
+}
+
+double MyWaterfallWidget::displayFrequencyForActualFrequency(double actualFrequency) const {
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            segment.actualEndHz <= segment.actualStartHz ||
+            actualFrequency < segment.actualStartHz ||
+            actualFrequency > segment.actualEndHz) {
+            continue;
+        }
+        const double ratio = (actualFrequency - segment.actualStartHz) /
+                             (segment.actualEndHz - segment.actualStartHz);
+        return segment.startHz + std::clamp(ratio, 0.0, 1.0) * (segment.endHz - segment.startHz);
+    }
+    return actualFrequency;
+}
+
+double MyWaterfallWidget::frequencyAtX(int x) const {
+    return actualFrequencyForDisplayFrequency(displayFrequencyAtX(x));
 }
 
 double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
@@ -81,6 +122,7 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
         return frequency;
     }
 
+    const double targetDisplayFrequency = displayFrequencyForActualFrequency(frequency);
     const double visibleSpan = std::abs(xMax - xMin);
     const double halfWindow = (std::clamp)(visibleSpan * AUTO_TUNE_WINDOW_FRACTION,
                                            AUTO_TUNE_MIN_WINDOW_HZ,
@@ -89,7 +131,8 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
     samples.reserve(256);
     for (int i = 0; i < dataCount; ++i) {
         const double sampleFrequency = xData[i];
-        if (!std::isfinite(sampleFrequency) || std::abs(sampleFrequency - frequency) > halfWindow) {
+        if (!std::isfinite(sampleFrequency) ||
+            std::abs(sampleFrequency - targetDisplayFrequency) > halfWindow) {
             continue;
         }
         const float level = yData[(i + dataCount / 2) % dataCount];
@@ -130,7 +173,7 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
     int peakIndex = 0;
     double bestScore = -std::numeric_limits<double>::infinity();
     for (int i = 0; i < sampleCount; ++i) {
-        const double distanceRatio = std::abs(samples[i].frequency - frequency) /
+        const double distanceRatio = std::abs(samples[i].frequency - targetDisplayFrequency) /
                                      (std::max)(1.0, halfWindow);
         const double score = smoothedLevels[static_cast<std::size_t>(i)] - distanceRatio * 8.0;
         if (score > bestScore) {
@@ -178,7 +221,10 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
     const double leftFrequency = interpolatedEdge(left, left - 1);
     const double rightFrequency = interpolatedEdge(right, right + 1);
     const double centerFrequency = (leftFrequency + rightFrequency) * 0.5;
-    return std::isfinite(centerFrequency) ? centerFrequency : samples[peakIndex].frequency;
+    const double actualCenterFrequency = actualFrequencyForDisplayFrequency(centerFrequency);
+    return std::isfinite(actualCenterFrequency)
+               ? actualCenterFrequency
+               : actualFrequencyForDisplayFrequency(samples[peakIndex].frequency);
 }
 
 void MyWaterfallWidget::ensureLineBuffer() {
@@ -327,6 +373,14 @@ void MyWaterfallWidget::setLevelRange(float minLevel, float maxLevel) {
     computeLineData();
 }
 
+void MyWaterfallWidget::setScanSegments(const QVector<ScanVisualSegment> &segments) {
+    {
+        QMutexLocker locker(&mutex);
+        scanSegments = segments;
+    }
+    update();
+}
+
 void MyWaterfallWidget::clearData() {
     {
         QMutexLocker locker(&mutex);
@@ -415,79 +469,109 @@ void MyWaterfallWidget::computeLineData() {
 
 void MyWaterfallWidget::paintGL() {
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    QMutexLocker locker(&mutex);
-    if (width() <= 0 || height() <= 0) {
-        return;
-    }
+    {
+        QMutexLocker locker(&mutex);
+        if (width() <= 0 || height() <= 0) {
+            return;
+        }
 
-    if (textureClearRequested) {
+        if (textureClearRequested) {
+            ensureLineBuffer();
+            std::fill(lineData.begin(), lineData.end(), 0);
+            resetWaterfallTexture(width(), height());
+            pendingTextureLine = false;
+            textureClearRequested = false;
+        }
+
+	    if (secondGraph == true) {
+        if (qFuzzyCompare(xMin, xMax)) {
+            return;
+        }
+	    //additional color graph
+	    glViewport(0, 0, width(), height());
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(xMin, xMax, 0, height(), -1, 1);
+
+        glColor3f(1.0f, 1.0f, 1.0f);
+	    glBegin(GL_LINE_STRIP);
+        const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
+	    for (int i = 0; i < dataCount; ++i) {
+        if (!std::isfinite(xData[i])) {
+            continue;
+        }
+        float intensityS = yData[(i + dataCount / 2) % dataCount];
+        if (!std::isfinite(intensityS)) {
+            intensityS = 0.0f;
+        }
+        QColor colors = valueToColors(normalizedLevel(intensityS));
+        glColor3f(colors.redF(), colors.greenF(), colors.blueF());
+        float yPos = normalizedLevel(intensityS) * (height() * 3 / 4);
+        glVertex2f(xData[i], yPos);
+	    }
+	    glEnd();
+	    } else {
+        //waterfall
+
+        glViewport(0, 0, width(), height());
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, width(), 0, height(), -1, 1);
+
+	    glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, waterfallTexture);
+        glColor3f(1.0f, 1.0f, 1.0f);
+
         ensureLineBuffer();
-        std::fill(lineData.begin(), lineData.end(), 0);
-        resetWaterfallTexture(width(), height());
-        pendingTextureLine = false;
-        textureClearRequested = false;
+        const int texWidth = std::max(1, width());
+        const int texHeight = std::max(1, height());
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        if (texWidth != textureWidth || texHeight != textureHeight) {
+            resizeWaterfallTexturePreserve(texWidth, texHeight);
+        }
+        if (pendingTextureLine && !lineData.empty()) {
+            waterfallWriteRow = (waterfallWriteRow + textureHeight - 1) % textureHeight;
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, waterfallWriteRow, textureWidth, 1, GL_RGB, GL_UNSIGNED_BYTE, lineData.data());
+            pendingTextureLine = false;
+        }
+        const float vStart = static_cast<float>(waterfallWriteRow) / static_cast<float>(textureHeight);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0.0f, vStart + 1.0f); glVertex2f(0, 0);
+        glTexCoord2f(1.0f, vStart + 1.0f); glVertex2f(width(), 0);
+        glTexCoord2f(1.0f, vStart); glVertex2f(width(), height());
+        glTexCoord2f(0.0f, vStart); glVertex2f(0, height());
+            glEnd();
+            glBindTexture(GL_TEXTURE_2D, 0);
+	    }
     }
+    QPainter painter(this);
+    drawScanSegments(painter);
+}
 
-	if (secondGraph == true) {
-    if (qFuzzyCompare(xMin, xMax)) {
+void MyWaterfallWidget::drawScanSegments(QPainter &painter) const {
+    QMutexLocker locker(&mutex);
+    if (scanSegments.size() < 2 || width() <= 0 || height() <= 0 || qFuzzyCompare(xMin, xMax)) {
         return;
     }
-	//additional color graph
-	glViewport(0, 0, width(), height());
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(xMin, xMax, 0, height(), -1, 1);
 
-    glColor3f(1.0f, 1.0f, 1.0f);
-	glBegin(GL_LINE_STRIP);
-    const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
-	for (int i = 0; i < dataCount; ++i) {
-    if (!std::isfinite(xData[i])) {
-        continue;
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    QPen edgePen(QColor(255, 255, 255, 42));
+    edgePen.setWidth(1);
+    painter.setPen(edgePen);
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) || !std::isfinite(segment.endHz)) {
+            continue;
+        }
+        const int left = static_cast<int>(std::round((segment.startHz - xMin) * width() / (xMax - xMin)));
+        const int right = static_cast<int>(std::round((segment.endHz - xMin) * width() / (xMax - xMin)));
+        if (right < 0 || left > width() || right <= left) {
+            continue;
+        }
+        painter.drawLine(left, 0, left, height());
+        painter.drawLine(right, 0, right, height());
     }
-    float intensityS = yData[(i + dataCount / 2) % dataCount];
-    if (!std::isfinite(intensityS)) {
-        intensityS = 0.0f;
-    }
-    QColor colors = valueToColors(normalizedLevel(intensityS));
-    glColor3f(colors.redF(), colors.greenF(), colors.blueF());
-    float yPos = normalizedLevel(intensityS) * (height() * 3 / 4);
-    glVertex2f(xData[i], yPos); 
-	}
-	glEnd();
-	} else {
-    //waterfall
-  
-    glViewport(0, 0, width(), height());
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0, width(), 0, height(), -1, 1);
-   
-	glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, waterfallTexture);
-    glColor3f(1.0f, 1.0f, 1.0f);
-    
-    ensureLineBuffer();
-    const int texWidth = std::max(1, width());
-    const int texHeight = std::max(1, height());
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (texWidth != textureWidth || texHeight != textureHeight) {
-        resizeWaterfallTexturePreserve(texWidth, texHeight);
-    }
-    if (pendingTextureLine && !lineData.empty()) {
-        waterfallWriteRow = (waterfallWriteRow + textureHeight - 1) % textureHeight;
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, waterfallWriteRow, textureWidth, 1, GL_RGB, GL_UNSIGNED_BYTE, lineData.data());
-        pendingTextureLine = false;
-    }
-    const float vStart = static_cast<float>(waterfallWriteRow) / static_cast<float>(textureHeight);
-    glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, vStart + 1.0f); glVertex2f(0, 0);
-    glTexCoord2f(1.0f, vStart + 1.0f); glVertex2f(width(), 0);
-    glTexCoord2f(1.0f, vStart); glVertex2f(width(), height());
-    glTexCoord2f(0.0f, vStart); glVertex2f(0, height());
-        glEnd();
-        glBindTexture(GL_TEXTURE_2D, 0);
-	}
+    painter.restore();
 }
 
 QColor MyWaterfallWidget::valueToColor(float value, float contrastFactor, float sensitivityFactor) {

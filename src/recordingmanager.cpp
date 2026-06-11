@@ -74,13 +74,13 @@ bool RecordingManager::start(Mode mode, const RadioSettings &settings, QString *
         }
         updateStatus(QStringLiteral("Recording audio: %1%2")
                          .arg(QFileInfo(filePath).fileName(),
-                              labMetadata.isEmpty() ? QString() : QStringLiteral(" + lab JSON")));
+                              labMetadata.isEmpty() ? QString() : QStringLiteral(" + metadata JSON")));
         return true;
     }
 
     filePath = makeRecordingPath(QStringLiteral("channel_iq.wav"));
     updateStatus(QStringLiteral("Recording channel IQ: waiting for IQ frames%1")
-                     .arg(labMetadata.isEmpty() ? QString() : QStringLiteral(" + lab JSON")));
+                     .arg(labMetadata.isEmpty() ? QString() : QStringLiteral(" + metadata JSON")));
     return true;
 }
 

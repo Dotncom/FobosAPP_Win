@@ -26,9 +26,22 @@ constexpr int NETWORK_CHANNEL_FRAME_SAMPLES = 8192;
 constexpr float NETWORK_IQ_QUANTIZE_GAIN = 1.0f;
 constexpr float NETWORK_CHANNEL_IQ_TARGET_LEVEL = 0.45f;
 constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
+constexpr double SAMPLE_RATE_DIAGNOSTIC_RELATIVE_WARN = 0.03;
+constexpr int SAMPLE_RATE_DIAGNOSTIC_INITIAL_REPORTS = 4;
+constexpr int DMR_CHANNEL_CIC_STAGES = 2;
 
 double clampDouble(double value, double low, double high) {
     return (std::max)(low, (std::min)(value, high));
+}
+
+bool shouldReportMeasuredSampleRate(double configuredRate, double measuredRate, int reportCount) {
+    if (!std::isfinite(configuredRate) || configuredRate <= 0.0 ||
+        !std::isfinite(measuredRate) || measuredRate <= 0.0) {
+        return false;
+    }
+    const double relativeError = std::abs(measuredRate - configuredRate) / configuredRate;
+    return reportCount < SAMPLE_RATE_DIAGNOSTIC_INITIAL_REPORTS ||
+           relativeError >= SAMPLE_RATE_DIAGNOSTIC_RELATIVE_WARN;
 }
 
 double networkChannelTargetRate(const RadioSettings &settings) {
@@ -41,6 +54,10 @@ double networkChannelTargetRate(const RadioSettings &settings) {
     case MOD_RTTY:
     case MOD_FSK:
         return clampDouble((std::max)(240000.0, settings.bandwidth * 4.0), 240000.0, 384000.0);
+    case MOD_DMR:
+        return (std::max)(192000.0,
+                          static_cast<double>(
+                              normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate)));
     case MOD_CW:
     case MOD_USB:
     case MOD_LSB:
@@ -67,6 +84,9 @@ double networkChannelCutoff(const RadioSettings &settings, double outputRate) {
     case MOD_RTTY:
     case MOD_FSK:
         requestedCutoff = (std::max)(12000.0, settings.bandwidth * 0.6);
+        break;
+    case MOD_DMR:
+        requestedCutoff = (std::min)(9500.0, (std::max)(6000.0, settings.bandwidth * 0.75));
         break;
     case MOD_USB:
     case MOD_LSB:
@@ -326,6 +346,7 @@ DataProcessor::DataProcessor(QObject *parent)
       activeSyncMode(false),
       requestedSyncMode(false),
       requestedQueueAudioBlocks(false),
+      requestedPublishIqSnapshot(false),
       requestedEmitIqFrames(false),
       requestedChannelizeIqFrames(false),
       requestedAgileScanEnabled(false),
@@ -346,6 +367,7 @@ void DataProcessor::startProcessing(void *device,
                                     bool syncEnabled,
                                     double sampleRate,
                                     bool queueAudioBlocks,
+                                    bool publishIqSnapshot,
                                     bool emitIqFrames,
                                     bool agileScanEnabled) {
     if (fobosVerboseLoggingEnabled()) {
@@ -355,6 +377,7 @@ void DataProcessor::startProcessing(void *device,
                  << "syncEnabled" << syncEnabled
                  << "sampleRate" << sampleRate
                  << "queueAudioBlocks" << queueAudioBlocks
+                 << "publishIqSnapshot" << publishIqSnapshot
                  << "emitIqFrames" << emitIqFrames
                  << "agileScanEnabled" << agileScanEnabled
                  << "threadRunning" << QThread::isRunning()
@@ -373,12 +396,14 @@ void DataProcessor::startProcessing(void *device,
     activeApiKind = apiKind;
     requestedSampleRate = sampleRate;
     requestedQueueAudioBlocks = queueAudioBlocks;
+    requestedPublishIqSnapshot = publishIqSnapshot;
     requestedEmitIqFrames = emitIqFrames;
     requestedAgileScanEnabled = agileScanEnabled;
     networkIqResetRequested = true;
     requestedSyncMode = useSyncReader;
     activeSyncMode = useSyncReader;
     totalCallbackCounter = 0;
+    asyncRateReportCount = 0;
     if (FORCE_SYNC_READER) {
         qDebug() << "Using SDR++-style sync Fobos reader for sample rate:" << sampleRate;
     } else if (fobosVerboseLoggingEnabled()) {
@@ -414,6 +439,7 @@ void DataProcessor::run() {
                  << "runningFlag" << running.load()
                  << "requestedSyncMode" << requestedSyncMode.load()
                  << "queueAudioBlocks" << requestedQueueAudioBlocks.load()
+                 << "publishIqSnapshot" << requestedPublishIqSnapshot.load()
                  << "emitIqFrames" << requestedEmitIqFrames.load()
                  << "agileScanEnabled" << requestedAgileScanEnabled.load()
                  << "requestedSampleRate" << requestedSampleRate.load();
@@ -423,7 +449,9 @@ void DataProcessor::run() {
         running = false;
         return;
     }
-    IqBuffer::clear();
+    if (requestedQueueAudioBlocks.load() || requestedPublishIqSnapshot.load()) {
+        IqBuffer::clear();
+    }
     const bool useSyncReader = FORCE_SYNC_READER || requestedSyncMode.load();
     const double sampleRate = requestedSampleRate.load();
     uint32_t readBlockSamples = useSyncReader
@@ -432,7 +460,15 @@ void DataProcessor::run() {
     if (readerApiKind == FobosApiKind::Agile && requestedAgileScanEnabled.load()) {
         readBlockSamples = (std::max)(readBlockSamples, MIN_SYNC_BLOCK_SAMPLES);
     }
-    const uint32_t asyncBufferCount = asyncBufferCountForRate(sampleRate);
+    uint32_t asyncBufferCount = asyncBufferCountForRate(sampleRate);
+    if (!useSyncReader &&
+        readerApiKind == FobosApiKind::Agile &&
+        !requestedAgileScanEnabled.load()) {
+        // uSDR keeps the agile normal-RF reader on fixed async parameters.
+        // Matching that avoids unnecessary USB transfer topology changes.
+        readBlockSamples = 65536;
+        asyncBufferCount = 32;
+    }
     activeSyncMode = useSyncReader;
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] selected reader"
@@ -521,6 +557,7 @@ void DataProcessor::run() {
         qint64 accumulatedReadMs = 0;
         qint64 accumulatedPublishMs = 0;
         uint64_t readCounter = 0;
+        int syncRateReportCount = 0;
         while (running.load()) {
             uint32_t actual_buf_length = 0;
             const bool logRead = readCounter < 5 || (readCounter % 400) == 0;
@@ -560,7 +597,11 @@ void DataProcessor::run() {
                 );
             QElapsedTimer publishTimer;
             publishTimer.start();
-            IqBuffer::publish(syncBuffer.data(), floatCount, requestedQueueAudioBlocks.load());
+            const bool queueAudioBlocks = requestedQueueAudioBlocks.load();
+            const bool publishIqSnapshot = requestedPublishIqSnapshot.load();
+            if (queueAudioBlocks || publishIqSnapshot) {
+                IqBuffer::publish(syncBuffer.data(), floatCount, queueAudioBlocks, publishIqSnapshot);
+            }
             if (requestedEmitIqFrames.load()) {
                 emitIqFrame(syncBuffer.data(), floatCount);
             }
@@ -577,6 +618,21 @@ void DataProcessor::run() {
                                                 ? static_cast<double>(accumulatedPublishMs) / static_cast<double>(measuredReads)
                                                 : 0.0;
                 IqBuffer::setSampleRateEstimate(measuredRate);
+                if (shouldReportMeasuredSampleRate(sampleRate, measuredRate, syncRateReportCount)) {
+                    const double errorPercent =
+                        sampleRate > 0.0
+                            ? ((measuredRate - sampleRate) / sampleRate) * 100.0
+                            : 0.0;
+                    qDebug() << "[DataProcessor] sync sample-rate check"
+                             << "configured" << sampleRate
+                             << "measured" << measuredRate
+                             << "errorPercent" << errorPercent
+                             << "elapsedMs" << elapsedMs
+                             << "readCounter" << readCounter
+                             << "avgReadMs" << avgReadMs
+                             << "avgPublishMs" << avgPublishMs;
+                    ++syncRateReportCount;
+                }
                 if (fobosVerboseLoggingEnabled()) {
                     qDebug() << "[DataProcessor] sync measured sample rate"
                              << "configured" << sampleRate
@@ -604,9 +660,14 @@ void DataProcessor::handleData(float *buf, uint32_t buf_length) {
         return;
     }
     ++totalCallbackCounter;
-    IqBuffer::publish(buf,
-                      static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE,
-                      requestedQueueAudioBlocks.load());
+    const bool queueAudioBlocks = requestedQueueAudioBlocks.load();
+    const bool publishIqSnapshot = requestedPublishIqSnapshot.load();
+    if (queueAudioBlocks || publishIqSnapshot) {
+        IqBuffer::publish(buf,
+                          static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE,
+                          queueAudioBlocks,
+                          publishIqSnapshot);
+    }
     if (requestedEmitIqFrames.load()) {
         emitIqFrame(buf, static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE);
     }
@@ -617,6 +678,21 @@ void DataProcessor::handleData(float *buf, uint32_t buf_length) {
         const double measuredRate = static_cast<double>(asyncMeasuredSamples) * 1000.0 /
                                     static_cast<double>((std::max)(qint64(1), elapsedMs));
         IqBuffer::setSampleRateEstimate(measuredRate);
+        const double configuredRate = requestedSampleRate.load();
+        if (shouldReportMeasuredSampleRate(configuredRate, measuredRate, asyncRateReportCount)) {
+            const double errorPercent =
+                configuredRate > 0.0
+                    ? ((measuredRate - configuredRate) / configuredRate) * 100.0
+                    : 0.0;
+            qDebug() << "[DataProcessor] async sample-rate check"
+                     << "configured" << configuredRate
+                     << "measured" << measuredRate
+                     << "errorPercent" << errorPercent
+                     << "elapsedMs" << elapsedMs
+                     << "callbackCounter" << asyncCallbackCounter
+                     << "blockSamples" << buf_length;
+            ++asyncRateReportCount;
+        }
         if (fobosVerboseLoggingEnabled()) {
             qDebug() << "[DataProcessor] async measured sample rate"
                      << "configured" << requestedSampleRate.load()
@@ -650,6 +726,15 @@ void DataProcessor::resetNetworkIqState() {
     networkIqDecimationSum = std::complex<float>(0.0f, 0.0f);
     networkIqDecimationCount = 0;
     networkIqLowPassState = std::complex<float>(0.0f, 0.0f);
+    networkIqPreLowPassStates.fill(std::complex<float>(0.0f, 0.0f));
+    for (auto &buffer : networkIqCicBuffers) {
+        buffer.clear();
+    }
+    networkIqCicSums.fill(std::complex<float>(0.0f, 0.0f));
+    networkIqCicIndex = 0;
+    networkIqCicLength = 0;
+    networkIqLastLoggedDmrOutputRate = 0;
+    networkIqLastLoggedDmrDecimationFactor = 0;
     networkIqAgcLevel = 0.01f;
     networkHfNoiseCancelCoeff = {0.0f, 0.0f};
     networkHfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
@@ -711,6 +796,42 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
         0.000001,
         1.0
         ));
+    const bool dmrChannelMode = settings.modulationType == MOD_DMR;
+    if (dmrChannelMode &&
+        (networkIqLastLoggedDmrOutputRate != static_cast<int>(std::lround(outputRate)) ||
+         networkIqLastLoggedDmrDecimationFactor != decimationFactor)) {
+        networkIqLastLoggedDmrOutputRate = static_cast<int>(std::lround(outputRate));
+        networkIqLastLoggedDmrDecimationFactor = decimationFactor;
+        qDebug() << "[DMR channel IQ] channelizer"
+                 << "inputRate" << inputRate
+                 << "targetRate" << targetRate
+                 << "outputRate" << outputRate
+                 << "decimation" << decimationFactor
+                 << "requested4fskRate"
+                 << normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate)
+                 << "cicStages" << DMR_CHANNEL_CIC_STAGES
+                 << "cutoffHz" << cutoff;
+    }
+    const float preLowPassAlpha = static_cast<float>((std::clamp)(
+        1.0 - std::exp(-TWO_PI * cutoff / inputRate),
+        0.000001,
+        1.0
+        ));
+    if (dmrChannelMode && networkIqCicLength != decimationFactor) {
+        for (auto &buffer : networkIqCicBuffers) {
+            buffer.assign(static_cast<std::size_t>(decimationFactor),
+                          std::complex<float>(0.0f, 0.0f));
+        }
+        networkIqCicSums.fill(std::complex<float>(0.0f, 0.0f));
+        networkIqCicIndex = 0;
+        networkIqCicLength = decimationFactor;
+        networkIqDecimationSum = std::complex<float>(0.0f, 0.0f);
+        networkIqDecimationCount = 0;
+    }
+    const float cicInvLength = dmrChannelMode
+                                   ? 1.0f / static_cast<float>(
+                                         (std::max)(1, networkIqCicLength))
+                                   : 1.0f;
 
     if (std::abs(networkIqFrameSampleRate - outputRate) > 0.5) {
         networkIqFrameBuffer.clear();
@@ -719,14 +840,22 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
 
     const double fShift = settings.listeningFrequency - settings.centerFrequency;
     const double phaseIncrement = -TWO_PI * fShift / inputRate;
-    float rotI = static_cast<float>(std::cos(networkIqNcoPhase));
-    float rotQ = static_cast<float>(std::sin(networkIqNcoPhase));
-    const float rotStepI = static_cast<float>(std::cos(phaseIncrement));
-    const float rotStepQ = static_cast<float>(std::sin(phaseIncrement));
+    const bool noFrequencyShift = std::abs(fShift) < 0.5;
+    float rotI = 1.0f;
+    float rotQ = 0.0f;
+    float rotStepI = 1.0f;
+    float rotStepQ = 0.0f;
+    if (!noFrequencyShift) {
+        rotI = static_cast<float>(std::cos(networkIqNcoPhase));
+        rotQ = static_cast<float>(std::sin(networkIqNcoPhase));
+        rotStepI = static_cast<float>(std::cos(phaseIncrement));
+        rotStepQ = static_cast<float>(std::sin(phaseIncrement));
+    }
 
     std::complex<float> decimationSum = networkIqDecimationSum;
     int decimationCount = networkIqDecimationCount;
     std::complex<float> lowPass = networkIqLowPassState;
+    std::array<std::complex<float>, 3> preLowPassStates = networkIqPreLowPassStates;
     const bool adaptiveNoiseCancel = settings.inputMode == INPUT_HF_NOISE_CANCEL;
     std::complex<float> refDecimationSum = networkHfNoiseCancelRefDecimationSum;
     std::complex<float> adaptiveCoeff = networkHfNoiseCancelCoeff;
@@ -752,9 +881,14 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
         }
 
         if (adaptiveNoiseCancel) {
-            const std::complex<float> oscillator(rotI, rotQ);
-            decimationSum += iSample * oscillator;
-            refDecimationSum += qSample * oscillator;
+            if (noFrequencyShift) {
+                decimationSum += std::complex<float>(iSample, 0.0f);
+                refDecimationSum += std::complex<float>(qSample, 0.0f);
+            } else {
+                const std::complex<float> oscillator(rotI, rotQ);
+                decimationSum += iSample * oscillator;
+                refDecimationSum += qSample * oscillator;
+            }
         } else {
             if (settings.inputMode == INPUT_HF_COMBINED) {
                 if (fShift < 0.0) {
@@ -769,21 +903,55 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
                 iSample = qSample;
                 qSample = 0.0f;
             }
-            const float mixedI = iSample * rotI - qSample * rotQ;
-            const float mixedQ = iSample * rotQ + qSample * rotI;
-            decimationSum += std::complex<float>(mixedI, mixedQ);
+            std::complex<float> mixedSample;
+            if (noFrequencyShift) {
+                mixedSample = std::complex<float>(iSample, qSample);
+            } else {
+                const float mixedI = iSample * rotI - qSample * rotQ;
+                const float mixedQ = iSample * rotQ + qSample * rotI;
+                mixedSample = std::complex<float>(mixedI, mixedQ);
+            }
+            if (dmrChannelMode && decimationFactor > 1) {
+                std::complex<float> cicSample = mixedSample;
+                for (int stage = 0; stage < DMR_CHANNEL_CIC_STAGES; ++stage) {
+                    auto &buffer = networkIqCicBuffers[static_cast<std::size_t>(stage)];
+                    const std::complex<float> delayed =
+                        buffer[static_cast<std::size_t>(networkIqCicIndex)];
+                    buffer[static_cast<std::size_t>(networkIqCicIndex)] = cicSample;
+                    networkIqCicSums[static_cast<std::size_t>(stage)] +=
+                        cicSample - delayed;
+                    cicSample =
+                        networkIqCicSums[static_cast<std::size_t>(stage)] * cicInvLength;
+                }
+                ++networkIqCicIndex;
+                if (networkIqCicIndex >= networkIqCicLength) {
+                    networkIqCicIndex = 0;
+                }
+                mixedSample = cicSample;
+            } else if (decimationFactor > 1) {
+                preLowPassStates[0] += preLowPassAlpha *
+                                       (mixedSample - preLowPassStates[0]);
+                preLowPassStates[1] += preLowPassAlpha *
+                                       (preLowPassStates[0] - preLowPassStates[1]);
+                preLowPassStates[2] += preLowPassAlpha *
+                                       (preLowPassStates[1] - preLowPassStates[2]);
+                mixedSample = preLowPassStates[2];
+            }
+            decimationSum += mixedSample;
         }
         ++decimationCount;
 
-        const float nextRotI = rotI * rotStepI - rotQ * rotStepQ;
-        const float nextRotQ = rotI * rotStepQ + rotQ * rotStepI;
-        rotI = nextRotI;
-        rotQ = nextRotQ;
-        if ((n & 4095) == 4095) {
-            const float norm = std::sqrt(rotI * rotI + rotQ * rotQ);
-            if (norm > 0.0f) {
-                rotI /= norm;
-                rotQ /= norm;
+        if (!noFrequencyShift) {
+            const float nextRotI = rotI * rotStepI - rotQ * rotStepQ;
+            const float nextRotQ = rotI * rotStepQ + rotQ * rotStepI;
+            rotI = nextRotI;
+            rotQ = nextRotQ;
+            if ((n & 4095) == 4095) {
+                const float norm = std::sqrt(rotI * rotI + rotQ * rotQ);
+                if (norm > 0.0f) {
+                    rotI /= norm;
+                    rotQ /= norm;
+                }
             }
         }
 
@@ -831,16 +999,28 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
 
     networkIqDecimationSum = decimationSum;
     networkIqDecimationCount = decimationCount;
+    networkIqPreLowPassStates = preLowPassStates;
     networkHfNoiseCancelRefDecimationSum =
         adaptiveNoiseCancel ? refDecimationSum : std::complex<float>(0.0f, 0.0f);
     networkIqLowPassState = lowPass;
-    networkIqNcoPhase = std::remainder(networkIqNcoPhase + phaseIncrement * static_cast<double>(iqSamples), TWO_PI);
+    networkIqNcoPhase = noFrequencyShift
+                            ? 0.0
+                            : std::remainder(networkIqNcoPhase +
+                                                 phaseIncrement * static_cast<double>(iqSamples),
+                                             TWO_PI);
 }
 
 uint64_t DataProcessor::callbackCount() const {
     return totalCallbackCounter.load();
 }
 
+void DataProcessor::setSampleRateHint(double sampleRate) {
+    if (sampleRate <= 0.0 || !std::isfinite(sampleRate)) {
+        return;
+    }
+    requestedSampleRate = sampleRate;
+    IqBuffer::setSampleRateEstimate(sampleRate);
+}
 
 void DataProcessor::requestStop() {
     if (fobosVerboseLoggingEnabled()) {

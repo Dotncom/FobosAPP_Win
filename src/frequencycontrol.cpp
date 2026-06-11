@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
@@ -50,34 +51,47 @@ FrequencyControl::FrequencyControl(QWidget *parent)
     valueSpin->setKeyboardTracking(false);
     valueSpin->setButtonSymbols(QAbstractSpinBox::NoButtons);
     valueSpin->setAlignment(Qt::AlignRight);
-    valueSpin->setMinimumWidth(125);
+    valueSpin->setMinimumWidth(92);
 
     unitCombo = new QComboBox(this);
     for (const UnitInfo &unit : UNITS) {
         unitCombo->addItem(unit.label, unit.factor);
     }
+    unitCombo->setMaximumWidth(62);
 
     stepCombo = new QComboBox(this);
     setStepPresets(defaultSteps());
+    stepCombo->setMinimumContentsLength(7);
+    stepCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
 
     presetCombo = new QComboBox(this);
     presetCombo->addItem("Preset", QVariant());
     presetCombo->setEnabled(false);
+    presetCombo->setMinimumContentsLength(7);
+    presetCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
 
     minusButton = new QPushButton("-", this);
     plusButton = new QPushButton("+", this);
     minusButton->setFixedWidth(28);
     plusButton->setFixedWidth(28);
 
-    QHBoxLayout *layout = new QHBoxLayout(this);
+    QVBoxLayout *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(4);
-    layout->addWidget(minusButton);
-    layout->addWidget(valueSpin, 1);
-    layout->addWidget(unitCombo);
-    layout->addWidget(stepCombo);
-    layout->addWidget(plusButton);
-    layout->addWidget(presetCombo);
+    layout->setSpacing(2);
+    QHBoxLayout *valueLayout = new QHBoxLayout();
+    valueLayout->setContentsMargins(0, 0, 0, 0);
+    valueLayout->setSpacing(4);
+    valueLayout->addWidget(minusButton);
+    valueLayout->addWidget(valueSpin, 1);
+    valueLayout->addWidget(unitCombo);
+    valueLayout->addWidget(plusButton);
+    QHBoxLayout *presetLayout = new QHBoxLayout();
+    presetLayout->setContentsMargins(0, 0, 0, 0);
+    presetLayout->setSpacing(4);
+    presetLayout->addWidget(stepCombo, 1);
+    presetLayout->addWidget(presetCombo, 1);
+    layout->addLayout(valueLayout);
+    layout->addLayout(presetLayout);
 
     connect(valueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) {
         if (!updatingUi) {

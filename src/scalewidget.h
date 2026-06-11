@@ -8,6 +8,7 @@
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include "radiosettings.h"
+#include "scanvisualassembler.h"
 
 class ScaleWidget : public QWidget {
     Q_OBJECT
@@ -16,6 +17,7 @@ public:
     explicit ScaleWidget(QWidget *parent = nullptr);
 	
     void setRange(double min, double max);
+    void setScanSegments(const QVector<ScanVisualSegment> &segments);
     void setMarkerPosition(double position);
     void setTuning(double listeningFrequency, double centerFrequency, double bandwidth);
     void setTuning(double listeningFrequency, double centerFrequency, double bandwidth, int modulationType);
@@ -33,6 +35,9 @@ signals:
     void centralFrequencyChanged();
     void tuningChanged(double listeningFrequency, double centerFrequency);
 private:
+    double displayFrequencyAtPosition(double position) const;
+    double actualFrequencyForDisplayFrequency(double displayFrequency) const;
+    double displayFrequencyForActualFrequency(double actualFrequency) const;
     double minValue;
     double maxValue;
     double markerPosition;
@@ -40,6 +45,7 @@ private:
     double centerValue;
     double bandwidthValue;
     int modulationTypeValue;
+    QVector<ScanVisualSegment> scanSegments;
     
     bool dragging = false;
     int lastMouseX = 0;

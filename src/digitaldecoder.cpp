@@ -1,5 +1,7 @@
 #include "digitaldecoder.h"
 
+#include "diagnosticlogging.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -37,6 +39,31 @@ constexpr double FT8_MIN_BUFFER_SECONDS = 13.0;
 constexpr double FT8_MIN_SYNC_DB = 3.0;
 constexpr int FT8_MIN_SYNC_HITS = 11;
 constexpr int FT8_MAX_REPORTED_CANDIDATES = 8;
+constexpr int DMR_TRUSTED_AUDIO_MAX_FEC_ERRORS = 2;
+constexpr int DMR_PROVISIONAL_AUDIO_MAX_FEC_ERRORS = 1;
+constexpr int DMR_TRUSTED_AUDIO_MAX_RAW_FEC_ERRORS = 5;
+constexpr int DMR_PROVISIONAL_AUDIO_MAX_RAW_FEC_ERRORS = 4;
+constexpr int DMR_MIN_QUALITY_PAYLOADS_PER_CHUNK = 1;
+constexpr int DMR_MAX_VOCODER_ERRORS_PER_FRAME = 2;
+constexpr int DMR_AUDIO_SELECTOR_SWITCH_MARGIN = 2;
+constexpr double DMR_AUDIO_ARTIFACT_PEAK = 0.85;
+constexpr double DMR_AUDIO_ARTIFACT_RMS = 0.18;
+constexpr double DMR_AUDIO_HARD_ARTIFACT_PEAK = 0.90;
+constexpr double DMR_AUDIO_HARD_ARTIFACT_RMS = 0.18;
+constexpr double DMR_AUDIO_SUSPICIOUS_ARTIFACT_RMS = 0.14;
+constexpr double DMR_AUDIO_NEAR_SILENCE_RMS = 0.0008;
+constexpr double DMR_VOCODER_COLLAPSE_PEAK = 0.025;
+constexpr double DMR_VOCODER_COLLAPSE_RMS = 0.004;
+constexpr double DMR_VOCODER_RECOVERY_PEAK = 0.030;
+constexpr double DMR_VOCODER_RECOVERY_RMS = 0.003;
+constexpr int DMR_VOICE_PCM_SAMPLE_RATE = 48000;
+constexpr int DMR_VOICE_PCM_BYTES_PER_SAMPLE = 2;
+constexpr int DMR_VOICE_PCM_CHUNK_MS = 60;
+constexpr int DMR_VOICE_PCM_CHUNK_BYTES =
+    DMR_VOICE_PCM_SAMPLE_RATE * DMR_VOICE_PCM_BYTES_PER_SAMPLE * DMR_VOICE_PCM_CHUNK_MS / 1000;
+constexpr int DMR_VOICE_PCM_MAX_BUFFER_BYTES = DMR_VOICE_PCM_CHUNK_BYTES * 4;
+constexpr int DMR_AMBE_PCM_FRAME_BYTES =
+    160 * (DMR_VOICE_PCM_SAMPLE_RATE / 8000) * DMR_VOICE_PCM_BYTES_PER_SAMPLE;
 constexpr double FT8_CANDIDATE_CLUSTER_HZ = 25.0;
 constexpr double FT8_CANDIDATE_CLUSTER_SECONDS = 1.2;
 constexpr int FT8_CANDIDATE_REPEAT_ANALYSES = 0;
@@ -158,6 +185,133 @@ qint16 readPcm16Le(const char *data) {
     qint16 value = 0;
     std::memcpy(&value, data, sizeof(value));
     return value;
+}
+
+struct PcmStats {
+    double peak = 0.0;
+    double rms = 0.0;
+    double clippedPercent = 0.0;
+};
+
+struct DmrVoiceProbeStats {
+    bool ran = false;
+    int pcmBytes = 0;
+    int decodedFrames = 0;
+    int errors = 0;
+    PcmStats pcm;
+};
+
+struct DmrAudioCandidate {
+    QString source;
+    QByteArray pcm;
+    int decodedFrames = 0;
+    int vocoderErrors = 0;
+    int concealedPayloads = 0;
+    int rejectedVocoderFrames = 0;
+    PcmStats stats;
+
+    bool valid() const {
+        return !pcm.isEmpty() && decodedFrames > 0;
+    }
+};
+
+PcmStats pcm16Stats(const QByteArray &pcm) {
+    PcmStats stats;
+    const int sampleCount = pcm.size() / static_cast<int>(sizeof(qint16));
+    if (sampleCount <= 0) {
+        return stats;
+    }
+
+    const char *raw = pcm.constData();
+    double squareSum = 0.0;
+    int clipped = 0;
+    for (int i = 0; i < sampleCount; ++i) {
+        const int value = readPcm16Le(raw + i * static_cast<int>(sizeof(qint16)));
+        const double normalized = static_cast<double>(value) / 32768.0;
+        stats.peak = (std::max)(stats.peak, std::abs(normalized));
+        squareSum += normalized * normalized;
+        if (value <= -32760 || value >= 32760) {
+            ++clipped;
+        }
+    }
+    stats.rms = std::sqrt(squareSum / static_cast<double>(sampleCount));
+    stats.clippedPercent =
+        100.0 * static_cast<double>(clipped) / static_cast<double>(sampleCount);
+    return stats;
+}
+
+QString dmrVoiceProbeSummary(const DmrVoiceProbeStats &probe) {
+    if (!probe.ran) {
+        return QStringLiteral("off");
+    }
+    return QStringLiteral("b%1/f%2/e%3/pk%4/rms%5")
+        .arg(probe.pcmBytes)
+        .arg(probe.decodedFrames)
+        .arg(probe.errors)
+        .arg(probe.pcm.peak, 0, 'f', 3)
+        .arg(probe.pcm.rms, 0, 'f', 3);
+}
+
+bool dmrAudioLooksLikeArtifact(const DmrAudioCandidate &candidate) {
+    if (!candidate.valid()) {
+        return false;
+    }
+    const int frames = (std::max)(1, candidate.decodedFrames);
+    return candidate.vocoderErrors > frames * DMR_MAX_VOCODER_ERRORS_PER_FRAME &&
+           (candidate.stats.peak >= DMR_AUDIO_ARTIFACT_PEAK ||
+            candidate.stats.rms >= DMR_AUDIO_ARTIFACT_RMS);
+}
+
+bool dmrAudioShouldConcealArtifact(const DmrAudioCandidate &candidate) {
+    if (!candidate.valid()) {
+        return false;
+    }
+
+    const int frames = (std::max)(1, candidate.decodedFrames);
+    const bool impossibleEnergy =
+        candidate.stats.peak >= DMR_AUDIO_HARD_ARTIFACT_PEAK &&
+        candidate.stats.rms >= DMR_AUDIO_HARD_ARTIFACT_RMS &&
+        candidate.vocoderErrors >= 2;
+    const bool suspiciousLoudEnergy =
+        candidate.stats.peak >= DMR_AUDIO_HARD_ARTIFACT_PEAK &&
+        candidate.stats.rms >= DMR_AUDIO_SUSPICIOUS_ARTIFACT_RMS &&
+        candidate.vocoderErrors >= frames + 2;
+    const bool severeVocoderErrors =
+        candidate.vocoderErrors > frames * 3 &&
+        candidate.stats.rms >= 0.050;
+
+    return impossibleEnergy || suspiciousLoudEnergy || severeVocoderErrors;
+}
+
+int dmrAudioCandidateScore(const DmrAudioCandidate &candidate, int expectedFrames) {
+    if (!candidate.valid()) {
+        return std::numeric_limits<int>::max() / 4;
+    }
+
+    int score = candidate.vocoderErrors * 100;
+    if (expectedFrames > 0 && candidate.decodedFrames < expectedFrames) {
+        score += (expectedFrames - candidate.decodedFrames) * 220;
+    }
+    if (candidate.stats.rms < DMR_AUDIO_NEAR_SILENCE_RMS) {
+        score += 350;
+    }
+    if (dmrAudioLooksLikeArtifact(candidate)) {
+        score += 10000;
+    }
+    return score;
+}
+
+DmrVoiceProbeStats dmrProbeFromCandidate(const DmrAudioCandidate &candidate) {
+    DmrVoiceProbeStats probe;
+    if (candidate.pcm.isEmpty() && candidate.decodedFrames <= 0) {
+        return probe;
+    }
+    probe.ran = true;
+    probe.pcmBytes = candidate.pcm.size();
+    probe.decodedFrames = candidate.decodedFrames;
+    probe.errors = candidate.vocoderErrors;
+    probe.pcm = candidate.stats;
+    return probe;
 }
 
 struct Ft8Candidate {
@@ -884,9 +1038,62 @@ void DigitalDecoder::reset() {
     spaceQ = 0.0;
     resetFt8State();
     dmrDecoder.reset();
+    dmrVocoder.reset();
+    dmrPayloadProbeVocoder.reset();
+    dmrRawProbeVocoder.reset();
+    dmrCanonicalProbeVocoder.reset();
+    dmrAmbeFrameCount = 0;
+    dmrAmbePayloadCount = 0;
+    dmrAmbeFecCorrectionCount = 0;
+    dmrVocoderFrameCount = 0;
+    dmrVocoderErrorCount = 0;
+    dmrAudioLogCounter = 0;
+    dmrCollapsedVoiceCount = 0;
+    dmrVocoderResetRecoveryCount = 0;
+    dmrArtifactConcealCount = 0;
+    clearDmrVoicePcmBuffer();
+}
+
+void DigitalDecoder::clearDmrVoicePcmBuffer() {
+    pendingDmrVoicePcm.clear();
+}
+
+void DigitalDecoder::queueDmrVoicePcm(const QByteArray &pcmData) {
+    if (pcmData.isEmpty()) {
+        return;
+    }
+
+    pendingDmrVoicePcm.append(pcmData);
+    if (pendingDmrVoicePcm.size() > DMR_VOICE_PCM_MAX_BUFFER_BYTES) {
+        const int overflow = pendingDmrVoicePcm.size() - DMR_VOICE_PCM_MAX_BUFFER_BYTES;
+        const int chunksToDrop =
+            (overflow + DMR_VOICE_PCM_CHUNK_BYTES - 1) / DMR_VOICE_PCM_CHUNK_BYTES;
+        const int dropBytes =
+            (std::min)(pendingDmrVoicePcm.size(), chunksToDrop * DMR_VOICE_PCM_CHUNK_BYTES);
+        pendingDmrVoicePcm.remove(0, dropBytes);
+        qDebug() << "[DMR audio]"
+                 << "pcmJitterBufferDropBytes" << dropBytes
+                 << "remainingBytes" << pendingDmrVoicePcm.size();
+    }
+
+    while (pendingDmrVoicePcm.size() >= DMR_VOICE_PCM_CHUNK_BYTES) {
+        const QByteArray chunk = pendingDmrVoicePcm.left(DMR_VOICE_PCM_CHUNK_BYTES);
+        pendingDmrVoicePcm.remove(0, DMR_VOICE_PCM_CHUNK_BYTES);
+        emit voicePcmReady(chunk);
+    }
 }
 
 void DigitalDecoder::configure(const RadioSettings &settings, int sampleRate) {
+    dmrDecoder.setLabHints(settings.dmrLabEnabled,
+                           settings.dmrLabColorCode,
+                           settings.dmrLabTimeslot,
+                           settings.dmrLabSourceId,
+                           settings.dmrLabTargetId,
+                           settings.dmrManualTimingEnabled,
+                           settings.dmrManualTimingOffset,
+                           static_cast<float>(settings.dmrSlicerRatio),
+                           settings.dmrAdaptiveSlicer,
+                           settings.dmrAmbeLayout);
     configureForMode(settings.modulationType, sampleRate);
 }
 
@@ -896,6 +1103,16 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
     }
 
     currentSettings = settings;
+    dmrDecoder.setLabHints(settings.dmrLabEnabled,
+                           settings.dmrLabColorCode,
+                           settings.dmrLabTimeslot,
+                           settings.dmrLabSourceId,
+                           settings.dmrLabTargetId,
+                           settings.dmrManualTimingEnabled,
+                           settings.dmrManualTimingOffset,
+                           static_cast<float>(settings.dmrSlicerRatio),
+                           settings.dmrAdaptiveSlicer,
+                           settings.dmrAmbeLayout);
     configureForMode(settings.modulationType, sampleRate);
     if (pcmData.size() < static_cast<int>(sizeof(qint16))) {
         return;
@@ -911,11 +1128,504 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
     if (settings.modulationType == MOD_DMR) {
         const DmrDecoder::Result result =
             dmrDecoder.processPcmFrame(pcmData, sampleRate, settings.listeningFrequency);
-        if (result.statusChanged && !result.statusText.isEmpty()) {
+        if (!result.serviceStatusText.isEmpty()) {
+            updateStatus(result.serviceStatusText);
+        } else if (result.statusChanged && !result.statusText.isEmpty()) {
             updateStatus(result.statusText);
+        }
+        if (result.metadataValid) {
+            emit dmrMetadataDetected(result.metadataColorCode,
+                                     result.metadataTimeslot,
+                                     result.metadataTargetId,
+                                     result.metadataSourceId,
+                                     result.metadataFlco);
+        }
+        if (result.lockAcquired) {
+            dmrVocoder.reset();
+            dmrPayloadProbeVocoder.reset();
+            dmrRawProbeVocoder.reset();
+            dmrCanonicalProbeVocoder.reset();
+            dmrCollapsedVoiceCount = 0;
+            dmrVocoderResetRecoveryCount = 0;
+            dmrArtifactConcealCount = 0;
+            clearDmrVoicePcmBuffer();
+        }
+        const qint64 previousFrameCount = dmrAmbeFrameCount;
+        const qint64 previousPayloadCount = dmrAmbePayloadCount;
+        if (!result.ambeFrames.empty()) {
+            dmrAmbeFrameCount += static_cast<qint64>(result.ambeFrames.size());
+        }
+        const int validAmbePayloads = static_cast<int>(
+            std::count_if(result.ambePayloads.begin(),
+                          result.ambePayloads.end(),
+                          [](const DmrAmbePayload &payload) {
+                              return !payload.hex.isEmpty();
+                          }));
+        if (validAmbePayloads > 0) {
+            dmrAmbePayloadCount += static_cast<qint64>(validAmbePayloads);
+            dmrAmbeFecCorrectionCount += result.ambeFecCorrections;
+        }
+        if (!result.ambeFrames.empty() ||
+            !result.ambeSoftFrames.empty() ||
+            !result.ambePayloads.empty()) {
+            int decodedVoiceFrames = 0;
+            int vocoderErrors = 0;
+            QByteArray voicePcm;
+            QString audioSource;
+            std::vector<int> qualityPayloadIndexes;
+            int filteredPayloads = 0;
+            int concealedPayloads = 0;
+            int rejectedVocoderFrames = 0;
+            QString softFrameErrorsText;
+            const auto isQualityPayload = [](const DmrAmbePayload &payload,
+                                             int maxCorrectedErrors,
+                                             int maxRawCorrectedErrors) {
+                return !payload.hex.isEmpty() &&
+                       payload.correctedErrors <= maxCorrectedErrors &&
+                       payload.rawCorrectedErrors <= maxRawCorrectedErrors;
+            };
+            const auto collectQualityPayloads = [&](int maxCorrectedErrors,
+                                                    int maxRawCorrectedErrors) {
+                qualityPayloadIndexes.clear();
+                qualityPayloadIndexes.reserve(result.ambePayloads.size());
+                filteredPayloads = 0;
+                for (int index = 0; index < static_cast<int>(result.ambePayloads.size()); ++index) {
+                    const DmrAmbePayload &payload =
+                        result.ambePayloads[static_cast<std::size_t>(index)];
+                    if (isQualityPayload(payload, maxCorrectedErrors, maxRawCorrectedErrors)) {
+                        qualityPayloadIndexes.push_back(index);
+                    } else {
+                        ++filteredPayloads;
+                    }
+                }
+            };
+            const bool payloadAudioCandidate =
+                !result.ambePayloads.empty() &&
+                (result.voiceAudioTrusted ||
+                 (!result.voiceAudioTrusted && result.voiceAudioConfidence >= 12));
+            int maxPayloadErrors = result.voiceAudioTrusted
+                                       ? DMR_TRUSTED_AUDIO_MAX_FEC_ERRORS
+                                       : DMR_PROVISIONAL_AUDIO_MAX_FEC_ERRORS;
+            int maxRawPayloadErrors = result.voiceAudioTrusted
+                                          ? DMR_TRUSTED_AUDIO_MAX_RAW_FEC_ERRORS
+                                          : DMR_PROVISIONAL_AUDIO_MAX_RAW_FEC_ERRORS;
+            if (payloadAudioCandidate) {
+                collectQualityPayloads(maxPayloadErrors, maxRawPayloadErrors);
+            }
+            const int minQualityPayloads =
+                validAmbePayloads >= DMR_MIN_QUALITY_PAYLOADS_PER_CHUNK
+                    ? DMR_MIN_QUALITY_PAYLOADS_PER_CHUNK
+                    : 1;
+            const bool hasQualityPayloadAudio =
+                static_cast<int>(qualityPayloadIndexes.size()) >= minQualityPayloads;
+            const bool provisionalVoiceAudio =
+                !result.voiceAudioTrusted &&
+                hasQualityPayloadAudio;
+            const bool softVoiceAudio =
+                !result.ambeSoftFrames.empty() &&
+                (result.voiceAudioTrusted || result.voiceAudioConfidence >= 12);
+            const bool frameVoiceAudio =
+                result.ambePayloads.empty() &&
+                (!result.ambeSoftFrames.empty() || !result.ambeFrames.empty()) &&
+                (result.voiceAudioTrusted || result.voiceAudioConfidence >= 12);
+            if (voicePcm.isEmpty() && softVoiceAudio) {
+                audioSource = QStringLiteral("softFrames");
+                std::vector<int> softFrameErrors;
+                voicePcm = dmrVocoder.decodeSoftFrames(result.ambeSoftFrames,
+                                                       &decodedVoiceFrames,
+                                                       &vocoderErrors,
+                                                       &softFrameErrors);
+                if (voicePcm.isEmpty()) {
+                    audioSource.clear();
+                    decodedVoiceFrames = 0;
+                    vocoderErrors = 0;
+                } else if (!softFrameErrors.empty()) {
+                    QStringList softFrameErrorItems;
+                    softFrameErrorItems.reserve(static_cast<int>(softFrameErrors.size()));
+                    for (int frameError : softFrameErrors) {
+                        softFrameErrorItems << QString::number(frameError);
+                    }
+                    softFrameErrorsText = softFrameErrorItems.join(QLatin1Char('/'));
+                }
+            }
+            if (voicePcm.isEmpty() && payloadAudioCandidate) {
+                audioSource = hasQualityPayloadAudio
+                                  ? (result.voiceAudioTrusted
+                                         ? QStringLiteral("payload49FecGate")
+                                         : QStringLiteral("provisionalPayload49FecGate"))
+                                  : QStringLiteral("concealedPayloads");
+                voicePcm.reserve(static_cast<int>(result.ambePayloads.size()) *
+                                 DMR_AMBE_PCM_FRAME_BYTES);
+                for (int index = 0; index < static_cast<int>(result.ambePayloads.size()); ++index) {
+                    const DmrAmbePayload &payload =
+                        result.ambePayloads[static_cast<std::size_t>(index)];
+                    if (!hasQualityPayloadAudio ||
+                        !isQualityPayload(payload, maxPayloadErrors, maxRawPayloadErrors)) {
+                        voicePcm.append(QByteArray(DMR_AMBE_PCM_FRAME_BYTES, '\0'));
+                        ++concealedPayloads;
+                        continue;
+                    }
+
+                    int frameCount = 0;
+                    int frameErrors = 0;
+                    QByteArray framePcm =
+                        dmrVocoder.decodePayloads(std::vector<DmrAmbePayload>{payload},
+                                                  &frameCount,
+                                                  &frameErrors);
+                    if (framePcm.isEmpty() &&
+                        index < static_cast<int>(result.ambeSoftFrames.size())) {
+                        framePcm = dmrVocoder.decodeSoftFrames(
+                            std::vector<DmrAmbeSoftFrame>{
+                                result.ambeSoftFrames[static_cast<std::size_t>(index)]},
+                            &frameCount,
+                            &frameErrors);
+                    }
+                    if (framePcm.isEmpty() &&
+                        index < static_cast<int>(result.ambeFrames.size())) {
+                        framePcm = dmrVocoder.decodeFrames(
+                            std::vector<QString>{
+                                result.ambeFrames[static_cast<std::size_t>(index)]},
+                            &frameCount,
+                            &frameErrors);
+                    }
+                    if (framePcm.isEmpty()) {
+                        voicePcm.append(QByteArray(DMR_AMBE_PCM_FRAME_BYTES, '\0'));
+                        ++concealedPayloads;
+                        continue;
+                    }
+                    const int maxVocoderErrors =
+                        DMR_MAX_VOCODER_ERRORS_PER_FRAME * (std::max)(1, frameCount);
+                    if (frameErrors > maxVocoderErrors) {
+                        voicePcm.append(QByteArray(DMR_AMBE_PCM_FRAME_BYTES, '\0'));
+                        ++concealedPayloads;
+                        ++rejectedVocoderFrames;
+                        continue;
+                    }
+                    voicePcm.append(framePcm);
+                    decodedVoiceFrames += frameCount;
+                    vocoderErrors += frameErrors;
+                }
+            }
+            if (voicePcm.isEmpty() && frameVoiceAudio) {
+                audioSource = QStringLiteral("rawFrames");
+                voicePcm = dmrVocoder.decodeFrames(result.ambeFrames,
+                                                   &decodedVoiceFrames,
+                                                   &vocoderErrors);
+            }
+            PcmStats voiceStats = pcm16Stats(voicePcm);
+            const int expectedAudioFrames = (std::max)({
+                static_cast<int>(result.ambePayloads.size()),
+                static_cast<int>(result.ambeSoftFrames.size()),
+                static_cast<int>(result.ambeFrames.size())});
+            DmrAudioCandidate selectedCandidate;
+            selectedCandidate.source = audioSource;
+            selectedCandidate.pcm = voicePcm;
+            selectedCandidate.decodedFrames = decodedVoiceFrames;
+            selectedCandidate.vocoderErrors = vocoderErrors;
+            selectedCandidate.concealedPayloads = concealedPayloads;
+            selectedCandidate.rejectedVocoderFrames = rejectedVocoderFrames;
+            selectedCandidate.stats = voiceStats;
+
+            DmrAudioCandidate payloadCandidate;
+            if (payloadAudioCandidate && !result.ambePayloads.empty()) {
+                payloadCandidate.source = result.voiceAudioTrusted
+                                              ? QStringLiteral("payload49Selector")
+                                              : QStringLiteral("provisionalPayload49Selector");
+                payloadCandidate.pcm.reserve(static_cast<int>(result.ambePayloads.size()) *
+                                             DMR_AMBE_PCM_FRAME_BYTES);
+                for (int index = 0; index < static_cast<int>(result.ambePayloads.size()); ++index) {
+                    const DmrAmbePayload &payload =
+                        result.ambePayloads[static_cast<std::size_t>(index)];
+                    if (!hasQualityPayloadAudio ||
+                        !isQualityPayload(payload, maxPayloadErrors, maxRawPayloadErrors)) {
+                        payloadCandidate.pcm.append(QByteArray(DMR_AMBE_PCM_FRAME_BYTES, '\0'));
+                        ++payloadCandidate.concealedPayloads;
+                        continue;
+                    }
+
+                    int frameCount = 0;
+                    int frameErrors = 0;
+                    QByteArray framePcm =
+                        dmrPayloadProbeVocoder.decodePayloads(std::vector<DmrAmbePayload>{payload},
+                                                              &frameCount,
+                                                              &frameErrors);
+                    if (framePcm.isEmpty()) {
+                        payloadCandidate.pcm.append(QByteArray(DMR_AMBE_PCM_FRAME_BYTES, '\0'));
+                        ++payloadCandidate.concealedPayloads;
+                        continue;
+                    }
+                    const int maxVocoderErrors =
+                        DMR_MAX_VOCODER_ERRORS_PER_FRAME * (std::max)(1, frameCount);
+                    if (frameErrors > maxVocoderErrors) {
+                        payloadCandidate.pcm.append(QByteArray(DMR_AMBE_PCM_FRAME_BYTES, '\0'));
+                        ++payloadCandidate.concealedPayloads;
+                        ++payloadCandidate.rejectedVocoderFrames;
+                        continue;
+                    }
+                    payloadCandidate.pcm.append(framePcm);
+                    payloadCandidate.decodedFrames += frameCount;
+                    payloadCandidate.vocoderErrors += frameErrors;
+                }
+                payloadCandidate.stats = pcm16Stats(payloadCandidate.pcm);
+            }
+
+            DmrAudioCandidate rawCandidate;
+            if (!result.ambeFrames.empty()) {
+                rawCandidate.source = QStringLiteral("rawFramesSelector");
+                rawCandidate.pcm = dmrRawProbeVocoder.decodeFrames(result.ambeFrames,
+                                                                   &rawCandidate.decodedFrames,
+                                                                   &rawCandidate.vocoderErrors);
+                rawCandidate.stats = pcm16Stats(rawCandidate.pcm);
+            }
+
+            DmrAudioCandidate canonicalCandidate;
+            if (!result.ambePayloads.empty()) {
+                canonicalCandidate.source = QStringLiteral("canonicalSelector");
+                canonicalCandidate.pcm =
+                    dmrCanonicalProbeVocoder.decodeCanonicalPayloads(
+                        result.ambePayloads,
+                        &canonicalCandidate.decodedFrames,
+                        &canonicalCandidate.vocoderErrors);
+                canonicalCandidate.stats = pcm16Stats(canonicalCandidate.pcm);
+            }
+
+            QString selectorSwitch;
+            auto maybeSelectCandidate = [&](const DmrAudioCandidate &candidate,
+                                            bool allowNearSilence) {
+                if (!candidate.valid()) {
+                    return;
+                }
+                if (!selectedCandidate.valid()) {
+                    selectorSwitch = QStringLiteral("none>%1").arg(candidate.source);
+                    selectedCandidate = candidate;
+                    return;
+                }
+
+                const bool currentArtifact = dmrAudioLooksLikeArtifact(selectedCandidate);
+                const bool candidateArtifact = dmrAudioLooksLikeArtifact(candidate);
+                if (!allowNearSilence &&
+                    candidate.stats.rms < DMR_AUDIO_NEAR_SILENCE_RMS &&
+                    !currentArtifact) {
+                    return;
+                }
+
+                const int currentScore =
+                    dmrAudioCandidateScore(selectedCandidate, expectedAudioFrames);
+                const int candidateScore =
+                    dmrAudioCandidateScore(candidate, expectedAudioFrames);
+                const bool scoreWin =
+                    candidateScore + DMR_AUDIO_SELECTOR_SWITCH_MARGIN * 100 < currentScore;
+                const bool clearlyCleaner =
+                    !candidateArtifact &&
+                    candidate.vocoderErrors + DMR_AUDIO_SELECTOR_SWITCH_MARGIN <
+                        selectedCandidate.vocoderErrors &&
+                    (candidate.stats.rms >= DMR_AUDIO_NEAR_SILENCE_RMS || currentArtifact);
+                if ((currentArtifact && !candidateArtifact) || scoreWin || clearlyCleaner) {
+                    const QString previousSource =
+                        selectedCandidate.source.isEmpty()
+                            ? QStringLiteral("none")
+                            : selectedCandidate.source;
+                    selectorSwitch =
+                        QStringLiteral("%1>%2").arg(previousSource, candidate.source);
+                    selectedCandidate = candidate;
+                }
+            };
+
+            maybeSelectCandidate(payloadCandidate, false);
+            maybeSelectCandidate(rawCandidate, false);
+            if (dmrAudioLooksLikeArtifact(selectedCandidate)) {
+                maybeSelectCandidate(canonicalCandidate, true);
+            }
+            if (selectedCandidate.source != audioSource) {
+                audioSource = selectedCandidate.source;
+                voicePcm = selectedCandidate.pcm;
+                decodedVoiceFrames = selectedCandidate.decodedFrames;
+                vocoderErrors = selectedCandidate.vocoderErrors;
+                concealedPayloads = selectedCandidate.concealedPayloads;
+                rejectedVocoderFrames = selectedCandidate.rejectedVocoderFrames;
+                voiceStats = selectedCandidate.stats;
+            }
+            PcmStats retryStats;
+            bool resetRetryAttempted = false;
+            bool resetRetryUsed = false;
+            const bool softVocoderCollapseCandidate =
+                audioSource == QStringLiteral("softFrames") &&
+                !voicePcm.isEmpty() &&
+                !result.ambeSoftFrames.empty() &&
+                decodedVoiceFrames > 0 &&
+                (result.voiceAudioTrusted || result.voiceAudioConfidence >= 30) &&
+                vocoderErrors <= decodedVoiceFrames * 4 &&
+                voiceStats.peak < DMR_VOCODER_COLLAPSE_PEAK &&
+                voiceStats.rms < DMR_VOCODER_COLLAPSE_RMS;
+            if (softVocoderCollapseCandidate) {
+                ++dmrCollapsedVoiceCount;
+                int retryDecodedVoiceFrames = 0;
+                int retryVocoderErrors = 0;
+                dmrVocoder.reset();
+                resetRetryAttempted = true;
+                QByteArray retryPcm =
+                    dmrVocoder.decodeSoftFrames(result.ambeSoftFrames,
+                                                &retryDecodedVoiceFrames,
+                                                &retryVocoderErrors);
+                retryStats = pcm16Stats(retryPcm);
+                const bool retryImproved =
+                    !retryPcm.isEmpty() &&
+                    retryDecodedVoiceFrames == decodedVoiceFrames &&
+                    retryVocoderErrors <= vocoderErrors + 2 &&
+                    retryStats.peak >= (std::max)(DMR_VOCODER_RECOVERY_PEAK,
+                                                  voiceStats.peak * 2.0) &&
+                    retryStats.rms >= (std::max)(DMR_VOCODER_RECOVERY_RMS,
+                                                 voiceStats.rms * 2.0);
+                if (retryImproved) {
+                    voicePcm = retryPcm;
+                    decodedVoiceFrames = retryDecodedVoiceFrames;
+                    vocoderErrors = retryVocoderErrors;
+                    voiceStats = retryStats;
+                    audioSource = QStringLiteral("softFramesResetRetry");
+                    ++dmrVocoderResetRecoveryCount;
+                    dmrCollapsedVoiceCount = 0;
+                    resetRetryUsed = true;
+                }
+            } else if (!voicePcm.isEmpty() &&
+                       (voiceStats.peak >= DMR_VOCODER_COLLAPSE_PEAK ||
+                        voiceStats.rms >= DMR_VOCODER_COLLAPSE_RMS)) {
+                dmrCollapsedVoiceCount = 0;
+            }
+
+            bool artifactConcealed = false;
+            PcmStats artifactStats = voiceStats;
+            const int artifactVocoderErrors = vocoderErrors;
+            DmrAudioCandidate finalCandidate;
+            finalCandidate.source = audioSource;
+            finalCandidate.pcm = voicePcm;
+            finalCandidate.decodedFrames = decodedVoiceFrames;
+            finalCandidate.vocoderErrors = vocoderErrors;
+            finalCandidate.stats = voiceStats;
+            if (dmrAudioShouldConcealArtifact(finalCandidate)) {
+                const int concealedFrames =
+                    (std::max)(1, (std::max)(expectedAudioFrames, decodedVoiceFrames));
+                voicePcm = QByteArray(concealedFrames * DMR_AMBE_PCM_FRAME_BYTES, '\0');
+                voiceStats = pcm16Stats(voicePcm);
+                audioSource =
+                    audioSource.isEmpty()
+                        ? QStringLiteral("artifactConceal")
+                        : QStringLiteral("%1ArtifactConceal").arg(audioSource);
+                concealedPayloads += concealedFrames;
+                rejectedVocoderFrames += concealedFrames;
+                artifactConcealed = true;
+                ++dmrArtifactConcealCount;
+                dmrVocoder.reset();
+                dmrPayloadProbeVocoder.reset();
+                dmrRawProbeVocoder.reset();
+                dmrCanonicalProbeVocoder.reset();
+            }
+
+            const int dmrAudioLogIndex = dmrAudioLogCounter++;
+            const bool verboseLogging = fobosVerboseLoggingEnabled();
+            bool shouldLogDmrAudio =
+                verboseLogging && (dmrAudioLogIndex < 12 || (dmrAudioLogIndex % 50) == 0);
+            const bool weakSoftAudio =
+                audioSource == QStringLiteral("softFrames") &&
+                !voicePcm.isEmpty() &&
+                voiceStats.peak < 0.080 &&
+                voiceStats.rms < 0.020;
+            const bool runVoiceProbe =
+                verboseLogging &&
+                (shouldLogDmrAudio ||
+                 resetRetryAttempted ||
+                 (weakSoftAudio &&
+                  (result.voiceAudioTrusted || result.voiceAudioConfidence >= 30)));
+            DmrVoiceProbeStats payloadProbe;
+            DmrVoiceProbeStats rawProbe;
+            DmrVoiceProbeStats canonicalProbe;
+            if (runVoiceProbe) {
+                shouldLogDmrAudio = true;
+                if (!result.ambePayloads.empty()) {
+                    payloadProbe = dmrProbeFromCandidate(payloadCandidate);
+                }
+                if (!result.ambeFrames.empty()) {
+                    rawProbe = dmrProbeFromCandidate(rawCandidate);
+                }
+                if (!result.ambePayloads.empty()) {
+                    canonicalProbe = dmrProbeFromCandidate(canonicalCandidate);
+                }
+            }
+            if (shouldLogDmrAudio) {
+                qDebug() << "[DMR audio]"
+                         << "source" << (audioSource.isEmpty() ? QStringLiteral("none") : audioSource)
+                         << "frames" << static_cast<int>(result.ambeFrames.size())
+                         << "softFrames" << static_cast<int>(result.ambeSoftFrames.size())
+                         << "payloads" << static_cast<int>(result.ambePayloads.size())
+                         << "qualityPayloads" << static_cast<int>(qualityPayloadIndexes.size())
+                         << "filteredPayloads" << filteredPayloads
+                         << "concealedPayloads" << concealedPayloads
+                         << "rejectedVocoderFrames" << rejectedVocoderFrames
+                         << "trusted" << result.voiceAudioTrusted
+                         << "provisional" << provisionalVoiceAudio
+                         << "confidence" << result.voiceAudioConfidence
+                         << "rawGate" << maxRawPayloadErrors
+                         << "softErr" << softFrameErrorsText
+                         << "selector" << (selectorSwitch.isEmpty()
+                                                ? QStringLiteral("keep")
+                                                : selectorSwitch)
+                         << "pcmBytes" << voicePcm.size()
+                         << "voicePk" << QString::number(voiceStats.peak, 'f', 3)
+                         << "voiceRms" << QString::number(voiceStats.rms, 'f', 3)
+                         << "voiceClip" << QString::number(voiceStats.clippedPercent, 'f', 3)
+                         << "collapse" << dmrCollapsedVoiceCount
+                         << "resetRetry" << resetRetryAttempted
+                         << "retryUsed" << resetRetryUsed
+                         << "retryPk" << QString::number(retryStats.peak, 'f', 3)
+                         << "retryRms" << QString::number(retryStats.rms, 'f', 3)
+                         << "resetRecoveries" << dmrVocoderResetRecoveryCount
+                         << "artifactGate" << artifactConcealed
+                         << "artifactPk" << QString::number(artifactStats.peak, 'f', 3)
+                         << "artifactRms" << QString::number(artifactStats.rms, 'f', 3)
+                         << "artifactErrors" << artifactVocoderErrors
+                         << "artifactConceals" << dmrArtifactConcealCount
+                         << "probePayload" << dmrVoiceProbeSummary(payloadProbe)
+                         << "probeRaw" << dmrVoiceProbeSummary(rawProbe)
+                         << "probeCanonical" << dmrVoiceProbeSummary(canonicalProbe)
+                         << "decoded" << decodedVoiceFrames
+                         << "vocoderErrors" << vocoderErrors;
+            }
+            if (decodedVoiceFrames > 0) {
+                dmrVocoderFrameCount += decodedVoiceFrames;
+                dmrVocoderErrorCount += vocoderErrors;
+            }
+            if (!voicePcm.isEmpty()) {
+                queueDmrVoicePcm(voicePcm);
+            }
+            if (previousPayloadCount == 0 ||
+                previousPayloadCount / 18 != dmrAmbePayloadCount / 18 ||
+                previousFrameCount / 18 != dmrAmbeFrameCount / 18) {
+                const QString vocoderText = dmrVocoder.isAvailable()
+                                                ? QStringLiteral("%1 PCM frames, %2 vocoder errors")
+                                                      .arg(dmrVocoderFrameCount)
+                                                      .arg(dmrVocoderErrorCount)
+                                                : QStringLiteral("vocoder unavailable");
+                if (result.serviceStatusText.isEmpty()) {
+                    updateStatus(QStringLiteral("DMR voice: %1 AMBE frames, %2 FEC payloads, %3 Golay corrections, %4")
+                                     .arg(dmrAmbeFrameCount)
+                                     .arg(dmrAmbePayloadCount)
+                                     .arg(dmrAmbeFecCorrectionCount)
+                                     .arg(vocoderText));
+                } else {
+                    updateStatus(QStringLiteral("%1, %2").arg(result.serviceStatusText, vocoderText));
+                }
+            }
         }
         if (!result.decodedText.isEmpty()) {
             emit textDecoded(result.decodedText);
+        }
+        if (result.lockLost) {
+            dmrVocoder.reset();
+            dmrPayloadProbeVocoder.reset();
+            dmrRawProbeVocoder.reset();
+            dmrCanonicalProbeVocoder.reset();
+            dmrCollapsedVoiceCount = 0;
+            dmrArtifactConcealCount = 0;
+            clearDmrVoicePcmBuffer();
         }
         return;
     }
@@ -988,7 +1698,18 @@ void DigitalDecoder::configureForMode(int modulationType, int sampleRate) {
     } else if (modulationType == MOD_FT8) {
         updateStatus(QStringLiteral("FT8 detector: waiting for a 15 s frame"));
     } else if (modulationType == MOD_DMR) {
-        updateStatus(QStringLiteral("DMR monitor: searching 4FSK sync"));
+        const double samplesPerSymbol = static_cast<double>(activeSampleRate) / 4800.0;
+        qDebug() << "[DMR decoder] configured"
+                 << "sampleRate" << activeSampleRate
+                 << "samplesPerSymbol" << samplesPerSymbol
+                 << "vocoderAvailable" << dmrVocoder.isAvailable();
+        updateStatus(dmrVocoder.isAvailable()
+                         ? QStringLiteral("DMR monitor: %1 kHz 4FSK, %2 sps, AMBE vocoder ready")
+                               .arg(activeSampleRate / 1000)
+                               .arg(samplesPerSymbol, 0, 'f', 1)
+                         : QStringLiteral("DMR monitor: %1 kHz 4FSK, %2 sps, AMBE vocoder unavailable")
+                               .arg(activeSampleRate / 1000)
+                               .arg(samplesPerSymbol, 0, 'f', 1));
     } else if (modulationType == MOD_PSK) {
         updateStatus(QStringLiteral("PSK mode: clean audio pass-through; PSK31 decoder not implemented yet"));
     } else if (isDigitalMode(modulationType)) {

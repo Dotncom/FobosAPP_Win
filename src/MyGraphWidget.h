@@ -11,6 +11,7 @@
 #include <QPainter>
 #include <QMouseEvent>
 #include <QPoint>
+#include "scanvisualassembler.h"
 
 struct GraphBandMarker {
     double startHz = 0.0;
@@ -32,6 +33,7 @@ public:
     void setBandMarkersEnabled(bool generalEnabled, bool amateurEnabled);
     void setBandMarkersCompact(bool compact);
     void setBandMarkers(const QVector<GraphBandMarker> &markers);
+    void setScanSegments(const QVector<ScanVisualSegment> &segments);
     void clearData();
 
 signals:
@@ -54,17 +56,22 @@ private:
     struct CursorPeak {
         bool valid = false;
         double frequency = 0.0;
+        double displayFrequency = 0.0;
         float level = 0.0f;
         int x = 0;
         int y = 0;
     };
 
     void drawBandMarkers(QPainter &painter) const;
+    void drawScanSegments(QPainter &painter) const;
     void drawYAxis(QPainter &painter) const;
     void drawBandwidthMeasurement(QPainter &painter) const;
     void drawHoverCursor(QPainter &painter) const;
     float normalizedLevel(float value) const;
     int bottomMargin() const;
+    double displayFrequencyAtX(int x) const;
+    double actualFrequencyForDisplayFrequency(double displayFrequency) const;
+    double displayFrequencyForActualFrequency(double actualFrequency) const;
     double frequencyAtX(int x) const;
     int xForFrequency(double frequency) const;
     CursorPeak cursorPeakAtX(int x) const;
@@ -89,6 +96,7 @@ private:
     QPoint bandwidthMeasureStartPos;
     QPoint bandwidthMeasureEndPos;
     QVector<GraphBandMarker> bandMarkers;
+    QVector<ScanVisualSegment> scanSegments;
     QColor valueToColor(float value);
 };
 

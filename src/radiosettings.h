@@ -79,6 +79,60 @@ inline bool isFrequencyDiscriminatorMode(int modulationType) {
            modulationType == MOD_DMR;
 }
 
+constexpr int DMR_DEFAULT_BASEBAND_SAMPLE_RATE = 192000;
+
+inline int normalizedDmrBasebandSampleRate(int sampleRate) {
+    switch (sampleRate) {
+    case 24000:
+    case 48000:
+    case 96000:
+    case 192000:
+    case 384000:
+        return sampleRate;
+    default:
+        return DMR_DEFAULT_BASEBAND_SAMPLE_RATE;
+    }
+}
+
+enum DmrAmbeLayout {
+    DMR_AMBE_LAYOUT_AUTO = 0,
+    DMR_AMBE_LAYOUT_LINEAR72 = 1,
+    DMR_AMBE_LAYOUT_SPLIT36 = 2,
+    DMR_AMBE_LAYOUT_DIBIT_STRIPE = 3,
+    DMR_AMBE_LAYOUT_BIT_STRIPE = 4
+};
+
+constexpr int DMR_DEFAULT_AMBE_LAYOUT = DMR_AMBE_LAYOUT_AUTO;
+
+inline int normalizedDmrAmbeLayout(int layout) {
+    switch (layout) {
+    case DMR_AMBE_LAYOUT_AUTO:
+    case DMR_AMBE_LAYOUT_LINEAR72:
+    case DMR_AMBE_LAYOUT_SPLIT36:
+    case DMR_AMBE_LAYOUT_DIBIT_STRIPE:
+    case DMR_AMBE_LAYOUT_BIT_STRIPE:
+        return layout;
+    default:
+        return DMR_DEFAULT_AMBE_LAYOUT;
+    }
+}
+
+inline const char *dmrAmbeLayoutName(int layout) {
+    switch (normalizedDmrAmbeLayout(layout)) {
+    case DMR_AMBE_LAYOUT_LINEAR72:
+        return "Linear72";
+    case DMR_AMBE_LAYOUT_SPLIT36:
+        return "Split36";
+    case DMR_AMBE_LAYOUT_DIBIT_STRIPE:
+        return "DibitStripe";
+    case DMR_AMBE_LAYOUT_BIT_STRIPE:
+        return "BitStripe";
+    case DMR_AMBE_LAYOUT_AUTO:
+    default:
+        return "Auto";
+    }
+}
+
 struct RadioSettings {
     int deviceIndex = 0;
     int clockSource = 0;
@@ -103,6 +157,17 @@ struct RadioSettings {
     bool audioEnabled = false;
     bool syncEnabled = false;
     std::uint8_t gpoValue = 0;
+    bool dmrLabEnabled = false;
+    int dmrLabColorCode = -1;
+    int dmrLabTimeslot = 0;
+    int dmrLabSourceId = 0;
+    int dmrLabTargetId = 0;
+    int dmrBasebandSampleRate = DMR_DEFAULT_BASEBAND_SAMPLE_RATE;
+    bool dmrManualTimingEnabled = false;
+    int dmrManualTimingOffset = 0;
+    double dmrSlicerRatio = 0.625;
+    bool dmrAdaptiveSlicer = true;
+    int dmrAmbeLayout = DMR_DEFAULT_AMBE_LAYOUT;
 };
 
 inline double hfNoiseCancelFrequencyForShaping(const RadioSettings &settings, double frequencyHz) {

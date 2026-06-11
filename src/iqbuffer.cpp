@@ -65,7 +65,7 @@ std::size_t maxQueuedFloatsForLiveAudio() {
 
 namespace IqBuffer {
 
-void publish(const float *samples, std::size_t floatCount, bool queueBlock) {
+void publish(const float *samples, std::size_t floatCount, bool queueBlock, bool updateSnapshot) {
     if (!samples || floatCount == 0) {
         return;
     }
@@ -76,8 +76,10 @@ void publish(const float *samples, std::size_t floatCount, bool queueBlock) {
     }
 
     std::lock_guard<std::mutex> lock(g_iqMutex);
-    appendToSnapshot(samples, floatCount);
-    ++g_iqSequence;
+    if (updateSnapshot) {
+        appendToSnapshot(samples, floatCount);
+        ++g_iqSequence;
+    }
 
     if (!queueBlock) {
         g_iqBlocks.clear();

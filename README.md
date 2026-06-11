@@ -2,10 +2,11 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android network-client support work. Version 3.6 keeps the stable
-real-device, network, and video/image work from the 2.x line, expands the DMR
-laboratory monitor, improves scan/measurement tooling, and adds more practical
-desktop, Raspberry Pi, and Android tuning controls.
+and Android network-client support work. Version 4.0 keeps the stable
+real-device, network, and video/image work from the 2.x/3.x line, expands the
+DMR laboratory monitor, adds optional GPL DMR voice backend modules, improves
+scan/measurement tooling, and adds more practical desktop, Raspberry Pi, and
+Android tuning controls.
 
 ## Windows Release Package
 
@@ -15,6 +16,60 @@ DLLs, and the `platforms/qwindows.dll` plugin together in the same folder tree.
 
 The app stores local settings in `FobosAPP.ini` next to the executable and writes
 diagnostic logs to `FobosAPP_diagnostic.log`.
+
+DMR voice in 4.0 is experimental. Windows packages may include optional
+`dmr_voice_backends/fobos_dmr_voice_*.dll` GPL backend modules. See
+`THIRD_PARTY_LICENSES.txt` and `licenses/dmr_voice_backend/` before
+redistributing AMBE-capable binaries.
+
+## Optional DMR Voice Backends
+
+FobosAPP loads optional DMR voice modules from `dmr_voice_backends/` at runtime.
+The app itself uses the stable C ABI in
+`FobosDMRVoiceBackend-gpl/include/fobos_dmr_voice_backend.h`; third-party AMBE
+implementations are kept as optional Git submodules so users can fetch and build
+them only when needed.
+
+Optional backend dependencies:
+
+- mbelib-neo: https://github.com/arancormonk/mbelib-neo
+- OpenDMR/softdmr: https://github.com/hicaoc/softdmr
+
+When cloning from Git:
+
+```bash
+git clone https://github.com/Dotncom/FobosAPP.git
+cd FobosAPP
+git submodule update --init --recursive third_party/mbelib-neo third_party/softdmr
+```
+
+If you are working from a source zip instead of a Git checkout, clone the
+optional dependencies into the same paths:
+
+```bash
+git clone https://github.com/arancormonk/mbelib-neo.git third_party/mbelib-neo
+git clone https://github.com/hicaoc/softdmr.git third_party/softdmr
+```
+
+Build the backend modules after the submodules are present:
+
+```powershell
+cmake -S FobosDMRVoiceBackend-gpl -B build\fobos-dmr-voice-backend-gpl-vs `
+  -G "Visual Studio 17 2022" -A x64
+cmake --build build\fobos-dmr-voice-backend-gpl-vs --config Release
+```
+
+Copy the resulting backend libraries into the runtime folder:
+
+```text
+release/bin/dmr_voice_backends/fobos_dmr_voice_mbelib.dll
+release/bin/dmr_voice_backends/fobos_dmr_voice_opendmr.dll
+```
+
+On Linux/Raspberry Pi the same backend project builds shared libraries with
+`.so` names, usually `libfobos_dmr_voice_mbelib.so` and
+`libfobos_dmr_voice_opendmr.so`; place them in the application runtime
+`dmr_voice_backends/` directory.
 
 ## Main Features
 
@@ -31,6 +86,11 @@ diagnostic logs to `FobosAPP_diagnostic.log`.
 - Stable async Fobos streaming path with safer start, stop, and retune handling.
 - Live retuning of frequency, sample rate, FFT length, gains, bandwidth, audio,
   and display settings.
+- Visual manual-retune scan by cycling through an explicit center frequency
+  list on Standard or Agile APIs. Adjacent centers are auto-spaced by at least
+  the current sample rate, and the dwell time is user-adjustable because the
+  practical scan rate is limited by host/libusb retune overhead, not by the RF
+  hardware alone.
 - Resizable/dockable UI, zoomable spectrum and waterfall, Y-axis level display,
   level range controls, and frequency widgets with units, presets, and step
   buttons.
@@ -65,8 +125,18 @@ libraries, or point the three cache paths at local builds.
 Build and deploy locally:
 
 ```powershell
-cmake --build build\Desktop_x86_windows_msvc2022_pe_64bit-Release --config Release
-powershell -ExecutionPolicy Bypass -File tools\deploy_windows.ps1
+powershell -ExecutionPolicy Bypass -File tools\build_windows_local.ps1
+powershell -ExecutionPolicy Bypass -File tools\deploy_windows.ps1 `
+  -BuildDir build\steamdeck-msvc-release\Release
+```
+
+Optional GPL DMR voice backend modules are built separately after the DMR
+submodules are present; see `Optional DMR Voice Backends` above.
+
+Create the Windows zip after deploy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package_windows_release.ps1
 ```
 
 The application icon is stored in `packaging/icons` and is embedded into the
@@ -116,6 +186,39 @@ sudo udevadm trigger
 ./tools/build_linux.sh
 ./tools/run_linux.sh
 ```
+
+For future Raspberry Pi DMR voice/backend testing, start from a Git checkout
+with the optional DMR submodules, or clone them into the unpacked source tree:
+
+```bash
+git submodule update --init --recursive third_party/mbelib-neo third_party/softdmr
+# or, inside a source zip tree:
+git clone https://github.com/arancormonk/mbelib-neo.git third_party/mbelib-neo
+git clone https://github.com/hicaoc/softdmr.git third_party/softdmr
+```
+
+Then build the app and the optional backend modules:
+
+```bash
+sudo ./tools/install_deps_debian.sh
+./tools/prepare_fobos_linux.sh
+./tools/build_linux.sh
+cmake -S FobosDMRVoiceBackend-gpl -B build/fobos-dmr-voice-backend-gpl \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build/fobos-dmr-voice-backend-gpl -j
+```
+
+For a normal runtime layout, copy the built backend `.so` files next to the app:
+
+```bash
+mkdir -p build/linux-release/dmr_voice_backends
+cp build/fobos-dmr-voice-backend-gpl/libfobos_dmr_voice_*.so \
+  build/linux-release/dmr_voice_backends/
+./tools/run_linux.sh
+```
+
+During development, FobosAPP also searches `build/fobos-dmr-voice-backend-gpl/`
+directly, so the copy step is optional for quick local tests.
 
 On Windows, create that source zip with:
 

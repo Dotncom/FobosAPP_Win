@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 3.6.0)
+project(FobosAPP VERSION 4.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,6 +66,20 @@ foreach(required_path
     endif()
 endforeach()
 
+option(FOBOS_ENABLE_MBELIB_NEO "Enable mbelib-neo DMR AMBE vocoder support" ON)
+set(FOBOS_HAS_MBELIB_NEO OFF)
+if(FOBOS_ENABLE_MBELIB_NEO AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/mbelib-neo/CMakeLists.txt")
+    set(MBELIB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MBELIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(MBELIB_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(MBELIB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(MBELIB_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/mbelib-neo EXCLUDE_FROM_ALL)
+    set(FOBOS_HAS_MBELIB_NEO ON)
+else()
+    message(STATUS "mbelib-neo not found or disabled; DMR voice synthesis will be unavailable.")
+endif()
+
 set(SOURCES
     src/main.cpp
     src/main.h
@@ -74,12 +88,20 @@ set(SOURCES
     src/diagnosticlogging.h
     src/dmrdecoder.cpp
     src/dmrdecoder.h
+    src/dmrvocoder.cpp
+    src/dmrvocoder.h
+    src/dmrhunterdetector.cpp
+    src/dmrhunterdetector.h
+    src/digitalvideohunterdetector.cpp
+    src/digitalvideohunterdetector.h
     src/digitaldecoder.cpp
     src/digitaldecoder.h
     src/frequencycontrol.cpp
     src/frequencycontrol.h
     src/finetunewidget.cpp
     src/finetunewidget.h
+    src/fpvhunterdetector.cpp
+    src/fpvhunterdetector.h
     src/iqbuffer.cpp
     src/iqbuffer.h
     src/networkcontroller.cpp
@@ -91,6 +113,8 @@ set(SOURCES
     src/recordingmanager.cpp
     src/recordingmanager.h
     src/radiosettings.h
+    src/spectrumhuntercontrols.cpp
+    src/spectrumhuntercontrols.h
     src/videoprocessor.cpp
     src/videoprocessor.h
     src/videowidget.cpp
@@ -105,6 +129,8 @@ set(SOURCES
     src/MyWaterfallWidget.h
     src/scalewidget.cpp
     src/scalewidget.h
+    src/scanvisualassembler.cpp
+    src/scanvisualassembler.h
     src/app_resources.qrc
 )
 
@@ -116,6 +142,7 @@ add_executable(FobosAPP ${SOURCES})
 
 target_include_directories(FobosAPP PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/FobosDMRVoiceBackend-gpl/include
     ${FOBOS_STANDARD_INCLUDE_DIR}
     ${FOBOS_AGILE_INCLUDE_DIR}
     ${FFTW_INCLUDE_DIR}
@@ -129,6 +156,11 @@ target_link_libraries(FobosAPP PRIVATE
     Qt5::Widgets
     Qt5::Network
 )
+
+if(FOBOS_HAS_MBELIB_NEO)
+    target_link_libraries(FobosAPP PRIVATE mbe_neo::mbe_static)
+    target_compile_definitions(FobosAPP PRIVATE FOBOSAPP_HAS_MBELIB_NEO=1)
+endif()
 
 if(WIN32)
     target_link_libraries(FobosAPP PRIVATE winmm opengl32)
@@ -144,6 +176,30 @@ elseif(NOT WIN32)
 endif()
 
 install(TARGETS FobosAPP RUNTIME DESTINATION bin)
+
+add_executable(dmr_lab_replay
+    tools/dmr_lab_replay.cpp
+    src/dmrdecoder.cpp
+    src/dmrdecoder.h
+    src/dmrvocoder.cpp
+    src/dmrvocoder.h
+)
+
+target_include_directories(dmr_lab_replay PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/FobosDMRVoiceBackend-gpl/include
+)
+
+target_link_libraries(dmr_lab_replay PRIVATE
+    Qt5::Core
+)
+
+if(FOBOS_HAS_MBELIB_NEO)
+    target_link_libraries(dmr_lab_replay PRIVATE mbe_neo::mbe_static)
+    target_compile_definitions(dmr_lab_replay PRIVATE FOBOSAPP_HAS_MBELIB_NEO=1)
+endif()
+
+install(TARGETS dmr_lab_replay RUNTIME DESTINATION bin)
 
 if(UNIX AND NOT APPLE)
     install(FILES packaging/linux/99-fobos-sdr.rules

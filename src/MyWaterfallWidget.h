@@ -15,6 +15,7 @@
 #include <QMouseEvent>
 #include <QPoint>
 #include <cmath>
+#include "scanvisualassembler.h"
 
 class MyWaterfallWidget : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
@@ -24,6 +25,7 @@ public:
     bool initialized;
     void setData(const std::vector<float> &xData, const std::vector<float> &yData, double minFrequency, double maxFrequency, int fftLength, bool secondGraph, float contrast, float sensitivity, float levelMin, float levelMax);
     void setLevelRange(float minLevel, float maxLevel);
+    void setScanSegments(const QVector<ScanVisualSegment> &segments);
     void clearData();
     void computeLineData();
 signals:
@@ -41,9 +43,13 @@ private:
     void ensureLineBuffer();
     void resetWaterfallTexture(int w, int h);
     void resizeWaterfallTexturePreserve(int w, int h);
+    void drawScanSegments(QPainter &painter) const;
+    double displayFrequencyAtX(int x) const;
+    double actualFrequencyForDisplayFrequency(double displayFrequency) const;
+    double displayFrequencyForActualFrequency(double actualFrequency) const;
     double frequencyAtX(int x) const;
     double signalCenterNearFrequency(double frequency);
-    QMutex mutex;
+    mutable QMutex mutex;
 	QOpenGLBuffer waterfallVbo;
     GLuint waterfallTexture;
     std::vector<unsigned char> lineData;
@@ -62,6 +68,7 @@ private:
     bool changebit;
     bool pendingTextureLine = false;
     bool textureClearRequested = false;
+    QVector<ScanVisualSegment> scanSegments;
 };
 
 #endif // MYWATERFALLWIDGET_H

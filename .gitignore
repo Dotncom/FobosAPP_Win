@@ -36,6 +36,11 @@ Makefile
 # Logs
 *.log
 
+# Local context screenshots/photos kept in the workspace root
+/*.jpg
+/*.jpeg
+/*.png
+
 # IDE
 .idea/
 .vscode/
@@ -57,9 +62,7 @@ toolchain.cmake
 # Backups and drafts
 _stable_backups/
 /git/
-/fork winapi/
-/shaders/
-/fobos/
+/sandbox/
 
 # Build/output
 build/
@@ -72,19 +75,25 @@ local.properties
 *.apk
 *.aab
 
+# Local SDR captures / decoder dumps
+*.iq.wav
+*.iq
+*.cu8
+*.cs16
+*.pcm
+*.raw
+
 # Bundled binary deps / SDKs
 fftw-3.3.5-dll64/
 libusb-1.0.27/
 
-# local repos
-.codex_libfobos/
-.codex_sdrpp/
-.codex_upstream/
+# Local SDK/cache trees
+fobos/
+fobos_agile/
 third_party/fobos-linux/
 third_party/firmware/
 third_party/src/
-/fobos_agile/
-/old/
+third_party/dsd-fme/
 
 # unused source
 src/udp_sender.cpp
@@ -93,6 +102,4 @@ src/ringbuffer.cpp
 src/ringbuffer.h
 
 # unused folders
-/fobos/
 /shaders/
-

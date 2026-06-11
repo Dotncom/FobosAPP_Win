@@ -7,7 +7,10 @@
 
 namespace IqBuffer {
 
-void publish(const float *samples, std::size_t floatCount, bool queueBlock = true);
+void publish(const float *samples,
+             std::size_t floatCount,
+             bool queueBlock = true,
+             bool updateSnapshot = true);
 bool snapshot(std::vector<float> &out, std::uint64_t *sequence = nullptr);
 bool popBlock(std::vector<float> &out, std::uint64_t *sequence = nullptr);
 void clear();

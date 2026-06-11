@@ -69,9 +69,13 @@ public:
 public slots:
     void startDemodulation();
     void stopDemodulation();
+    void enqueueExternalPcm(const QByteArray &pcmData);
+    void clearExternalPcm();
 
 signals:
     void audioFrameReady(const QByteArray &pcmData);
+    void demodulatorFrameReady(const QByteArray &pcmData);
+    void dmrBasebandFrameReady(const QByteArray &pcmData, int sampleRate);
 
 private:
     void SDRThread();
@@ -83,7 +87,15 @@ private:
     void joinWorkerThreads();
     void resetDemodulatorState();
     RadioSettings currentSettingsSnapshot() const;
-    void processDemodulatorBlock(const std::vector<float>& iqBlock, std::vector<short>& audioSamples, const RadioSettings &settings);
+    void processDemodulatorBlock(const std::vector<float>& iqBlock,
+                                 std::vector<short>& audioSamples,
+                                 std::vector<short>& dmrBasebandSamples,
+                                 int &dmrBasebandSampleRate,
+                                 const RadioSettings &settings);
+    void processDmrIqDemodulatorBlock(const std::vector<float>& iqBlock,
+                                       std::vector<short>& dmrBasebandSamples,
+                                       int &dmrBasebandSampleRate,
+                                       const RadioSettings &settings);
     size_t queuedAudioSamples() const;
     void discardAudioSamples(size_t count);
     void compactAudioBufferIfNeeded();
@@ -92,6 +104,7 @@ private:
     std::vector<short> waveBuffers[NUM_BUFFERS];
     std::vector<short> audioBuffer;
     size_t audioBufferReadOffset = 0;
+    bool externalAudioPrimed = false;
 #ifdef _WIN32
     WAVEHDR waveHdrs[NUM_BUFFERS];
 #endif
@@ -99,6 +112,7 @@ private:
     std::atomic<int> currentBufferIndex = 0;
     std::atomic<float> outputVolume = 1.0f;
     std::atomic<bool> hfNoiseCancelResetRequested = false;
+    std::atomic<bool> demodulatorResetRequested = false;
     std::condition_variable cv;
     std::mutex audioMutex;
 #ifdef _WIN32
@@ -125,6 +139,7 @@ private:
     double ncoPhase = 0.0;
     double audioResamplePhase = 0.0;
     std::complex<float> amLowPassState = {0.0f, 0.0f};
+    std::array<std::complex<float>, 3> dmrChannelPreLowPassStates = {};
     std::array<std::complex<float>, 4> sidebandLowPassStates = {};
     std::complex<float> channelDecimationSum = {0.0f, 0.0f};
     int channelDecimationCount = 0;
@@ -141,6 +156,24 @@ private:
     double cwTonePhase = 0.0;
     float amDcEstimate = 0.0f;
     float amAgcLevel = 0.05f;
+    double dmrResamplePhase = 0.0;
+    std::array<std::vector<std::complex<float>>, 4> dmrCicBuffers = {};
+    std::array<std::complex<float>, 4> dmrCicSums = {};
+    int dmrCicIndex = 0;
+    int dmrCicLength = 0;
+    std::complex<float> dmrLowPassState = {0.0f, 0.0f};
+    std::complex<float> dmrDecimationSum = {0.0f, 0.0f};
+    int dmrDecimationCount = 0;
+    std::complex<float> dmrPreviousSample = {1.0f, 0.0f};
+    bool dmrPreviousValid = false;
+    float dmrDiscriminatorDc = 0.0f;
+    float dmrFskLowPassState = 0.0f;
+    float dmrFskLowPassState2 = 0.0f;
+    float dmrPreviousOutputSample = 0.0f;
+    bool dmrPreviousOutputValid = false;
+    int dmrLastLoggedOutputRate = 0;
+    int dmrLastLoggedDecimationFactor = 0;
+    double dmrLastLoggedChannelRate = 0.0;
     std::complex<float> hfNoiseCancelCoeff = {0.0f, 0.0f};
     std::complex<float> hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
 

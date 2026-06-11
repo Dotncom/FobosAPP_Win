@@ -42,6 +42,8 @@ final class FobosNetworkClient {
         final double bandwidth;
         final int modulationType;
         final int inputMode;
+        final int requestedFftLength;
+        final boolean localUsb;
 
         SpectrumFrame(double[] frequencies,
                       float[] magnitudes,
@@ -53,6 +55,22 @@ final class FobosNetworkClient {
                       double bandwidth,
                       int modulationType,
                       int inputMode) {
+            this(frequencies, magnitudes, minFrequency, maxFrequency, centerFrequency,
+                    listeningFrequency, sampleRate, bandwidth, modulationType, inputMode, 0, false);
+        }
+
+        SpectrumFrame(double[] frequencies,
+                      float[] magnitudes,
+                      double minFrequency,
+                      double maxFrequency,
+                      double centerFrequency,
+                      double listeningFrequency,
+                      double sampleRate,
+                      double bandwidth,
+                      int modulationType,
+                      int inputMode,
+                      int requestedFftLength,
+                      boolean localUsb) {
             this.frequencies = frequencies;
             this.magnitudes = magnitudes;
             this.minFrequency = minFrequency;
@@ -63,6 +81,8 @@ final class FobosNetworkClient {
             this.bandwidth = bandwidth;
             this.modulationType = modulationType;
             this.inputMode = inputMode;
+            this.requestedFftLength = requestedFftLength;
+            this.localUsb = localUsb;
         }
     }
 

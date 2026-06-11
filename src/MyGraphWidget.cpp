@@ -10,6 +10,7 @@ constexpr int GRAPH_RIGHT_MARGIN = 0;
 constexpr int GRAPH_TOP_MARGIN = 8;
 constexpr int GRAPH_BOTTOM_MARGIN = 20;
 constexpr int GRAPH_COMPACT_BAND_BOTTOM_MARGIN = 30;
+constexpr int GRAPH_SCAN_SEGMENT_BOTTOM_MARGIN = 34;
 constexpr int GRAPH_Y_TICKS = 6;
 constexpr double AUTO_TUNE_WINDOW_FRACTION = 1.0 / 80.0;
 constexpr double AUTO_TUNE_MIN_WINDOW_HZ = 300.0;
@@ -92,6 +93,11 @@ void MyGraphWidget::setBandMarkers(const QVector<GraphBandMarker> &markers) {
     update();
 }
 
+void MyGraphWidget::setScanSegments(const QVector<ScanVisualSegment> &segments) {
+    scanSegments = segments;
+    update();
+}
+
 void MyGraphWidget::clearData() {
     xData.clear();
     yData.clear();
@@ -169,6 +175,7 @@ void MyGraphWidget::paintGL() {
         }
     }
     painter.endNativePainting();
+    drawScanSegments(painter);
     drawBandMarkers(painter);
     drawYAxis(painter);
     drawBandwidthMeasurement(painter);
@@ -251,7 +258,7 @@ void MyGraphWidget::leaveEvent(QEvent *event) {
     QOpenGLWidget::leaveEvent(event);
 }
 
-double MyGraphWidget::frequencyAtX(int x) const {
+double MyGraphWidget::displayFrequencyAtX(int x) const {
     if (width() <= 0 || qFuzzyCompare(xMin, xMax)) {
         return xMin;
     }
@@ -259,6 +266,47 @@ double MyGraphWidget::frequencyAtX(int x) const {
     const double plotWidth = (std::max)(1, width() - GRAPH_LEFT_MARGIN - GRAPH_RIGHT_MARGIN);
     const double normalized = std::clamp((static_cast<double>(x) - plotLeft) / plotWidth, 0.0, 1.0);
     return xMin + normalized * (xMax - xMin);
+}
+
+double MyGraphWidget::actualFrequencyForDisplayFrequency(double displayFrequency) const {
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            displayFrequency < segment.startHz ||
+            displayFrequency > segment.endHz) {
+            continue;
+        }
+        const double ratio = (displayFrequency - segment.startHz) / (segment.endHz - segment.startHz);
+        return segment.actualStartHz +
+               std::clamp(ratio, 0.0, 1.0) * (segment.actualEndHz - segment.actualStartHz);
+    }
+    return displayFrequency;
+}
+
+double MyGraphWidget::displayFrequencyForActualFrequency(double actualFrequency) const {
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            segment.actualEndHz <= segment.actualStartHz ||
+            actualFrequency < segment.actualStartHz ||
+            actualFrequency > segment.actualEndHz) {
+            continue;
+        }
+        const double ratio = (actualFrequency - segment.actualStartHz) /
+                             (segment.actualEndHz - segment.actualStartHz);
+        return segment.startHz + std::clamp(ratio, 0.0, 1.0) * (segment.endHz - segment.startHz);
+    }
+    return actualFrequency;
+}
+
+double MyGraphWidget::frequencyAtX(int x) const {
+    return actualFrequencyForDisplayFrequency(displayFrequencyAtX(x));
 }
 
 int MyGraphWidget::xForFrequency(double frequency) const {
@@ -283,20 +331,21 @@ MyGraphWidget::CursorPeak MyGraphWidget::cursorPeakAtX(int x) const {
         return peak;
     }
 
-    const double cursorFrequency = frequencyAtX(x);
+    const double cursorDisplayFrequency = displayFrequencyAtX(x);
     const double plotWidth = (std::max)(1, width() - GRAPH_LEFT_MARGIN - GRAPH_RIGHT_MARGIN);
     const double hzPerPixel = std::abs(xMax - xMin) / plotWidth;
     const double binSpanHz = std::abs(xMax - xMin) / (std::max)(1, dataCount);
     const double halfWindowHz = (std::max)(hzPerPixel * 5.0, binSpanHz * 2.0);
 
-    auto considerLevel = [&](double frequency, float level) {
-        if (!std::isfinite(frequency) || !std::isfinite(level) ||
-            std::abs(frequency - cursorFrequency) > halfWindowHz) {
+    auto considerLevel = [&](double displayFrequency, float level) {
+        if (!std::isfinite(displayFrequency) || !std::isfinite(level) ||
+            std::abs(displayFrequency - cursorDisplayFrequency) > halfWindowHz) {
             return;
         }
         if (!peak.valid || level > peak.level) {
             peak.valid = true;
-            peak.frequency = frequency;
+            peak.displayFrequency = displayFrequency;
+            peak.frequency = actualFrequencyForDisplayFrequency(displayFrequency);
             peak.level = level;
         }
     };
@@ -321,11 +370,12 @@ MyGraphWidget::CursorPeak MyGraphWidget::cursorPeakAtX(int x) const {
             if (!std::isfinite(frequency) || !std::isfinite(level)) {
                 continue;
             }
-            const double distance = std::abs(frequency - cursorFrequency);
+            const double distance = std::abs(frequency - cursorDisplayFrequency);
             if (distance < bestDistance) {
                 bestDistance = distance;
                 peak.valid = true;
-                peak.frequency = frequency;
+                peak.displayFrequency = frequency;
+                peak.frequency = actualFrequencyForDisplayFrequency(frequency);
                 peak.level = level;
             }
         }
@@ -338,7 +388,7 @@ MyGraphWidget::CursorPeak MyGraphWidget::cursorPeakAtX(int x) const {
     const int plotTop = GRAPH_TOP_MARGIN;
     const int plotBottom = (std::max)(plotTop + 1, height() - bottomMargin());
     const int plotHeight = plotBottom - plotTop;
-    peak.x = xForFrequency(peak.frequency);
+    peak.x = xForFrequency(peak.displayFrequency);
     peak.y = plotBottom - static_cast<int>(std::round(normalizedLevel(peak.level) * plotHeight));
     peak.y = (std::clamp)(peak.y, plotTop, plotBottom);
     return peak;
@@ -382,6 +432,7 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
         return frequency;
     }
 
+    const double targetDisplayFrequency = displayFrequencyForActualFrequency(frequency);
     const double visibleSpan = std::abs(xMax - xMin);
     const double halfWindow = (std::clamp)(visibleSpan * AUTO_TUNE_WINDOW_FRACTION,
                                            AUTO_TUNE_MIN_WINDOW_HZ,
@@ -390,7 +441,8 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
     samples.reserve(256);
     for (int i = 0; i < dataCount; ++i) {
         const double sampleFrequency = xData[i];
-        if (!std::isfinite(sampleFrequency) || std::abs(sampleFrequency - frequency) > halfWindow) {
+        if (!std::isfinite(sampleFrequency) ||
+            std::abs(sampleFrequency - targetDisplayFrequency) > halfWindow) {
             continue;
         }
         const float level = yData[(i + dataCount / 2) % dataCount];
@@ -431,7 +483,7 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
     int peakIndex = 0;
     double bestScore = -std::numeric_limits<double>::infinity();
     for (int i = 0; i < sampleCount; ++i) {
-        const double distanceRatio = std::abs(samples[i].frequency - frequency) /
+        const double distanceRatio = std::abs(samples[i].frequency - targetDisplayFrequency) /
                                      (std::max)(1.0, halfWindow);
         const double score = smoothedLevels[static_cast<std::size_t>(i)] - distanceRatio * 8.0;
         if (score > bestScore) {
@@ -479,7 +531,10 @@ double MyGraphWidget::signalCenterNearFrequency(double frequency) const {
     const double leftFrequency = interpolatedEdge(left, left - 1);
     const double rightFrequency = interpolatedEdge(right, right + 1);
     const double centerFrequency = (leftFrequency + rightFrequency) * 0.5;
-    return std::isfinite(centerFrequency) ? centerFrequency : samples[peakIndex].frequency;
+    const double actualCenterFrequency = actualFrequencyForDisplayFrequency(centerFrequency);
+    return std::isfinite(actualCenterFrequency)
+               ? actualCenterFrequency
+               : actualFrequencyForDisplayFrequency(samples[peakIndex].frequency);
 }
 
 QColor MyGraphWidget::valueToColor(float value) {
@@ -530,9 +585,52 @@ float MyGraphWidget::normalizedLevel(float value) const {
 }
 
 int MyGraphWidget::bottomMargin() const {
-    return compactBandMarkersEnabled && (generalBandMarkersEnabled || amateurBandMarkersEnabled)
-               ? GRAPH_COMPACT_BAND_BOTTOM_MARGIN
-               : GRAPH_BOTTOM_MARGIN;
+    int margin = GRAPH_BOTTOM_MARGIN;
+    if (compactBandMarkersEnabled && (generalBandMarkersEnabled || amateurBandMarkersEnabled)) {
+        margin = (std::max)(margin, GRAPH_COMPACT_BAND_BOTTOM_MARGIN);
+    }
+    if (!scanSegments.isEmpty()) {
+        margin = (std::max)(margin, GRAPH_SCAN_SEGMENT_BOTTOM_MARGIN);
+    }
+    return margin;
+}
+
+void MyGraphWidget::drawScanSegments(QPainter &painter) const {
+    if (scanSegments.size() < 2 || width() <= 0 || height() <= 0 || qFuzzyCompare(xMin, xMax)) {
+        return;
+    }
+
+    const int markerTop = (std::max)(GRAPH_TOP_MARGIN + 1, height() - bottomMargin());
+    const int markerBottom = height();
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    QPen edgePen(QColor(180, 215, 255, 190));
+    edgePen.setWidth(1);
+    painter.setPen(edgePen);
+    for (const ScanVisualSegment &segment : scanSegments) {
+        if (!std::isfinite(segment.startHz) || !std::isfinite(segment.endHz)) {
+            continue;
+        }
+        const int left = xForFrequency(segment.startHz);
+        const int right = xForFrequency(segment.endHz);
+        if (right < 0 || left > width() || right <= left) {
+            continue;
+        }
+        const QRect segmentRect(left,
+                                markerTop,
+                                right - left,
+                                (std::max)(1, markerBottom - markerTop));
+        painter.fillRect(segmentRect, QColor(50, 130, 220, 72));
+        painter.drawLine(left, markerTop, left, markerBottom);
+        painter.drawLine(right, markerTop, right, markerBottom);
+        if (right - left >= 52) {
+            const QRect labelRect(left + 3, markerTop, right - left - 6, markerBottom - markerTop);
+            painter.setPen(QColor(235, 246, 255, 230));
+            painter.drawText(labelRect, Qt::AlignLeft | Qt::AlignVCenter, segment.label);
+            painter.setPen(edgePen);
+        }
+    }
+    painter.restore();
 }
 
 void MyGraphWidget::drawBandMarkers(QPainter &painter) const {

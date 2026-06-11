@@ -23,14 +23,19 @@ a lightweight remote client, not a direct USB receiver build.
   screen, especially in landscape orientation.
 - Includes a USB sandbox panel for early direct-receiver work. It can list
   Android-visible USB devices, request permission for a likely Fobos device, and
-  safely open/close the device to verify Android USB Host access.
+  safely open/close the device to verify Android USB Host access. It also has
+  an experimental OTG session probe that claims the likely streaming interface,
+  reports bulk endpoints, reads firmware info with a safe vendor control
+  transfer, performs short one-shot bulk read tests, and can start an
+  experimental live OTG preview with Android-side FFT frames.
 
 ## Current Scope
 
-This first step intentionally uses only server-side processing. The Android app
-does not yet process Channel IQ or Full IQ locally, and it does not talk to the
-Fobos receiver over Android USB for IQ streaming yet. The USB sandbox is only a
-diagnostic proof-of-life layer for the next direct-receiver phase.
+The normal Android client path still uses server-side processing. The USB
+sandbox now has a first direct-receiver preview path, but it is intentionally
+limited and diagnostic: 4096-bin FFT maximum, no local audio demodulation yet,
+and no full replacement for the desktop receiver pipeline. High sample rates
+are exposed for testing, but phone, hub, and USB stack limits still matter.
 
 ## Build
 
@@ -72,6 +77,20 @@ Use a powered USB-C/OTG hub or dock. The Fobos receiver can draw up to about
 6. Confirm that a `16d0:132e` device appears.
 7. Press `USB permission/open` and accept the Android permission prompt.
 8. Check the log for `openDevice OK` and the detected `bcdDevice` hint.
+9. Press `OTG open`.
+10. Confirm that the log says `claimed if...` and lists a `bulk IN` endpoint.
+11. Press `OTG info` and check that hardware/firmware/build strings are shown.
+12. Press `OTG read`. A `-1` result is acceptable before streaming starts; this
+    button only verifies that the Android bulk-transfer path is wired.
+13. Press `OTG sample test` for a one-shot `OPEN -> START -> bulk read -> STOP`
+    experiment at 100 MHz / 8 Msps.
+14. Press the top `Net` button to switch it to `OTG`.
+15. Press the normal top `Start` button for a short live spectrum/waterfall
+    preview. The log should include `preview first FFT frame 4096 bins`.
+16. Press the normal top `Stop` button before unplugging during repeated
+    experiments.
+17. Press `Tools` only when you need the lower-level USB diagnostics:
+    scan, permission/open, raw read, one-shot sample test, or explicit close.
 
 Expected Fobos identifiers from the patched desktop libraries:
 

@@ -13,6 +13,7 @@
 #include <QDial>
 #include <QLabel>
 #include <QDoubleSpinBox>
+#include <QSpinBox>
 #include <QGroupBox>
 #include <QMap>
 #include <memory>
@@ -64,6 +65,11 @@
 #include "radiosettings.h"
 #include "videoprocessor.h"
 #include "videowidget.h"
+#include "dmrhunterdetector.h"
+#include "fpvhunterdetector.h"
+#include "digitalvideohunterdetector.h"
+#include "spectrumhuntercontrols.h"
+#include "scanvisualassembler.h"
 #include "frequencycontrol.h"
 #include "scalewidget.h"
 #include "MyGraphWidget.h"
@@ -142,6 +148,11 @@ private slots:
     void onAudioEnabledChanged(bool checked);
     void onDigitalTextDecoded(const QString &text);
     void onDigitalDecoderStatusChanged(const QString &status);
+    void onDmrMetadataDetected(int colorCode,
+                               int timeslot,
+                               quint32 targetId,
+                               quint32 sourceId,
+                               int flco);
     void startRecording(bool momentary);
     void stopRecording(bool momentaryRelease);
     void startPlayback();
@@ -188,8 +199,16 @@ private:
     bool closeFobosSession(bool clearIq = true);
     bool applyFobosSettings();
     bool applyAgileScanSettings(bool forceStop = false);
+    bool applyStandardScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
+    QVector<double> standardScanFrequencyList(QString *error = nullptr) const;
     double currentAgileScanCenterFrequencyHz() const;
+    double currentStandardScanCenterFrequencyHz() const;
+    void resetStandardScanState(bool clearSegments = true);
+    bool applyStandardScanRetune(double targetFrequencyHz, const char *reason);
+    void advanceStandardScanIfNeeded();
+    void normalizeStandardScanCentersUi(bool requireTwoCenters = false);
+    void applyStandardScanRangeToCenters();
     void updateAgileScanControls();
     void saveAgileScanPreset();
     void deleteAgileScanPreset();
@@ -201,6 +220,33 @@ private:
     void resetScanMeasurementPeaks();
     void clearScanMeasurement();
     void exportScanMeasurementCsv();
+    void updateFpvHunter(const std::vector<float> &frequencies,
+                         const std::vector<float> &magnitudes);
+    void updateFpvHunterControls();
+    void applyFpvHunterPresetToScan();
+    void tuneFpvHunterCandidate();
+    void selectFpvHunterCandidate(int direction);
+    void tuneFpvHunterCandidateIndex(int index);
+    void tuneFpvHunterCandidateValue(const FpvHunterCandidate &candidate, bool saveSettings);
+    void rememberFpvHunterCandidate(const FpvHunterCandidate &candidate, bool startNewEvent, qint64 nowMs);
+    void updateFpvHunterHistoryControls();
+    void tuneFpvHunterHistorySelection();
+    void clearFpvHunterHistory();
+    void updateDigitalVideoHunter(const std::vector<float> &frequencies,
+                                  const std::vector<float> &magnitudes);
+    void updateDigitalVideoHunterControls();
+    void applyDigitalVideoHunterPresetToScan();
+    void tuneDigitalVideoHunterCandidate();
+    void selectDigitalVideoHunterCandidate(int direction);
+    void tuneDigitalVideoHunterCandidateIndex(int index);
+    void tuneDigitalVideoHunterCandidateValue(const DigitalVideoHunterCandidate &candidate, bool saveSettings);
+    void updateDmrHunter(const std::vector<float> &frequencies,
+                         const std::vector<float> &magnitudes);
+    void updateDmrHunterControls();
+    void applyDmrHunterPresetToScan();
+    void tuneDmrHunterCandidate();
+    void selectDmrHunterCandidate(int direction);
+    void tuneDmrHunterCandidateIndex(int index);
     void startSpurCalibration();
     void clearSpurMask();
     void updateSpurCalibration(const std::vector<float> &frequencies,
@@ -253,15 +299,20 @@ private:
     QString localizedStatusText(const QString &status) const;
     void markTranslatable(QWidget *widget, const QString &key, const QString &fallback);
     void applyUiLanguage();
+    void applySpectrumHunterTranslations();
     void setComboItemText(QComboBox *combo, const QVariant &data, const QString &key, const QString &fallback);
     void updateNetworkButtonText();
     void updateAudioFilterLabels();
     void updateHfNoiseCancelControls();
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
     void handleDataProcessorFailure(int errorCode, bool stoppedByRequest);
+    void clearLiveSpectrumSnapshot(bool clearVisualHistory = false);
+    void schedulePostStartRetune(const QString &reason);
+    bool stabilizeAgileFrequencyBeforeStreaming(const char *reason);
     void connectDataProcessorSignals();
     void applyServerLocalOutputPolicy();
     bool applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings, const char *reason);
+    bool applyLiveAgileCenterRetune(uint64_t generation, const QString &reason);
     void resetNetworkIqReceptionState(bool clearGraph, bool clearWaterfall, bool restartAudioPrebuffer);
     void loadPersistentSettings();
     void savePersistentSettings();
@@ -272,7 +323,8 @@ private:
                                   const std::vector<float> &referenceMagnitudes = {},
                                   double frameCenterFrequency = std::numeric_limits<double>::quiet_NaN(),
                                   double frameMinFrequency = std::numeric_limits<double>::quiet_NaN(),
-                                  double frameMaxFrequency = std::numeric_limits<double>::quiet_NaN());
+                                  double frameMaxFrequency = std::numeric_limits<double>::quiet_NaN(),
+                                  const QVector<ScanVisualSegment> &scanSegments = QVector<ScanVisualSegment>());
     void displayNetworkSpectrumFrame(const QJsonObject &frame);
     void displayNetworkSpectrumFrameBinary(const QJsonObject &frame, const QByteArray &payload);
     void sendNetworkAudioFrame(const QByteArray &pcmData);
@@ -288,7 +340,7 @@ private:
     void receiveNetworkIqFrame(const QJsonObject &frame);
     void receiveNetworkIqFrameBinary(const QJsonObject &frame, const QByteArray &iqData);
     void handleNetworkIqPayload(const QJsonObject &frame, QByteArray iqBytes);
-    void processDigitalAudioFrame(const QByteArray &pcmData);
+    void processDigitalAudioFrame(const QByteArray &pcmData, int sampleRate = 48000);
     void processSstvAudioFrame(const QByteArray &pcmData);
     void processAptAudioFrame(const QByteArray &pcmData);
     void processWefaxAudioFrame(const QByteArray &pcmData);
@@ -312,6 +364,7 @@ private:
     void tuneSidebandEdgeAt(double frequency, int modulationType);
     void centerReceiverAt(double frequency);
     bool applyFftLengthChange(int newFftLength, bool notifyRemote);
+    bool stopAgileScanForNormalRf(const char *reason);
     
     QComboBox *clkBox = nullptr;
     QComboBox *comboBox = nullptr;
@@ -323,11 +376,18 @@ private:
     QComboBox *playbackFileCombo = nullptr;
     QComboBox *languageComboBox = nullptr;
     QComboBox *agileScanPresetCombo = nullptr;
+    QComboBox *standardScanPresetCombo = nullptr;
     QComboBox *videoDemodCombo = nullptr;
     QComboBox *videoStandardCombo = nullptr;
     QComboBox *dmrLabColorCodeCombo = nullptr;
     QComboBox *dmrLabSlotCombo = nullptr;
     QComboBox *dmrLabCallTypeCombo = nullptr;
+    QComboBox *dmrBasebandRateCombo = nullptr;
+    QComboBox *dmrAmbeLayoutCombo = nullptr;
+    QCheckBox *dmrManualTimingCheckbox = nullptr;
+    QSpinBox *dmrTimingOffsetSpin = nullptr;
+    QDoubleSpinBox *dmrSlicerRatioSpin = nullptr;
+    QCheckBox *dmrAdaptiveSlicerCheckbox = nullptr;
     QButtonGroup *modulationButtonGroup = nullptr;
     
     QPushButton *refreshButton = nullptr;
@@ -358,6 +418,8 @@ private:
     QCheckBox *videoTestPatternCheckbox = nullptr;
     QCheckBox *hfNoiseCancelFreezeCheckbox = nullptr;
     QCheckBox *agileScanCheckbox = nullptr;
+    QCheckBox *standardScanCheckbox = nullptr;
+    QCheckBox *scanListeningLockCheckbox = nullptr;
     QCheckBox *scanMeasurementCheckbox = nullptr;
     QCheckBox *spurSuppressionCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
@@ -380,6 +442,9 @@ private:
     QSlider *hfNoiseCancelRefGainSlider = nullptr;
     QSlider *hfNoiseCancelRefDelaySlider = nullptr;
     QSlider *hfNoiseCancelRefTiltSlider = nullptr;
+    SpectrumHunterControls *dmrHunterControls = nullptr;
+    SpectrumHunterControls *fpvHunterControls = nullptr;
+    SpectrumHunterControls *digitalVideoHunterControls = nullptr;
 
     QLabel *volumeLabel = nullptr;
     QLabel *audioLowPassLabel = nullptr;
@@ -412,16 +477,33 @@ private:
     QLineEdit *dmrLabRadioEdit = nullptr;
     QLineEdit *dmrLabNotesEdit = nullptr;
     QLineEdit *agileScanRangesEdit = nullptr;
+    QLineEdit *standardScanCentersEdit = nullptr;
+    QLineEdit *standardScanRangeStartEdit = nullptr;
+    QLineEdit *standardScanRangeEndEdit = nullptr;
     QDoubleSpinBox *agileScanStepSpin = nullptr;
+    QSpinBox *standardScanDwellSpin = nullptr;
+    QSpinBox *standardScanSettleSpin = nullptr;
     QDoubleSpinBox *scanMeasurementBinSpin = nullptr;
     QPushButton *agileScanSavePresetButton = nullptr;
     QPushButton *agileScanDeletePresetButton = nullptr;
+    QPushButton *standardScanSavePresetButton = nullptr;
+    QPushButton *standardScanDeletePresetButton = nullptr;
+    QPushButton *standardScanAddLowerButton = nullptr;
+    QPushButton *standardScanAddUpperButton = nullptr;
+    QPushButton *standardScanRemoveLowerButton = nullptr;
+    QPushButton *standardScanRemoveUpperButton = nullptr;
+    QPushButton *standardScanFillRangeButton = nullptr;
     QPushButton *scanMeasurementBaselineButton = nullptr;
     QPushButton *scanMeasurementResetPeakButton = nullptr;
     QPushButton *scanMeasurementExportButton = nullptr;
     QPushButton *spurCalibrateButton = nullptr;
     QPushButton *spurClearButton = nullptr;
+    QPushButton *fpvHunterHistoryTuneButton = nullptr;
+    QPushButton *fpvHunterHistoryClearButton = nullptr;
+    QComboBox *fpvHunterHistoryCombo = nullptr;
+    QLabel *fpvHunterHistoryLabel = nullptr;
     QLabel *agileScanStatusLabel = nullptr;
+    QLabel *standardScanStatusLabel = nullptr;
     QLabel *scanMeasurementStatusLabel = nullptr;
     QLabel *spurSuppressionStatusLabel = nullptr;
 
@@ -433,6 +515,7 @@ private:
     QTimer *stopPollTimer = nullptr;
     QTimer *streamWatchdogTimer = nullptr;
     QTimer *networkSettingsDebounceTimer = nullptr;
+    QTimer *standardScanAdvanceTimer = nullptr;
     QTimer *videoSnapshotTimer = nullptr;
 
     DataProcessor *processor = nullptr;
@@ -467,6 +550,7 @@ private:
     bool restartAfterStartupWatchdog = false;
     bool automaticStreamRestart = false;
     bool pendingAudioStartAfterStreamReady = false;
+    bool clearSpectrumAfterStop = false;
     bool pendingNetworkAudioStartAfterIqPrebuffer = false;
     bool sampleRateReopenRequired = false;
     bool fobosCloseKnownUnsafe = false;
@@ -488,6 +572,7 @@ private:
     RadioSettings appliedHardwareSettings;
     bool hardwareSettingsApplied = false;
     int spectrumDebugFramesRemaining = 0;
+    int spectrumTuningDebugFramesRemaining = 0;
     RadioRunState runState = RadioRunState::Idle;
     NetworkMode networkMode = NetworkMode::Disabled;
     NetworkProcessingMode networkProcessingMode = NetworkProcessingMode::ServerSide;
@@ -500,16 +585,85 @@ private:
     bool fineTuneScaleHoldMode = false;
     bool serverDisableLocalVisualAudio = true;
     bool digitalDecodeEnabled = true;
+    QByteArray pendingDmrDecoderPcm;
+    int pendingDmrDecoderSampleRate = 48000;
+    std::atomic<uint64_t> digitalDecoderGeneration {0};
+    std::atomic<int> pendingDigitalDecoderFrames {0};
+    std::atomic<int> droppedDigitalDecoderFramesSinceLog {0};
     bool videoDecodeEnabled = false;
     bool agileScanEnabled = false;
     bool agileScanRunning = false;
+    bool standardScanEnabled = false;
+    bool standardScanRunning = false;
+    bool scanListeningLockEnabled = true;
     QString agileScanRangesMhz = QStringLiteral("430-432");
     double agileScanStepMhz = 0.0125;
+    QString standardScanCentersMhz = QStringLiteral("430, 480");
+    int standardScanDwellMs = 650;
+    int standardScanSettleMs = 60;
+    QString standardScanRangeStartMhz;
+    QString standardScanRangeEndMhz;
+    QMap<QString, QString> standardScanPresets;
+    int spectrumUpdateIntervalMs = 0;
     bool scanMeasurementEnabled = false;
     bool scanMeasurementBaselineRecording = false;
     double scanMeasurementBinMhz = 0.1;
+    DmrHunterSettings dmrHunterSettings;
+    DmrHunterResult dmrHunterLastResult;
+    std::vector<DmrHunterCandidate> dmrHunterCandidates;
+    int dmrHunterCandidateIndex = -1;
+    FpvHunterSettings fpvHunterSettings;
+    FpvHunterResult fpvHunterLastResult;
+    std::vector<FpvHunterCandidate> fpvHunterCandidates;
+    int fpvHunterCandidateIndex = -1;
+    bool fpvHunterFollowEnabled = false;
+    double fpvHunterLastFollowCenterHz = std::numeric_limits<double>::quiet_NaN();
+    double fpvHunterLastFollowBandwidthHz = std::numeric_limits<double>::quiet_NaN();
+    struct FpvHunterTrack {
+        bool valid = false;
+        bool stable = false;
+        double centerHz = 0.0;
+        double widthHz = 0.0;
+        float peakDb = -160.0f;
+        float averageDb = -160.0f;
+        float excessDb = 0.0f;
+        float score = 0.0f;
+        int hits = 0;
+        int misses = 0;
+        uint64_t lastSeenSequence = 0;
+        qint64 firstSeenMsec = -1;
+        qint64 lastSeenMsec = -1;
+        QString type;
+    };
+    FpvHunterTrack fpvHunterTrack;
+    uint64_t fpvHunterFrameSequence = 0;
+    QElapsedTimer fpvHunterClock;
+    struct FpvHunterEvent {
+        bool valid = false;
+        quint64 id = 0;
+        double centerHz = 0.0;
+        double widthHz = 0.0;
+        float peakDb = -160.0f;
+        float averageDb = -160.0f;
+        float excessDb = 0.0f;
+        float score = 0.0f;
+        int hits = 0;
+        qint64 firstSeenMsec = -1;
+        qint64 lastSeenMsec = -1;
+        QString type;
+    };
+    QVector<FpvHunterEvent> fpvHunterEvents;
+    int fpvHunterActiveEventIndex = -1;
+    quint64 fpvHunterNextEventId = 1;
+    DigitalVideoHunterSettings digitalVideoHunterSettings;
+    DigitalVideoHunterResult digitalVideoHunterLastResult;
+    std::vector<DigitalVideoHunterCandidate> digitalVideoHunterCandidates;
+    int digitalVideoHunterCandidateIndex = -1;
     QMap<QString, QString> agileScanPresets;
     QVector<double> activeAgileScanFrequencies;
+    QVector<double> activeStandardScanFrequencies;
+    int standardScanIndex = 0;
+    ScanVisualAssembler scanVisualAssembler;
 
     struct ScanMeasurementBin {
         double frequencyHz = 0.0;
@@ -560,6 +714,7 @@ private:
     bool showGeneralBandMarkers = false;
     bool showAmateurBandMarkers = false;
     bool compactBandMarkers = false;
+    bool diagnosticVerboseLogging = false;
     std::atomic_bool videoIqFramePending{false};
     bool momentaryRecordingActive = false;
     bool offlineIqPlaybackActive = false;
@@ -570,6 +725,10 @@ private:
     RadioSettings settingsBeforePlayback;
     int volumePercent = 100;
     QElapsedTimer networkSpectrumFrameTimer;
+    QElapsedTimer liveRetuneSettleTimer;
+    QElapsedTimer standardScanDwellTimer;
+    qint64 liveRetuneSettleDurationMs = 80;
+    uint64_t liveCenterRetuneGeneration = 0;
     uint64_t networkSpectrumFrameSequence = 0;
     uint64_t networkIqFrameSequence = 0;
     uint64_t networkIqFramesDropped = 0;

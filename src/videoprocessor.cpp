@@ -23,6 +23,8 @@ constexpr int TEST_PATTERN_INTERVAL_MS = 20;
 constexpr double TWO_PI = 6.28318530717958647692;
 constexpr float HSYNC_MIN_SPAN = 0.05f;
 constexpr float HSYNC_DARK_FRACTION = 0.18f;
+constexpr float ANALOG_SYNC_FRACTION = 0.073f;
+constexpr float ANALOG_BLANKING_FRACTION = 0.16f;
 constexpr int SSTV_WIDTH = 320;
 constexpr int SSTV_HEIGHT = 240;
 constexpr double ROBOT36_LINE_SECONDS = 0.150;
@@ -121,7 +123,7 @@ double clampDouble(double value, double low, double high) {
 }
 
 double videoTargetRate(const RadioSettings &settings) {
-    return clampDouble((std::max)(1200000.0, settings.bandwidth * 0.9), 1200000.0, 4000000.0);
+    return clampDouble((std::max)(1200000.0, settings.bandwidth * 0.75), 1200000.0, 6000000.0);
 }
 
 double videoCutoff(const RadioSettings &settings, double outputRate) {
@@ -199,6 +201,10 @@ void VideoProcessor::reset() {
     dcEstimate = 0.0f;
     levelMin = -0.25f;
     levelMax = 0.25f;
+    hSyncOffsetValid = false;
+    hSyncOffsetEstimate = 0.0;
+    hSyncPolarityAccumulator = 0;
+    autoInvertActive = false;
     hSyncLockedLines = 0;
     hSyncObservedLines = 0;
     resetChannelizer();
@@ -631,9 +637,10 @@ void VideoProcessor::processFloatIqSnapshot(const std::vector<float> &iqSamples,
         currentLine.clear();
         fmPreviousValid = false;
         resetRaster();
-        emitStatus(QStringLiteral("Video snapshot %1 MS/s, %2 samples/line")
+        emitStatus(QStringLiteral("Video snapshot %1 MS/s, %2 samples/line, BW %3 MHz")
                        .arg(outputRate / 1000000.0, 0, 'f', 2)
-                       .arg(samplesPerLine),
+                       .arg(samplesPerLine)
+                       .arg(settings.bandwidth / 1000000.0, 0, 'f', 1),
                    true);
     }
 
@@ -701,9 +708,10 @@ void VideoProcessor::processFloatIqSnapshot(const std::vector<float> &iqSamples,
     decimationCount = count;
     lowPassState = lowPass;
     ncoPhase = std::remainder(ncoPhase + phaseIncrement * static_cast<double>(iqCount), TWO_PI);
-    emitStatus(QStringLiteral("Video snapshot %1 MS/s, %2 samples/line")
+    emitStatus(QStringLiteral("Video snapshot %1 MS/s, %2 samples/line, BW %3 MHz")
                    .arg(outputRate / 1000000.0, 0, 'f', 2)
-                   .arg(samplesPerLine));
+                   .arg(samplesPerLine)
+                   .arg(settings.bandwidth / 1000000.0, 0, 'f', 1));
 }
 
 void VideoProcessor::processSstvBuffer() {
@@ -1992,53 +2000,158 @@ void VideoProcessor::renderCurrentLine() {
     }
 
     const auto minmax = std::minmax_element(currentLine.cbegin(), currentLine.cend());
-    levelMin += 0.04f * (*minmax.first - levelMin);
-    levelMax += 0.04f * (*minmax.second - levelMax);
-    if (levelMax - levelMin < 0.02f) {
-        const float mid = 0.5f * (levelMin + levelMax);
-        levelMin = mid - 0.01f;
-        levelMax = mid + 0.01f;
-    }
-
     uchar *line = raster.scanLine(nextLine);
     const int sourceCount = currentLine.size();
     int sourceOffset = 0;
+    int syncWindow = (std::clamp)(static_cast<int>(std::lround(sourceCount * ANALOG_SYNC_FRACTION)),
+                                  3,
+                                  (std::max)(3, sourceCount / 4));
+    bool lineAutoInvert = autoInvertActive;
     if (hSync && sourceCount > 0) {
         const float lineMin = *minmax.first;
         const float lineMax = *minmax.second;
         const float lineSpan = lineMax - lineMin;
-        const int minIndex = static_cast<int>(std::distance(currentLine.cbegin(), minmax.first));
+        double lineSum = 0.0;
+        for (float sample : currentLine) {
+            lineSum += sample;
+        }
+        const float lineMean = static_cast<float>(lineSum / static_cast<double>((std::max)(1, sourceCount)));
+
+        double windowSum = 0.0;
+        const int maxWindowStart = (std::max)(0, sourceCount - syncWindow);
+        for (int i = 0; i < syncWindow && i < sourceCount; ++i) {
+            windowSum += currentLine[i];
+        }
+        double lowestWindowSum = windowSum;
+        double highestWindowSum = windowSum;
+        int lowestWindowStart = 0;
+        int highestWindowStart = 0;
+        for (int start = 1; start <= maxWindowStart; ++start) {
+            windowSum += currentLine[start + syncWindow - 1];
+            windowSum -= currentLine[start - 1];
+            if (windowSum < lowestWindowSum) {
+                lowestWindowSum = windowSum;
+                lowestWindowStart = start;
+            }
+            if (windowSum > highestWindowSum) {
+                highestWindowSum = windowSum;
+                highestWindowStart = start;
+            }
+        }
+        const float lowestWindowAverage = static_cast<float>(lowestWindowSum / syncWindow);
+        const float highestWindowAverage = static_cast<float>(highestWindowSum / syncWindow);
+        const float darkScore = lineMean - lowestWindowAverage;
+        const float brightScore = highestWindowAverage - lineMean;
+        const bool brightSync = brightScore > darkScore * 1.12f;
+        const float syncScore = (std::max)(darkScore, brightScore);
+        const int candidateOffset = brightSync ? highestWindowStart : lowestWindowStart;
+
         int lowSampleCount = 0;
         const float lowThreshold = lineMin + lineSpan * 0.12f;
+        const float highThreshold = lineMax - lineSpan * 0.12f;
+        int highSampleCount = 0;
         for (float sample : currentLine) {
             if (sample <= lowThreshold) {
                 ++lowSampleCount;
             }
+            if (sample >= highThreshold) {
+                ++highSampleCount;
+            }
         }
         const float lowFraction = static_cast<float>(lowSampleCount) /
                                   static_cast<float>((std::max)(1, sourceCount));
-        if (vSync && lineSpan >= HSYNC_MIN_SPAN && lowFraction > 0.32f) {
+        const float highFraction = static_cast<float>(highSampleCount) /
+                                   static_cast<float>((std::max)(1, sourceCount));
+        const float syncFraction = brightSync ? highFraction : lowFraction;
+        if (vSync && lineSpan >= HSYNC_MIN_SPAN && syncFraction > 0.32f) {
             nextLine = 0;
             currentLine.clear();
             emitStatus(QStringLiteral("Video VSync lock"), false);
             return;
         }
         ++hSyncObservedLines;
-        if (lineSpan >= HSYNC_MIN_SPAN && lineMin <= lineMax - lineSpan * HSYNC_DARK_FRACTION) {
-            sourceOffset = minIndex;
+        if (lineSpan >= HSYNC_MIN_SPAN && syncScore >= lineSpan * HSYNC_DARK_FRACTION) {
+            if (!hSyncOffsetValid) {
+                hSyncOffsetEstimate = candidateOffset;
+                hSyncOffsetValid = true;
+            } else {
+                double delta = static_cast<double>(candidateOffset) - hSyncOffsetEstimate;
+                const double halfLine = static_cast<double>(sourceCount) * 0.5;
+                while (delta > halfLine) {
+                    delta -= sourceCount;
+                }
+                while (delta < -halfLine) {
+                    delta += sourceCount;
+                }
+                hSyncOffsetEstimate += delta * 0.35;
+                while (hSyncOffsetEstimate < 0.0) {
+                    hSyncOffsetEstimate += sourceCount;
+                }
+                while (hSyncOffsetEstimate >= sourceCount) {
+                    hSyncOffsetEstimate -= sourceCount;
+                }
+            }
+            sourceOffset = (std::clamp)(static_cast<int>(std::lround(hSyncOffsetEstimate)),
+                                        0,
+                                        sourceCount - 1);
+            hSyncPolarityAccumulator += brightSync ? 1 : -1;
+            hSyncPolarityAccumulator = (std::clamp)(hSyncPolarityAccumulator, -24, 24);
+            if (hSyncPolarityAccumulator >= 8) {
+                autoInvertActive = true;
+            } else if (hSyncPolarityAccumulator <= -8) {
+                autoInvertActive = false;
+            }
+            lineAutoInvert = autoInvertActive;
             ++hSyncLockedLines;
         }
         if (hSyncObservedLines >= 120) {
             const int lockPercent = static_cast<int>(std::lround(
                 100.0 * static_cast<double>(hSyncLockedLines) /
                 static_cast<double>((std::max)(1, hSyncObservedLines))));
-            emitStatus(QStringLiteral("Video HSync %1%, %2 samples/line")
+            emitStatus(QStringLiteral("Video HSync %1%, %2 samples/line%3, level %4")
                            .arg(lockPercent)
-                           .arg(samplesPerLine));
+                           .arg(samplesPerLine)
+                           .arg(autoInvertActive ? QStringLiteral(", auto invert") : QString())
+                           .arg(levelMax - levelMin, 0, 'f', 3));
             hSyncObservedLines = 0;
             hSyncLockedLines = 0;
         }
     }
+
+    std::vector<float> activeSamples;
+    activeSamples.reserve(static_cast<std::size_t>(sourceCount));
+    const int blankingSamples = hSync
+                                    ? (std::clamp)(static_cast<int>(std::lround(sourceCount * ANALOG_BLANKING_FRACTION)),
+                                                   syncWindow,
+                                                   (std::max)(syncWindow, sourceCount / 3))
+                                    : 0;
+    for (int i = 0; i < sourceCount; ++i) {
+        const int relative = hSync ? (i - sourceOffset + sourceCount) % sourceCount : i;
+        if (relative < blankingSamples) {
+            continue;
+        }
+        activeSamples.push_back(currentLine[i]);
+    }
+    if (activeSamples.size() >= 8) {
+        std::sort(activeSamples.begin(), activeSamples.end());
+        const int lowIndex = (std::clamp)(static_cast<int>(activeSamples.size() * 3 / 100),
+                                          0,
+                                          static_cast<int>(activeSamples.size()) - 1);
+        const int highIndex = (std::clamp)(static_cast<int>(activeSamples.size() * 97 / 100),
+                                           0,
+                                           static_cast<int>(activeSamples.size()) - 1);
+        levelMin += 0.06f * (activeSamples[static_cast<std::size_t>(lowIndex)] - levelMin);
+        levelMax += 0.06f * (activeSamples[static_cast<std::size_t>(highIndex)] - levelMax);
+    } else {
+        levelMin += 0.04f * (*minmax.first - levelMin);
+        levelMax += 0.04f * (*minmax.second - levelMax);
+    }
+    if (levelMax - levelMin < 0.02f) {
+        const float mid = 0.5f * (levelMin + levelMax);
+        levelMin = mid - 0.01f;
+        levelMax = mid + 0.01f;
+    }
+
     const float invSpan = 1.0f / (levelMax - levelMin);
     for (int x = 0; x < width; ++x) {
         const float sourcePos = width > 1
@@ -2053,7 +2166,7 @@ void VideoProcessor::renderCurrentLine() {
         const float value = currentLine[index] * (1.0f - frac) + currentLine[nextIndex] * frac;
         float normalized = (value - levelMin) * invSpan;
         normalized = clampFloat(normalized, 0.0f, 1.0f);
-        if (invert) {
+        if (invert ^ lineAutoInvert) {
             normalized = 1.0f - normalized;
         }
         line[x] = static_cast<uchar>(std::lround(normalized * 255.0f));

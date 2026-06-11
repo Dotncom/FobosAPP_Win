@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "dmrdecoder.h"
+#include "dmrvocoder.h"
 #include "radiosettings.h"
 
 class DigitalDecoder : public QObject {
@@ -26,6 +27,12 @@ public:
 signals:
     void textDecoded(const QString &text);
     void statusChanged(const QString &status);
+    void voicePcmReady(const QByteArray &pcmData);
+    void dmrMetadataDetected(int colorCode,
+                             int timeslot,
+                             quint32 targetId,
+                             quint32 sourceId,
+                             int flco);
 
 private:
     enum class RttyState {
@@ -45,6 +52,8 @@ private:
     void advanceRttyState(bool markBit, QString &decodedText);
     QString decodeBaudotCode(unsigned int code);
     void updateStatus(const QString &status);
+    void clearDmrVoicePcmBuffer();
+    void queueDmrVoicePcm(const QByteArray &pcmData);
 
     bool decoderEnabled = true;
     int activeMode = -1;
@@ -81,6 +90,20 @@ private:
     std::vector<int> recentFt8CandidateAnalysis;
     QString lastStatus;
     DmrDecoder dmrDecoder;
+    DmrVocoder dmrVocoder;
+    DmrVocoder dmrPayloadProbeVocoder;
+    DmrVocoder dmrRawProbeVocoder;
+    DmrVocoder dmrCanonicalProbeVocoder;
+    qint64 dmrAmbeFrameCount = 0;
+    qint64 dmrAmbePayloadCount = 0;
+    qint64 dmrAmbeFecCorrectionCount = 0;
+    qint64 dmrVocoderFrameCount = 0;
+    qint64 dmrVocoderErrorCount = 0;
+    int dmrAudioLogCounter = 0;
+    int dmrCollapsedVoiceCount = 0;
+    int dmrVocoderResetRecoveryCount = 0;
+    int dmrArtifactConcealCount = 0;
+    QByteArray pendingDmrVoicePcm;
 };
 
 #endif // DIGITALDECODER_H

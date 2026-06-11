@@ -25,10 +25,18 @@ constexpr double FM_MAX_CHANNEL_RATE = 768000.0;
 constexpr double FM_DEEMPHASIS_SECONDS = 50e-6;
 constexpr double NFM_DEEMPHASIS_SECONDS = 300e-6;
 constexpr size_t MAX_AUDIO_BUFFER_SAMPLES = BUFFER_SIZE * 10;
+constexpr size_t EXTERNAL_AUDIO_START_BUFFER_SAMPLES = BUFFER_SIZE * 2;
 constexpr double SSB_LOW_CUT_HZ = 250.0;
 constexpr double SSB_MAX_AUDIO_HZ = 3600.0;
 constexpr double SAM_LOCK_RANGE_HZ = 1500.0;
 constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
+constexpr double DMR_CHANNEL_RATE = 192000.0;
+constexpr double DMR_FOURFSK_CHANNEL_CUTOFF_HZ = 9500.0;
+constexpr double DMR_FOURFSK_SYMBOL_FILTER_HZ = 6200.0;
+constexpr double DMR_FOURFSK_DC_TRACK_HZ = 12.0;
+constexpr double DMR_FOURFSK_OUTER_DEVIATION_HZ = 1944.0;
+constexpr double DMR_FOURFSK_OUTPUT_OUTER_LEVEL = 0.15;
+constexpr int DMR_CHANNEL_CIC_STAGES = 4;
 
 double clampDouble(double value, double low, double high) {
     return (std::max)(low, (std::min)(value, high));
@@ -165,7 +173,7 @@ double targetChannelRate(int modulationType, double bandwidth) {
         return 240000.0;
     }
     if (modulationType == MOD_DMR) {
-        return 96000.0;
+        return 192000.0;
     }
     if (modulationType == MOD_NFM || modulationType == MOD_FSK) {
         return clampDouble((std::max)(FM_MIN_CHANNEL_RATE, bandwidth * 4.0),
@@ -230,6 +238,15 @@ AudioProcessor::~AudioProcessor() {
 
 void AudioProcessor::configure(const RadioSettings &settings) {
     std::lock_guard<std::mutex> lock(settingsMutex);
+    const bool resetDemodulator =
+        audioSettings.inputMode != settings.inputMode ||
+        audioSettings.modulationType != settings.modulationType ||
+        std::abs(audioSettings.centerFrequency - settings.centerFrequency) > 0.5 ||
+        std::abs(audioSettings.listeningFrequency - settings.listeningFrequency) > 0.5 ||
+        std::abs(audioSettings.sampleRate - settings.sampleRate) > 0.5 ||
+        std::abs(audioSettings.bandwidth - settings.bandwidth) > 1.0 ||
+        normalizedDmrBasebandSampleRate(audioSettings.dmrBasebandSampleRate) !=
+            normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
     const bool resetNoiseCancel =
         audioSettings.inputMode != settings.inputMode ||
         std::abs(audioSettings.listeningFrequency - settings.listeningFrequency) > 0.5 ||
@@ -239,6 +256,9 @@ void AudioProcessor::configure(const RadioSettings &settings) {
         std::abs(audioSettings.hfNoiseCancelRefTiltDb - settings.hfNoiseCancelRefTiltDb) > 0.001;
     audioSettings = settings;
     selectedAudioDeviceID = settings.audioDeviceId;
+    if (resetDemodulator) {
+        demodulatorResetRequested = true;
+    }
     if (resetNoiseCancel) {
         hfNoiseCancelResetRequested = true;
     }
@@ -286,6 +306,73 @@ void AudioProcessor::setVolume(float volume) {
     outputVolume.store(std::clamp(volume, 0.0f, 3.0f));
 }
 
+void AudioProcessor::enqueueExternalPcm(const QByteArray &pcmData) {
+    if (!running.load() || pcmData.size() < static_cast<int>(sizeof(qint16))) {
+        static std::atomic<int> droppedLogCount{0};
+        const int logIndex = droppedLogCount.fetch_add(1);
+        if (logIndex < 20 || (logIndex % 100) == 0) {
+            qDebug() << "[Audio] external PCM dropped"
+                     << "running" << running.load()
+                     << "bytes" << pcmData.size();
+        }
+        return;
+    }
+
+    const int sampleCount = pcmData.size() / static_cast<int>(sizeof(qint16));
+    std::vector<short> samples;
+    samples.reserve(static_cast<size_t>(sampleCount));
+    const char *raw = pcmData.constData();
+    for (int i = 0; i < sampleCount; ++i) {
+        const unsigned char lo = static_cast<unsigned char>(raw[i * 2]);
+        const unsigned char hi = static_cast<unsigned char>(raw[i * 2 + 1]);
+        const qint16 value = static_cast<qint16>(static_cast<quint16>(lo) |
+                                                 (static_cast<quint16>(hi) << 8));
+        samples.push_back(static_cast<short>(value));
+    }
+
+    bool notifyPlayback = false;
+    {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        const size_t queuedSamples = queuedAudioSamples();
+        const size_t overflow = queuedSamples + samples.size() > MAX_AUDIO_BUFFER_SAMPLES
+                                    ? queuedSamples + samples.size() - MAX_AUDIO_BUFFER_SAMPLES
+                                    : 0;
+        if (overflow > 0) {
+            discardAudioSamples(overflow);
+        }
+        audioBuffer.insert(audioBuffer.end(), samples.begin(), samples.end());
+        compactAudioBufferIfNeeded();
+        const size_t afterInsertSamples = queuedAudioSamples();
+        if (!externalAudioPrimed) {
+            externalAudioPrimed = afterInsertSamples >= EXTERNAL_AUDIO_START_BUFFER_SAMPLES;
+        }
+        notifyPlayback = externalAudioPrimed;
+        static std::atomic<int> queuedLogCount{0};
+        const int logIndex = queuedLogCount.fetch_add(1);
+        if (logIndex < 40 || (logIndex % 100) == 0) {
+            qDebug() << "[Audio] external PCM queued"
+                     << "samples" << samples.size()
+                     << "queued" << afterInsertSamples
+                     << "primed" << externalAudioPrimed
+                     << "notify" << notifyPlayback
+                     << "overflow" << overflow;
+        }
+    }
+    if (notifyPlayback) {
+        cv.notify_one();
+    }
+}
+
+void AudioProcessor::clearExternalPcm() {
+    {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        audioBuffer.clear();
+        audioBufferReadOffset = 0;
+        externalAudioPrimed = false;
+    }
+    cv.notify_one();
+}
+
 void AudioProcessor::startDemodulation() {
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
@@ -297,6 +384,7 @@ void AudioProcessor::startDemodulation() {
         std::lock_guard<std::mutex> lock(audioMutex);
         audioBuffer.clear();
         audioBufferReadOffset = 0;
+        externalAudioPrimed = false;
         for (int i = 0; i < NUM_BUFFERS; ++i) {
             bufferReady[i] = true;
         }
@@ -495,6 +583,7 @@ void AudioProcessor::resetDemodulatorState() {
     ncoPhase = 0.0;
     audioResamplePhase = 0.0;
     amLowPassState = std::complex<float>(0.0f, 0.0f);
+    dmrChannelPreLowPassStates.fill(std::complex<float>(0.0f, 0.0f));
     sidebandLowPassStates.fill(std::complex<float>(0.0f, 0.0f));
     channelDecimationSum = std::complex<float>(0.0f, 0.0f);
     channelDecimationCount = 0;
@@ -511,6 +600,26 @@ void AudioProcessor::resetDemodulatorState() {
     cwTonePhase = 0.0;
     amDcEstimate = 0.0f;
     amAgcLevel = 0.05f;
+    for (auto &buffer : dmrCicBuffers) {
+        buffer.clear();
+    }
+    dmrCicSums.fill(std::complex<float>(0.0f, 0.0f));
+    dmrCicIndex = 0;
+    dmrCicLength = 0;
+    dmrResamplePhase = 0.0;
+    dmrLowPassState = std::complex<float>(0.0f, 0.0f);
+    dmrDecimationSum = std::complex<float>(0.0f, 0.0f);
+    dmrDecimationCount = 0;
+    dmrPreviousSample = std::complex<float>(1.0f, 0.0f);
+    dmrPreviousValid = false;
+    dmrDiscriminatorDc = 0.0f;
+    dmrFskLowPassState = 0.0f;
+    dmrFskLowPassState2 = 0.0f;
+    dmrPreviousOutputSample = 0.0f;
+    dmrPreviousOutputValid = false;
+    dmrLastLoggedOutputRate = 0;
+    dmrLastLoggedDecimationFactor = 0;
+    dmrLastLoggedChannelRate = 0.0;
     hfNoiseCancelCoeff = {0.0f, 0.0f};
     hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
 }
@@ -548,8 +657,257 @@ RadioSettings AudioProcessor::currentSettingsSnapshot() const {
     return audioSettings;
 }
 
-void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, std::vector<short>& audioSamples, const RadioSettings &settings) {
+void AudioProcessor::processDmrIqDemodulatorBlock(const std::vector<float>& iqBlock,
+                                                  std::vector<short>& dmrBasebandSamples,
+                                                  int &dmrBasebandSampleRate,
+                                                  const RadioSettings &settings) {
+    dmrBasebandSamples.clear();
+    dmrBasebandSampleRate = 0;
+
+    const double rfInputRate = settings.sampleRate;
+    if (iqBlock.size() < 2 || rfInputRate <= 0.0) {
+        return;
+    }
+
+    const std::size_t iqSamples = iqBlock.size() / 2;
+    const int requestedOutputRate =
+        normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
+    const double dmrChannelTargetRate =
+        (std::max)(DMR_CHANNEL_RATE, static_cast<double>(requestedOutputRate));
+    const int decimationFactor =
+        (std::max)(1, static_cast<int>(std::floor(rfInputRate / dmrChannelTargetRate)));
+    const double channelRate = rfInputRate / static_cast<double>(decimationFactor);
+    if (channelRate + 0.5 < static_cast<double>(requestedOutputRate)) {
+        qWarning() << "[DMR demod] requested 4FSK output rate exceeds channel rate"
+                   << "requestedRate" << requestedOutputRate
+                   << "channelRate" << channelRate
+                   << "rfRate" << rfInputRate
+                   << "decimation" << decimationFactor;
+        return;
+    }
+
+    const double fShift = settings.listeningFrequency - settings.centerFrequency;
+    const double phaseIncrement = -TWO_PI * fShift / rfInputRate;
+    const float channelLowPassAlpha = static_cast<float>((std::clamp)(
+        1.0 - std::exp(-TWO_PI *
+                       (std::min)(DMR_FOURFSK_CHANNEL_CUTOFF_HZ, channelRate * 0.42) /
+                       channelRate),
+        0.000001,
+        1.0));
+    const float fskLowPassAlpha = static_cast<float>((std::clamp)(
+        1.0 - std::exp(-TWO_PI *
+                       (std::min)(DMR_FOURFSK_SYMBOL_FILTER_HZ, channelRate * 0.42) /
+                       channelRate),
+        0.000001,
+        1.0));
+    const float dcAlpha = static_cast<float>((std::clamp)(
+        1.0 - std::exp(-TWO_PI * DMR_FOURFSK_DC_TRACK_HZ / channelRate),
+        0.000001,
+        0.02));
+    const double outputStep = static_cast<double>(requestedOutputRate) / channelRate;
+    const double outputScale =
+        DMR_FOURFSK_OUTPUT_OUTER_LEVEL / DMR_FOURFSK_OUTER_DEVIATION_HZ;
+
+    dmrBasebandSampleRate = requestedOutputRate;
+    dmrBasebandSamples.reserve(static_cast<std::size_t>(
+        (static_cast<double>(iqSamples) / static_cast<double>(decimationFactor)) *
+            outputStep +
+        8.0));
+    if (dmrLastLoggedOutputRate != requestedOutputRate ||
+        dmrLastLoggedDecimationFactor != decimationFactor ||
+        std::abs(dmrLastLoggedChannelRate - channelRate) > 1.0) {
+        dmrLastLoggedOutputRate = requestedOutputRate;
+        dmrLastLoggedDecimationFactor = decimationFactor;
+        dmrLastLoggedChannelRate = channelRate;
+        qDebug() << "[DMR demod] IQ FM/4FSK path"
+                 << "rfRate" << rfInputRate
+                 << "targetChannelRate" << dmrChannelTargetRate
+                 << "channelRate" << channelRate
+                 << "decimation" << decimationFactor
+                 << "outputRate" << requestedOutputRate
+                 << "samplesPerSymbol"
+                 << (static_cast<double>(requestedOutputRate) / 4800.0)
+                 << "cicStages" << DMR_CHANNEL_CIC_STAGES
+                 << "channelCutoffHz" << DMR_FOURFSK_CHANNEL_CUTOFF_HZ
+                 << "symbolFilterHz" << DMR_FOURFSK_SYMBOL_FILTER_HZ
+                 << "outerLevel" << DMR_FOURFSK_OUTPUT_OUTER_LEVEL;
+    }
+
+    float rotI = static_cast<float>(std::cos(ncoPhase));
+    float rotQ = static_cast<float>(std::sin(ncoPhase));
+    const float rotStepI = static_cast<float>(std::cos(phaseIncrement));
+    const float rotStepQ = static_cast<float>(std::sin(phaseIncrement));
+    if (dmrCicLength != decimationFactor) {
+        for (auto &buffer : dmrCicBuffers) {
+            buffer.assign(static_cast<std::size_t>(decimationFactor),
+                          std::complex<float>(0.0f, 0.0f));
+        }
+        dmrCicSums.fill(std::complex<float>(0.0f, 0.0f));
+        dmrCicIndex = 0;
+        dmrCicLength = decimationFactor;
+        dmrDecimationSum = std::complex<float>(0.0f, 0.0f);
+        dmrDecimationCount = 0;
+    }
+    const float cicInvLength =
+        1.0f / static_cast<float>((std::max)(1, dmrCicLength));
+    std::complex<float> decimationSum = dmrDecimationSum;
+    int decimationCount = dmrDecimationCount;
+    std::complex<float> channelLowPass = dmrLowPassState;
+    std::complex<float> previousSample = dmrPreviousSample;
+    bool previousValid = dmrPreviousValid;
+    float discriminatorDc = dmrDiscriminatorDc;
+    float fskLowPass = dmrFskLowPassState;
+    float fskLowPass2 = dmrFskLowPassState2;
+    float previousOutputSample = dmrPreviousOutputSample;
+    bool previousOutputValid = dmrPreviousOutputValid;
+    double resamplePhase = dmrResamplePhase;
+
+    const auto pushDemodSample = [&](float normalizedSample) {
+        if (!std::isfinite(normalizedSample)) {
+            normalizedSample = 0.0f;
+        }
+        normalizedSample = (std::clamp)(normalizedSample, -1.0f, 1.0f);
+
+        if (!previousOutputValid) {
+            previousOutputSample = normalizedSample;
+            previousOutputValid = true;
+            return;
+        }
+
+        const double phaseBefore = resamplePhase;
+        resamplePhase += outputStep;
+        while (resamplePhase >= 1.0) {
+            const double fraction =
+                outputStep > 0.0
+                    ? (std::clamp)((1.0 - phaseBefore) / outputStep, 0.0, 1.0)
+                    : 1.0;
+            const float interpolated =
+                previousOutputSample +
+                static_cast<float>(fraction) * (normalizedSample - previousOutputSample);
+            const float clamped = (std::clamp)(interpolated, -1.0f, 1.0f);
+            dmrBasebandSamples.push_back(
+                static_cast<short>(std::lrint(clamped * 32767.0f)));
+            resamplePhase -= 1.0;
+        }
+        previousOutputSample = normalizedSample;
+    };
+
+    for (std::size_t n = 0; n < iqSamples; ++n) {
+        float iSample = iqBlock[2 * n];
+        float qSample = iqBlock[2 * n + 1];
+        if (!std::isfinite(iSample)) {
+            iSample = 0.0f;
+        }
+        if (!std::isfinite(qSample)) {
+            qSample = 0.0f;
+        }
+
+        if (settings.inputMode == INPUT_HF_COMBINED) {
+            if (fShift < 0.0) {
+                qSample = 0.0f;
+            } else {
+                iSample = qSample;
+                qSample = 0.0f;
+            }
+        } else if (settings.inputMode == INPUT_HF1) {
+            qSample = 0.0f;
+        } else if (settings.inputMode == INPUT_HF2) {
+            iSample = qSample;
+            qSample = 0.0f;
+        }
+
+        const float mixedI = iSample * rotI - qSample * rotQ;
+        const float mixedQ = iSample * rotQ + qSample * rotI;
+        std::complex<float> mixedSample(mixedI, mixedQ);
+        if (decimationFactor > 1) {
+            std::complex<float> cicSample = mixedSample;
+            for (int stage = 0; stage < DMR_CHANNEL_CIC_STAGES; ++stage) {
+                auto &buffer = dmrCicBuffers[static_cast<std::size_t>(stage)];
+                const std::complex<float> delayed =
+                    buffer[static_cast<std::size_t>(dmrCicIndex)];
+                buffer[static_cast<std::size_t>(dmrCicIndex)] = cicSample;
+                dmrCicSums[static_cast<std::size_t>(stage)] += cicSample - delayed;
+                cicSample = dmrCicSums[static_cast<std::size_t>(stage)] * cicInvLength;
+            }
+            ++dmrCicIndex;
+            if (dmrCicIndex >= dmrCicLength) {
+                dmrCicIndex = 0;
+            }
+            mixedSample = cicSample;
+        }
+        decimationSum += mixedSample;
+        ++decimationCount;
+
+        const float nextRotI = rotI * rotStepI - rotQ * rotStepQ;
+        const float nextRotQ = rotI * rotStepQ + rotQ * rotStepI;
+        rotI = nextRotI;
+        rotQ = nextRotQ;
+        if ((n & 4095) == 4095) {
+            const float norm = std::sqrt(rotI * rotI + rotQ * rotQ);
+            if (norm > 0.0f) {
+                rotI /= norm;
+                rotQ /= norm;
+            }
+        }
+
+        if (decimationCount < decimationFactor) {
+            continue;
+        }
+
+        const std::complex<float> channelSample =
+            decimationSum * (1.0f / static_cast<float>(decimationCount));
+        decimationSum = std::complex<float>(0.0f, 0.0f);
+        decimationCount = 0;
+
+        channelLowPass += channelLowPassAlpha * (channelSample - channelLowPass);
+        std::complex<float> limited = channelLowPass;
+        const float magnitude = std::abs(limited);
+        if (magnitude > 0.000001f) {
+            limited *= (1.0f / magnitude);
+        } else {
+            limited = std::complex<float>(1.0f, 0.0f);
+        }
+
+        if (previousValid) {
+            const std::complex<float> delta = limited * std::conj(previousSample);
+            const float phase = std::atan2(std::imag(delta), std::real(delta));
+            const float instantaneousHz =
+                static_cast<float>(static_cast<double>(phase) * channelRate / TWO_PI);
+            discriminatorDc += dcAlpha * (instantaneousHz - discriminatorDc);
+            const float centeredHz = instantaneousHz - discriminatorDc;
+            fskLowPass += fskLowPassAlpha * (centeredHz - fskLowPass);
+            fskLowPass2 += fskLowPassAlpha * (fskLowPass - fskLowPass2);
+            pushDemodSample(static_cast<float>(fskLowPass2 * outputScale));
+        }
+        previousSample = limited;
+        previousValid = true;
+    }
+
+    ncoPhase = std::remainder(ncoPhase + phaseIncrement * static_cast<double>(iqSamples), TWO_PI);
+    dmrDecimationSum = decimationSum;
+    dmrDecimationCount = decimationCount;
+    dmrLowPassState = channelLowPass;
+    dmrPreviousSample = previousSample;
+    dmrPreviousValid = previousValid;
+    dmrDiscriminatorDc = discriminatorDc;
+    dmrFskLowPassState = fskLowPass;
+    dmrFskLowPassState2 = fskLowPass2;
+    dmrPreviousOutputSample = previousOutputSample;
+    dmrPreviousOutputValid = previousOutputValid;
+    dmrResamplePhase = std::remainder(resamplePhase, 1.0);
+    if (dmrResamplePhase < 0.0) {
+        dmrResamplePhase += 1.0;
+    }
+}
+
+void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock,
+                                             std::vector<short>& audioSamples,
+                                             std::vector<short>& dmrBasebandSamples,
+                                             int &dmrBasebandSampleRate,
+                                             const RadioSettings &settings) {
     audioSamples.clear();
+    dmrBasebandSamples.clear();
+    dmrBasebandSampleRate = 0;
 
     const double rfInputRate = settings.sampleRate;
     const double audioTimingRate = rfInputRate;
@@ -559,6 +917,11 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     }
 
     const int modulationType = settings.modulationType;
+    if (modulationType == MOD_DMR) {
+        processDmrIqDemodulatorBlock(iqBlock, dmrBasebandSamples, dmrBasebandSampleRate, settings);
+        return;
+    }
+
     const int inputMode = settings.inputMode;
     const size_t iqSamples = iqBlock.size() / 2;
     const double fShift = settings.listeningFrequency - settings.centerFrequency;
@@ -568,11 +931,17 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     const double rfChannelRate = rfInputRate / decimationFactor;
     const double audioTimingChannelRate = audioTimingRate / decimationFactor;
     const double outputStep = AUDIO_OUTPUT_RATE / audioTimingChannelRate;
+    const bool dmrBasebandMode = modulationType == MOD_DMR;
 
     double cutoff = channelCutoffForMode(modulationType, bandwidth);
     cutoff = (std::min)(cutoff, rfChannelRate * 0.45);
     const float lowPassAlpha = static_cast<float>((std::clamp)(
         1.0 - std::exp(-TWO_PI * cutoff / rfChannelRate),
+        0.000001,
+        1.0
+        ));
+    const float dmrChannelPreLowPassAlpha = static_cast<float>((std::clamp)(
+        1.0 - std::exp(-TWO_PI * cutoff / rfInputRate),
         0.000001,
         1.0
         ));
@@ -582,8 +951,10 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
         demodAudioCutoff = clampDouble(settings.audioLowPassHz, 100.0, 20000.0);
     }
     demodAudioCutoff = (std::min)(demodAudioCutoff, AUDIO_OUTPUT_RATE * 0.45);
+    const double demodAudioFilterRate =
+        modulationType == MOD_DMR ? audioTimingChannelRate : AUDIO_OUTPUT_RATE;
     const float demodAudioLowPassAlpha = static_cast<float>((std::clamp)(
-        1.0 - std::exp(-TWO_PI * demodAudioCutoff / AUDIO_OUTPUT_RATE),
+        1.0 - std::exp(-TWO_PI * demodAudioCutoff / demodAudioFilterRate),
         0.000001,
         1.0
         ));
@@ -613,6 +984,11 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
 
     const size_t reserveCount = static_cast<size_t>((iqSamples / decimationFactor + 1) * outputStep) + 8;
     audioSamples.reserve(reserveCount);
+    if (dmrBasebandMode) {
+        dmrBasebandSampleRate =
+            normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
+        dmrBasebandSamples.reserve(reserveCount);
+    }
 
     float rotI = static_cast<float>(std::cos(ncoPhase));
     float rotQ = static_cast<float>(std::sin(ncoPhase));
@@ -625,6 +1001,7 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     float lowPassQ = std::imag(amLowPassState);
     float fmPrevI = std::real(fmPreviousSample);
     float fmPrevQ = std::imag(fmPreviousSample);
+    std::array<std::complex<float>, 3> dmrPreLowPassStates = dmrChannelPreLowPassStates;
     std::array<std::complex<float>, 4> sidebandStates = sidebandLowPassStates;
     double sidebandPhase = sidebandFilterPhase;
     float audioLowPass = demodAudioLowPassState;
@@ -689,8 +1066,18 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
             }
             const float mixedI = iSample * rotI - qSample * rotQ;
             const float mixedQ = iSample * rotQ + qSample * rotI;
-            channelSumI += mixedI;
-            channelSumQ += mixedQ;
+            std::complex<float> mixedSample(mixedI, mixedQ);
+            if (dmrBasebandMode && decimationFactor > 1) {
+                dmrPreLowPassStates[0] += dmrChannelPreLowPassAlpha *
+                                           (mixedSample - dmrPreLowPassStates[0]);
+                dmrPreLowPassStates[1] += dmrChannelPreLowPassAlpha *
+                                           (dmrPreLowPassStates[0] - dmrPreLowPassStates[1]);
+                dmrPreLowPassStates[2] += dmrChannelPreLowPassAlpha *
+                                           (dmrPreLowPassStates[1] - dmrPreLowPassStates[2]);
+                mixedSample = dmrPreLowPassStates[2];
+            }
+            channelSumI += std::real(mixedSample);
+            channelSumQ += std::imag(mixedSample);
         }
         ++decimationCount;
 
@@ -861,6 +1248,12 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
             const float normalized = digitalAudioMode
                                          ? acSample * (0.25f / amAgcLevel)
                                          : std::tanh(acSample * (0.35f / amAgcLevel));
+            if (dmrBasebandMode) {
+                const float dmrNormalized = acSample * (0.18f / amAgcLevel);
+                const float finiteDmrSample = std::isfinite(dmrNormalized) ? dmrNormalized : 0.0f;
+                const float clampedDmrSample = (std::clamp)(finiteDmrSample, -1.0f, 1.0f);
+                dmrBasebandSamples.push_back(static_cast<short>(clampedDmrSample * 32767.0f));
+            }
             const float finiteSample = std::isfinite(normalized) ? normalized : 0.0f;
             const float clamped = (std::clamp)(finiteSample, -1.0f, 1.0f);
             audioSamples.push_back(static_cast<short>(clamped * 32767.0f));
@@ -871,6 +1264,7 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock, 
     channelDecimationCount = decimationCount;
     hfNoiseCancelRefDecimationSum = adaptiveNoiseCancel ? refChannelSum : std::complex<float>(0.0f, 0.0f);
     amLowPassState = std::complex<float>(lowPassI, lowPassQ);
+    dmrChannelPreLowPassStates = dmrPreLowPassStates;
     sidebandLowPassStates = sidebandStates;
     fmPreviousSample = std::complex<float>(fmPrevI, fmPrevQ);
     demodAudioLowPassState = audioLowPass;
@@ -893,22 +1287,43 @@ void AudioProcessor::SDRThread() {
 
     std::vector<float> iqBlock;
     std::vector<short> audioSamples;
-    int activeModulationType = currentSettingsSnapshot().modulationType;
+    std::vector<short> dmrBasebandSamples;
+    RadioSettings activeSettings = currentSettingsSnapshot();
+    int activeInputMode = activeSettings.inputMode;
+    int activeModulationType = activeSettings.modulationType;
     uint64_t audioBlockCounter = 0;
-    double activeBandwidth = currentSettingsSnapshot().bandwidth;
-    double activeAudioLowPassHz = currentSettingsSnapshot().audioLowPassHz;
-    double activeAudioHighPassHz = currentSettingsSnapshot().audioHighPassHz;
+    double activeCenterFrequency = activeSettings.centerFrequency;
+    double activeListeningFrequency = activeSettings.listeningFrequency;
+    double activeSampleRate = activeSettings.sampleRate;
+    double activeBandwidth = activeSettings.bandwidth;
+    double activeAudioLowPassHz = activeSettings.audioLowPassHz;
+    double activeAudioHighPassHz = activeSettings.audioHighPassHz;
+    int activeDmrBasebandSampleRate =
+        normalizedDmrBasebandSampleRate(activeSettings.dmrBasebandSampleRate);
 
     while (running) {
         const RadioSettings settings = currentSettingsSnapshot();
-        if (activeModulationType != settings.modulationType ||
+        if (demodulatorResetRequested.exchange(false) ||
+            activeInputMode != settings.inputMode ||
+            activeModulationType != settings.modulationType ||
+            std::abs(activeCenterFrequency - settings.centerFrequency) > 0.5 ||
+            std::abs(activeListeningFrequency - settings.listeningFrequency) > 0.5 ||
+            std::abs(activeSampleRate - settings.sampleRate) > 0.5 ||
             std::abs(activeBandwidth - settings.bandwidth) > 1.0 ||
             std::abs(activeAudioLowPassHz - settings.audioLowPassHz) > 1.0 ||
-            std::abs(activeAudioHighPassHz - settings.audioHighPassHz) > 1.0) {
+            std::abs(activeAudioHighPassHz - settings.audioHighPassHz) > 1.0 ||
+            activeDmrBasebandSampleRate !=
+                normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate)) {
+            activeInputMode = settings.inputMode;
             activeModulationType = settings.modulationType;
+            activeCenterFrequency = settings.centerFrequency;
+            activeListeningFrequency = settings.listeningFrequency;
+            activeSampleRate = settings.sampleRate;
             activeBandwidth = settings.bandwidth;
             activeAudioLowPassHz = settings.audioLowPassHz;
             activeAudioHighPassHz = settings.audioHighPassHz;
+            activeDmrBasebandSampleRate =
+                normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
             resetDemodulatorState();
         }
 
@@ -918,9 +1333,20 @@ void AudioProcessor::SDRThread() {
         }
 
         const auto demodStart = std::chrono::steady_clock::now();
-        processDemodulatorBlock(iqBlock, audioSamples, settings);
+        int dmrBasebandSampleRate = 0;
+        processDemodulatorBlock(iqBlock,
+                                audioSamples,
+                                dmrBasebandSamples,
+                                dmrBasebandSampleRate,
+                                settings);
         const auto demodEnd = std::chrono::steady_clock::now();
         const double demodMs = std::chrono::duration<double, std::milli>(demodEnd - demodStart).count();
+        if (!dmrBasebandSamples.empty() && dmrBasebandSampleRate > 0) {
+            const QByteArray dmrBasebandFrame(
+                reinterpret_cast<const char *>(dmrBasebandSamples.data()),
+                static_cast<int>(dmrBasebandSamples.size() * sizeof(short)));
+            emit dmrBasebandFrameReady(dmrBasebandFrame, dmrBasebandSampleRate);
+        }
         if (audioSamples.empty()) {
             continue;
         }
@@ -933,9 +1359,19 @@ void AudioProcessor::SDRThread() {
                      << "configuredRate" << settings.sampleRate
                      << "estimatedRate" << IqBuffer::sampleRateEstimate()
                      << "audioSamples" << audioSamples.size()
+                     << "dmrBasebandSamples" << dmrBasebandSamples.size()
+                     << "dmrBasebandRate" << dmrBasebandSampleRate
                      << "demodMs" << demodMs;
         }
         ++audioBlockCounter;
+
+        const QByteArray demodPcmFrame(reinterpret_cast<const char *>(audioSamples.data()),
+                                       static_cast<int>(audioSamples.size() * sizeof(short)));
+        emit demodulatorFrameReady(demodPcmFrame);
+
+        if (settings.modulationType == MOD_DMR) {
+            continue;
+        }
 
         {
             std::lock_guard<std::mutex> lock(audioMutex);
@@ -994,7 +1430,8 @@ void AudioProcessor::startAudioOutput() {
             if (!running.load()) {
                 return true;
             }
-            if (queuedAudioSamples() < static_cast<size_t>(BUFFER_SIZE)) {
+            const size_t queuedSamples = queuedAudioSamples();
+            if (queuedSamples < static_cast<size_t>(BUFFER_SIZE)) {
                 return false;
             }
             for (int i = 0; i < NUM_BUFFERS; ++i) {
@@ -1007,10 +1444,13 @@ void AudioProcessor::startAudioOutput() {
         for (int i = 0; i < NUM_BUFFERS; ++i) {
             if (!bufferReady[i]) continue;
 
-            if (queuedAudioSamples() < static_cast<size_t>(BUFFER_SIZE)) continue;
+            const size_t queuedBeforeCopy = queuedAudioSamples();
+            if (queuedBeforeCopy < static_cast<size_t>(BUFFER_SIZE)) {
+                continue;
+            }
 
             QByteArray pcmFrame;
-            const size_t samplesToCopy = (std::min)(queuedAudioSamples(), static_cast<size_t>(BUFFER_SIZE));
+            const size_t samplesToCopy = (std::min)(queuedBeforeCopy, static_cast<size_t>(BUFFER_SIZE));
             if (samplesToCopy > 0) {
                 const float volume = outputVolume.load();
 

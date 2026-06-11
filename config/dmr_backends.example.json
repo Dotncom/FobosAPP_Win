@@ -1,0 +1,39 @@
+{
+  "schema": "fobosapp-dmr-backends",
+  "schemaVersion": 1,
+  "defaultBackend": "internal",
+  "pcm": {
+    "sampleRate": 48000,
+    "format": "s16le",
+    "channels": 1
+  },
+  "backends": [
+    {
+      "id": "internal",
+      "label": "Internal DMR monitor",
+      "type": "internal",
+      "enabled": true
+    },
+    {
+      "id": "dsd-neo-tcp",
+      "label": "DSD-neo TCP PCM16LE",
+      "type": "tcp_pcm16le",
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 7355,
+      "notes": "Start dsd-neo separately with TCP PCM16LE input and DMR mono options."
+    },
+    {
+      "id": "dsd-neo-process",
+      "label": "DSD-neo process",
+      "type": "process",
+      "enabled": false,
+      "program": "dsd-neo",
+      "arguments": [
+        "-fs",
+        "-nm"
+      ],
+      "notes": "Process bridging is a placeholder until exact stdin/file/TCP mode is selected per platform."
+    }
+  ]
+}

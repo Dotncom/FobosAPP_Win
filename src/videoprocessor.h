@@ -149,6 +149,10 @@ private:
     float dcEstimate = 0.0f;
     float levelMin = -0.25f;
     float levelMax = 0.25f;
+    bool hSyncOffsetValid = false;
+    double hSyncOffsetEstimate = 0.0;
+    int hSyncPolarityAccumulator = 0;
+    bool autoInvertActive = false;
 
     QElapsedTimer frameTimer;
     QElapsedTimer statusTimer;

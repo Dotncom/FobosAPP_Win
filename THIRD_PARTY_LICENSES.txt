@@ -1,9 +1,18 @@
 FobosAPP third-party components
-Version: 3.1.0-beta
+Version: 4.0 beta release preparation
 
-This file lists third-party runtime and build components used by FobosAPP.
-The release package contains redistributable binaries from several upstream
-projects/vendors. Their licenses remain owned by their respective authors.
+FobosAPP is prepared for publication as a GPL project. The repository root
+contains the GNU General Public License version 2 text in LICENSE.
+
+This file lists third-party runtime, build, and optional DMR voice components
+used by FobosAPP. Their copyrights remain owned by their respective authors.
+
+Important DMR/AMBE note:
+DMR voice support is experimental. AMBE/AMBE+2 technologies may be
+patent-encumbered in some jurisdictions. The DMR voice backend binaries are
+optional research/interoperability components. Users and redistributors should
+verify local legal and patent requirements before compiling, distributing, or
+using AMBE-capable binaries.
 
 1. Qt 5.15.2 runtime libraries
    Files used in the Windows package:
@@ -68,3 +77,80 @@ projects/vendors. Their licenses remain owned by their respective authors.
 
    Upstream/vendor: Microsoft
    License: Microsoft Visual C++ Redistributable license terms.
+
+7. Fobos DMR Voice Backend GPL
+   Project path:
+   - FobosDMRVoiceBackend-gpl/
+
+   Runtime files, when built and deployed:
+   - dmr_voice_backends/fobos_dmr_voice_mbelib.dll
+   - dmr_voice_backends/fobos_dmr_voice_opendmr.dll
+
+   Purpose: optional loadable DMR voice backend modules using the stable
+   Fobos DMR voice C ABI in FobosDMRVoiceBackend-gpl/include.
+
+   License: GPL-2.0-or-later for the Fobos backend wrapper code, except where
+   upstream GPL-2.0-only components make the combined backend module GPL-2.0
+   compatible only.
+
+   Local license and notice files in release packages:
+   - licenses/dmr_voice_backend/FobosDMRVoiceBackend-LICENSE.txt
+   - licenses/dmr_voice_backend/FobosDMRVoiceBackend-README.md
+
+8. mbelib-neo
+   Project path:
+   - third_party/mbelib-neo/
+
+   Upstream:
+   - https://github.com/arancormonk/mbelib-neo
+
+   This is an optional Git submodule. Users who need DMR voice backend support
+   can fetch it with:
+   - git submodule update --init --recursive third_party/mbelib-neo
+
+   Used by:
+   - optional fobos_dmr_voice_mbelib backend
+   - internal DMR voice fallback when FobosAPP is built with
+     FOBOS_ENABLE_MBELIB_NEO=ON
+
+   License: GNU General Public License version 2 or later.
+   Local license and notice files in release packages:
+   - licenses/dmr_voice_backend/mbelib-neo-LICENSE.txt
+   - licenses/dmr_voice_backend/mbelib-neo-README.md
+
+9. OpenDMR / softdmr
+   Project path:
+   - third_party/softdmr/
+
+   Upstream:
+   - https://github.com/hicaoc/softdmr
+
+   This is an optional Git submodule. Users who need the OpenDMR/OP25-backed
+   backend can fetch it with:
+   - git submodule update --init --recursive third_party/softdmr
+
+   Used by:
+   - optional fobos_dmr_voice_opendmr backend
+
+   License: GNU General Public License version 2.
+   Local license and notice files in release packages:
+   - licenses/dmr_voice_backend/softdmr-LICENSE.txt
+   - licenses/dmr_voice_backend/softdmr-README.md
+
+10. OP25 MBE encoder-derived code
+   Project path:
+   - third_party/softdmr/encoder/
+
+   Used by:
+   - optional fobos_dmr_voice_opendmr backend
+
+   The OpenDMR/softdmr tree contains encoder code derived from OP25
+   MBEEncoder work. Preserve upstream source headers, attribution comments,
+   and the softdmr GPL license when distributing source or binaries that use
+   this backend.
+
+Release/source obligation note:
+If a binary release includes GPL DMR voice backend DLLs, publish the
+corresponding FobosAPP and FobosDMRVoiceBackend-gpl source, plus the exact
+mbelib-neo and softdmr/OpenDMR source revisions used to build those DLLs, or
+provide an equivalent GPL-compliant source offer.

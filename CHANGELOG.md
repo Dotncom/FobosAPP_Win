@@ -1,5 +1,39 @@
 # Changelog
 
+## 4.0 - 2026-06-11
+
+### Added
+
+- Added optional GPL DMR voice backend modules under
+  `dmr_voice_backends/`, with mbelib-neo and OpenDMR/OP25-backed paths.
+- Added Ukrainian UI coverage for the main control sections, DMR/digital
+  controls, preset manager, network settings, and scan/hunter panels.
+- Added release-facing default configuration snapshot in
+  `config/fobosapp_defaults_4.0.json`.
+- Added DMR backend licensing and attribution notes for GitHub/binary release
+  preparation.
+- Added a standard-firmware visual scan prototype with an explicit center
+  frequency list, sample-rate-safe auto-spacing, and adjustable dwell time for
+  slower hosts or libusb-heavy retune paths.
+- Added persistent collapsible control-section state so rarely used panels can
+  stay closed between launches.
+
+### Changed
+
+- DMR remains experimental, but the 4.0 package can expose the current DMR
+  metadata/voice lab state instead of hiding the feature.
+- Detailed DMR logging is user-controlled through the settings dialog, with
+  log rotation to reduce runaway diagnostic files.
+- Standard scan retune timing now uses a small dedicated timer instead of being
+  quantized by the spectrum/waterfall refresh interval.
+
+### Known Issues
+
+- DMR voice quality is not beta-stable yet. Real Motorola DMR voice may still
+  alternate between intelligible speech, artifacts, and silence.
+- External DMR decoder mirroring is documented as the next bridge target but is
+  not implemented in the desktop UI yet.
+
 ## 3.6 - 2026-06-04
 
 ### Added

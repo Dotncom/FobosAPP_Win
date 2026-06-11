@@ -9,12 +9,17 @@ import android.graphics.Rect;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 
 import java.util.Locale;
 
 public final class SpectrumView extends View {
     public interface TuneRequestListener {
         void onTuneRequested(double frequencyHz);
+    }
+
+    public interface PanTuneRequestListener {
+        void onPanTuneRequested(double deltaHz);
     }
 
     private static final int[] WATERFALL_COLORS = new int[] {
@@ -94,6 +99,8 @@ public final class SpectrumView extends View {
     private float[] magnitudes = new float[0];
     private double minFrequency = 0.0;
     private double maxFrequency = 1.0;
+    private double rawMinFrequency = 0.0;
+    private double rawMaxFrequency = 1.0;
     private double visibleMinFrequency = 0.0;
     private double visibleMaxFrequency = 1.0;
     private double listeningFrequency = 0.0;
@@ -104,15 +111,19 @@ public final class SpectrumView extends View {
     private Bitmap waterfall;
     private int[] waterfallPixels = new int[0];
     private TuneRequestListener tuneRequestListener;
+    private PanTuneRequestListener panTuneRequestListener;
     private float downX = 0.0f;
     private float downY = 0.0f;
     private float lastPanX = 0.0f;
+    private float tapSlopPx = 24.0f;
     private float pinchStartDistance = 0.0f;
+    private float pinchStartFocusX = 0.0f;
     private double pinchStartSpan = 1.0;
     private double pinchFocusFrequency = 0.0;
     private boolean gestureMoved = false;
     private boolean pinching = false;
     private boolean userZoomed = false;
+    private boolean allowNegativeFrequencies = false;
     private boolean showGeneralBandMarkers = false;
     private boolean showAmateurBandMarkers = false;
 
@@ -123,6 +134,10 @@ public final class SpectrumView extends View {
 
     public synchronized void setTuneRequestListener(TuneRequestListener listener) {
         tuneRequestListener = listener;
+    }
+
+    public synchronized void setPanTuneRequestListener(PanTuneRequestListener listener) {
+        panTuneRequestListener = listener;
     }
 
     public SpectrumView(Context context, AttributeSet attrs) {
@@ -146,8 +161,39 @@ public final class SpectrumView extends View {
         invalidate();
     }
 
+    public synchronized void setAllowNegativeFrequencies(boolean allowNegative) {
+        if (allowNegativeFrequencies == allowNegative) {
+            return;
+        }
+        allowNegativeFrequencies = allowNegative;
+        updateVisibleRange((visibleMinFrequency + visibleMaxFrequency) * 0.5,
+                visibleMaxFrequency - visibleMinFrequency);
+        invalidate();
+    }
+
     public synchronized double visibleSpanHz() {
         return Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+    }
+
+    public synchronized void shiftFrequencyDisplay(double deltaHz) {
+        if (!Double.isFinite(deltaHz) || Math.abs(deltaHz) < 0.01) {
+            return;
+        }
+        minFrequency += deltaHz;
+        maxFrequency += deltaHz;
+        visibleMinFrequency += deltaHz;
+        visibleMaxFrequency += deltaHz;
+        setVisibleRange((visibleMinFrequency + visibleMaxFrequency) * 0.5,
+                visibleMaxFrequency - visibleMinFrequency);
+        invalidate();
+    }
+
+    public synchronized void setListeningFrequency(double frequencyHz) {
+        if (!Double.isFinite(frequencyHz)) {
+            return;
+        }
+        listeningFrequency = frequencyHz;
+        invalidate();
     }
 
     public synchronized void setSpectrum(double[] newFrequencies,
@@ -161,8 +207,10 @@ public final class SpectrumView extends View {
         magnitudes = newMagnitudes != null ? newMagnitudes : new float[0];
         double oldVisibleCenter = (visibleMinFrequency + visibleMaxFrequency) * 0.5;
         double oldVisibleSpan = visibleMaxFrequency - visibleMinFrequency;
-        minFrequency = newMinFrequency;
-        maxFrequency = newMaxFrequency > newMinFrequency ? newMaxFrequency : newMinFrequency + 1.0;
+        rawMinFrequency = newMinFrequency;
+        rawMaxFrequency = newMaxFrequency > newMinFrequency ? newMaxFrequency : newMinFrequency + 1.0;
+        minFrequency = rawMinFrequency;
+        maxFrequency = rawMaxFrequency;
         updateVisibleRange(oldVisibleCenter, oldVisibleSpan);
         listeningFrequency = newListeningFrequency;
         bandwidth = newBandwidth;
@@ -205,8 +253,10 @@ public final class SpectrumView extends View {
                     pinching = true;
                     gestureMoved = true;
                     pinchStartDistance = pointerDistance(event);
-                    pinchStartSpan = visibleMaxFrequency - visibleMinFrequency;
-                    pinchFocusFrequency = frequencyAtX(pointerCenterX(event), getWidth());
+                    pinchStartSpan = Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+                    pinchStartFocusX = Math.max(0.0f,
+                            Math.min(pointerCenterX(event), Math.max(1.0f, getWidth() - 1.0f)));
+                    pinchFocusFrequency = frequencyAtX(pinchStartFocusX, getWidth());
                 }
                 return true;
             case MotionEvent.ACTION_MOVE:
@@ -275,6 +325,7 @@ public final class SpectrumView extends View {
     }
 
     private void init() {
+        tapSlopPx = Math.max(18.0f, ViewConfiguration.get(getContext()).getScaledTouchSlop() * 2.5f);
         paint.setTypeface(android.graphics.Typeface.MONOSPACE);
     }
 
@@ -656,38 +707,61 @@ public final class SpectrumView extends View {
     }
 
     private void updateVisibleRange(double oldCenter, double oldSpan) {
-        double fullSpan = Math.max(1.0, maxFrequency - minFrequency);
+        double lowerLimit = rangeLowerLimit();
+        double upperLimit = rangeUpperLimit();
+        double fullSpan = Math.max(1.0, upperLimit - lowerLimit);
         if (!userZoomed || !Double.isFinite(oldSpan) || oldSpan <= 0.0) {
-            visibleMinFrequency = minFrequency;
-            visibleMaxFrequency = maxFrequency;
+            visibleMinFrequency = lowerLimit;
+            visibleMaxFrequency = upperLimit;
             userZoomed = false;
             return;
         }
         double span = Math.max(fullSpan / 100.0, Math.min(fullSpan, oldSpan));
-        double center = Double.isFinite(oldCenter) ? oldCenter : (minFrequency + maxFrequency) * 0.5;
+        double center = Double.isFinite(oldCenter) ? oldCenter : (lowerLimit + upperLimit) * 0.5;
         setVisibleRange(center, span);
     }
 
     private void setVisibleRange(double center, double span) {
-        double fullSpan = Math.max(1.0, maxFrequency - minFrequency);
+        double lowerLimit = rangeLowerLimit();
+        double upperLimit = rangeUpperLimit();
+        double fullSpan = Math.max(1.0, upperLimit - lowerLimit);
         double clampedSpan = Math.max(fullSpan / 100.0, Math.min(fullSpan, span));
         double half = clampedSpan * 0.5;
-        double clampedCenter = Math.max(minFrequency + half, Math.min(maxFrequency - half, center));
+        double clampedCenter = Math.max(lowerLimit + half, Math.min(upperLimit - half, center));
         visibleMinFrequency = clampedCenter - half;
         visibleMaxFrequency = clampedCenter + half;
         userZoomed = clampedSpan < fullSpan * 0.99;
     }
 
+    private double rangeLowerLimit() {
+        return allowNegativeFrequencies ? minFrequency : Math.max(0.0, minFrequency);
+    }
+
+    private double rangeUpperLimit() {
+        double lowerLimit = rangeLowerLimit();
+        return Math.max(lowerLimit + 1.0, maxFrequency);
+    }
+
     private void applyPan(float x, float y) {
         float dx = x - lastPanX;
-        if (Math.abs(x - downX) > 8.0f || Math.abs(y - downY) > 8.0f) {
+        if (Math.abs(x - downX) > tapSlopPx || Math.abs(y - downY) > tapSlopPx) {
             gestureMoved = true;
         }
         if (Math.abs(dx) > 0.5f && userZoomed) {
             double span = visibleMaxFrequency - visibleMinFrequency;
             double deltaHz = -dx / Math.max(1.0, getWidth() - 1.0) * span;
-            setVisibleRange((visibleMinFrequency + visibleMaxFrequency) * 0.5 + deltaHz, span);
-            invalidate();
+            if (panTuneRequestListener != null) {
+                panTuneRequestListener.onPanTuneRequested(deltaHz);
+            } else {
+                setVisibleRange((visibleMinFrequency + visibleMaxFrequency) * 0.5 + deltaHz, span);
+                invalidate();
+            }
+        } else if (Math.abs(dx) > 0.5f && !userZoomed) {
+            double span = visibleMaxFrequency - visibleMinFrequency;
+            double deltaHz = -dx / Math.max(1.0, getWidth() - 1.0) * span;
+            if (panTuneRequestListener != null) {
+                panTuneRequestListener.onPanTuneRequested(deltaHz);
+            }
         }
         lastPanX = x;
     }
@@ -699,11 +773,9 @@ public final class SpectrumView extends View {
         }
         double scale = distance / pinchStartDistance;
         double nextSpan = pinchStartSpan / Math.max(0.1, scale);
-        double focusX = pointerCenterX(event);
         double oldVisibleSpan = Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
-        double focusFraction = focusX / Math.max(1.0, getWidth() - 1.0);
-        double nextMin = pinchFocusFrequency - focusFraction * nextSpan;
-        double nextCenter = nextMin + nextSpan * 0.5;
+        double focusFraction = pinchStartFocusX / Math.max(1.0, getWidth() - 1.0);
+        double nextCenter = pinchFocusFrequency + (0.5 - focusFraction) * nextSpan;
         setVisibleRange(nextCenter, nextSpan);
         if (Math.abs(oldVisibleSpan - (visibleMaxFrequency - visibleMinFrequency)) > 0.5) {
             invalidate();

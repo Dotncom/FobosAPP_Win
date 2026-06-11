@@ -16,6 +16,7 @@
 #include <QElapsedTimer>
 #include <QByteArray>
 #include <atomic>
+#include <array>
 #include <complex>
 #include "radiosettings.h"
 //#include <main.h>
@@ -36,6 +37,7 @@ public:
                          bool syncEnabled,
                          double sampleRate,
                          bool queueAudioBlocks,
+                         bool publishIqSnapshot = true,
                          bool emitIqFrames = false,
                          bool agileScanEnabled = false);
     void requestStop();
@@ -43,6 +45,7 @@ public:
     bool forceStop(int timeoutMs = 1000);
     bool stop(int timeoutMs = 5000);
     uint64_t callbackCount() const;
+    void setSampleRateHint(double sampleRate);
     void updateNetworkIqSettings(const RadioSettings &settings, bool channelizeFrames);
     void configureNetworkIqStreaming(const RadioSettings &settings, bool emitFrames, bool channelizeFrames);
 signals:
@@ -62,6 +65,7 @@ private:
     std::atomic<bool> activeSyncMode;
     std::atomic<bool> requestedSyncMode;
     std::atomic<bool> requestedQueueAudioBlocks;
+    std::atomic<bool> requestedPublishIqSnapshot;
     std::atomic<bool> requestedEmitIqFrames;
     std::atomic<bool> requestedChannelizeIqFrames;
     std::atomic<bool> requestedAgileScanEnabled;
@@ -75,6 +79,13 @@ private:
     std::complex<float> networkIqDecimationSum = {0.0f, 0.0f};
     int networkIqDecimationCount = 0;
     std::complex<float> networkIqLowPassState = {0.0f, 0.0f};
+    std::array<std::complex<float>, 3> networkIqPreLowPassStates = {};
+    std::array<std::vector<std::complex<float>>, 4> networkIqCicBuffers = {};
+    std::array<std::complex<float>, 4> networkIqCicSums = {};
+    int networkIqCicIndex = 0;
+    int networkIqCicLength = 0;
+    int networkIqLastLoggedDmrOutputRate = 0;
+    int networkIqLastLoggedDmrDecimationFactor = 0;
     float networkIqAgcLevel = 0.01f;
     std::complex<float> networkHfNoiseCancelCoeff = {0.0f, 0.0f};
     std::complex<float> networkHfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
@@ -83,6 +94,7 @@ private:
     QElapsedTimer asyncRateTimer;
     uint64_t asyncMeasuredSamples = 0;
     uint64_t asyncCallbackCounter = 0;
+    int asyncRateReportCount = 0;
     std::atomic<uint64_t> totalCallbackCounter;
 //int reti;
 };

@@ -2,6 +2,7 @@ package com.fobosapp.networkclient;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.os.Bundle;
@@ -11,6 +12,7 @@ import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -35,19 +37,29 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private static final int DEFAULT_PORT = 21090;
     private static final int AUTO_APPLY_DELAY_MS = 650;
     private static final int FAST_APPLY_DELAY_MS = 120;
+    private static final int PAN_APPLY_DELAY_MS = 80;
+    private static final int PAN_RETUNE_INTERVAL_MS = 120;
     private static final int RELIABLE_SETTINGS_REPEAT_MS = 280;
     private static final int RELIABLE_SETTINGS_REPEAT_COUNT = 2;
     private static final int REMOTE_ECHO_GUARD_MS = 2500;
     private static final int LEVEL_DB_MIN = -160;
-    private static final int LEVEL_DB_MAX = 0;
+    private static final int LEVEL_DB_MAX = 90;
     private static final int LEVEL_MIN_GAP_DB = 5;
     private static final double RF_MIN_CENTER_FREQUENCY = 50_000_000.0;
     private static final double RF_MIN_LISTENING_FREQUENCY = 25_000_000.0;
     private static final double RF_EXPERIMENTAL_MAX_FREQUENCY = 7_750_000_000.0;
+    private static final String USB_LOG_TAG = "FobosUsbSandbox";
+    private static final int RECEIVER_MODE_NETWORK = 0;
+    private static final int RECEIVER_MODE_OTG = 1;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final RadioSettings settings = new RadioSettings();
     private final Runnable deferredSettingsApply = () -> sendControlNow("settings", false, true);
+    private final Runnable deferredUsbPreviewApply = () -> applyUsbOtgPreviewSettings(false);
+    private final Runnable deferredPanRetune = () -> {
+        lastPanRetuneMs = SystemClock.uptimeMillis();
+        applyRetuneSettingsNow(false);
+    };
     private final Runnable reliableSettingsRepeat = new Runnable() {
         @Override
         public void run() {
@@ -83,14 +95,22 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private CheckBox fullResolutionSpectrumCheck;
     private CheckBox generalBandMarkersCheck;
     private CheckBox amateurBandMarkersCheck;
+    private Button receiverModeButton;
     private Button connectButton;
     private Button startButton;
     private Button stopButton;
     private Button settingsButton;
     private Button controlsButton;
+    private Button settingsToggleButton;
     private Button requestControlButton;
     private Button usbScanButton;
     private Button usbPermissionButton;
+    private Button usbOpenButton;
+    private Button usbInfoButton;
+    private Button usbReadButton;
+    private Button usbCloseButton;
+    private Button usbSampleButton;
+    private Button usbToolsButton;
     private TextView statusText;
     private TextView levelMinLabel;
     private TextView levelMaxLabel;
@@ -102,13 +122,18 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private FineTuneDialView fineTuneDial;
     private SpectrumView spectrumView;
     private ScrollView controlsScroll;
+    private ScrollView settingsScroll;
     private LinearLayout rootLayout;
     private LinearLayout commandPanel;
     private LinearLayout contentPanel;
     private LinearLayout levelPanel;
+    private LinearLayout usbToolsRow;
+    private LinearLayout usbSessionRow;
+    private LinearLayout usbSampleRow;
 
     private volatile boolean audioPlaybackEnabled = true;
     private boolean controlsVisible = true;
+    private boolean settingsVisible = false;
     private boolean fullResolutionSpectrumFrames = false;
     private int pendingReliableSettingsRepeats = 0;
     private boolean suppressUiCallbacks = false;
@@ -119,6 +144,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private boolean fineTuneHoldMode = false;
     private boolean showGeneralBandMarkers = false;
     private boolean showAmateurBandMarkers = false;
+    private boolean usbToolsVisible = false;
+    private int receiverMode = RECEIVER_MODE_NETWORK;
+    private long lastPanRetuneMs = 0L;
 
     private final double[] sampleRates = new double[] {
             8_000_000.0, 10_000_000.0, 12_500_000.0, 16_000_000.0,
@@ -141,8 +169,29 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         client = new FobosNetworkClient(this);
         audioPlayer = new PcmAudioPlayer();
         buildUi();
-        usbSandbox = new UsbSandbox(this, this::appendUsbLog);
+        usbSandbox = new UsbSandbox(this, new UsbSandbox.Listener() {
+            @Override
+            public void onUsbLog(String message) {
+                appendUsbLog(message);
+            }
+
+            @Override
+            public void onUsbSpectrum(FobosNetworkClient.SpectrumFrame frame) {
+                onSpectrum(frame);
+            }
+
+            @Override
+            public void onUsbAudio(byte[] pcmData) {
+                onAudio(pcmData);
+            }
+
+            @Override
+            public void onUsbTelemetry(String message) {
+                MainActivity.this.onUsbTelemetry(message);
+            }
+        });
         usbSandbox.start();
+        appendUsbLogIfNotEmpty(usbSandbox.handleLaunchIntent(getIntent()));
         loadPrefs();
         updateButtons();
     }
@@ -153,6 +202,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         savePrefs();
         mainHandler.removeCallbacks(deferredSettingsApply);
         mainHandler.removeCallbacks(reliableSettingsRepeat);
+        mainHandler.removeCallbacks(deferredUsbPreviewApply);
+        mainHandler.removeCallbacks(deferredPanRetune);
         if (client != null) {
             client.shutdown();
         }
@@ -168,6 +219,15 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
         applyResponsiveLayout();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (usbSandbox != null) {
+            appendUsbLogIfNotEmpty(usbSandbox.handleLaunchIntent(intent));
+        }
     }
 
     @Override
@@ -205,8 +265,6 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     public void onSpectrum(FobosNetworkClient.SpectrumFrame frame) {
         runOnMain(() -> {
             boolean waitingForLocalSettingsEcho =
-                    client != null &&
-                    client.canControl() &&
                     SystemClock.uptimeMillis() < localSettingsGuardUntilMs;
             if (!waitingForLocalSettingsEcho) {
                 if (frame.inputMode >= RadioSettings.INPUT_RF &&
@@ -225,10 +283,14 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                     settings.listeningFrequency = frame.listeningFrequency;
                 }
                 settings.sampleRate = frame.sampleRate > 0.0 ? frame.sampleRate : settings.sampleRate;
+                if (frame.requestedFftLength > 0) {
+                    settings.fftLength = frame.requestedFftLength;
+                }
                 settings.bandwidth = frame.bandwidth > 0.0 ? frame.bandwidth : settings.bandwidth;
                 settings.modulationType = frame.modulationType;
                 updateControlsFromSettings(false);
             }
+            spectrumView.setAllowNegativeFrequencies(settings.inputMode == RadioSettings.INPUT_HF_COMBINED);
             spectrumView.setSpectrum(
                     frame.frequencies,
                     frame.magnitudes,
@@ -246,6 +308,17 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         if (audioPlayer != null && audioPlaybackEnabled) {
             audioPlayer.playPcm(pcmData);
         }
+    }
+
+    private void onUsbTelemetry(String message) {
+        String audioStats = audioPlayer != null ? audioPlayer.statsSnapshot() : "";
+        String status = audioStats.isEmpty() ? message : message + " | " + audioStats;
+        Log.d(USB_LOG_TAG, status);
+        runOnMain(() -> {
+            if (statusText != null) {
+                statusText.setText(status);
+            }
+        });
     }
 
     @Override
@@ -268,40 +341,52 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         contentPanel.setOrientation(LinearLayout.VERTICAL);
         contentPanel.setBackgroundColor(0xff101418);
 
+        receiverModeButton = button("Net");
         connectButton = button("Connect");
         startButton = button("Start");
         stopButton = button("Stop");
         settingsButton = button("Apply");
         controlsButton = button("Hide");
-        connectButton.setOnClickListener(v -> toggleConnection());
-        startButton.setOnClickListener(v -> {
-            if (sendCommand("start", true)) {
-                setControlsVisible(false);
+        settingsToggleButton = button("Settings");
+        receiverModeButton.setOnClickListener(v -> toggleReceiverMode());
+        connectButton.setOnClickListener(v -> {
+            if (isOtgMode()) {
+                requestUsbPermission();
+            } else {
+                toggleConnection();
             }
         });
-        stopButton.setOnClickListener(v -> {
-            if (audioPlayer != null) {
-                audioPlayer.stop();
-            }
-            sendCommand("stop", true);
-        });
-        settingsButton.setOnClickListener(v -> sendCommand("settings", true));
+        startButton.setOnClickListener(v -> startActiveReceiver());
+        stopButton.setOnClickListener(v -> stopActiveReceiver());
+        settingsButton.setOnClickListener(v -> applyActiveReceiverSettings(true));
         controlsButton.setOnClickListener(v -> setControlsVisible(!controlsVisible));
+        settingsToggleButton.setOnClickListener(v -> setSettingsVisible(!settingsVisible));
 
         statusText = label("Network disabled");
         statusText.setTextColor(0xffe7edf2);
         statusText.setPadding(dp(10), dp(5), dp(10), dp(3));
+        statusText.setTextSize(12.0f);
         levelPanel = buildLevelPanel();
 
         controlsScroll = new ScrollView(this);
         controlsScroll.setFillViewport(false);
         controlsScroll.setBackgroundColor(0xff182129);
+        LinearLayout controlsPanel = new LinearLayout(this);
+        controlsPanel.setOrientation(LinearLayout.VERTICAL);
+        controlsPanel.setPadding(dp(8), dp(5), dp(8), dp(6));
+        controlsScroll.addView(controlsPanel);
+
+        settingsScroll = new ScrollView(this);
+        settingsScroll.setFillViewport(false);
+        settingsScroll.setBackgroundColor(0xff182129);
+        settingsScroll.setVisibility(View.GONE);
         LinearLayout settingsPanel = new LinearLayout(this);
         settingsPanel.setOrientation(LinearLayout.VERTICAL);
         settingsPanel.setPadding(dp(8), dp(5), dp(8), dp(6));
-        controlsScroll.addView(settingsPanel);
+        settingsScroll.addView(settingsPanel);
 
         LinearLayout connectionRow = row();
+        LinearLayout connectionActionRow = row();
         hostEdit = edit("Server IP");
         hostEdit.setInputType(InputType.TYPE_CLASS_TEXT |
                 InputType.TYPE_TEXT_VARIATION_URI |
@@ -312,15 +397,39 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         requestControlButton.setOnClickListener(v -> sendCommand("requestPriority", true));
         connectionRow.addView(fieldWithLabel("Server IP", hostEdit), new LinearLayout.LayoutParams(0, dp(62), 1.5f));
         connectionRow.addView(fieldWithLabel("Port", portEdit), new LinearLayout.LayoutParams(0, dp(62), 0.7f));
-        connectionRow.addView(requestControlButton, new LinearLayout.LayoutParams(0, dp(48), 1.0f));
+        connectionActionRow.addView(connectButton, new LinearLayout.LayoutParams(0, dp(44), 0.8f));
+        connectionActionRow.addView(requestControlButton, new LinearLayout.LayoutParams(0, dp(44), 1.2f));
 
-        LinearLayout usbRow = row();
+        LinearLayout usbPrimaryRow = row();
+        usbToolsRow = row();
+        usbSessionRow = row();
+        usbSampleRow = row();
         usbScanButton = button("USB scan");
         usbPermissionButton = button("USB permission/open");
+        usbOpenButton = button("OTG open");
+        usbInfoButton = button("OTG info");
+        usbReadButton = button("OTG read");
+        usbCloseButton = button("OTG close");
+        usbSampleButton = button("OTG sample test");
+        usbToolsButton = button("Tools");
         usbScanButton.setOnClickListener(v -> scanUsbDevices());
         usbPermissionButton.setOnClickListener(v -> requestUsbPermission());
-        usbRow.addView(usbScanButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
-        usbRow.addView(usbPermissionButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbOpenButton.setOnClickListener(v -> openUsbOtgSession());
+        usbInfoButton.setOnClickListener(v -> readUsbOtgInfo());
+        usbReadButton.setOnClickListener(v -> readUsbOtgProbe());
+        usbCloseButton.setOnClickListener(v -> closeUsbOtgSession());
+        usbSampleButton.setOnClickListener(v -> runUsbOtgSampleTest());
+        usbToolsButton.setOnClickListener(v -> toggleUsbTools());
+        usbPrimaryRow.addView(usbInfoButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbPrimaryRow.addView(usbToolsButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbToolsRow.addView(usbScanButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbToolsRow.addView(usbPermissionButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbSessionRow.addView(usbOpenButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbSessionRow.addView(usbReadButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbSessionRow.addView(usbCloseButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbSampleRow.addView(usbSampleButton, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
+        updateUsbToolsVisibility();
 
         LinearLayout freqRow = row();
         centerEdit = edit("Center MHz");
@@ -412,36 +521,36 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         logScroll.setBackgroundColor(0xff0b1014);
         logScroll.addView(logText);
 
+        controlsPanel.addView(freqRow);
+        controlsPanel.addView(modeRow);
+        controlsPanel.addView(fftRow);
+
         settingsPanel.addView(connectionRow);
-        settingsPanel.addView(usbRow);
-        settingsPanel.addView(freqRow);
-        settingsPanel.addView(modeRow);
-        settingsPanel.addView(fftRow);
+        settingsPanel.addView(connectionActionRow);
+        settingsPanel.addView(usbPrimaryRow);
+        settingsPanel.addView(usbToolsRow);
+        settingsPanel.addView(usbSessionRow);
+        settingsPanel.addView(usbSampleRow);
         settingsPanel.addView(optionsRow);
         settingsPanel.addView(markerRow);
+        settingsPanel.addView(statusText, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(38)));
         settingsPanel.addView(logScroll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(76)));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(88)));
 
         spectrumView = new SpectrumView(this);
         spectrumView.setLevelRange(displayLevelMin, displayLevelMax);
         updateBandMarkerVisibility();
         spectrumView.setTuneRequestListener(frequencyHz -> {
-            settings.listeningFrequency = RadioSettings.clampDirectListeningFrequency(
-                    settings.inputMode,
-                    settings.sampleRate,
-                    frequencyHz);
-            if (RadioSettings.isDirectInput(settings.inputMode)) {
-                settings.centerFrequency = 0.0;
-                settings.actualFrequency = 0.0;
-            }
-            setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
-            setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
-            sendCommand("settings", true);
+            tuneToFrequency(frequencyHz, true);
         });
+        spectrumView.setPanTuneRequestListener(deltaHz -> applySpectrumPanDelta(deltaHz));
 
         contentPanel.addView(levelPanel, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
         contentPanel.addView(controlsScroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(230)));
+        contentPanel.addView(settingsScroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(230)));
         contentPanel.addView(spectrumView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
@@ -468,7 +577,63 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         updateButtons();
     }
 
+    private boolean isOtgMode() {
+        return receiverMode == RECEIVER_MODE_OTG;
+    }
+
+    private void toggleReceiverMode() {
+        if (isOtgMode()) {
+            if (isUsbOtgPreviewRunning()) {
+                stopUsbOtgPreview();
+            }
+            receiverMode = RECEIVER_MODE_NETWORK;
+            statusText.setText("Network mode");
+        } else {
+            receiverMode = RECEIVER_MODE_OTG;
+            if (audioPlayer != null) {
+                audioPlayer.stop();
+            }
+            statusText.setText("OTG mode");
+        }
+        savePrefs();
+        updateButtons();
+    }
+
+    private void startActiveReceiver() {
+        if (isOtgMode()) {
+            startUsbOtgPreview();
+            setControlsVisible(false);
+            updateButtons();
+            return;
+        }
+        if (sendCommand("start", true)) {
+            setControlsVisible(false);
+        }
+    }
+
+    private void stopActiveReceiver() {
+        if (audioPlayer != null) {
+            audioPlayer.stop();
+        }
+        if (isOtgMode()) {
+            mainHandler.removeCallbacks(deferredUsbPreviewApply);
+            stopUsbOtgPreview();
+            updateButtons();
+            return;
+        }
+        sendCommand("stop", true);
+    }
+
+    private void applyActiveReceiverSettings(boolean logExplicitly) {
+        if (isOtgMode()) {
+            applyUsbOtgPreviewSettings(logExplicitly);
+            return;
+        }
+        sendCommand("settings", logExplicitly);
+    }
+
     private void scanUsbDevices() {
+        Log.d(USB_LOG_TAG, "USB scan button clicked");
         if (usbSandbox == null) {
             appendLog("[USB] sandbox is not ready");
             return;
@@ -477,6 +642,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void requestUsbPermission() {
+        Log.d(USB_LOG_TAG, "USB permission/open button clicked");
         if (usbSandbox == null) {
             appendLog("[USB] sandbox is not ready");
             return;
@@ -484,9 +650,143 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         appendUsbLog(usbSandbox.requestPermissionForBestDevice());
     }
 
+    private void openUsbOtgSession() {
+        Log.d(USB_LOG_TAG, "OTG open button clicked");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.openReceiverSession());
+    }
+
+    private void readUsbOtgProbe() {
+        Log.d(USB_LOG_TAG, "OTG read button clicked");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.readReceiverProbe());
+    }
+
+    private void readUsbOtgInfo() {
+        Log.d(USB_LOG_TAG, "OTG info button clicked");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.readReceiverInfo());
+    }
+
+    private void closeUsbOtgSession() {
+        Log.d(USB_LOG_TAG, "OTG close button clicked");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.closeReceiverSession());
+    }
+
+    private void runUsbOtgSampleTest() {
+        Log.d(USB_LOG_TAG, "OTG sample test button clicked");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.runReceiverSampleTest());
+    }
+
+    private void toggleUsbTools() {
+        usbToolsVisible = !usbToolsVisible;
+        updateUsbToolsVisibility();
+    }
+
+    private void updateUsbToolsVisibility() {
+        int visibility = usbToolsVisible ? View.VISIBLE : View.GONE;
+        if (usbToolsRow != null) {
+            usbToolsRow.setVisibility(visibility);
+        }
+        if (usbSessionRow != null) {
+            usbSessionRow.setVisibility(visibility);
+        }
+        if (usbSampleRow != null) {
+            usbSampleRow.setVisibility(visibility);
+        }
+        if (usbToolsButton != null) {
+            usbToolsButton.setText(usbToolsVisible ? "Hide" : "Tools");
+        }
+    }
+
+    private void startUsbOtgPreview() {
+        Log.d(USB_LOG_TAG, "OTG preview start requested");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        collectSettingsFromUi();
+        appendUsbLog(usbSandbox.startReceiverPreview(
+                settings.centerFrequency,
+                settings.listeningFrequency,
+                settings.sampleRate,
+                settings.inputMode,
+                settings.bandwidth,
+                settings.modulationType,
+                settings.audioEnabled,
+                settings.lnaGain,
+                settings.vgaGain,
+                settings.fftLength));
+    }
+
+    private void stopUsbOtgPreview() {
+        Log.d(USB_LOG_TAG, "OTG preview stop requested");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.stopReceiverPreview());
+    }
+
+    private boolean isUsbOtgPreviewRunning() {
+        return usbSandbox != null && usbSandbox.isReceiverPreviewRunning();
+    }
+
+    private void applyUsbOtgPreviewSettings(boolean logExplicitly) {
+        if (!isUsbOtgPreviewRunning()) {
+            if (logExplicitly) {
+                appendUsbLog("[USB OTG] settings will apply on next Start");
+            }
+            return;
+        }
+        localSettingsGuardUntilMs = SystemClock.uptimeMillis() + REMOTE_ECHO_GUARD_MS;
+        collectSettingsFromUi();
+        String message = usbSandbox.applyReceiverPreviewSettings(
+                settings.centerFrequency,
+                settings.listeningFrequency,
+                settings.sampleRate,
+                settings.inputMode,
+                settings.bandwidth,
+                settings.modulationType,
+                settings.audioEnabled,
+                settings.lnaGain,
+                settings.vgaGain,
+                settings.fftLength);
+        Log.d(USB_LOG_TAG, String.format(Locale.US,
+                "applyUsbOtgPreviewSettings center %.3f listen %.3f sr %.3f input %d mod %d bw %.0f",
+                settings.centerFrequency / 1_000_000.0,
+                settings.listeningFrequency / 1_000_000.0,
+                settings.sampleRate / 1_000_000.0,
+                settings.inputMode,
+                settings.modulationType,
+                settings.bandwidth));
+        if (logExplicitly) {
+            appendUsbLog(message);
+        }
+    }
+
     private boolean sendCommand(String action, boolean logExplicitly) {
         mainHandler.removeCallbacks(deferredSettingsApply);
         mainHandler.removeCallbacks(reliableSettingsRepeat);
+        mainHandler.removeCallbacks(deferredUsbPreviewApply);
+        mainHandler.removeCallbacks(deferredPanRetune);
         pendingReliableSettingsRepeats = 0;
         return sendControlNow(action, logExplicitly, true);
     }
@@ -509,10 +809,16 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void sendReliableSettingsNow() {
-        if (suppressUiCallbacks ||
-                client == null ||
-                !client.isConnected() ||
-                !client.canControl()) {
+        if (suppressUiCallbacks) {
+            return;
+        }
+        if (isUsbOtgPreviewRunning()) {
+            localSettingsGuardUntilMs = SystemClock.uptimeMillis() + REMOTE_ECHO_GUARD_MS;
+            mainHandler.removeCallbacks(deferredUsbPreviewApply);
+            applyUsbOtgPreviewSettings(false);
+            return;
+        }
+        if (client == null || !client.isConnected() || !client.canControl()) {
             return;
         }
         mainHandler.removeCallbacks(deferredSettingsApply);
@@ -602,11 +908,15 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         boolean connected = client != null && client.isConnected();
         boolean active = client != null && client.isActive();
         boolean canControl = connected && client.canControl();
-        connectButton.setText(active ? "Disconnect" : "Connect");
-        startButton.setEnabled(canControl);
-        stopButton.setEnabled(canControl);
-        settingsButton.setEnabled(canControl);
-        requestControlButton.setEnabled(connected && !client.canControl());
+        boolean otgMode = isOtgMode();
+        boolean otgPreviewRunning = isUsbOtgPreviewRunning();
+        receiverModeButton.setText(otgMode ? "OTG" : "Net");
+        connectButton.setText(otgMode ? "USB" : (active ? "Disconnect" : "Connect"));
+        connectButton.setEnabled(otgMode || client != null);
+        startButton.setEnabled(otgMode ? (usbSandbox != null && !otgPreviewRunning) : canControl);
+        stopButton.setEnabled(otgMode ? otgPreviewRunning : canControl);
+        settingsButton.setEnabled(otgMode ? usbSandbox != null : canControl);
+        requestControlButton.setEnabled(!otgMode && connected && !client.canControl());
     }
 
     private void loadPrefs() {
@@ -634,6 +944,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         fineTuneHoldMode = prefs.getBoolean("fineTuneHoldMode", fineTuneHoldMode);
         showGeneralBandMarkers = prefs.getBoolean("showGeneralBandMarkers", showGeneralBandMarkers);
         showAmateurBandMarkers = prefs.getBoolean("showAmateurBandMarkers", showAmateurBandMarkers);
+        receiverMode = prefs.getInt("receiverMode", receiverMode) == RECEIVER_MODE_OTG
+                ? RECEIVER_MODE_OTG
+                : RECEIVER_MODE_NETWORK;
         boolean suppressServer = prefs.getBoolean("suppressServer", true);
         displayLevelMin = prefs.getFloat("levelMin", displayLevelMin);
         displayLevelMax = prefs.getFloat("levelMax", displayLevelMax);
@@ -641,6 +954,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             displayLevelMin = -130.0f;
             displayLevelMax = -50.0f;
         }
+        normalizeSettingsForCurrentInput();
 
         updateControlsFromSettings(true);
         updateLevelControls();
@@ -685,6 +999,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 .putBoolean("fineTuneHoldMode", fineTuneHoldMode)
                 .putBoolean("showGeneralBandMarkers", showGeneralBandMarkers)
                 .putBoolean("showAmateurBandMarkers", showAmateurBandMarkers)
+                .putInt("receiverMode", receiverMode)
                 .putBoolean("suppressServer", suppressServerCheck.isChecked())
                 .putFloat("levelMin", displayLevelMin)
                 .putFloat("levelMax", displayLevelMax)
@@ -692,6 +1007,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void updateControlsFromSettings(boolean force) {
+        normalizeSettingsForCurrentInput();
         suppressUiCallbacks = true;
         setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), force);
         setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), force);
@@ -705,6 +1021,35 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         centerEdit.setAlpha(directInput ? 0.55f : 1.0f);
         suppressUiCallbacks = false;
         updateFineTuneControl();
+    }
+
+    private void normalizeSettingsForCurrentInput() {
+        if (!isFinite(settings.sampleRate) || settings.sampleRate <= 0.0) {
+            settings.sampleRate = 8_000_000.0;
+        }
+        if (!isFinite(settings.bandwidth) || settings.bandwidth <= 0.0) {
+            settings.bandwidth = RadioSettings.defaultBandwidthForModulation(settings.modulationType);
+        }
+        if (RadioSettings.isDirectInput(settings.inputMode)) {
+            settings.centerFrequency = 0.0;
+            settings.actualFrequency = 0.0;
+            settings.listeningFrequency = RadioSettings.clampDirectListeningFrequency(
+                    settings.inputMode,
+                    settings.sampleRate,
+                    settings.listeningFrequency);
+        } else {
+            if (!isFinite(settings.centerFrequency) || settings.centerFrequency < RF_MIN_CENTER_FREQUENCY) {
+                settings.centerFrequency = 100_000_000.0;
+            }
+            settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.centerFrequency));
+            settings.actualFrequency = settings.centerFrequency;
+            if (!isFinite(settings.listeningFrequency) ||
+                    settings.listeningFrequency < RF_MIN_LISTENING_FREQUENCY ||
+                    settings.listeningFrequency > RF_EXPERIMENTAL_MAX_FREQUENCY) {
+                settings.listeningFrequency = settings.centerFrequency;
+            }
+        }
     }
 
     private void setTextIfNotFocused(EditText editText, String text, boolean force) {
@@ -721,10 +1066,17 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void scheduleSettingsApply(int delayMs) {
-        if (suppressUiCallbacks ||
-                client == null ||
-                !client.isConnected() ||
-                !client.canControl()) {
+        if (suppressUiCallbacks) {
+            return;
+        }
+        if (isUsbOtgPreviewRunning()) {
+            localSettingsGuardUntilMs = SystemClock.uptimeMillis() + REMOTE_ECHO_GUARD_MS;
+            collectSettingsFromUi();
+            mainHandler.removeCallbacks(deferredUsbPreviewApply);
+            mainHandler.postDelayed(deferredUsbPreviewApply, Math.max(0, delayMs));
+            return;
+        }
+        if (client == null || !client.isConnected() || !client.canControl()) {
             return;
         }
         collectSettingsFromUi();
@@ -737,8 +1089,30 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
 
     private void setControlsVisible(boolean visible) {
         controlsVisible = visible;
+        if (visible) {
+            settingsVisible = false;
+            if (settingsScroll != null) {
+                settingsScroll.setVisibility(View.GONE);
+            }
+        }
         controlsScroll.setVisibility(visible ? View.VISIBLE : View.GONE);
         controlsButton.setText(visible ? "Hide" : "Controls");
+        if (settingsToggleButton != null) {
+            settingsToggleButton.setText(settingsVisible ? "Hide" : "Settings");
+        }
+    }
+
+    private void setSettingsVisible(boolean visible) {
+        settingsVisible = visible;
+        if (visible) {
+            controlsVisible = false;
+            controlsScroll.setVisibility(View.GONE);
+        }
+        if (settingsScroll != null) {
+            settingsScroll.setVisibility(visible ? View.VISIBLE : View.GONE);
+        }
+        controlsButton.setText(controlsVisible ? "Hide" : "Controls");
+        settingsToggleButton.setText(visible ? "Hide" : "Settings");
     }
 
     private void applyResponsiveLayout() {
@@ -762,6 +1136,11 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             ((LinearLayout.LayoutParams) controlsParams).height = dp(landscape ? 188 : 230);
             controlsScroll.setLayoutParams(controlsParams);
         }
+        ViewGroup.LayoutParams settingsParams = settingsScroll.getLayoutParams();
+        if (settingsParams instanceof LinearLayout.LayoutParams) {
+            ((LinearLayout.LayoutParams) settingsParams).height = dp(landscape ? 188 : 230);
+            settingsScroll.setLayoutParams(settingsParams);
+        }
         ViewGroup.LayoutParams levelParams = levelPanel.getLayoutParams();
         if (levelParams instanceof LinearLayout.LayoutParams) {
             ((LinearLayout.LayoutParams) levelParams).height = dp(landscape ? 44 : 52);
@@ -784,7 +1163,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private void rebuildCommandPanel(boolean landscape) {
         commandPanel.removeAllViews();
         Button[] buttons = new Button[] {
-                connectButton, startButton, stopButton, settingsButton, controlsButton
+                receiverModeButton, startButton, stopButton, settingsButton, controlsButton, settingsToggleButton
         };
         for (Button button : buttons) {
             button.setTextSize(landscape ? 11.0f : 12.0f);
@@ -972,6 +1351,126 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
         setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
         scheduleSettingsApply(FAST_APPLY_DELAY_MS);
+    }
+
+    private void tuneToFrequency(double frequencyHz, boolean immediate) {
+        if (!isFinite(frequencyHz)) {
+            return;
+        }
+        double beforeCenter = settings.centerFrequency;
+        double beforeListen = settings.listeningFrequency;
+        collectSettingsFromUi();
+        if (RadioSettings.isDirectInput(settings.inputMode)) {
+            settings.centerFrequency = 0.0;
+            settings.actualFrequency = 0.0;
+            settings.listeningFrequency = RadioSettings.clampDirectListeningFrequency(
+                    settings.inputMode,
+                    settings.sampleRate,
+                    frequencyHz);
+        } else {
+            settings.listeningFrequency = Math.max(RF_MIN_LISTENING_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, frequencyHz));
+            keepRfListeningInsideVisiblePassband();
+        }
+        setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
+        setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
+        if (spectrumView != null) {
+            spectrumView.setListeningFrequency(settings.listeningFrequency);
+        }
+        Log.d(USB_LOG_TAG, String.format(Locale.US,
+                "tuneToFrequency tap %.3f MHz center %.3f->%.3f listen %.3f->%.3f input %d",
+                frequencyHz / 1_000_000.0,
+                beforeCenter / 1_000_000.0,
+                settings.centerFrequency / 1_000_000.0,
+                beforeListen / 1_000_000.0,
+                settings.listeningFrequency / 1_000_000.0,
+                settings.inputMode));
+        if (immediate) {
+            sendReliableSettingsNow();
+        } else {
+            scheduleSettingsApply(FAST_APPLY_DELAY_MS);
+        }
+    }
+
+    private void applySpectrumPanDelta(double deltaHz) {
+        if (!isFinite(deltaHz) || Math.abs(deltaHz) < 1.0) {
+            return;
+        }
+        collectSettingsFromUi();
+        double beforeCenter = settings.centerFrequency;
+        double beforeListen = settings.listeningFrequency;
+        double appliedDelta;
+        if (RadioSettings.isDirectInput(settings.inputMode)) {
+            // Direct inputs have no tunable RF center in this preview path; keep the audio marker stable.
+            settings.centerFrequency = 0.0;
+            settings.actualFrequency = 0.0;
+            appliedDelta = 0.0;
+        } else {
+            double oldCenter = settings.centerFrequency;
+            settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.centerFrequency + deltaHz));
+            appliedDelta = settings.centerFrequency - oldCenter;
+            settings.actualFrequency = settings.centerFrequency;
+        }
+        if (Math.abs(appliedDelta) < 1.0) {
+            return;
+        }
+        if (spectrumView != null) {
+            spectrumView.shiftFrequencyDisplay(appliedDelta);
+        }
+        setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
+        setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
+        Log.d(USB_LOG_TAG, String.format(Locale.US,
+                "pan delta %.0f applied %.0f center %.3f->%.3f listen %.3f->%.3f input %d",
+                deltaHz,
+                appliedDelta,
+                beforeCenter / 1_000_000.0,
+                settings.centerFrequency / 1_000_000.0,
+                beforeListen / 1_000_000.0,
+                settings.listeningFrequency / 1_000_000.0,
+                settings.inputMode));
+        requestLivePanRetune();
+    }
+
+    private void requestLivePanRetune() {
+        long now = SystemClock.uptimeMillis();
+        localSettingsGuardUntilMs = now + REMOTE_ECHO_GUARD_MS;
+        long elapsed = now - lastPanRetuneMs;
+        if (elapsed >= PAN_RETUNE_INTERVAL_MS) {
+            mainHandler.removeCallbacks(deferredPanRetune);
+            lastPanRetuneMs = now;
+            applyRetuneSettingsNow(false);
+            return;
+        }
+        mainHandler.removeCallbacks(deferredPanRetune);
+        mainHandler.postDelayed(deferredPanRetune,
+                Math.max(PAN_APPLY_DELAY_MS, PAN_RETUNE_INTERVAL_MS - elapsed));
+    }
+
+    private void applyRetuneSettingsNow(boolean logExplicitly) {
+        if (isUsbOtgPreviewRunning()) {
+            applyUsbOtgPreviewSettings(logExplicitly);
+            return;
+        }
+        if (client != null && client.isConnected() && client.canControl()) {
+            sendControlNow("settings", logExplicitly, true);
+        }
+    }
+
+    private void keepRfListeningInsideVisiblePassband() {
+        if (RadioSettings.isDirectInput(settings.inputMode)) {
+            return;
+        }
+        double halfRate = Math.max(1.0, settings.sampleRate * 0.5);
+        if (settings.listeningFrequency < settings.centerFrequency - halfRate) {
+            settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency + halfRate));
+            settings.actualFrequency = settings.centerFrequency;
+        } else if (settings.listeningFrequency > settings.centerFrequency + halfRate) {
+            settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                    Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency - halfRate));
+            settings.actualFrequency = settings.centerFrequency;
+        }
     }
 
     private String formatFineTuneRange(double hz) {
@@ -1203,12 +1702,21 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void appendUsbLog(String text) {
+        String safeText = text != null ? text : "<null USB log>";
+        Log.d(USB_LOG_TAG, safeText);
         runOnMain(() -> {
             if (statusText != null) {
-                statusText.setText("USB sandbox");
+                int newline = safeText.indexOf('\n');
+                statusText.setText(newline >= 0 ? safeText.substring(0, newline) : safeText);
             }
-            appendLog(text);
+            appendLog(safeText);
         });
+    }
+
+    private void appendUsbLogIfNotEmpty(String text) {
+        if (text != null && !text.isEmpty()) {
+            appendUsbLog(text);
+        }
     }
 
     private void runOnMain(Runnable runnable) {

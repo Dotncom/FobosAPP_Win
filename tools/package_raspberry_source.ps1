@@ -25,9 +25,29 @@ if (Test-Path -LiteralPath $Stage) {
 New-Item -ItemType Directory -Path $Stage | Out-Null
 
 $files = git -C $Workspace ls-files --cached --others --exclude-standard
+$excludePrefixes = @(
+    "android/",
+    "sandbox/"
+)
+$excludeExactPaths = @(
+    "third_party/mbelib-neo",
+    "third_party/softdmr"
+)
+
 foreach ($file in $files) {
     $normalized = $file -replace "\\", "/"
-    if ($normalized.StartsWith("android/", [System.StringComparison]::OrdinalIgnoreCase)) {
+    $normalizedExact = $normalized.TrimEnd("/")
+    if ($excludeExactPaths -contains $normalizedExact) {
+        continue
+    }
+    $excluded = $false
+    foreach ($prefix in $excludePrefixes) {
+        if ($normalized.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $excluded = $true
+            break
+        }
+    }
+    if ($excluded) {
         continue
     }
 
