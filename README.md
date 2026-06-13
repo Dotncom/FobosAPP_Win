@@ -2,11 +2,11 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android network-client support work. Version 4.0 keeps the stable
+and Android network-client support work. Version 4.1 keeps the stable
 real-device, network, and video/image work from the 2.x/3.x line, expands the
 DMR laboratory monitor, adds optional GPL DMR voice backend modules, improves
-scan/measurement tooling, and adds more practical desktop, Raspberry Pi, and
-Android tuning controls.
+scan/measurement tooling, adds the GNSS/QTH laboratory workflow, and keeps the
+desktop, Raspberry Pi, and Android tuning controls current.
 
 ## Windows Release Package
 
@@ -17,10 +17,20 @@ DLLs, and the `platforms/qwindows.dll` plugin together in the same folder tree.
 The app stores local settings in `FobosAPP.ini` next to the executable and writes
 diagnostic logs to `FobosAPP_diagnostic.log`.
 
-DMR voice in 4.0 is experimental. Windows packages may include optional
+Before replacing a release folder during an update, keep or export
+`FobosAPP.ini`. It contains user presets, scan lists, QTH map markers, API keys
+for map providers, and UI settings. The desktop app also provides
+`Settings... -> Settings backup -> Export settings... / Import settings...` for
+making a separate backup file.
+
+DMR voice in 4.1 is experimental. Windows packages may include optional
 `dmr_voice_backends/fobos_dmr_voice_*.dll` GPL backend modules. See
 `THIRD_PARTY_LICENSES.txt` and `licenses/dmr_voice_backend/` before
 redistributing AMBE-capable binaries.
+
+GNSS/QTH work in 4.1 is a laboratory workflow, not a finished
+navigation receiver. See `docs/gnss_preflight_4.1.md` for the recommended test
+order, RF notes, and the generated acquisition report files.
 
 ## Optional DMR Voice Backends
 

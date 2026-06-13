@@ -1,103 +1,234 @@
-# FobosAPP 4.0 cleanup and receiver roadmap
+# FobosAPP roadmap after 4.0
 
-## Before publishing 4.0
+This file tracks the practical roadmap after the 4.0 release work. It should stay ordered by the next useful engineering steps, not by the order in which features were originally imagined.
 
-1. Stabilize the DMR path enough for a beta-quality 4.0 label:
-   - reliable burst/cadence lock on known Motorola test IQ;
-   - stable Color Code, timeslot, source ID, and talkgroup output;
-   - voice path that is repeatable across start/stop cycles, even if quality is still marked experimental.
-   - Status for 4.0: deferred. Ship current DMR as experimental/lab quality.
-2. Keep release packages clean:
-   - do not ship `FobosAPP.ini`, diagnostic logs, recordings, screenshots, backups, or lab replay tools in the normal Windows runtime zip;
-   - package Raspberry/Linux source from an allowlist or explicit excludes, not from a dirty working directory by accident;
-   - keep reference repositories and reverse-engineering traces outside release artifacts.
-   - Status for 4.0: Windows package script verified against logs, recordings, and lab replay tools.
-3. Keep local defaults recoverable:
-   - band plans and presets must be created from code defaults or a small checked-in default config;
-   - if a user config contains an empty/corrupt marker array, the app should fall back to defaults.
-   - Status for 4.0: code defaults are active; `config/fobosapp_defaults_4.0.json` records the release snapshot.
+## Current 4.0 State
 
-## Third-party code policy
+Completed or good enough for the current release:
 
-Keep for now:
-   - patched `libfobos` and `libfobos_sdr` sources needed for Linux/Raspberry builds;
-   - `mbelib-neo` only as a temporary AMBE backend while DMR voice is still experimental.
+1. Windows release packaging:
+   - package script excludes logs, recordings, screenshots, backups, private tokens, and local lab artifacts;
+   - README documents the release package layout and update warning.
+2. User settings protection:
+   - settings import/export exists in `Settings...`;
+   - README tells users to preserve or export `FobosAPP.ini` before replacing the runtime folder;
+   - presets, scan lists, QTH markers, map provider keys, and UI settings are treated as user data.
+3. Default configuration:
+   - runtime defaults are created from code;
+   - `config/fobosapp_defaults_4.0.json` stores the release snapshot.
+4. DMR status:
+   - DMR remains experimental/lab quality, not a stable voice feature;
+   - metadata detection and DMR UI are useful for tests, but Motorola voice quality is not release-grade;
+   - optional GPL DMR voice backend DLLs and license notes are release-ready.
+5. Standard firmware scan:
+   - explicit-center scan is implemented;
+   - sample-rate-safe spacing, +/- sample-rate add/remove controls, range fill, dwell/settle parameters, presets, and stitched `ScanVisualAssembler` output are implemented;
+   - performance remains limited by host/libusb retune overhead.
+6. GNSS/QTH first pass:
+   - GPS/QTH menu section exists;
+   - manual coordinates, NMEA GGA/RMC paste-from-clipboard, Maidenhead/QTH locator, copy QTH, user markers, marker editing, online/offline map layers, map cache options, mouse zoom/pan, provider selection, MapTiler support, and satellite map providers are implemented;
+   - GNSS L1 presets, GNSS IQ save, IQ monitor, GPS L1 C/A acquisition/self-test/deep test/offline replay, synthetic multi-satellite position solver self-test, configurable Doppler search bounds, NTP time check, cancellation, GNSS spur watch logging, acquisition diagnostic plots, and acquisition JSON/CSV reports are implemented.
 
-Do not vendor into releases:
-   - external reference repositories used during research;
-   - local trace, decompilation, and reverse-engineering work folders;
-   - downloaded SDKs, firmware archives, build products, or private tokens.
+## 4.1 Draft Scope
 
-Longer term:
-   - make DMR voice backend pluggable: internal test backend, external process backend, and optional AMBE library backend;
-   - keep license notes explicit in `THIRD_PARTY_LICENSES.txt`;
-   - only consider writing a custom AMBE decoder after the DMR sync/framing path is proven correct.
-   - Status for 4.0: optional GPL DMR voice backend DLLs and release license bundle are included; external process backend remains next work.
+The useful 4.1 candidate is a GNSS/QTH laboratory release:
 
-## Other receiver support
+1. QTH map and marker workflow is usable online and offline.
+2. GNSS L1 tuning, saved IQ, replay, acquisition diagnostics, and synthetic tests are usable.
+3. Acquisition attempts write repeatable artifacts to `recordings/gnss_reports`.
+4. Real GNSS positioning is not claimed until a real GPS L1 C/A lock is proven with better RF conditions.
+5. Receiver-backend abstraction and RTL-SDR support stay next after this GNSS/QTH checkpoint.
 
-First split the hardware layer behind a `ReceiverBackend` interface:
+## Active Focus: GNSS/GPS
+
+Goal: determine whether the current Fobos RF path can acquire real GNSS signals, then decide how far raw-SDR positioning should go inside FobosAPP.
+
+What is implemented:
+
+1. QTH map workflow:
+   - manual latitude/longitude entry;
+   - NMEA GGA/RMC clipboard import for coordinates from phones, GPS loggers, or terminal output;
+   - Maidenhead locator calculation and overlay;
+   - map window with online/offline modes;
+   - map providers including OpenStreetMap, MapTiler, Mapbox placeholder, NASA GIBS, and custom XYZ;
+   - user/search/current markers with editable marker list.
+2. GNSS RF workflow:
+   - GNSS L1 presets for all L1, GPS L1 C/A, Galileo E1, BeiDou B1I, and GLONASS L1OF;
+   - GNSS listening scan presets;
+   - raw IQ snapshot saving with tuning context;
+   - IQ monitor for level, DC, clipping, crest factor, and I/Q balance.
+3. GPS L1 C/A acquisition prototype:
+   - synthetic GPS IQ self-test passes;
+   - real IQ acquisition searches PRN, Doppler, and code phase;
+   - selected Channel IQ WAV files can be replayed directly through GPS acquisition without real-time playback;
+   - Doppler half-span and Doppler step are user-configurable for fast/coarse versus wide/deep searches;
+   - acquisition is cancellable and safe to stop;
+   - diagnostic plot shows PRN/Doppler heatmap, best code-phase correlation, and peak-to-second history;
+   - each completed live/deep/replay/synthetic acquisition writes JSON plus heatmap/profile CSV files to `recordings/gnss_reports`;
+   - NTP time query exists as assisted-GNSS context, not as code-phase lock.
+4. Navigation solver prototype:
+   - synthetic multi-satellite pseudoranges solve receiver latitude/longitude/altitude and receiver clock bias;
+   - result is applied to QTH coordinates and shown on the QTH map as a temporary marker;
+   - this verifies the future bridge from real/synthetic pseudoranges into map/QTH workflows.
+
+Current blocker:
+
+1. Real GPS L1 C/A lock is not proven yet.
+2. The visible waterfall/spectrum can show narrow parallel lines near 1575.42 MHz, but true GPS C/A should usually appear as spread-spectrum energy below the noise floor.
+3. We need to distinguish real correlation peaks from receiver/USB/power/display spurs.
+4. DMR and GNSS both show synchronization-sensitive failures, so the raw IQ stream contract must be verified before deeper decoder work.
+
+Next GNSS steps:
+
+1. IQ stream contract audit:
+   - log callback block sizes, measured sample rate, callback intervals, late callbacks, queue depth, clipping, DC, and non-finite samples before any decoder;
+   - verify whether live IQ is continuous enough for DMR bursts and GNSS coherent/non-coherent accumulation;
+   - add sequence/timing metadata to internal IQ frames if diagnostics show drops or discontinuities;
+   - keep current findings and optimization ideas in `docs/iq_pipeline_audit.md`.
+2. Offline replay:
+   - run the same acquisition on saved GNSS IQ recordings; implemented for selected stereo Channel IQ WAV files;
+   - preserve acquisition diagnostic metrics per recording; implemented as JSON plus PRN/Doppler and correlation-profile CSV dumps;
+   - compare multiple recordings, gains, antennas, and sample rates.
+3. External GNSS reference comparison:
+   - temporarily use GNSS-SDR or another mature receiver as a verifier on saved IQ;
+   - convert/export Fobos IQ into a format accepted by the reference tool;
+   - compare acquisition grids, Doppler/code-phase candidates, and failure modes against FobosAPP.
+4. Acquisition improvements:
+   - follow GNSS-SDR style acquisition more closely: bounded Doppler search, configurable Doppler step, false-alarm based threshold, and optional second-stage Doppler refinement;
+   - expand the current dump-style acquisition artifacts if GNSS-SDR comparison needs additional fields;
+   - add non-coherent accumulation modes that tolerate navigation bit transitions better than long naive coherent accumulation.
+5. Interference/spur handling:
+   - GNSS spur watch logs stable narrow peaks around the current GNSS target;
+   - add averaged spectrum overlay for GNSS mode with expected GPS L1 C/A bandwidth marked;
+   - optionally feed detected/calibrated narrow spurs into acquisition preprocessing;
+   - log spur candidates near the GNSS target frequency.
+6. Assisted GNSS options:
+   - use NTP/system time as a coarse context source;
+   - later add almanac/ephemeris download or user-provided files to predict visible PRNs and Doppler ranges;
+   - do not make internet access mandatory.
+7. Alternative location sources:
+   - NMEA GGA/RMC clipboard import is implemented;
+   - serial/USB NMEA GPS receiver input;
+   - OS/location-service input where available;
+   - network-provided coordinates as a fallback for map/QTH workflows.
+
+## Next Receiver Backends
+
+These come immediately after the current GNSS work, as requested.
+
+1. Receiver backend abstraction:
+   - split hardware control behind a `ReceiverBackend` interface;
    - capabilities: sample rates, frequency range, gains, inputs, direct sampling, scan features;
    - lifecycle: enumerate, open, close, start stream, stop stream;
    - controls: set center frequency, sample rate, gain/input/clock;
    - streaming: IQ callback with format metadata and actual center/sample-rate values.
+2. Fobos backend adapter:
+   - move existing standard and Agile Fobos behavior behind the interface without changing user-visible behavior.
+3. RTL-SDR through `rtl_tcp`:
+   - first non-Fobos backend;
+   - avoids direct USB/library deployment complexity;
+   - useful for Raspberry Pi and remote receiver tests.
+4. Direct RTL-SDR through `librtlsdr`:
+   - add after `rtl_tcp` backend is working;
+   - keep deployment and driver notes explicit.
+5. Optional SoapySDR backend:
+   - later path for Airspy, HackRF, SDRplay, LimeSDR, and similar receivers;
+   - keep optional to avoid making the core package fragile.
 
-Recommended order:
-   - Fobos backend adapter first, preserving current behavior behind the interface;
-   - RTL-SDR via `rtl_tcp` as the easiest first non-Fobos backend, because it avoids direct USB/library deployment complexity;
-   - direct RTL-SDR via `librtlsdr` after the network backend works;
-   - optional SoapySDR backend later for Airspy, HackRF, SDRplay, LimeSDR, and similar receivers.
+## Architecture And Reference Audit
 
-## Standard-firmware scan mode
+Goal: compare FobosAPP architecture against mature SDR applications and decide what to simplify, optimize, or isolate before the codebase becomes harder to move.
 
-Goal: a slower but stable scan mode that works without Agile firmware.
+References to review:
 
-First version:
-   - define one or more scan segments by start/end frequency or by explicit center frequencies;
-   - for each segment, tune the receiver center frequency, wait a short settle time, collect a few FFT frames, and write the result into a stitched scan canvas;
-   - adjacent centers should normally be spaced by at least the selected sample rate to avoid self-overlap.
-   - Status for 4.0: first-pass explicit-center standard scan is implemented with sample-rate-safe auto-spacing, +/- sample-rate add buttons, adjustable dwell time, and stitched ScanVisualAssembler output. Performance depends on host/libusb retune overhead.
+1. Gqrx:
+   - release/source entry point: https://github.com/gqrx-sdr/gqrx/releases
+   - compare device abstraction, DSP chain separation, demodulator structure, bookmarks/presets, audio path, settings model, and GNU Radio integration.
+2. SDR++:
+   - compare modular plugin architecture, source modules, DSP routing, UI responsiveness, waterfall/spectrum performance, and device backend handling.
+3. GNU Radio:
+   - compare flowgraph-style DSP composition, block boundaries, scheduler assumptions, buffering, metadata, and how much of that model is useful inside a Qt desktop SDR app.
+4. GNSS-SDR:
+   - compare acquisition/tracking architecture, acquisition grid dumps, thresholds, Doppler refinement, channelization, and offline replay workflow.
 
-Visualization:
-   - continuous ranges can be drawn as one long spectrum/waterfall row;
-   - sparse ranges should be drawn as stitched sections with visible segment separators and labels;
-   - each segment stores its own center/sample-rate so frequency labels do not rely on the current receiver center alone.
+Expected decisions:
 
-Demodulation:
-   - first pass: visual scan and candidate detection only;
-   - second pass: when a candidate is selected, retune and hold on that segment for normal demodulation;
-   - later: optional scan-follow mode where demodulation runs only while the active scan segment contains the listening frequency.
+1. Whether to keep extending the current monolithic `main.cpp` path or start extracting feature modules.
+2. Whether scan, GNSS, DMR, video, and network paths should become explicit processing modules with shared IQ-frame contracts.
+3. Whether spectrum/waterfall rendering and scan assembly need a shared visual data model.
+4. Whether receiver backends should be loaded statically first and optionally as plugins later.
+5. Which optimizations are worth doing now:
+   - fewer UI-thread operations;
+   - stricter worker cancellation;
+   - bounded logging;
+   - lower-copy IQ buffers;
+   - reusable channelizers for DMR/GNSS/video.
 
-## GNSS/GPS and QTH mapping
+## DMR Path
 
-Goal: explore whether FobosAPP can receive and use GNSS signals, then expose the operator location in a radio-friendly map view.
+Current status:
 
-Research first:
-   - evaluate whether the current SDR path can practically capture GNSS L1 signals with enough bandwidth, stability, and timestamp quality for acquisition/tracking;
-   - start with offline IQ recordings and a small GNSS acquisition prototype before adding live UI;
-   - keep expectations realistic: full GPS/GNSS positioning from raw SDR is a spread-spectrum receiver project, not a normal narrowband demodulator.
+1. DMR is experimental/lab quality.
+2. The app can expose metadata and attempt voice, but real Motorola DMR voice quality has been inconsistent.
+3. Optional AMBE/voice backend architecture exists, but the sync/framing/voice path is not stable enough to call complete.
 
-Fallback location sources:
-   - allow manual latitude/longitude entry for testing and offline use;
-   - later consider OS/location-service input, serial/NMEA GPS receivers, or network-provided location as easier non-SDR sources.
+Next DMR steps:
 
-Map window:
-   - separate dock/window showing own position, current receiver frequency context, and optional saved markers;
-   - online map source first if acceptable, with an offline tile/cache option later;
-   - never require network access for the rest of the SDR app to function.
+1. Stop broad trial-and-error changes until a repeatable offline harness proves each stage.
+2. Preserve the current optional GPL backend approach:
+   - internal test backend;
+   - optional mbelib/OpenDMR style backend;
+   - external process bridge later.
+3. External decoder bridge for lab comparison:
+   - mirror selected narrow DMR baseband/audio frames to an external decoder;
+   - compare CC/TS/SRC/TG and audio output against our parser;
+   - keep this as a verifier, not as a hidden dependency.
+4. Only consider a custom AMBE decoder after sync/framing is proven with clean synthetic and real IQ.
 
-Radio amateur overlay:
-   - compute Maidenhead locator/QTH grid from current coordinates;
-   - draw Maidenhead grid squares over the map with locator labels at useful zoom levels;
-   - show current QTH locator prominently and make it copyable for logs or radio contacts.
+## Third-Party Code Policy
 
-## Practical priority
+Keep for now:
 
-1. Clean packaging and config defaults.
-2. External DMR decoder bridge for lab comparison.
-3. Standard-firmware visual scan.
-4. RTL-SDR network backend.
-5. Direct RTL-SDR backend.
-6. Optional SoapySDR backend.
-7. GNSS/GPS and QTH map research prototype.
-8. Replace or isolate remaining DMR voice third-party code.
+1. Patched `libfobos` and `libfobos_sdr` sources needed for Linux/Raspberry builds.
+2. `mbelib-neo` as a temporary optional AMBE backend while DMR voice is experimental.
+
+Do not vendor into releases:
+
+1. External reference repositories used during research.
+2. Local trace, decompilation, and reverse-engineering folders.
+3. Downloaded SDKs, firmware archives, build products, diagnostic logs, recordings, screenshots, backups, or private tokens.
+
+Release rules:
+
+1. Keep license notes explicit in `THIRD_PARTY_LICENSES.txt`.
+2. Keep optional DMR voice modules clearly separated from the core app.
+3. Treat non-core external tools as submodules or user-installed dependencies when practical.
+
+## Release And Maintenance
+
+Routine before each public build:
+
+1. Verify Windows package contents.
+2. Verify README update instructions and optional DMR backend notes.
+3. Verify `translations.json` parses.
+4. Verify app starts without local-only files.
+5. Verify settings import/export.
+6. Verify standard scan presets and GNSS/QTH defaults.
+7. Verify GNSS preflight workflow and generated `recordings/gnss_reports` artifacts.
+8. Verify Raspberry/Linux source package allowlist.
+9. Verify Android network-client build/upload if that release includes Android.
+
+## Practical Priority
+
+1. Verify the raw IQ stream contract with live diagnostics before more decoder tuning.
+2. Continue GNSS acquisition investigation with the new diagnostic plot and saved IQ replays.
+3. Test saved Fobos IQ against GNSS-SDR or another mature GNSS reference receiver.
+4. Add GNSS non-coherent acquisition improvements.
+5. Add external/non-SDR location fallbacks: NMEA GPS, OS location, network/manual presets.
+6. Start receiver backend abstraction.
+7. Add RTL-SDR via `rtl_tcp`.
+8. Add direct RTL-SDR through `librtlsdr`.
+9. Add optional SoapySDR backend.
+10. Audit Gqrx, SDR++, GNU Radio, and GNSS-SDR architecture for useful refactors.
+11. Build the DMR external decoder bridge for comparison.
+12. Return to DMR voice only with a repeatable offline harness and clearer stage-by-stage metrics.

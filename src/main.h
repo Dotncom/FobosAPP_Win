@@ -71,6 +71,9 @@
 #include "spectrumhuntercontrols.h"
 #include "scanvisualassembler.h"
 #include "frequencycontrol.h"
+#include "gnssacquisition.h"
+#include "gnsssignalmonitor.h"
+#include "qthlocator.h"
 #include "scalewidget.h"
 #include "MyGraphWidget.h"
 #include "MyWaterfallWidget.h"
@@ -96,8 +99,10 @@ extern float sensitivity;
 extern float contrast;
 class FFTResult;
 class FineTuneScaleWidget;
+class QDialog;
 class QStackedWidget;
 class QToolButton;
+class QthMapWidget;
 extern int deviceID;
 
 class YourClassName : public QMainWindow {
@@ -202,14 +207,20 @@ private:
     bool applyStandardScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
     QVector<double> standardScanFrequencyList(QString *error = nullptr) const;
+    QVector<double> listeningScanFrequencyList(QString *error = nullptr) const;
     double currentAgileScanCenterFrequencyHz() const;
     double currentStandardScanCenterFrequencyHz() const;
     void resetStandardScanState(bool clearSegments = true);
+    void resetListeningScanState();
     bool applyStandardScanRetune(double targetFrequencyHz, const char *reason);
+    bool applyListeningScanTarget(double targetFrequencyHz, const char *reason);
+    bool applyListeningScanSettings(bool forceStop = false);
     void advanceStandardScanIfNeeded();
+    void advanceListeningScanIfNeeded();
     void normalizeStandardScanCentersUi(bool requireTwoCenters = false);
     void applyStandardScanRangeToCenters();
     void updateAgileScanControls();
+    void updateListeningScanControls();
     void saveAgileScanPreset();
     void deleteAgileScanPreset();
     void updateScanMeasurement(const std::vector<float> &frequencies,
@@ -257,6 +268,9 @@ private:
                               std::vector<float> &magnitudes,
                               double centerFrequency) const;
     void updateSpurSuppressionStatus();
+    void updateGnssSpurWatch(const std::vector<float> &frequencies,
+                             const std::vector<float> &magnitudes,
+                             double centerFrequency);
     void ensureDefaultFrequencyPresets();
     void ensureDefaultBandMarkers();
     void updateFrequencyPresetControls();
@@ -265,6 +279,40 @@ private:
     QVector<QPair<QString, double>> presetMapToVector(const QMap<QString, double> &presets) const;
     void openPresetManager();
     void openApplicationSettings();
+    void exportSettingsBackup();
+    void importSettingsBackup();
+    void updateQthControls();
+    void applyQthPositionFromUi();
+    void pasteNmeaPositionFromClipboard();
+    bool applyNmeaPositionText(const QString &text, QString *statusMessage = nullptr);
+    void openQthMapWindow();
+    void copyQthLocator();
+    void updateGnssSystemSelection();
+    void applyGnssSystemPresetToReceiver(const QString &systemId);
+    void applyQthMapSearch();
+    void tuneGnssL1Preset();
+    void applyGnssScanPreset();
+    void logGnssRawContext();
+    bool isGnssMonitorActive() const;
+    void resetGnssMonitor();
+    void processGnssIqSnapshot(const RadioSettings &settings);
+    void processGnssPackedIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
+    void updateGnssMonitorStatus(const GnssSignalReport &report, bool forceLog = false);
+    void runGnssAcquisitionTest();
+    void runGnssDeepAcquisitionTest();
+    void runGnssOfflineReplayTest();
+    void runGnssSyntheticSelfTest();
+    void runGnssPositionSelfTest();
+    void updateGnssAcquisitionStatus(const GnssAcquisitionResult &result);
+    void updateGnssAcquisitionPlot(const GnssAcquisitionResult &result);
+    void saveGnssAcquisitionArtifacts(const GnssAcquisitionResult &result, const QString &sourceLabel);
+    void requestGnssNetworkTime();
+    void handleGnssNetworkTimeResponse();
+    void updateQthMapControls();
+    void applyQthOnlineProviderPreset(const QString &providerId, bool applyTemplate);
+    QString resolvedQthOnlineTileUrlTemplate() const;
+    void selectQthTileDirectory();
+    void openQthTileDirectory();
     double fineTuneRangeHz() const;
     double fineTuneStepHz() const;
     void updateFineTuneLabel();
@@ -377,6 +425,7 @@ private:
     QComboBox *languageComboBox = nullptr;
     QComboBox *agileScanPresetCombo = nullptr;
     QComboBox *standardScanPresetCombo = nullptr;
+    QComboBox *listeningScanPresetCombo = nullptr;
     QComboBox *videoDemodCombo = nullptr;
     QComboBox *videoStandardCombo = nullptr;
     QComboBox *dmrLabColorCodeCombo = nullptr;
@@ -384,9 +433,13 @@ private:
     QComboBox *dmrLabCallTypeCombo = nullptr;
     QComboBox *dmrBasebandRateCombo = nullptr;
     QComboBox *dmrAmbeLayoutCombo = nullptr;
+    QComboBox *qthSourceCombo = nullptr;
+    QComboBox *gnssSystemCombo = nullptr;
     QCheckBox *dmrManualTimingCheckbox = nullptr;
     QSpinBox *dmrTimingOffsetSpin = nullptr;
     QDoubleSpinBox *dmrSlicerRatioSpin = nullptr;
+    QSpinBox *gnssDopplerSpanSpin = nullptr;
+    QSpinBox *gnssDopplerStepSpin = nullptr;
     QCheckBox *dmrAdaptiveSlicerCheckbox = nullptr;
     QButtonGroup *modulationButtonGroup = nullptr;
     
@@ -403,6 +456,19 @@ private:
     QPushButton *playbackButton = nullptr;
     QPushButton *startButton = nullptr;
     QPushButton *stopButton = nullptr;
+    QPushButton *qthMapButton = nullptr;
+    QPushButton *qthCopyButton = nullptr;
+    QPushButton *qthPasteNmeaButton = nullptr;
+    QPushButton *gnssTuneButton = nullptr;
+    QPushButton *gnssScanButton = nullptr;
+    QPushButton *gnssRawLogButton = nullptr;
+    QPushButton *gnssAcquireButton = nullptr;
+    QPushButton *gnssDeepAcquireButton = nullptr;
+    QPushButton *gnssOfflineAcquireButton = nullptr;
+    QPushButton *gnssSelfTestButton = nullptr;
+    QPushButton *gnssPositionSelfTestButton = nullptr;
+    QPushButton *gnssNetworkTimeButton = nullptr;
+    QPushButton *gnssMonitorResetButton = nullptr;
     
     QCheckBox *spectrumCheckbox = nullptr;
     QCheckBox *audioCheckbox = nullptr;
@@ -419,9 +485,11 @@ private:
     QCheckBox *hfNoiseCancelFreezeCheckbox = nullptr;
     QCheckBox *agileScanCheckbox = nullptr;
     QCheckBox *standardScanCheckbox = nullptr;
+    QCheckBox *listeningScanCheckbox = nullptr;
     QCheckBox *scanListeningLockCheckbox = nullptr;
     QCheckBox *scanMeasurementCheckbox = nullptr;
     QCheckBox *spurSuppressionCheckbox = nullptr;
+    QCheckBox *gnssMonitorCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
@@ -478,16 +546,30 @@ private:
     QLineEdit *dmrLabNotesEdit = nullptr;
     QLineEdit *agileScanRangesEdit = nullptr;
     QLineEdit *standardScanCentersEdit = nullptr;
+    QLineEdit *listeningScanTargetsEdit = nullptr;
     QLineEdit *standardScanRangeStartEdit = nullptr;
     QLineEdit *standardScanRangeEndEdit = nullptr;
+    QLineEdit *qthTileDirectoryEdit = nullptr;
+    QLineEdit *qthOnlineTileUrlEdit = nullptr;
+    QLineEdit *qthOnlineAttributionEdit = nullptr;
+    QLineEdit *qthOnlineApiKeyEdit = nullptr;
+    QLineEdit *qthMapSearchEdit = nullptr;
     QDoubleSpinBox *agileScanStepSpin = nullptr;
+    QDoubleSpinBox *qthLatitudeSpin = nullptr;
+    QDoubleSpinBox *qthLongitudeSpin = nullptr;
+    QDoubleSpinBox *gnssChannelFilterSpin = nullptr;
     QSpinBox *standardScanDwellSpin = nullptr;
     QSpinBox *standardScanSettleSpin = nullptr;
+    QSpinBox *listeningScanDwellSpin = nullptr;
+    QSpinBox *listeningScanSettleSpin = nullptr;
+    QSpinBox *gnssIntegrationSpin = nullptr;
     QDoubleSpinBox *scanMeasurementBinSpin = nullptr;
     QPushButton *agileScanSavePresetButton = nullptr;
     QPushButton *agileScanDeletePresetButton = nullptr;
     QPushButton *standardScanSavePresetButton = nullptr;
     QPushButton *standardScanDeletePresetButton = nullptr;
+    QPushButton *listeningScanSavePresetButton = nullptr;
+    QPushButton *listeningScanDeletePresetButton = nullptr;
     QPushButton *standardScanAddLowerButton = nullptr;
     QPushButton *standardScanAddUpperButton = nullptr;
     QPushButton *standardScanRemoveLowerButton = nullptr;
@@ -498,14 +580,31 @@ private:
     QPushButton *scanMeasurementExportButton = nullptr;
     QPushButton *spurCalibrateButton = nullptr;
     QPushButton *spurClearButton = nullptr;
+    QPushButton *qthSelectTilesButton = nullptr;
+    QPushButton *qthOpenTilesButton = nullptr;
+    QPushButton *qthCenterMapButton = nullptr;
+    QPushButton *qthUseOsmButton = nullptr;
+    QPushButton *qthMapSearchButton = nullptr;
     QPushButton *fpvHunterHistoryTuneButton = nullptr;
     QPushButton *fpvHunterHistoryClearButton = nullptr;
     QComboBox *fpvHunterHistoryCombo = nullptr;
+    QComboBox *qthMapLayerCombo = nullptr;
+    QComboBox *qthOnlineProviderCombo = nullptr;
+    QComboBox *qthGridPrecisionCombo = nullptr;
+    QCheckBox *qthOnlineNoDiskCacheCheckbox = nullptr;
+    QSpinBox *qthMapZoomSpin = nullptr;
     QLabel *fpvHunterHistoryLabel = nullptr;
     QLabel *agileScanStatusLabel = nullptr;
     QLabel *standardScanStatusLabel = nullptr;
+    QLabel *listeningScanStatusLabel = nullptr;
     QLabel *scanMeasurementStatusLabel = nullptr;
     QLabel *spurSuppressionStatusLabel = nullptr;
+    QLabel *qthLocatorLabel = nullptr;
+    QLabel *qthStatusLabel = nullptr;
+    QLabel *qthMapStatusLabel = nullptr;
+    QLabel *gnssMonitorStatusLabel = nullptr;
+    QLabel *gnssAcquireStatusLabel = nullptr;
+    QLabel *gnssAcquisitionPlotLabel = nullptr;
 
     FrequencyControl *frequencyControl = nullptr;
     FrequencyControl *listeningFrequencyControl = nullptr;
@@ -516,7 +615,9 @@ private:
     QTimer *streamWatchdogTimer = nullptr;
     QTimer *networkSettingsDebounceTimer = nullptr;
     QTimer *standardScanAdvanceTimer = nullptr;
+    QTimer *listeningScanAdvanceTimer = nullptr;
     QTimer *videoSnapshotTimer = nullptr;
+    QUdpSocket *gnssNtpSocket = nullptr;
 
     DataProcessor *processor = nullptr;
     AudioProcessor *audioProcessor = nullptr;
@@ -534,6 +635,8 @@ private:
     QDockWidget *controlsDock = nullptr;
     QDockWidget *digitalDock = nullptr;
     QDockWidget *videoDock = nullptr;
+    QDialog *qthMapDialog = nullptr;
+    QthMapWidget *qthMapWidget = nullptr;
     QPlainTextEdit *digitalTextEdit = nullptr;
     VideoWidget *videoWidget = nullptr;
     
@@ -595,6 +698,8 @@ private:
     bool agileScanRunning = false;
     bool standardScanEnabled = false;
     bool standardScanRunning = false;
+    bool listeningScanEnabled = false;
+    bool listeningScanRunning = false;
     bool scanListeningLockEnabled = true;
     QString agileScanRangesMhz = QStringLiteral("430-432");
     double agileScanStepMhz = 0.0125;
@@ -604,6 +709,10 @@ private:
     QString standardScanRangeStartMhz;
     QString standardScanRangeEndMhz;
     QMap<QString, QString> standardScanPresets;
+    QString listeningScanTargetsMhz = QStringLiteral("1561.098, 1575.420, 1602.000");
+    int listeningScanDwellMs = 3000;
+    int listeningScanSettleMs = 100;
+    QMap<QString, QString> listeningScanPresets;
     int spectrumUpdateIntervalMs = 0;
     bool scanMeasurementEnabled = false;
     bool scanMeasurementBaselineRecording = false;
@@ -662,7 +771,9 @@ private:
     QMap<QString, QString> agileScanPresets;
     QVector<double> activeAgileScanFrequencies;
     QVector<double> activeStandardScanFrequencies;
+    QVector<double> activeListeningScanFrequencies;
     int standardScanIndex = 0;
+    int listeningScanIndex = 0;
     ScanVisualAssembler scanVisualAssembler;
 
     struct ScanMeasurementBin {
@@ -689,8 +800,14 @@ private:
         float maxProminenceDb = 0.0f;
         int hits = 0;
     };
+    struct GnssSpurWatchBin {
+        float averageDb = -160.0f;
+        int hits = 0;
+        qint64 lastSeenMs = 0;
+    };
     QVector<SpurMaskEntry> spurMaskEntries;
     QMap<qint64, SpurCalibrationBin> spurCalibrationBins;
+    QMap<qint64, GnssSpurWatchBin> gnssSpurWatchBins;
     bool spurSuppressionEnabled = false;
     bool spurCalibrationActive = false;
     int spurCalibrationFramesDone = 0;
@@ -715,6 +832,35 @@ private:
     bool showAmateurBandMarkers = false;
     bool compactBandMarkers = false;
     bool diagnosticVerboseLogging = false;
+    bool gnssMonitorEnabled = false;
+    bool gnssAcquisitionRunning = false;
+    std::shared_ptr<std::atomic_bool> gnssAcquisitionCancelFlag;
+    QVector<double> gnssPeakToSecondHistoryDb;
+    QString gnssSystemId = QStringLiteral("gps_l1_ca");
+    QString gnssAcquisitionSource = QStringLiteral("live");
+    int gnssAcquisitionIntegrationMs = 24;
+    double gnssChannelFilterCutoffHz = 1800000.0;
+    int gnssDopplerSpanHz = 25000;
+    int gnssDopplerStepHz = 1000;
+    GnssSignalMonitor gnssSignalMonitor;
+    QElapsedTimer gnssMonitorSnapshotTimer;
+    QElapsedTimer gnssMonitorLogTimer;
+    QElapsedTimer gnssMonitorUiTimer;
+    QElapsedTimer gnssSpurWatchTimer;
+    QElapsedTimer gnssSpurLogTimer;
+    double qthLatitude = 0.0;
+    double qthLongitude = 0.0;
+    QString qthSource = QStringLiteral("manual");
+    QString qthTileDirectory;
+    QString qthOnlineProviderId = QStringLiteral("osm");
+    QString qthOnlineTileUrlTemplate = QStringLiteral("https://tile.openstreetmap.org/{z}/{x}/{y}.png");
+    QString qthOnlineAttribution = QString::fromUtf8("\xC2\xA9 OpenStreetMap contributors");
+    QString qthOnlineApiKey;
+    bool qthOnlineNoDiskCache = false;
+    int qthMapLayer = 0;
+    int qthMapZoom = 12;
+    int qthGridPrecision = 6;
+    QVector<qth::UserMarker> qthUserMarkers;
     std::atomic_bool videoIqFramePending{false};
     bool momentaryRecordingActive = false;
     bool offlineIqPlaybackActive = false;
@@ -727,6 +873,8 @@ private:
     QElapsedTimer networkSpectrumFrameTimer;
     QElapsedTimer liveRetuneSettleTimer;
     QElapsedTimer standardScanDwellTimer;
+    QElapsedTimer listeningScanDwellTimer;
+    QElapsedTimer listeningScanSettleTimer;
     qint64 liveRetuneSettleDurationMs = 80;
     uint64_t liveCenterRetuneGeneration = 0;
     uint64_t networkSpectrumFrameSequence = 0;

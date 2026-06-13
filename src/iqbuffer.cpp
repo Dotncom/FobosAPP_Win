@@ -11,7 +11,7 @@ constexpr std::size_t MAX_QUEUED_BLOCKS = 256;
 constexpr std::size_t MAX_QUEUED_FLOATS = 16 * 1024 * 1024;
 constexpr std::size_t MIN_LIVE_QUEUED_FLOATS = 128 * 1024;
 constexpr double MAX_LIVE_QUEUED_SECONDS = 1.25;
-constexpr std::size_t MAX_SNAPSHOT_FLOATS = 524288 * 2;
+constexpr std::size_t MAX_SNAPSHOT_FLOATS = 16 * 1024 * 1024;
 
 std::mutex g_iqMutex;
 std::vector<float> g_iqSnapshot(MAX_SNAPSHOT_FLOATS);
@@ -44,6 +44,45 @@ void appendToSnapshot(const float *samples, std::size_t floatCount) {
         std::copy(samples + firstCopy, samples + floatCount, g_iqSnapshot.begin());
     }
     g_iqSnapshotSize += floatCount;
+}
+
+bool copySnapshotTail(std::vector<float> &out,
+                      std::size_t maxFloatCount,
+                      std::uint64_t *sequence) {
+    if (g_iqSnapshotSize == 0 || maxFloatCount == 0) {
+        out.clear();
+        if (sequence) {
+            *sequence = g_iqSequence;
+        }
+        return false;
+    }
+
+    std::size_t copyCount = (std::min)(g_iqSnapshotSize, maxFloatCount);
+    copyCount -= copyCount % 2U;
+    if (copyCount == 0) {
+        out.clear();
+        if (sequence) {
+            *sequence = g_iqSequence;
+        }
+        return false;
+    }
+
+    const std::size_t tailOffset = g_iqSnapshotSize - copyCount;
+    const std::size_t readStart = (g_iqSnapshotStart + tailOffset) % MAX_SNAPSHOT_FLOATS;
+    out.resize(copyCount);
+    const std::size_t firstCopy = (std::min)(copyCount, MAX_SNAPSHOT_FLOATS - readStart);
+    std::copy(g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(readStart),
+              g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(readStart + firstCopy),
+              out.begin());
+    if (firstCopy < copyCount) {
+        std::copy(g_iqSnapshot.begin(),
+                  g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(copyCount - firstCopy),
+                  out.begin() + static_cast<std::ptrdiff_t>(firstCopy));
+    }
+    if (sequence) {
+        *sequence = g_iqSequence;
+    }
+    return true;
 }
 
 std::size_t maxQueuedFloatsForLiveAudio() {
@@ -101,28 +140,14 @@ void publish(const float *samples, std::size_t floatCount, bool queueBlock, bool
 
 bool snapshot(std::vector<float> &out, std::uint64_t *sequence) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
-    if (g_iqSnapshotSize == 0) {
-        out.clear();
-        if (sequence) {
-            *sequence = g_iqSequence;
-        }
-        return false;
-    }
+    return copySnapshotTail(out, g_iqSnapshotSize, sequence);
+}
 
-    out.resize(g_iqSnapshotSize);
-    const std::size_t firstCopy = (std::min)(g_iqSnapshotSize, MAX_SNAPSHOT_FLOATS - g_iqSnapshotStart);
-    std::copy(g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(g_iqSnapshotStart),
-              g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(g_iqSnapshotStart + firstCopy),
-              out.begin());
-    if (firstCopy < g_iqSnapshotSize) {
-        std::copy(g_iqSnapshot.begin(),
-                  g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(g_iqSnapshotSize - firstCopy),
-                  out.begin() + static_cast<std::ptrdiff_t>(firstCopy));
-    }
-    if (sequence) {
-        *sequence = g_iqSequence;
-    }
-    return true;
+bool snapshotRecent(std::vector<float> &out,
+                    std::size_t maxFloatCount,
+                    std::uint64_t *sequence) {
+    std::lock_guard<std::mutex> lock(g_iqMutex);
+    return copySnapshotTail(out, maxFloatCount, sequence);
 }
 
 bool popBlock(std::vector<float> &out, std::uint64_t *sequence) {

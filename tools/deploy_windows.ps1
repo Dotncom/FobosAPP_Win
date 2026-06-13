@@ -22,6 +22,7 @@ if (-not (Test-Path -LiteralPath $BuildPath)) {
 
 New-Item -ItemType Directory -Path $DeployPath -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $DeployPath "platforms") -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $DeployPath "imageformats") -Force | Out-Null
 
 $RootFiles = @(
     @{ Source = Join-Path $BuildPath "FobosAPP.exe"; Name = "FobosAPP.exe" },
@@ -61,6 +62,20 @@ if (-not (Test-Path -LiteralPath $QWindows)) {
 }
 Copy-Item -LiteralPath $QWindows -Destination (Join-Path $DeployPath "platforms\qwindows.dll") -Force
 
+$ImageFormatPlugins = @(
+    "qgif.dll",
+    "qico.dll",
+    "qjpeg.dll",
+    "qtiff.dll",
+    "qwebp.dll"
+)
+foreach ($PluginName in $ImageFormatPlugins) {
+    $PluginPath = Join-Path $QtRoot "plugins\imageformats\$PluginName"
+    if (Test-Path -LiteralPath $PluginPath) {
+        Copy-Item -LiteralPath $PluginPath -Destination (Join-Path $DeployPath "imageformats\$PluginName") -Force
+    }
+}
+
 $DocFiles = @(
     "README.md",
     "CHANGELOG.md",
@@ -75,6 +90,20 @@ foreach ($DocFile in $DocFiles) {
     }
 }
 
+$ReleaseDocFiles = @(
+    "docs\gnss_preflight_4.1.md",
+    "docs\iq_pipeline_audit.md",
+    "docs\roadmap_4.0_cleanup.md"
+)
+foreach ($DocFile in $ReleaseDocFiles) {
+    $DocPath = Join-Path $Workspace $DocFile
+    if (Test-Path -LiteralPath $DocPath) {
+        $DeployDocPath = Join-Path $DeployPath $DocFile
+        New-Item -ItemType Directory -Path (Split-Path -Parent $DeployDocPath) -Force | Out-Null
+        Copy-Item -LiteralPath $DocPath -Destination $DeployDocPath -Force
+    }
+}
+
 $LicensePath = Join-Path $Workspace "licenses"
 if (Test-Path -LiteralPath $LicensePath) {
     $DeployLicensePath = Join-Path $DeployPath "licenses"
@@ -86,9 +115,12 @@ if (Test-Path -LiteralPath $LicensePath) {
 }
 
 $ConfigDeployPath = Join-Path $DeployPath "config"
+if (Test-Path -LiteralPath $ConfigDeployPath) {
+    Remove-Item -LiteralPath $ConfigDeployPath -Recurse -Force
+}
 New-Item -ItemType Directory -Path $ConfigDeployPath -Force | Out-Null
 $ReleaseConfigFiles = @(
-    "config\fobosapp_defaults_4.0.json",
+    "config\fobosapp_defaults_4.1.json",
     "config\dmr_backends.example.json"
 )
 foreach ($ConfigFile in $ReleaseConfigFiles) {

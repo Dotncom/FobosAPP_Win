@@ -57,6 +57,8 @@ private:
     void emitFullIqFrame(const float *samples, std::size_t floatCount);
     void emitChannelIqFrame(const float *samples, std::size_t floatCount, const RadioSettings &settings);
     void resetNetworkIqState();
+    void resetStreamDiagnostics();
+    void updateStreamDiagnostics(const float *samples, uint32_t sampleCount, const char *readerMode);
 
 //signals:
     //void dataReady();
@@ -92,10 +94,28 @@ private:
     QByteArray networkIqFrameBuffer;
     double networkIqFrameSampleRate = 0.0;
     QElapsedTimer asyncRateTimer;
+    QElapsedTimer streamDiagnosticTimer;
     uint64_t asyncMeasuredSamples = 0;
     uint64_t asyncCallbackCounter = 0;
     int asyncRateReportCount = 0;
     std::atomic<uint64_t> totalCallbackCounter;
+    qint64 streamDiagnosticLastNs = -1;
+    uint64_t streamDiagnosticCallbacks = 0;
+    uint64_t streamDiagnosticSamples = 0;
+    uint64_t streamDiagnosticIntervals = 0;
+    uint64_t streamDiagnosticLateCallbacks = 0;
+    uint64_t streamDiagnosticReportCount = 0;
+    uint32_t streamDiagnosticMinBlock = 0;
+    uint32_t streamDiagnosticMaxBlock = 0;
+    double streamDiagnosticIntervalMsSum = 0.0;
+    double streamDiagnosticMinIntervalMs = 0.0;
+    double streamDiagnosticMaxIntervalMs = 0.0;
+    double streamDiagnosticMeanI = 0.0;
+    double streamDiagnosticMeanQ = 0.0;
+    double streamDiagnosticPower = 0.0;
+    uint64_t streamDiagnosticInspectedSamples = 0;
+    uint64_t streamDiagnosticNonFiniteSamples = 0;
+    uint64_t streamDiagnosticClippedSamples = 0;
 //int reti;
 };
 

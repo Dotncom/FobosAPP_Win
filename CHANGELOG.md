@@ -1,5 +1,37 @@
 # Changelog
 
+## 4.1 - 2026-06-13
+
+### Added
+
+- Added the GNSS/QTH laboratory workflow with map window, Maidenhead/QTH grid
+  overlay, online/offline map layers, provider selection, marker editing,
+  coordinate search, NMEA paste, and QTH copy support.
+- Added GNSS L1 tuning presets, GNSS IQ monitor, raw GNSS IQ save, listening
+  scan presets, GPS L1 C/A live/deep acquisition, offline replay, synthetic GPS
+  acquisition self-test, synthetic multi-satellite position solver test, NTP
+  time query, Doppler search controls, and spur-watch diagnostics.
+- Added repeatable GNSS acquisition artifacts under `recordings/gnss_reports`:
+  JSON summary reports plus PRN/Doppler heatmap and correlation-profile CSV
+  dumps.
+- Added `docs/gnss_preflight_4.1.md` and expanded the roadmap/IQ audit notes
+  for future GNSS-SDR/reference comparison.
+
+### Changed
+
+- Standard-firmware scan now includes explicit-center controls, range fill,
+  safe spacing, presets, adjustable dwell/settle timing, and stitched scan
+  display improvements.
+- Android network client version is bumped to `4.1-network`.
+- Release deployment now includes the 4.1 default configuration snapshot.
+
+### Known Issues
+
+- Real GPS L1 C/A lock is not proven yet. The GNSS tools are meant for saved IQ,
+  replay, RF diagnostics, and future active-antenna testing.
+- DMR voice remains experimental/lab quality and is not a stable voice receiver
+  in this release.
+
 ## 4.0 - 2026-06-11
 
 ### Added

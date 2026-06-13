@@ -4,6 +4,7 @@
 #include <QDebug>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 extern int globalMode;
 
@@ -170,7 +171,9 @@ bool FFTResult::storeFFTResults(const RadioSettings &settings,
         outFrequencies[i] = (i - currentFftLength / 2) * (sampleRate / currentFftLength) + centerFrequency;
     }
 
-    if (!IqBuffer::snapshot(iqSnapshot)) {
+    const std::size_t requestedSnapshotFloats =
+        static_cast<std::size_t>((std::max)(1, currentFftLength)) * 2U;
+    if (!IqBuffer::snapshotRecent(iqSnapshot, requestedSnapshotFloats)) {
         return false;
     }
 

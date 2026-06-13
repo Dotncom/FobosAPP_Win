@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.0.0)
+project(FobosAPP VERSION 4.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -102,12 +102,20 @@ set(SOURCES
     src/finetunewidget.h
     src/fpvhunterdetector.cpp
     src/fpvhunterdetector.h
+    src/gnssacquisition.cpp
+    src/gnssacquisition.h
+    src/gnsssignalmonitor.cpp
+    src/gnsssignalmonitor.h
     src/iqbuffer.cpp
     src/iqbuffer.h
     src/networkcontroller.cpp
     src/networkcontroller.h
     src/playbackmanager.cpp
     src/playbackmanager.h
+    src/qthlocator.cpp
+    src/qthlocator.h
+    src/qthmapwidget.cpp
+    src/qthmapwidget.h
     src/remoteaudioplayer.cpp
     src/remoteaudioplayer.h
     src/recordingmanager.cpp
@@ -163,7 +171,7 @@ if(FOBOS_HAS_MBELIB_NEO)
 endif()
 
 if(WIN32)
-    target_link_libraries(FobosAPP PRIVATE winmm opengl32)
+    target_link_libraries(FobosAPP PRIVATE winmm opengl32 winhttp)
 else()
     target_link_libraries(FobosAPP PRIVATE OpenGL::GL Threads::Threads)
 endif()

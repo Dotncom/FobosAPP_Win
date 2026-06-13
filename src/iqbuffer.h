@@ -12,6 +12,9 @@ void publish(const float *samples,
              bool queueBlock = true,
              bool updateSnapshot = true);
 bool snapshot(std::vector<float> &out, std::uint64_t *sequence = nullptr);
+bool snapshotRecent(std::vector<float> &out,
+                    std::size_t maxFloatCount,
+                    std::uint64_t *sequence = nullptr);
 bool popBlock(std::vector<float> &out, std::uint64_t *sequence = nullptr);
 void clear();
 std::size_t size();

@@ -29,6 +29,9 @@ constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
 constexpr double SAMPLE_RATE_DIAGNOSTIC_RELATIVE_WARN = 0.03;
 constexpr int SAMPLE_RATE_DIAGNOSTIC_INITIAL_REPORTS = 4;
 constexpr int DMR_CHANNEL_CIC_STAGES = 2;
+constexpr qint64 STREAM_DIAGNOSTIC_REPORT_MS = 3000;
+constexpr qint64 STREAM_DIAGNOSTIC_INITIAL_REPORT_MS = 700;
+constexpr uint32_t STREAM_DIAGNOSTIC_MAX_INSPECT_SAMPLES = 4096;
 
 double clampDouble(double value, double low, double high) {
     return (std::max)(low, (std::min)(value, high));
@@ -404,6 +407,7 @@ void DataProcessor::startProcessing(void *device,
     activeSyncMode = useSyncReader;
     totalCallbackCounter = 0;
     asyncRateReportCount = 0;
+    resetStreamDiagnostics();
     if (FORCE_SYNC_READER) {
         qDebug() << "Using SDR++-style sync Fobos reader for sample rate:" << sampleRate;
     } else if (fobosVerboseLoggingEnabled()) {
@@ -602,6 +606,7 @@ void DataProcessor::run() {
             if (queueAudioBlocks || publishIqSnapshot) {
                 IqBuffer::publish(syncBuffer.data(), floatCount, queueAudioBlocks, publishIqSnapshot);
             }
+            updateStreamDiagnostics(syncBuffer.data(), actual_buf_length, "sync");
             if (requestedEmitIqFrames.load()) {
                 emitIqFrame(syncBuffer.data(), floatCount);
             }
@@ -668,6 +673,7 @@ void DataProcessor::handleData(float *buf, uint32_t buf_length) {
                           queueAudioBlocks,
                           publishIqSnapshot);
     }
+    updateStreamDiagnostics(buf, buf_length, "async");
     if (requestedEmitIqFrames.load()) {
         emitIqFrame(buf, static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE);
     }
@@ -705,6 +711,171 @@ void DataProcessor::handleData(float *buf, uint32_t buf_length) {
         asyncCallbackCounter = 0;
         asyncRateTimer.restart();
     }
+}
+
+void DataProcessor::resetStreamDiagnostics() {
+    streamDiagnosticTimer.invalidate();
+    streamDiagnosticLastNs = -1;
+    streamDiagnosticCallbacks = 0;
+    streamDiagnosticSamples = 0;
+    streamDiagnosticIntervals = 0;
+    streamDiagnosticLateCallbacks = 0;
+    streamDiagnosticReportCount = 0;
+    streamDiagnosticMinBlock = 0;
+    streamDiagnosticMaxBlock = 0;
+    streamDiagnosticIntervalMsSum = 0.0;
+    streamDiagnosticMinIntervalMs = 0.0;
+    streamDiagnosticMaxIntervalMs = 0.0;
+    streamDiagnosticMeanI = 0.0;
+    streamDiagnosticMeanQ = 0.0;
+    streamDiagnosticPower = 0.0;
+    streamDiagnosticInspectedSamples = 0;
+    streamDiagnosticNonFiniteSamples = 0;
+    streamDiagnosticClippedSamples = 0;
+}
+
+void DataProcessor::updateStreamDiagnostics(const float *samples,
+                                            uint32_t sampleCount,
+                                            const char *readerMode) {
+    if (!samples || sampleCount == 0) {
+        return;
+    }
+
+    if (!streamDiagnosticTimer.isValid()) {
+        streamDiagnosticTimer.start();
+        streamDiagnosticLastNs = -1;
+    }
+
+    const qint64 nowNs = streamDiagnosticTimer.nsecsElapsed();
+    const double configuredRate = requestedSampleRate.load();
+    const double expectedIntervalMs =
+        configuredRate > 0.0 && std::isfinite(configuredRate)
+            ? (static_cast<double>(sampleCount) * 1000.0 / configuredRate)
+            : 0.0;
+
+    if (streamDiagnosticLastNs >= 0) {
+        const double intervalMs =
+            static_cast<double>(nowNs - streamDiagnosticLastNs) / 1000000.0;
+        if (std::isfinite(intervalMs) && intervalMs >= 0.0) {
+            ++streamDiagnosticIntervals;
+            streamDiagnosticIntervalMsSum += intervalMs;
+            if (streamDiagnosticIntervals == 1) {
+                streamDiagnosticMinIntervalMs = intervalMs;
+                streamDiagnosticMaxIntervalMs = intervalMs;
+            } else {
+                streamDiagnosticMinIntervalMs = (std::min)(streamDiagnosticMinIntervalMs, intervalMs);
+                streamDiagnosticMaxIntervalMs = (std::max)(streamDiagnosticMaxIntervalMs, intervalMs);
+            }
+
+            const double lateThresholdMs =
+                expectedIntervalMs > 0.0
+                    ? (std::max)(expectedIntervalMs * 2.5, expectedIntervalMs + 20.0)
+                    : 50.0;
+            if (intervalMs > lateThresholdMs) {
+                ++streamDiagnosticLateCallbacks;
+            }
+        }
+    }
+    streamDiagnosticLastNs = nowNs;
+
+    ++streamDiagnosticCallbacks;
+    streamDiagnosticSamples += sampleCount;
+    streamDiagnosticMinBlock =
+        streamDiagnosticMinBlock == 0
+            ? sampleCount
+            : (std::min)(streamDiagnosticMinBlock, sampleCount);
+    streamDiagnosticMaxBlock = (std::max)(streamDiagnosticMaxBlock, sampleCount);
+
+    const uint32_t inspectCount = (std::min)(sampleCount, STREAM_DIAGNOSTIC_MAX_INSPECT_SAMPLES);
+    const uint32_t stride = (std::max)(uint32_t(1), sampleCount / inspectCount);
+    for (uint32_t n = 0, inspected = 0; n < sampleCount && inspected < inspectCount; n += stride, ++inspected) {
+        const float iSample = samples[static_cast<size_t>(n) * 2U];
+        const float qSample = samples[static_cast<size_t>(n) * 2U + 1U];
+        if (!std::isfinite(iSample) || !std::isfinite(qSample)) {
+            ++streamDiagnosticNonFiniteSamples;
+            continue;
+        }
+        streamDiagnosticMeanI += static_cast<double>(iSample);
+        streamDiagnosticMeanQ += static_cast<double>(qSample);
+        streamDiagnosticPower += static_cast<double>(iSample) * iSample +
+                                 static_cast<double>(qSample) * qSample;
+        ++streamDiagnosticInspectedSamples;
+        if (std::abs(iSample) >= 0.999f || std::abs(qSample) >= 0.999f) {
+            ++streamDiagnosticClippedSamples;
+        }
+    }
+
+    const qint64 elapsedMs = streamDiagnosticTimer.elapsed();
+    const bool initialReport =
+        streamDiagnosticReportCount < 3 && elapsedMs >= STREAM_DIAGNOSTIC_INITIAL_REPORT_MS;
+    if (!initialReport && elapsedMs < STREAM_DIAGNOSTIC_REPORT_MS) {
+        return;
+    }
+
+    const double elapsedSeconds =
+        static_cast<double>((std::max)(qint64(1), elapsedMs)) / 1000.0;
+    const double measuredRate = static_cast<double>(streamDiagnosticSamples) / elapsedSeconds;
+    const double avgIntervalMs =
+        streamDiagnosticIntervals > 0
+            ? streamDiagnosticIntervalMsSum / static_cast<double>(streamDiagnosticIntervals)
+            : 0.0;
+    const double inspected = static_cast<double>((std::max)(uint64_t(1), streamDiagnosticInspectedSamples));
+    const double meanI = streamDiagnosticMeanI / inspected;
+    const double meanQ = streamDiagnosticMeanQ / inspected;
+    const double rms = std::sqrt((std::max)(0.0, streamDiagnosticPower / inspected * 0.5));
+    const double clipPercent =
+        100.0 * static_cast<double>(streamDiagnosticClippedSamples) / inspected;
+    const double nonFinitePercent =
+        100.0 * static_cast<double>(streamDiagnosticNonFiniteSamples) /
+        static_cast<double>((std::max)(uint64_t(1),
+                                       streamDiagnosticInspectedSamples +
+                                           streamDiagnosticNonFiniteSamples));
+    const double errorPercent =
+        configuredRate > 0.0 && std::isfinite(configuredRate)
+            ? ((measuredRate - configuredRate) / configuredRate) * 100.0
+            : 0.0;
+
+    qDebug() << "[IQ stream]"
+             << "mode" << readerMode
+             << "configuredRate" << configuredRate
+             << "measuredRate" << measuredRate
+             << "errorPercent" << errorPercent
+             << "callbacks" << streamDiagnosticCallbacks
+             << "samples" << streamDiagnosticSamples
+             << "blockSamples" << sampleCount
+             << "blockMin" << streamDiagnosticMinBlock
+             << "blockMax" << streamDiagnosticMaxBlock
+             << "expectedIntervalMs" << expectedIntervalMs
+             << "avgIntervalMs" << avgIntervalMs
+             << "minIntervalMs" << streamDiagnosticMinIntervalMs
+             << "maxIntervalMs" << streamDiagnosticMaxIntervalMs
+             << "lateCallbacks" << streamDiagnosticLateCallbacks
+             << "queuedBlocks" << IqBuffer::queuedBlocks()
+             << "queuedFloats" << IqBuffer::queuedFloatCount()
+             << "rms" << rms
+             << "meanI" << meanI
+             << "meanQ" << meanQ
+             << "clipPercent" << clipPercent
+             << "nonFinitePercent" << nonFinitePercent;
+
+    ++streamDiagnosticReportCount;
+    streamDiagnosticTimer.restart();
+    streamDiagnosticLastNs = -1;
+    streamDiagnosticCallbacks = 0;
+    streamDiagnosticSamples = 0;
+    streamDiagnosticIntervals = 0;
+    streamDiagnosticLateCallbacks = 0;
+    streamDiagnosticMinBlock = 0;
+    streamDiagnosticMaxBlock = 0;
+    streamDiagnosticIntervalMsSum = 0.0;
+    streamDiagnosticMinIntervalMs = 0.0;
+    streamDiagnosticMaxIntervalMs = 0.0;
+    streamDiagnosticMeanI = 0.0;
+    streamDiagnosticMeanQ = 0.0;
+    streamDiagnosticPower = 0.0;
+    streamDiagnosticInspectedSamples = 0;
+    streamDiagnosticNonFiniteSamples = 0;
+    streamDiagnosticClippedSamples = 0;
 }
 
 void DataProcessor::updateNetworkIqSettings(const RadioSettings &settings, bool channelizeFrames) {

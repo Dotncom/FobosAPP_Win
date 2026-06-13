@@ -2,9 +2,14 @@
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
 #include "finetunewidget.h"
+#include "qthlocator.h"
+#include "qthmapwidget.h"
 
 #include <fobos_sdr.h>
+#include <QApplication>
+#include <QClipboard>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -18,10 +23,17 @@
 #include <QJsonObject>
 #include <QList>
 #include <QMenu>
+#include <QMetaObject>
 #include <QMessageLogContext>
 #include <QMutexLocker>
 #include <QHostAddress>
+#include <QHostInfo>
 #include <QIcon>
+#include <QImage>
+#include <QPainter>
+#include <QPixmap>
+#include <QPolygonF>
+#include <QPointer>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStackedWidget>
@@ -40,10 +52,12 @@
 #include <QRegularExpression>
 #include <QScopeGuard>
 #include <QSettings>
+#include <QUrl>
 #if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
 #include <QAudioDeviceInfo>
 #endif
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <array>
@@ -150,6 +164,10 @@ constexpr int STANDARD_SCAN_MIN_SETTLE_MS = 0;
 constexpr int STANDARD_SCAN_MAX_SETTLE_MS = 1000;
 constexpr int STANDARD_SCAN_MIN_DWELL_MS = 20;
 constexpr int STANDARD_SCAN_MAX_DWELL_MS = 5000;
+constexpr int LISTENING_SCAN_MIN_DWELL_MS = 50;
+constexpr int LISTENING_SCAN_MAX_DWELL_MS = 600000;
+constexpr int LISTENING_SCAN_MIN_SETTLE_MS = 0;
+constexpr int LISTENING_SCAN_MAX_SETTLE_MS = 10000;
 constexpr int SPECTRUM_UPDATE_AUTO_MS = 0;
 constexpr int SPECTRUM_UPDATE_MIN_MS = 10;
 constexpr int SPECTRUM_UPDATE_MAX_MS = 250;
@@ -172,6 +190,573 @@ constexpr int SPUR_MAX_MASK_ENTRIES = 16;
 constexpr double SPUR_MIN_MASK_WIDTH_HZ = 50.0;
 constexpr double SPUR_MAX_MASK_WIDTH_HZ = 20000.0;
 constexpr qint64 DIAGNOSTIC_LOG_MAX_BYTES = 8 * 1024 * 1024;
+constexpr double GNSS_L1_BAND_START_HZ = 1559000000.0;
+constexpr double GNSS_L1_BAND_END_HZ = 1610000000.0;
+constexpr double GNSS_L1_BAND_CENTER_HZ = (GNSS_L1_BAND_START_HZ + GNSS_L1_BAND_END_HZ) * 0.5;
+constexpr double GNSS_L1_LISTENING_SCAN_CENTER_HZ = 1583000000.0;
+constexpr double GNSS_GPS_L1_HZ = 1575420000.0;
+constexpr double GNSS_BEIDOU_B1I_HZ = 1561098000.0;
+constexpr double GNSS_GLONASS_L1_CENTER_HZ = 1602000000.0;
+constexpr double GNSS_RAW_BANDWIDTH_HZ = 2046000.0;
+constexpr double GNSS_USEFUL_STANDARD_SPAN_HZ = 50000000.0;
+constexpr int GNSS_ACQUISITION_INTEGRATION_MS = 24;
+constexpr int GNSS_ACQUISITION_MIN_INTEGRATION_MS = 1;
+constexpr int GNSS_ACQUISITION_MAX_INTEGRATION_MS = 160;
+constexpr int GNSS_DEEP_ACQUISITION_MS = 160;
+constexpr std::size_t GNSS_QUICK_SNAPSHOT_MAX_FLOATS = 4 * 1024 * 1024;
+constexpr double GNSS_CHANNEL_FILTER_MIN_HZ = 300000.0;
+constexpr double GNSS_CHANNEL_FILTER_MAX_HZ = 1840000.0;
+
+enum class GnssAcquisitionKind {
+    None,
+    GpsL1Ca,
+};
+
+struct GnssSystemPreset {
+    QString id;
+    QString textKey;
+    QString fallbackName;
+    double centerHz = 0.0;
+    double targetHz = 0.0;
+    double bandwidthHz = 0.0;
+    QString standardScanCentersMhz;
+    QString agileScanRangesMhz;
+    int standardDwellMs = 3000;
+    int standardSettleMs = 120;
+    GnssAcquisitionKind acquisitionKind = GnssAcquisitionKind::None;
+};
+
+struct ParsedNmeaPosition {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    QString talker;
+    QString sentence;
+    QString utc;
+};
+
+struct Vec3d {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+struct SyntheticPseudorange {
+    Vec3d satellite;
+    double pseudorangeMeters = 0.0;
+};
+
+struct SyntheticPositionResult {
+    bool valid = false;
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double altitudeMeters = 0.0;
+    double clockBiasMeters = 0.0;
+    double errorMeters = 0.0;
+    int iterations = 0;
+    int satellites = 0;
+};
+
+constexpr double kWgs84A = 6378137.0;
+constexpr double kWgs84F = 1.0 / 298.257223563;
+constexpr double kWgs84E2 = kWgs84F * (2.0 - kWgs84F);
+constexpr double kDegToRad = 3.1415926535897932384626433832795 / 180.0;
+constexpr double kRadToDeg = 180.0 / 3.1415926535897932384626433832795;
+
+Vec3d operator+(const Vec3d &a, const Vec3d &b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3d operator-(const Vec3d &a, const Vec3d &b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+Vec3d operator*(const Vec3d &v, double scale) {
+    return {v.x * scale, v.y * scale, v.z * scale};
+}
+
+double dot(const Vec3d &a, const Vec3d &b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+double norm(const Vec3d &v) {
+    return std::sqrt(dot(v, v));
+}
+
+Vec3d geodeticToEcef(double latitudeDeg, double longitudeDeg, double altitudeMeters) {
+    const double lat = latitudeDeg * kDegToRad;
+    const double lon = longitudeDeg * kDegToRad;
+    const double sinLat = std::sin(lat);
+    const double cosLat = std::cos(lat);
+    const double sinLon = std::sin(lon);
+    const double cosLon = std::cos(lon);
+    const double n = kWgs84A / std::sqrt(1.0 - kWgs84E2 * sinLat * sinLat);
+    return {
+        (n + altitudeMeters) * cosLat * cosLon,
+        (n + altitudeMeters) * cosLat * sinLon,
+        (n * (1.0 - kWgs84E2) + altitudeMeters) * sinLat
+    };
+}
+
+void ecefToGeodetic(const Vec3d &ecef, double *latitudeDeg, double *longitudeDeg, double *altitudeMeters) {
+    const double b = kWgs84A * (1.0 - kWgs84F);
+    const double ep2 = (kWgs84A * kWgs84A - b * b) / (b * b);
+    const double p = std::sqrt(ecef.x * ecef.x + ecef.y * ecef.y);
+    const double theta = std::atan2(ecef.z * kWgs84A, p * b);
+    const double sinTheta = std::sin(theta);
+    const double cosTheta = std::cos(theta);
+    const double lat = std::atan2(ecef.z + ep2 * b * sinTheta * sinTheta * sinTheta,
+                                  p - kWgs84E2 * kWgs84A * cosTheta * cosTheta * cosTheta);
+    const double lon = std::atan2(ecef.y, ecef.x);
+    const double sinLat = std::sin(lat);
+    const double n = kWgs84A / std::sqrt(1.0 - kWgs84E2 * sinLat * sinLat);
+    const double alt = p / std::cos(lat) - n;
+    if (latitudeDeg) {
+        *latitudeDeg = lat * kRadToDeg;
+    }
+    if (longitudeDeg) {
+        *longitudeDeg = lon * kRadToDeg;
+    }
+    if (altitudeMeters) {
+        *altitudeMeters = alt;
+    }
+}
+
+void enuBasis(double latitudeDeg, double longitudeDeg, Vec3d *east, Vec3d *north, Vec3d *up) {
+    const double lat = latitudeDeg * kDegToRad;
+    const double lon = longitudeDeg * kDegToRad;
+    const double sinLat = std::sin(lat);
+    const double cosLat = std::cos(lat);
+    const double sinLon = std::sin(lon);
+    const double cosLon = std::cos(lon);
+    if (east) {
+        *east = {-sinLon, cosLon, 0.0};
+    }
+    if (north) {
+        *north = {-sinLat * cosLon, -sinLat * sinLon, cosLat};
+    }
+    if (up) {
+        *up = {cosLat * cosLon, cosLat * sinLon, sinLat};
+    }
+}
+
+bool solve4x4(double a[4][4], double b[4], double out[4]) {
+    double m[4][5] = {};
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            m[row][col] = a[row][col];
+        }
+        m[row][4] = b[row];
+    }
+
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        for (int row = col + 1; row < 4; ++row) {
+            if (std::abs(m[row][col]) > std::abs(m[pivot][col])) {
+                pivot = row;
+            }
+        }
+        if (std::abs(m[pivot][col]) < 1.0e-9) {
+            return false;
+        }
+        if (pivot != col) {
+            for (int k = col; k < 5; ++k) {
+                std::swap(m[col][k], m[pivot][k]);
+            }
+        }
+        const double divisor = m[col][col];
+        for (int k = col; k < 5; ++k) {
+            m[col][k] /= divisor;
+        }
+        for (int row = 0; row < 4; ++row) {
+            if (row == col) {
+                continue;
+            }
+            const double factor = m[row][col];
+            for (int k = col; k < 5; ++k) {
+                m[row][k] -= factor * m[col][k];
+            }
+        }
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        out[i] = m[i][4];
+    }
+    return true;
+}
+
+SyntheticPositionResult solveSyntheticPosition(const QVector<SyntheticPseudorange> &measurements,
+                                               const Vec3d &truthEcef,
+                                               const Vec3d &initialEcef) {
+    SyntheticPositionResult result;
+    result.satellites = measurements.size();
+    if (measurements.size() < 4) {
+        return result;
+    }
+
+    Vec3d receiver = initialEcef;
+    double clockBias = 0.0;
+    for (int iteration = 0; iteration < 12; ++iteration) {
+        double normal[4][4] = {};
+        double rhs[4] = {};
+
+        for (const SyntheticPseudorange &measurement : measurements) {
+            const Vec3d delta = receiver - measurement.satellite;
+            const double range = (std::max)(1.0, norm(delta));
+            const double predicted = range + clockBias;
+            const double residual = measurement.pseudorangeMeters - predicted;
+            const double h[4] = {
+                delta.x / range,
+                delta.y / range,
+                delta.z / range,
+                1.0
+            };
+            for (int row = 0; row < 4; ++row) {
+                rhs[row] += h[row] * residual;
+                for (int col = 0; col < 4; ++col) {
+                    normal[row][col] += h[row] * h[col];
+                }
+            }
+        }
+
+        double update[4] = {};
+        if (!solve4x4(normal, rhs, update)) {
+            return result;
+        }
+        receiver.x += update[0];
+        receiver.y += update[1];
+        receiver.z += update[2];
+        clockBias += update[3];
+        result.iterations = iteration + 1;
+        if (std::sqrt(update[0] * update[0] + update[1] * update[1] + update[2] * update[2]) < 0.001 &&
+            std::abs(update[3]) < 0.001) {
+            break;
+        }
+    }
+
+    ecefToGeodetic(receiver, &result.latitude, &result.longitude, &result.altitudeMeters);
+    result.clockBiasMeters = clockBias;
+    result.errorMeters = norm(receiver - truthEcef);
+    result.valid = qth::isValidLatitude(result.latitude) &&
+                   qth::isValidLongitude(result.longitude) &&
+                   std::isfinite(result.errorMeters);
+    return result;
+}
+
+bool nmeaChecksumMatches(const QString &body, const QString &checksumText) {
+    if (checksumText.size() < 2) {
+        return false;
+    }
+    bool ok = false;
+    const int expected = checksumText.left(2).toInt(&ok, 16);
+    if (!ok) {
+        return false;
+    }
+    quint8 actual = 0;
+    const QByteArray bytes = body.toLatin1();
+    for (char byte : bytes) {
+        actual ^= static_cast<quint8>(byte);
+    }
+    return actual == static_cast<quint8>(expected);
+}
+
+bool parseNmeaCoordinate(const QString &value,
+                         const QString &hemisphere,
+                         bool latitude,
+                         double *coordinate) {
+    if (!coordinate) {
+        return false;
+    }
+    const QString text = value.trimmed();
+    const QString hemi = hemisphere.trimmed().toUpper();
+    const int degreeDigits = latitude ? 2 : 3;
+    if (text.size() <= degreeDigits || hemi.size() != 1) {
+        return false;
+    }
+    bool degreesOk = false;
+    bool minutesOk = false;
+    const int degrees = text.left(degreeDigits).toInt(&degreesOk);
+    const double minutes = text.mid(degreeDigits).toDouble(&minutesOk);
+    if (!degreesOk || !minutesOk || !std::isfinite(minutes) || minutes < 0.0 || minutes >= 60.0) {
+        return false;
+    }
+    double result = static_cast<double>(degrees) + minutes / 60.0;
+    if (hemi == QStringLiteral("S") || hemi == QStringLiteral("W")) {
+        result = -result;
+    } else if (hemi != QStringLiteral("N") && hemi != QStringLiteral("E")) {
+        return false;
+    }
+    if (latitude) {
+        if (result < -90.0 || result > 90.0) {
+            return false;
+        }
+    } else if (result < -180.0 || result > 180.0) {
+        return false;
+    }
+    *coordinate = result;
+    return true;
+}
+
+bool parseNmeaPositionSentence(const QString &line, ParsedNmeaPosition *position) {
+    if (!position) {
+        return false;
+    }
+    QString sentence = line.trimmed();
+    if (sentence.isEmpty()) {
+        return false;
+    }
+    const int start = sentence.indexOf(QLatin1Char('$'));
+    if (start >= 0) {
+        sentence = sentence.mid(start + 1);
+    } else if (sentence.startsWith(QLatin1Char('!'))) {
+        sentence.remove(0, 1);
+    }
+    const int checksumPos = sentence.indexOf(QLatin1Char('*'));
+    const QString body = checksumPos >= 0 ? sentence.left(checksumPos) : sentence;
+    if (checksumPos >= 0) {
+        const QString checksumText = sentence.mid(checksumPos + 1).trimmed();
+        if (!nmeaChecksumMatches(body, checksumText)) {
+            return false;
+        }
+    }
+
+    const QStringList fields = body.split(QLatin1Char(','));
+    if (fields.isEmpty()) {
+        return false;
+    }
+    const QString type = fields.at(0).trimmed().toUpper();
+    if (type.size() < 5) {
+        return false;
+    }
+
+    double lat = 0.0;
+    double lon = 0.0;
+    if (type.endsWith(QStringLiteral("GGA"))) {
+        if (fields.size() < 7) {
+            return false;
+        }
+        bool fixOk = false;
+        const int fixQuality = fields.at(6).trimmed().toInt(&fixOk);
+        if (!fixOk || fixQuality <= 0) {
+            return false;
+        }
+        if (!parseNmeaCoordinate(fields.at(2), fields.at(3), true, &lat) ||
+            !parseNmeaCoordinate(fields.at(4), fields.at(5), false, &lon)) {
+            return false;
+        }
+        position->utc = fields.at(1).trimmed();
+    } else if (type.endsWith(QStringLiteral("RMC"))) {
+        if (fields.size() < 7 || fields.at(2).trimmed().toUpper() != QStringLiteral("A")) {
+            return false;
+        }
+        if (!parseNmeaCoordinate(fields.at(3), fields.at(4), true, &lat) ||
+            !parseNmeaCoordinate(fields.at(5), fields.at(6), false, &lon)) {
+            return false;
+        }
+        position->utc = fields.at(1).trimmed();
+    } else {
+        return false;
+    }
+
+    position->latitude = lat;
+    position->longitude = lon;
+    position->talker = type.left(type.size() - 3);
+    position->sentence = type.right(3);
+    return true;
+}
+
+QVector<GnssSystemPreset> gnssSystemPresets() {
+    return {
+        {
+            QStringLiteral("all_l1"),
+            QStringLiteral("gnss_system_all_l1"),
+            QStringLiteral("All L1 systems"),
+            GNSS_L1_LISTENING_SCAN_CENTER_HZ,
+            GNSS_GPS_L1_HZ,
+            GNSS_USEFUL_STANDARD_SPAN_HZ,
+            QStringLiteral("1583.000000"),
+            QStringLiteral("1559-1610"),
+            3000,
+            120,
+            GnssAcquisitionKind::None
+        },
+        {
+            QStringLiteral("gps_l1_ca"),
+            QStringLiteral("gnss_system_gps_l1_ca"),
+            QStringLiteral("GPS L1 C/A"),
+            GNSS_GPS_L1_HZ,
+            GNSS_GPS_L1_HZ,
+            GNSS_RAW_BANDWIDTH_HZ,
+            QStringLiteral("1575.420000"),
+            QStringLiteral("1574.397-1576.443"),
+            3000,
+            80,
+            GnssAcquisitionKind::GpsL1Ca
+        },
+        {
+            QStringLiteral("galileo_e1"),
+            QStringLiteral("gnss_system_galileo_e1"),
+            QStringLiteral("Galileo E1"),
+            GNSS_GPS_L1_HZ,
+            GNSS_GPS_L1_HZ,
+            4092000.0,
+            QStringLiteral("1575.420000"),
+            QStringLiteral("1571.328-1579.512"),
+            3000,
+            80,
+            GnssAcquisitionKind::None
+        },
+        {
+            QStringLiteral("beidou_b1i"),
+            QStringLiteral("gnss_system_beidou_b1i"),
+            QStringLiteral("BeiDou B1I"),
+            GNSS_BEIDOU_B1I_HZ,
+            GNSS_BEIDOU_B1I_HZ,
+            GNSS_RAW_BANDWIDTH_HZ,
+            QStringLiteral("1561.098000"),
+            QStringLiteral("1560.075-1562.121"),
+            3000,
+            80,
+            GnssAcquisitionKind::None
+        },
+        {
+            QStringLiteral("glonass_l1of"),
+            QStringLiteral("gnss_system_glonass_l1of"),
+            QStringLiteral("GLONASS L1OF"),
+            GNSS_GLONASS_L1_CENTER_HZ,
+            GNSS_GLONASS_L1_CENTER_HZ,
+            9000000.0,
+            QStringLiteral("1602.000000"),
+            QStringLiteral("1598-1606"),
+            3000,
+            80,
+            GnssAcquisitionKind::None
+        }
+    };
+}
+
+GnssSystemPreset gnssSystemPreset(const QString &id) {
+    const QVector<GnssSystemPreset> presets = gnssSystemPresets();
+    for (const GnssSystemPreset &preset : presets) {
+        if (preset.id == id) {
+            return preset;
+        }
+    }
+    for (const GnssSystemPreset &preset : presets) {
+        if (preset.id == QStringLiteral("gps_l1_ca")) {
+            return preset;
+        }
+    }
+    return presets.constFirst();
+}
+
+struct QthOnlineProviderPreset {
+    QString id;
+    QString textKey;
+    QString fallbackName;
+    QString urlTemplate;
+    QString attribution;
+    bool requiresKey = false;
+    bool noDiskCache = false;
+    int maxZoom = 19;
+};
+
+QVector<QthOnlineProviderPreset> qthOnlineProviderPresets() {
+    return {
+        {
+            QStringLiteral("osm"),
+            QStringLiteral("qth_provider_osm"),
+            QStringLiteral("OpenStreetMap"),
+            QStringLiteral("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
+            QString::fromUtf8("\xC2\xA9 OpenStreetMap contributors"),
+            false,
+            false,
+            19
+        },
+        {
+            QStringLiteral("maptiler_satellite"),
+            QStringLiteral("qth_provider_maptiler_satellite"),
+            QStringLiteral("MapTiler Satellite"),
+            QStringLiteral("https://api.maptiler.com/maps/satellite/256/{z}/{x}/{y}.jpg?key={key}"),
+            QStringLiteral("MapTiler Satellite"),
+            true,
+            true,
+            19
+        },
+        {
+            QStringLiteral("maptiler_hybrid"),
+            QStringLiteral("qth_provider_maptiler_hybrid"),
+            QStringLiteral("MapTiler Hybrid"),
+            QStringLiteral("https://api.maptiler.com/maps/hybrid/256/{z}/{x}/{y}.jpg?key={key}"),
+            QStringLiteral("MapTiler Hybrid"),
+            true,
+            true,
+            19
+        },
+        {
+            QStringLiteral("mapbox_satellite"),
+            QStringLiteral("qth_provider_mapbox_satellite"),
+            QStringLiteral("Mapbox Satellite"),
+            QStringLiteral("https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}.jpg90?access_token={key}"),
+            QStringLiteral("Mapbox Satellite"),
+            true,
+            true,
+            19
+        },
+        {
+            QStringLiteral("nasa_gibs_truecolor"),
+            QStringLiteral("qth_provider_nasa_gibs_truecolor"),
+            QStringLiteral("NASA GIBS True Color"),
+            QStringLiteral("https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/default/GoogleMapsCompatible_Level9/{z}/{row}/{col}.jpg"),
+            QStringLiteral("NASA GIBS / ESDIS"),
+            false,
+            true,
+            9
+        },
+        {
+            QStringLiteral("custom"),
+            QStringLiteral("qth_provider_custom"),
+            QStringLiteral("Custom XYZ"),
+            QString(),
+            QString(),
+            false,
+            false,
+            19
+        }
+    };
+}
+
+QthOnlineProviderPreset qthOnlineProviderPreset(const QString &id) {
+    const QVector<QthOnlineProviderPreset> presets = qthOnlineProviderPresets();
+    for (const QthOnlineProviderPreset &preset : presets) {
+        if (preset.id == id) {
+            return preset;
+        }
+    }
+    return presets.constLast();
+}
+
+bool qthOnlineTemplateNeedsKey(const QString &urlTemplate) {
+    return urlTemplate.contains(QStringLiteral("{key}"), Qt::CaseInsensitive) ||
+           urlTemplate.contains(QStringLiteral("{token}"), Qt::CaseInsensitive);
+}
+
+QColor gnssHeatColor(double value, double minValue, double maxValue) {
+    if (!std::isfinite(value)) {
+        value = minValue;
+    }
+    const double span = (std::max)(0.001, maxValue - minValue);
+    const double t = (std::clamp)((value - minValue) / span, 0.0, 1.0);
+    if (t < 0.5) {
+        const double u = t * 2.0;
+        return QColor(static_cast<int>(30 + u * 35),
+                      static_cast<int>(55 + u * 130),
+                      static_cast<int>(110 + u * 70));
+    }
+    const double u = (t - 0.5) * 2.0;
+    return QColor(static_cast<int>(65 + u * 190),
+                  static_cast<int>(185 + u * 55),
+                  static_cast<int>(180 - u * 155));
+}
 
 QMutex gLogMutex;
 QFile gLogFile;
@@ -232,6 +817,12 @@ quint32 readLe32(const char *data) {
            (static_cast<quint32>(bytes[3]) << 24);
 }
 
+qint16 readLeI16(const char *data) {
+    const auto *bytes = reinterpret_cast<const uchar *>(data);
+    return static_cast<qint16>(static_cast<quint16>(bytes[0]) |
+                               (static_cast<quint16>(bytes[1]) << 8));
+}
+
 QByteArray streamingWavHeader() {
     constexpr quint32 streamDataBytes = 0x7fffffffU;
     constexpr quint16 channels = 1;
@@ -255,6 +846,38 @@ QByteArray streamingWavHeader() {
     appendLe16(header, bitsPerSample);
     header.append("data", 4);
     appendLe32(header, streamDataBytes);
+    return header;
+}
+
+qint16 pcm16FromFloat(float sample) {
+    if (!std::isfinite(sample)) {
+        sample = 0.0f;
+    }
+    const float clamped = (std::clamp)(sample, -1.0f, 1.0f);
+    return static_cast<qint16>(std::lrint(clamped * 32767.0f));
+}
+
+QByteArray fixedPcm16StereoWavHeader(int sampleRate, quint32 dataBytes) {
+    constexpr quint16 channels = 2;
+    constexpr quint16 bitsPerSample = 16;
+    constexpr quint16 blockAlign = channels * bitsPerSample / 8;
+    const quint32 byteRate = static_cast<quint32>(sampleRate) * blockAlign;
+
+    QByteArray header;
+    header.reserve(44);
+    header.append("RIFF", 4);
+    appendLe32(header, dataBytes + 36U);
+    header.append("WAVE", 4);
+    header.append("fmt ", 4);
+    appendLe32(header, 16);
+    appendLe16(header, 1);
+    appendLe16(header, channels);
+    appendLe32(header, static_cast<quint32>(sampleRate));
+    appendLe32(header, byteRate);
+    appendLe16(header, blockAlign);
+    appendLe16(header, bitsPerSample);
+    header.append("data", 4);
+    appendLe32(header, dataBytes);
     return header;
 }
 
@@ -324,6 +947,34 @@ double directMaxFrequency(double sampleRate) {
 
 double directMinFrequencyForMode(int inputMode, double sampleRate) {
     return inputMode == INPUT_HF_COMBINED ? -directMaxFrequency(sampleRate) : DIRECT_MIN_FREQUENCY;
+}
+
+QPair<double, double> listeningScanVisibleSpanHz(const RadioSettings &settings) {
+    if (settings.inputMode == INPUT_RF) {
+        const double halfRate = (std::max)(1.0, settings.sampleRate) * 0.5;
+        const double low = (std::max)(RF_MIN_LISTENING_FREQUENCY,
+                                      settings.centerFrequency - halfRate);
+        const double high = (std::clamp)(settings.centerFrequency + halfRate,
+                                         low,
+                                         RF_EXPERIMENTAL_MAX_FREQUENCY);
+        return qMakePair(low, high);
+    }
+
+    const double low = directMinFrequencyForMode(settings.inputMode, settings.sampleRate);
+    const double high = (std::max)(low, directMaxFrequency(settings.sampleRate));
+    return qMakePair(low, high);
+}
+
+bool frequencyListChanged(const QVector<double> &a, const QVector<double> &b, double toleranceHz = 0.5) {
+    if (a.size() != b.size()) {
+        return true;
+    }
+    for (int i = 0; i < a.size(); ++i) {
+        if (std::abs(a.at(i) - b.at(i)) > toleranceHz) {
+            return true;
+        }
+    }
+    return false;
 }
 
 double autoTuneRoundingStepHz(double frequencyHz, double visibleSpanHz) {
@@ -471,12 +1122,23 @@ QString standardScanPresetSpec(const QString &centersMhz, int dwellMs, int settl
                                             QString::number(settleMs));
 }
 
+QString listeningScanPresetSpec(const QString &targetsMhz, int dwellMs, int settleMs) {
+    return QStringLiteral("%1\t%2\t%3").arg(targetsMhz.trimmed(),
+                                            QString::number(dwellMs),
+                                            QString::number(settleMs));
+}
+
 QString agileScanPresetRanges(const QString &spec, const QString &fallback = QString()) {
     const QStringList parts = spec.split(QChar('\t'));
     return parts.isEmpty() ? fallback : parts.first().trimmed();
 }
 
 QString standardScanPresetCenters(const QString &spec, const QString &fallback = QString()) {
+    const QStringList parts = spec.split(QChar('\t'));
+    return parts.isEmpty() ? fallback : parts.first().trimmed();
+}
+
+QString listeningScanPresetTargets(const QString &spec, const QString &fallback = QString()) {
     const QStringList parts = spec.split(QChar('\t'));
     return parts.isEmpty() ? fallback : parts.first().trimmed();
 }
@@ -509,6 +1171,26 @@ int standardScanPresetSettleMs(const QString &spec, int fallback) {
     bool ok = false;
     const int value = parts.at(2).toInt(&ok);
     return ok ? (std::clamp)(value, STANDARD_SCAN_MIN_SETTLE_MS, STANDARD_SCAN_MAX_SETTLE_MS) : fallback;
+}
+
+int listeningScanPresetDwellMs(const QString &spec, int fallback) {
+    const QStringList parts = spec.split(QChar('\t'));
+    if (parts.size() < 2) {
+        return fallback;
+    }
+    bool ok = false;
+    const int value = parts.at(1).toInt(&ok);
+    return ok ? (std::clamp)(value, LISTENING_SCAN_MIN_DWELL_MS, LISTENING_SCAN_MAX_DWELL_MS) : fallback;
+}
+
+int listeningScanPresetSettleMs(const QString &spec, int fallback) {
+    const QStringList parts = spec.split(QChar('\t'));
+    if (parts.size() < 3) {
+        return fallback;
+    }
+    bool ok = false;
+    const int value = parts.at(2).toInt(&ok);
+    return ok ? (std::clamp)(value, LISTENING_SCAN_MIN_SETTLE_MS, LISTENING_SCAN_MAX_SETTLE_MS) : fallback;
 }
 
 QVector<ScanVisualSegment> scanSegmentsFromFrame(const QJsonObject &frame) {
@@ -790,6 +1472,77 @@ QVector<double> parseStandardScanCentersMhz(const QString &centersMhz,
     if (frequencies.size() < minimumPoints) {
         if (error) {
             *error = QStringLiteral("Standard scan needs at least two centers");
+        }
+        frequencies.clear();
+    }
+    return frequencies;
+}
+
+QVector<double> parseListeningScanTargetsMhz(const QString &targetsMhz,
+                                             double minimumHz,
+                                             double maximumHz,
+                                             int minimumPoints,
+                                             QString *error) {
+    QVector<double> frequencies;
+    QString text = targetsMhz.trimmed();
+    text.replace(QChar(0x2013), QLatin1Char('-'));
+    text.replace(QChar(0x2014), QLatin1Char('-'));
+    text.replace(QLatin1Char('\\'), QLatin1Char(','));
+    text.replace(QLatin1Char('/'), QLatin1Char(','));
+    text.replace(QLatin1Char(';'), QLatin1Char(','));
+    text.replace(QRegularExpression(QStringLiteral("mhz|РјРіС†|Р СР С–РЎвЂ "),
+                                    QRegularExpression::CaseInsensitiveOption),
+                 QString());
+    text.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(","));
+
+    if (text.isEmpty()) {
+        if (minimumPoints > 0 && error) {
+            *error = QStringLiteral("Listening scan targets are empty");
+        }
+        return frequencies;
+    }
+
+    if (!std::isfinite(minimumHz) || minimumHz < 0.0) {
+        minimumHz = 0.0;
+    }
+    if (!std::isfinite(maximumHz) || maximumHz <= minimumHz) {
+        maximumHz = RF_EXPERIMENTAL_MAX_FREQUENCY;
+    }
+
+    const QStringList tokens = text.split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &token : tokens) {
+        bool ok = false;
+        const double mhz = token.toDouble(&ok);
+        const double frequencyHz = mhz * 1000000.0;
+        if (!ok ||
+            !std::isfinite(frequencyHz) ||
+            frequencyHz < minimumHz ||
+            frequencyHz > maximumHz) {
+            if (error) {
+                *error = QStringLiteral("Listening scan target out of range: %1 MHz to %2 MHz")
+                             .arg(minimumHz / 1000000.0, 0, 'f', 3)
+                             .arg(maximumHz / 1000000.0, 0, 'f', 3);
+            }
+            frequencies.clear();
+            return frequencies;
+        }
+        bool duplicate = false;
+        for (const double existingHz : std::as_const(frequencies)) {
+            if (std::abs(existingHz - frequencyHz) < 0.5) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            frequencies.push_back(frequencyHz);
+        }
+    }
+
+    if (frequencies.size() < minimumPoints) {
+        if (error) {
+            *error = QStringLiteral("Listening scan needs at least %1 target%2")
+                         .arg(minimumPoints)
+                         .arg(minimumPoints == 1 ? QString() : QStringLiteral("s"));
         }
         frequencies.clear();
     }
@@ -2262,6 +3015,7 @@ YourClassName::YourClassName(QWidget *parent)
     networkController = new NetworkController(this);
     remoteAudioPlayer = new RemoteAudioPlayer(this);
     audioRelaySocket = new QUdpSocket(this);
+    gnssNtpSocket = new QUdpSocket(this);
     connect(audioRelaySocket, &QUdpSocket::readyRead, this, &YourClassName::receiveAudioRelayDatagrams);
     audioHttpServer = new QTcpServer(this);
     connect(audioHttpServer, &QTcpServer::newConnection, this, &YourClassName::acceptAudioHttpClient);
@@ -2785,6 +3539,301 @@ YourClassName::YourClassName(QWidget *parent)
     standardScanLayout->addLayout(standardScanRangeLayout);
     standardScanLayout->addWidget(standardScanStatusLabel);
 
+    QGroupBox *listeningScanBox = new QGroupBox("Listening scan", this);
+    markTranslatable(listeningScanBox, QStringLiteral("listening_scan"), QStringLiteral("Listening scan"));
+    listeningScanCheckbox = new QCheckBox("Enable listening scan", listeningScanBox);
+    markTranslatable(listeningScanCheckbox,
+                     QStringLiteral("enable_listening_scan"),
+                     QStringLiteral("Enable listening scan"));
+    listeningScanCheckbox->setToolTip(uiText(
+        QStringLiteral("listening_scan_tooltip"),
+        QStringLiteral("Cycle only the listening/marker frequency inside the current visible IQ span.")));
+    listeningScanCheckbox->setChecked(listeningScanEnabled);
+    listeningScanPresetCombo = new QComboBox(listeningScanBox);
+    listeningScanPresetCombo->setEditable(true);
+    listeningScanPresetCombo->setInsertPolicy(QComboBox::NoInsert);
+    listeningScanPresetCombo->setMinimumWidth(150);
+    listeningScanPresetCombo->setToolTip(uiText(
+        QStringLiteral("listening_scan_preset_tooltip"),
+        QStringLiteral("Preset of listening target frequencies in MHz.")));
+    listeningScanSavePresetButton = new QPushButton(uiText(QStringLiteral("save"), QStringLiteral("Save")), listeningScanBox);
+    listeningScanSavePresetButton->setMaximumWidth(58);
+    listeningScanDeletePresetButton = new QPushButton(uiText(QStringLiteral("delete_short"), QStringLiteral("Del")), listeningScanBox);
+    listeningScanDeletePresetButton->setMaximumWidth(48);
+    listeningScanTargetsEdit = new QLineEdit(listeningScanTargetsMhz, listeningScanBox);
+    listeningScanTargetsEdit->setPlaceholderText(QStringLiteral("1561.098, 1575.420, 1602.000"));
+    listeningScanTargetsEdit->setToolTip(uiText(
+        QStringLiteral("listening_scan_targets_tooltip"),
+        QStringLiteral("Listening target frequencies in MHz. They must fit inside the current center +/- sample-rate/2 span.")));
+    listeningScanDwellSpin = new QSpinBox(listeningScanBox);
+    listeningScanDwellSpin->setRange(LISTENING_SCAN_MIN_DWELL_MS, LISTENING_SCAN_MAX_DWELL_MS);
+    listeningScanDwellSpin->setSingleStep(250);
+    listeningScanDwellSpin->setSuffix(QStringLiteral(" ms"));
+    listeningScanDwellSpin->setValue(listeningScanDwellMs);
+    listeningScanDwellSpin->setMaximumWidth(104);
+    listeningScanDwellSpin->setToolTip(uiText(
+        QStringLiteral("listening_scan_dwell_tooltip"),
+        QStringLiteral("How long to stay on each listening target.")));
+    listeningScanSettleSpin = new QSpinBox(listeningScanBox);
+    listeningScanSettleSpin->setRange(LISTENING_SCAN_MIN_SETTLE_MS, LISTENING_SCAN_MAX_SETTLE_MS);
+    listeningScanSettleSpin->setSingleStep(50);
+    listeningScanSettleSpin->setSuffix(QStringLiteral(" ms"));
+    listeningScanSettleSpin->setValue(listeningScanSettleMs);
+    listeningScanSettleSpin->setMaximumWidth(104);
+    listeningScanSettleSpin->setToolTip(uiText(
+        QStringLiteral("listening_scan_settle_tooltip"),
+        QStringLiteral("Short mute/settle delay after moving the listening marker.")));
+    listeningScanStatusLabel = new QLabel(
+        uiText(QStringLiteral("listening_scan_off"), QStringLiteral("Listening scan: off")),
+        listeningScanBox);
+    listeningScanStatusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    listeningScanStatusLabel->setMinimumWidth(0);
+    listeningScanStatusLabel->setWordWrap(false);
+    listeningScanStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    QLabel *listeningScanTargetsLabel = new QLabel("Targets MHz:", listeningScanBox);
+    markTranslatable(listeningScanTargetsLabel,
+                     QStringLiteral("targets_mhz"),
+                     QStringLiteral("Targets MHz:"));
+    QLabel *listeningScanDwellLabel = new QLabel("Dwell:", listeningScanBox);
+    markTranslatable(listeningScanDwellLabel,
+                     QStringLiteral("dwell"),
+                     QStringLiteral("Dwell:"));
+    QLabel *listeningScanSettleLabel = new QLabel("Settle:", listeningScanBox);
+    markTranslatable(listeningScanSettleLabel,
+                     QStringLiteral("settle"),
+                     QStringLiteral("Settle:"));
+    QVBoxLayout *listeningScanLayout = new QVBoxLayout(listeningScanBox);
+    QHBoxLayout *listeningScanTopLayout = new QHBoxLayout();
+    QHBoxLayout *listeningScanPresetLayout = new QHBoxLayout();
+    QHBoxLayout *listeningScanTargetsLayout = new QHBoxLayout();
+    QHBoxLayout *listeningScanTimingLayout = new QHBoxLayout();
+    listeningScanTopLayout->setContentsMargins(0, 0, 0, 0);
+    listeningScanTopLayout->setSpacing(4);
+    listeningScanTopLayout->addWidget(listeningScanCheckbox);
+    listeningScanTopLayout->addStretch(1);
+    listeningScanPresetLayout->setContentsMargins(0, 0, 0, 0);
+    listeningScanPresetLayout->setSpacing(4);
+    listeningScanPresetLayout->addWidget(new QLabel(uiText(QStringLiteral("presets"), QStringLiteral("Presets...")), listeningScanBox));
+    listeningScanPresetLayout->addWidget(listeningScanPresetCombo, 1);
+    listeningScanPresetLayout->addWidget(listeningScanSavePresetButton);
+    listeningScanPresetLayout->addWidget(listeningScanDeletePresetButton);
+    listeningScanTargetsLayout->setContentsMargins(0, 0, 0, 0);
+    listeningScanTargetsLayout->setSpacing(4);
+    listeningScanTargetsLayout->addWidget(listeningScanTargetsLabel);
+    listeningScanTargetsLayout->addWidget(listeningScanTargetsEdit, 1);
+    listeningScanTimingLayout->setContentsMargins(0, 0, 0, 0);
+    listeningScanTimingLayout->setSpacing(4);
+    listeningScanTimingLayout->addWidget(listeningScanDwellLabel);
+    listeningScanTimingLayout->addWidget(listeningScanDwellSpin);
+    listeningScanTimingLayout->addWidget(listeningScanSettleLabel);
+    listeningScanTimingLayout->addWidget(listeningScanSettleSpin);
+    listeningScanTimingLayout->addStretch(1);
+    listeningScanLayout->addLayout(listeningScanTopLayout);
+    listeningScanLayout->addLayout(listeningScanPresetLayout);
+    listeningScanLayout->addLayout(listeningScanTargetsLayout);
+    listeningScanLayout->addLayout(listeningScanTimingLayout);
+    listeningScanLayout->addWidget(listeningScanStatusLabel);
+
+    QGroupBox *qthBox = new QGroupBox("GPS / QTH", this);
+    markTranslatable(qthBox, QStringLiteral("gps_qth"), QStringLiteral("GPS / QTH"));
+    qthSourceCombo = new QComboBox(qthBox);
+    qthSourceCombo->addItem(uiText(QStringLiteral("manual"), QStringLiteral("Manual")), QStringLiteral("manual"));
+    qthSourceCombo->addItem(QStringLiteral("NMEA GPS"), QStringLiteral("nmea"));
+    qthSourceCombo->addItem(uiText(QStringLiteral("os_location"), QStringLiteral("OS location")), QStringLiteral("os"));
+    qthSourceCombo->setItemData(1,
+                                uiText(QStringLiteral("nmea_paste_tooltip"),
+                                       QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")),
+                                Qt::ToolTipRole);
+    qthSourceCombo->setItemData(2,
+                                uiText(QStringLiteral("gps_source_future_tooltip"),
+                                       QStringLiteral("OS location input is planned; manual coordinates are used for now.")),
+                                Qt::ToolTipRole);
+    qthSourceCombo->setCurrentIndex(0);
+    gnssSystemCombo = new QComboBox(qthBox);
+    for (const GnssSystemPreset &preset : gnssSystemPresets()) {
+        gnssSystemCombo->addItem(uiText(preset.textKey, preset.fallbackName), preset.id);
+    }
+    gnssSystemCombo->setToolTip(uiText(
+        QStringLiteral("gnss_system_tooltip"),
+        QStringLiteral("Select which GNSS signal family the tune, scan and acquisition controls should target.")));
+    gnssIntegrationSpin = new QSpinBox(qthBox);
+    gnssIntegrationSpin->setRange(GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                                  GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    gnssIntegrationSpin->setSingleStep(4);
+    gnssIntegrationSpin->setValue(gnssAcquisitionIntegrationMs);
+    gnssIntegrationSpin->setSuffix(QStringLiteral(" ms"));
+    gnssIntegrationSpin->setToolTip(uiText(
+        QStringLiteral("gnss_acq_integration_tooltip"),
+        QStringLiteral("How many milliseconds of GPS C/A code to accumulate from the current IQ snapshot.")));
+    gnssChannelFilterSpin = new QDoubleSpinBox(qthBox);
+    gnssChannelFilterSpin->setRange(GNSS_CHANNEL_FILTER_MIN_HZ / 1000000.0,
+                                    GNSS_CHANNEL_FILTER_MAX_HZ / 1000000.0);
+    gnssChannelFilterSpin->setDecimals(3);
+    gnssChannelFilterSpin->setSingleStep(0.1);
+    gnssChannelFilterSpin->setValue(gnssChannelFilterCutoffHz / 1000000.0);
+    gnssChannelFilterSpin->setSuffix(QStringLiteral(" MHz"));
+    gnssChannelFilterSpin->setToolTip(uiText(
+        QStringLiteral("gnss_channel_lpf_tooltip"),
+        QStringLiteral("Low-pass cutoff for the GPS L1 C/A IQ channelizer before PRN correlation.")));
+    gnssDopplerSpanSpin = new QSpinBox(qthBox);
+    gnssDopplerSpanSpin->setRange(1, 50);
+    gnssDopplerSpanSpin->setSingleStep(1);
+    gnssDopplerSpanSpin->setValue((std::clamp)(gnssDopplerSpanHz / 1000, 1, 50));
+    gnssDopplerSpanSpin->setSuffix(QStringLiteral(" kHz"));
+    gnssDopplerSpanSpin->setToolTip(uiText(
+        QStringLiteral("gnss_doppler_span_tooltip"),
+        QStringLiteral("GPS C/A acquisition Doppler search half-span. Lower values are faster; wider values tolerate larger clock/frequency error.")));
+    gnssDopplerStepSpin = new QSpinBox(qthBox);
+    gnssDopplerStepSpin->setRange(250, 5000);
+    gnssDopplerStepSpin->setSingleStep(250);
+    gnssDopplerStepSpin->setValue((std::clamp)(gnssDopplerStepHz, 250, 5000));
+    gnssDopplerStepSpin->setSuffix(QStringLiteral(" Hz"));
+    gnssDopplerStepSpin->setToolTip(uiText(
+        QStringLiteral("gnss_doppler_step_tooltip"),
+        QStringLiteral("GPS C/A acquisition Doppler bin spacing. Smaller values are slower but can refine weak candidates.")));
+    qthLatitudeSpin = new QDoubleSpinBox(qthBox);
+    qthLatitudeSpin->setRange(-90.0, 90.0);
+    qthLatitudeSpin->setDecimals(6);
+    qthLatitudeSpin->setSingleStep(0.0001);
+    qthLatitudeSpin->setValue(qthLatitude);
+    qthLatitudeSpin->setSuffix(QStringLiteral(" deg"));
+    qthLongitudeSpin = new QDoubleSpinBox(qthBox);
+    qthLongitudeSpin->setRange(-180.0, 180.0);
+    qthLongitudeSpin->setDecimals(6);
+    qthLongitudeSpin->setSingleStep(0.0001);
+    qthLongitudeSpin->setValue(qthLongitude);
+    qthLongitudeSpin->setSuffix(QStringLiteral(" deg"));
+    qthLocatorLabel = new QLabel(qthBox);
+    qthLocatorLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    qthStatusLabel = new QLabel(qthBox);
+    qthStatusLabel->setWordWrap(true);
+    qthStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    qthMapButton = new QPushButton("QTH Map", qthBox);
+    markTranslatable(qthMapButton, QStringLiteral("qth_map"), QStringLiteral("QTH Map"));
+    qthCopyButton = new QPushButton("Copy QTH", qthBox);
+    markTranslatable(qthCopyButton, QStringLiteral("copy_qth"), QStringLiteral("Copy QTH"));
+    qthPasteNmeaButton = new QPushButton("Paste NMEA", qthBox);
+    markTranslatable(qthPasteNmeaButton, QStringLiteral("paste_nmea"), QStringLiteral("Paste NMEA"));
+    qthPasteNmeaButton->setToolTip(uiText(
+        QStringLiteral("nmea_paste_tooltip"),
+        QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
+    gnssTuneButton = new QPushButton("Tune GNSS L1", qthBox);
+    markTranslatable(gnssTuneButton, QStringLiteral("tune_gnss_l1"), QStringLiteral("Tune GNSS L1"));
+    gnssScanButton = new QPushButton("Use GNSS scan", qthBox);
+    markTranslatable(gnssScanButton, QStringLiteral("use_gnss_scan"), QStringLiteral("Use GNSS scan"));
+    gnssRawLogButton = new QPushButton("Save GNSS IQ", qthBox);
+    markTranslatable(gnssRawLogButton, QStringLiteral("log_raw_context"), QStringLiteral("Save GNSS IQ"));
+    gnssRawLogButton->setToolTip(uiText(
+        QStringLiteral("gnss_raw_context_tooltip"),
+        QStringLiteral("Save the current live GNSS IQ snapshot as stereo PCM16 WAV and write its tuning context to the diagnostic log.")));
+    gnssAcquireButton = new QPushButton("GPS C/A accumulate", qthBox);
+    markTranslatable(gnssAcquireButton, QStringLiteral("gps_ca_scan"), QStringLiteral("GPS C/A accumulate"));
+    gnssAcquireButton->setToolTip(uiText(
+        QStringLiteral("gps_ca_scan_tooltip"),
+        QStringLiteral("Run accumulated GPS L1 C/A PRN correlation on the current IQ snapshot.")));
+    gnssDeepAcquireButton = new QPushButton("GPS deep", qthBox);
+    markTranslatable(gnssDeepAcquireButton, QStringLiteral("gps_ca_deep_scan"), QStringLiteral("GPS deep"));
+    gnssDeepAcquireButton->setToolTip(uiText(
+        QStringLiteral("gps_ca_deep_scan_tooltip"),
+        QStringLiteral("Run a 160 ms GPS L1 C/A acquisition using the extended live IQ buffer.")));
+    gnssOfflineAcquireButton = new QPushButton("GPS replay", qthBox);
+    markTranslatable(gnssOfflineAcquireButton, QStringLiteral("gps_ca_replay_scan"), QStringLiteral("GPS replay"));
+    gnssOfflineAcquireButton->setToolTip(uiText(
+        QStringLiteral("gps_ca_replay_scan_tooltip"),
+        QStringLiteral("Run GPS L1 C/A acquisition directly on the selected Channel IQ WAV recording.")));
+    gnssSelfTestButton = new QPushButton("GPS self-test", qthBox);
+    markTranslatable(gnssSelfTestButton, QStringLiteral("gps_ca_self_test"), QStringLiteral("GPS self-test"));
+    gnssSelfTestButton->setToolTip(uiText(
+        QStringLiteral("gps_ca_self_test_tooltip"),
+        QStringLiteral("Generate an ideal GPS L1 C/A IQ signal and run it through the same acquisition path.")));
+    gnssPositionSelfTestButton = new QPushButton("Position test", qthBox);
+    markTranslatable(gnssPositionSelfTestButton, QStringLiteral("gnss_position_self_test"), QStringLiteral("Position test"));
+    gnssPositionSelfTestButton->setToolTip(uiText(
+        QStringLiteral("gnss_position_self_test_tooltip"),
+        QStringLiteral("Solve a synthetic multi-satellite pseudorange fix and show the result on the QTH map.")));
+    gnssMonitorCheckbox = new QCheckBox("GNSS IQ monitor", qthBox);
+    markTranslatable(gnssMonitorCheckbox, QStringLiteral("gnss_iq_monitor"), QStringLiteral("GNSS IQ monitor"));
+    gnssMonitorCheckbox->setToolTip(uiText(
+        QStringLiteral("gnss_iq_monitor_tooltip"),
+        QStringLiteral("Measure live/playback IQ level, DC offset, clipping and I/Q balance before attempting GNSS acquisition.")));
+    gnssMonitorResetButton = new QPushButton("Reset", qthBox);
+    markTranslatable(gnssMonitorResetButton, QStringLiteral("reset"), QStringLiteral("Reset"));
+    gnssNetworkTimeButton = new QPushButton("NTP time", qthBox);
+    markTranslatable(gnssNetworkTimeButton, QStringLiteral("gnss_ntp_time"), QStringLiteral("NTP time"));
+    gnssNetworkTimeButton->setToolTip(uiText(
+        QStringLiteral("gnss_ntp_time_tooltip"),
+        QStringLiteral("Query an internet NTP server for UTC time. This is only an assisted-GNSS hint, not code-phase lock.")));
+    gnssMonitorStatusLabel = new QLabel(qthBox);
+    gnssMonitorStatusLabel->setWordWrap(true);
+    gnssMonitorStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    gnssAcquireStatusLabel = new QLabel(qthBox);
+    gnssAcquireStatusLabel->setWordWrap(true);
+    gnssAcquireStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    gnssAcquisitionPlotLabel = new QLabel(qthBox);
+    gnssAcquisitionPlotLabel->setMinimumHeight(170);
+    gnssAcquisitionPlotLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    gnssAcquisitionPlotLabel->setScaledContents(false);
+    gnssAcquisitionPlotLabel->setToolTip(uiText(
+        QStringLiteral("gnss_acq_plot_tooltip"),
+        QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
+
+    QLabel *qthSourceLabel = new QLabel("Source:", qthBox);
+    markTranslatable(qthSourceLabel, QStringLiteral("source"), QStringLiteral("Source:"));
+    QLabel *gnssSystemLabel = new QLabel("System:", qthBox);
+    markTranslatable(gnssSystemLabel, QStringLiteral("gnss_system"), QStringLiteral("System:"));
+    QLabel *gnssIntegrationLabel = new QLabel("Accum:", qthBox);
+    markTranslatable(gnssIntegrationLabel, QStringLiteral("gnss_acq_integration"), QStringLiteral("Accum:"));
+    QLabel *gnssFilterLabel = new QLabel("GPS LPF:", qthBox);
+    markTranslatable(gnssFilterLabel, QStringLiteral("gnss_channel_lpf"), QStringLiteral("GPS LPF:"));
+    QLabel *gnssDopplerLabel = new QLabel("Doppler:", qthBox);
+    markTranslatable(gnssDopplerLabel, QStringLiteral("gnss_doppler"), QStringLiteral("Doppler:"));
+    QLabel *qthLatLabel = new QLabel("Lat:", qthBox);
+    markTranslatable(qthLatLabel, QStringLiteral("latitude_short"), QStringLiteral("Lat:"));
+    QLabel *qthLonLabel = new QLabel("Lon:", qthBox);
+    markTranslatable(qthLonLabel, QStringLiteral("longitude_short"), QStringLiteral("Lon:"));
+    QLabel *qthLocatorTitleLabel = new QLabel("QTH:", qthBox);
+    markTranslatable(qthLocatorTitleLabel, QStringLiteral("qth_locator_short"), QStringLiteral("QTH:"));
+
+    QGridLayout *qthLayout = new QGridLayout(qthBox);
+    qthLayout->setContentsMargins(6, 8, 6, 6);
+    qthLayout->setHorizontalSpacing(6);
+    qthLayout->setVerticalSpacing(4);
+    qthLayout->addWidget(qthSourceLabel, 0, 0);
+    qthLayout->addWidget(qthSourceCombo, 0, 1, 1, 2);
+    qthLayout->addWidget(gnssSystemLabel, 1, 0);
+    qthLayout->addWidget(gnssSystemCombo, 1, 1, 1, 2);
+    qthLayout->addWidget(gnssIntegrationLabel, 2, 0);
+    qthLayout->addWidget(gnssIntegrationSpin, 2, 1, 1, 2);
+    qthLayout->addWidget(gnssFilterLabel, 3, 0);
+    qthLayout->addWidget(gnssChannelFilterSpin, 3, 1, 1, 2);
+    qthLayout->addWidget(gnssDopplerLabel, 4, 0);
+    qthLayout->addWidget(gnssDopplerSpanSpin, 4, 1);
+    qthLayout->addWidget(gnssDopplerStepSpin, 4, 2);
+    qthLayout->addWidget(qthLatLabel, 5, 0);
+    qthLayout->addWidget(qthLatitudeSpin, 5, 1, 1, 2);
+    qthLayout->addWidget(qthLonLabel, 6, 0);
+    qthLayout->addWidget(qthLongitudeSpin, 6, 1, 1, 2);
+    qthLayout->addWidget(qthLocatorTitleLabel, 7, 0);
+    qthLayout->addWidget(qthLocatorLabel, 7, 1, 1, 2);
+    qthLayout->addWidget(qthMapButton, 8, 0);
+    qthLayout->addWidget(qthCopyButton, 8, 1);
+    qthLayout->addWidget(qthPasteNmeaButton, 8, 2);
+    qthLayout->addWidget(gnssTuneButton, 9, 0);
+    qthLayout->addWidget(gnssScanButton, 9, 1);
+    qthLayout->addWidget(gnssSelfTestButton, 9, 2);
+    qthLayout->addWidget(gnssRawLogButton, 10, 0);
+    qthLayout->addWidget(gnssAcquireButton, 10, 1);
+    qthLayout->addWidget(gnssDeepAcquireButton, 10, 2);
+    qthLayout->addWidget(gnssNetworkTimeButton, 11, 0);
+    qthLayout->addWidget(gnssOfflineAcquireButton, 11, 1);
+    qthLayout->addWidget(gnssPositionSelfTestButton, 11, 2);
+    qthLayout->addWidget(gnssMonitorCheckbox, 12, 0, 1, 2);
+    qthLayout->addWidget(gnssMonitorResetButton, 12, 2);
+    qthLayout->addWidget(gnssMonitorStatusLabel, 13, 0, 1, 3);
+    qthLayout->addWidget(gnssAcquireStatusLabel, 14, 0, 1, 3);
+    qthLayout->addWidget(gnssAcquisitionPlotLabel, 15, 0, 1, 3);
+    qthLayout->addWidget(qthStatusLabel, 16, 0, 1, 3);
+
     dmrHunterControls = new SpectrumHunterControls(
         QStringLiteral("DMR Hunter"),
         QStringLiteral("Detect narrow DMR-like 4FSK channel candidates in the current spectrum"),
@@ -3103,6 +4152,12 @@ YourClassName::YourClassName(QWidget *parent)
     scanSection.contentLayout->addWidget(agileScanBox);
     scanSection.contentLayout->addWidget(standardScanBox);
 
+    CollapsibleSection listeningScanSection = createCollapsibleSection(QStringLiteral("listening_scan"), QStringLiteral("Listening scan"), false);
+    listeningScanSection.contentLayout->addWidget(listeningScanBox);
+
+    CollapsibleSection qthSection = createCollapsibleSection(QStringLiteral("gps_qth"), QStringLiteral("GPS / QTH"), false);
+    qthSection.contentLayout->addWidget(qthBox);
+
     CollapsibleSection dmrHunterSection = createCollapsibleSection(QStringLiteral("dmr_hunter"), QStringLiteral("DMR Hunter"), false);
     dmrHunterSection.contentLayout->addWidget(dmrHunterControls);
 
@@ -3152,6 +4207,8 @@ YourClassName::YourClassName(QWidget *parent)
     layout->addWidget(receiverSection.widget);
     layout->addWidget(hfCancelSection.widget);
     layout->addWidget(scanSection.widget);
+    layout->addWidget(listeningScanSection.widget);
+    layout->addWidget(qthSection.widget);
     layout->addWidget(dmrHunterSection.widget);
     layout->addWidget(fpvHunterSection.widget);
     layout->addWidget(digitalVideoHunterSection.widget);
@@ -3180,6 +4237,9 @@ YourClassName::YourClassName(QWidget *parent)
     standardScanAdvanceTimer = new QTimer(this);
     standardScanAdvanceTimer->setTimerType(Qt::PreciseTimer);
     standardScanAdvanceTimer->setInterval(10);
+    listeningScanAdvanceTimer = new QTimer(this);
+    listeningScanAdvanceTimer->setTimerType(Qt::PreciseTimer);
+    listeningScanAdvanceTimer->setInterval(25);
     videoSnapshotTimer = new QTimer(this);
     videoSnapshotTimer->setInterval(VIDEO_SNAPSHOT_INTERVAL_MS);
     
@@ -3187,6 +4247,7 @@ YourClassName::YourClassName(QWidget *parent)
     connect(stopPollTimer, &QTimer::timeout, this, &YourClassName::pollStopCompletion);
     connect(streamWatchdogTimer, &QTimer::timeout, this, &YourClassName::checkStreamStartup);
     connect(standardScanAdvanceTimer, &QTimer::timeout, this, &YourClassName::advanceStandardScanIfNeeded);
+    connect(listeningScanAdvanceTimer, &QTimer::timeout, this, &YourClassName::advanceListeningScanIfNeeded);
     connect(videoSnapshotTimer, &QTimer::timeout, this, &YourClassName::processVideoSnapshotFrame);
     connect(graphCheckbox, &QCheckBox::toggled, this, &YourClassName::doubleGraphEnable);
     connect(colorCheckbox, &QCheckBox::toggled, this, &YourClassName::colorGraphEnable);
@@ -3303,6 +4364,68 @@ YourClassName::YourClassName(QWidget *parent)
     connect(hfNoiseCancelRefDelaySlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfNoiseCancelRefTiltSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfNoiseCancelFreezeCheckbox, &QCheckBox::toggled, this, applyHfNoiseCancelControls);
+    connect(qthSourceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        qthSource = qthSourceCombo ? qthSourceCombo->currentData().toString() : QStringLiteral("manual");
+        updateQthControls();
+        savePersistentSettings();
+    });
+    connect(gnssSystemCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        updateGnssSystemSelection();
+        applyGnssSystemPresetToReceiver(gnssSystemId);
+    });
+    connect(gnssIntegrationSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        gnssAcquisitionIntegrationMs =
+            (std::clamp)(value,
+                         GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                         GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+        savePersistentSettings();
+    });
+    connect(gnssChannelFilterSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double valueMhz) {
+        const double cutoffHz = valueMhz * 1000000.0;
+        gnssChannelFilterCutoffHz =
+            (std::clamp)(std::isfinite(cutoffHz) ? cutoffHz : 1800000.0,
+                         GNSS_CHANNEL_FILTER_MIN_HZ,
+                         GNSS_CHANNEL_FILTER_MAX_HZ);
+        savePersistentSettings();
+    });
+    connect(gnssDopplerSpanSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int valueKhz) {
+        gnssDopplerSpanHz = (std::clamp)(valueKhz, 1, 50) * 1000;
+        savePersistentSettings();
+    });
+    connect(gnssDopplerStepSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int valueHz) {
+        gnssDopplerStepHz = (std::clamp)(valueHz, 250, 5000);
+        savePersistentSettings();
+    });
+    connect(qthLatitudeSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) {
+        applyQthPositionFromUi();
+    });
+    connect(qthLongitudeSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) {
+        applyQthPositionFromUi();
+    });
+    connect(qthMapButton, &QPushButton::clicked, this, &YourClassName::openQthMapWindow);
+    connect(qthCopyButton, &QPushButton::clicked, this, &YourClassName::copyQthLocator);
+    connect(qthPasteNmeaButton, &QPushButton::clicked, this, &YourClassName::pasteNmeaPositionFromClipboard);
+    connect(gnssTuneButton, &QPushButton::clicked, this, &YourClassName::tuneGnssL1Preset);
+    connect(gnssScanButton, &QPushButton::clicked, this, &YourClassName::applyGnssScanPreset);
+    connect(gnssRawLogButton, &QPushButton::clicked, this, &YourClassName::logGnssRawContext);
+    connect(gnssAcquireButton, &QPushButton::clicked, this, &YourClassName::runGnssAcquisitionTest);
+    connect(gnssDeepAcquireButton, &QPushButton::clicked, this, &YourClassName::runGnssDeepAcquisitionTest);
+    connect(gnssOfflineAcquireButton, &QPushButton::clicked, this, &YourClassName::runGnssOfflineReplayTest);
+    connect(gnssSelfTestButton, &QPushButton::clicked, this, &YourClassName::runGnssSyntheticSelfTest);
+    connect(gnssPositionSelfTestButton, &QPushButton::clicked, this, &YourClassName::runGnssPositionSelfTest);
+    connect(gnssNetworkTimeButton, &QPushButton::clicked, this, &YourClassName::requestGnssNetworkTime);
+    connect(gnssNtpSocket, &QUdpSocket::readyRead, this, &YourClassName::handleGnssNetworkTimeResponse);
+    connect(gnssMonitorCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        gnssMonitorEnabled = checked;
+        if (checked) {
+            resetGnssMonitor();
+        } else if (gnssMonitorStatusLabel) {
+            gnssMonitorStatusLabel->setText(uiText(QStringLiteral("gnss_iq_monitor_idle"),
+                                                   QStringLiteral("GNSS IQ monitor: off")));
+        }
+        savePersistentSettings();
+    });
+    connect(gnssMonitorResetButton, &QPushButton::clicked, this, &YourClassName::resetGnssMonitor);
     connect(startButton, &QPushButton::clicked, this, &YourClassName::startFobosProcessing);
     connect(stopButton, &QPushButton::clicked, this, &YourClassName::stopFobosProcessing);
     connect(modeBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onDirectSamplingChanged);
@@ -3759,6 +4882,103 @@ YourClassName::YourClassName(QWidget *parent)
             }
         }
     };
+    auto applyListeningScanUiChange = [this](bool applyNow) {
+        refreshSettingsFromUi();
+        updateListeningScanControls();
+        publishSettingsToGlobals();
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+            if (persistentSettingsReady) {
+                savePersistentSettings();
+            }
+            return;
+        }
+        if (applyNow) {
+            applyListeningScanSettings(false);
+        }
+        if (persistentSettingsReady) {
+            savePersistentSettings();
+        }
+    };
+    connect(listeningScanCheckbox, &QCheckBox::toggled, this, [applyListeningScanUiChange](bool) {
+        applyListeningScanUiChange(true);
+    });
+    connect(listeningScanPresetCombo, QOverload<int>::of(&QComboBox::activated), this, [this, applyListeningScanUiChange](int index) {
+        const QString name = listeningScanPresetCombo ? listeningScanPresetCombo->itemData(index).toString() : QString();
+        if (name.isEmpty() || !listeningScanPresets.contains(name)) {
+            return;
+        }
+        const QString spec = listeningScanPresets.value(name);
+        listeningScanTargetsMhz = listeningScanPresetTargets(spec, listeningScanTargetsMhz);
+        listeningScanDwellMs = listeningScanPresetDwellMs(spec, listeningScanDwellMs);
+        listeningScanSettleMs = listeningScanPresetSettleMs(spec, listeningScanSettleMs);
+        if (listeningScanTargetsEdit) {
+            listeningScanTargetsEdit->setText(listeningScanTargetsMhz);
+        }
+        if (listeningScanDwellSpin) {
+            listeningScanDwellSpin->setValue(listeningScanDwellMs);
+        }
+        if (listeningScanSettleSpin) {
+            listeningScanSettleSpin->setValue(listeningScanSettleMs);
+        }
+        applyListeningScanUiChange(true);
+    });
+    connect(listeningScanSavePresetButton, &QPushButton::clicked, this, [this]() {
+        refreshSettingsFromUi();
+        QString name = listeningScanPresetCombo ? listeningScanPresetCombo->currentText().trimmed() : QString();
+        if (name.isEmpty()) {
+            name = QStringLiteral("Listening scan %1").arg(listeningScanPresets.size() + 1);
+        }
+        QString error;
+        parseListeningScanTargetsMhz(listeningScanTargetsMhz,
+                                     0.0,
+                                     RF_EXPERIMENTAL_MAX_FREQUENCY,
+                                     1,
+                                     &error);
+        if (!error.isEmpty()) {
+            if (listeningScanStatusLabel) {
+                listeningScanStatusLabel->setText(error);
+            }
+            return;
+        }
+        listeningScanPresets[name] =
+            listeningScanPresetSpec(listeningScanTargetsMhz, listeningScanDwellMs, listeningScanSettleMs);
+        savePersistentSettings();
+        updateListeningScanControls();
+    });
+    connect(listeningScanDeletePresetButton, &QPushButton::clicked, this, [this]() {
+        const QString name = listeningScanPresetCombo ? listeningScanPresetCombo->currentText().trimmed() : QString();
+        if (name.isEmpty()) {
+            return;
+        }
+        listeningScanPresets.remove(name);
+        savePersistentSettings();
+        updateListeningScanControls();
+    });
+    connect(listeningScanTargetsEdit, &QLineEdit::editingFinished, this, [applyListeningScanUiChange]() {
+        applyListeningScanUiChange(true);
+    });
+    connect(listeningScanTargetsEdit, &QLineEdit::returnPressed, this, [applyListeningScanUiChange]() {
+        applyListeningScanUiChange(true);
+    });
+    connect(listeningScanDwellSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, applyListeningScanUiChange](int value) {
+        listeningScanDwellMs = (std::clamp)(value,
+                                            LISTENING_SCAN_MIN_DWELL_MS,
+                                            LISTENING_SCAN_MAX_DWELL_MS);
+        applyListeningScanUiChange(false);
+    });
+    connect(listeningScanDwellSpin, &QSpinBox::editingFinished, this, [applyListeningScanUiChange]() {
+        applyListeningScanUiChange(true);
+    });
+    connect(listeningScanSettleSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, applyListeningScanUiChange](int value) {
+        listeningScanSettleMs = (std::clamp)(value,
+                                             LISTENING_SCAN_MIN_SETTLE_MS,
+                                             LISTENING_SCAN_MAX_SETTLE_MS);
+        applyListeningScanUiChange(false);
+    });
+    connect(listeningScanSettleSpin, &QSpinBox::editingFinished, this, [applyListeningScanUiChange]() {
+        applyListeningScanUiChange(true);
+    });
     connect(agileScanCheckbox, &QCheckBox::toggled, this, [this, applyScanUiChange](bool checked) {
         if (checked && standardScanCheckbox && standardScanCheckbox->isChecked()) {
             QSignalBlocker blocker(standardScanCheckbox);
@@ -4332,6 +5552,9 @@ YourClassName::~YourClassName() {
     if (streamWatchdogTimer) {
         streamWatchdogTimer->stop();
     }
+    if (listeningScanAdvanceTimer) {
+        listeningScanAdvanceTimer->stop();
+    }
     if (videoSnapshotTimer) {
         videoSnapshotTimer->stop();
     }
@@ -4628,6 +5851,18 @@ QVector<double> YourClassName::standardScanFrequencyList(QString *error) const {
                                        AGILE_SCAN_MIN_POINTS,
                                        error,
                                        nullptr);
+}
+
+QVector<double> YourClassName::listeningScanFrequencyList(QString *error) const {
+    const QString targets = listeningScanTargetsEdit
+                                ? listeningScanTargetsEdit->text().trimmed()
+                                : listeningScanTargetsMhz.trimmed();
+    const QPair<double, double> span = listeningScanVisibleSpanHz(pendingSettings);
+    return parseListeningScanTargetsMhz(targets,
+                                        span.first,
+                                        span.second,
+                                        listeningScanEnabled ? 1 : 0,
+                                        error);
 }
 
 void YourClassName::normalizeStandardScanCentersUi(bool requireTwoCenters) {
@@ -4950,6 +6185,72 @@ void YourClassName::updateAgileScanControls() {
             standardScanStatusLabel->setText(uiText(QStringLiteral("standard_scan_off"),
                                                     QStringLiteral("Standard scan: off")));
         }
+    }
+
+    updateListeningScanControls();
+}
+
+void YourClassName::updateListeningScanControls() {
+    if (listeningScanPresetCombo) {
+        const QString currentText = listeningScanPresetCombo->currentText();
+        QSignalBlocker blocker(listeningScanPresetCombo);
+        listeningScanPresetCombo->clear();
+        for (auto it = listeningScanPresets.constBegin(); it != listeningScanPresets.constEnd(); ++it) {
+            listeningScanPresetCombo->addItem(it.key(), it.key());
+        }
+        listeningScanPresetCombo->setEditText(currentText);
+    }
+
+    if (listeningScanCheckbox) {
+        QSignalBlocker blocker(listeningScanCheckbox);
+        listeningScanCheckbox->setChecked(listeningScanEnabled);
+    }
+    if (listeningScanTargetsEdit) {
+        listeningScanTargetsEdit->setEnabled(listeningScanEnabled);
+    }
+    if (listeningScanDwellSpin) {
+        listeningScanDwellSpin->setEnabled(true);
+    }
+    if (listeningScanSettleSpin) {
+        listeningScanSettleSpin->setEnabled(true);
+    }
+    if (listeningScanPresetCombo) {
+        listeningScanPresetCombo->setEnabled(true);
+    }
+    if (listeningScanSavePresetButton) {
+        listeningScanSavePresetButton->setEnabled(true);
+    }
+    if (listeningScanDeletePresetButton) {
+        listeningScanDeletePresetButton->setEnabled(true);
+    }
+
+    if (!listeningScanStatusLabel) {
+        return;
+    }
+
+    if (!listeningScanEnabled) {
+        listeningScanStatusLabel->setText(uiText(QStringLiteral("listening_scan_off"),
+                                                QStringLiteral("Listening scan: off")));
+        return;
+    }
+
+    QString error;
+    const QVector<double> targets = listeningScanFrequencyList(&error);
+    if (!error.isEmpty()) {
+        listeningScanStatusLabel->setText(error);
+    } else if (listeningScanEnabled && listeningScanRunning && !activeListeningScanFrequencies.isEmpty()) {
+        const int index = (std::clamp)(listeningScanIndex, 0, activeListeningScanFrequencies.size() - 1);
+        listeningScanStatusLabel->setText(
+            uiText(QStringLiteral("listening_scan_active"),
+                   QStringLiteral("Listening scan active: %1 targets, #%2 %3 MHz"))
+                .arg(activeListeningScanFrequencies.size())
+                .arg(index + 1)
+                .arg(activeListeningScanFrequencies.at(index) / 1000000.0, 0, 'f', 6));
+    } else if (listeningScanEnabled) {
+        listeningScanStatusLabel->setText(
+            uiText(QStringLiteral("listening_scan_list_points"),
+                   QStringLiteral("Listening scan: %1 targets"))
+                .arg(targets.size()));
     }
 }
 
@@ -6400,6 +7701,117 @@ void YourClassName::updateSpurSuppressionStatus() {
             .arg(suffix));
 }
 
+void YourClassName::updateGnssSpurWatch(const std::vector<float> &frequencies,
+                                        const std::vector<float> &magnitudes,
+                                        double centerFrequency) {
+    if (frequencies.empty() || magnitudes.empty() || frequencies.size() != magnitudes.size()) {
+        return;
+    }
+
+    const GnssSystemPreset preset = gnssSystemPreset(gnssSystemId);
+    const double targetHz = preset.id == QStringLiteral("all_l1")
+                                ? GNSS_GPS_L1_HZ
+                                : preset.targetHz;
+    if (!std::isfinite(targetHz) || targetHz <= 0.0 ||
+        !std::isfinite(centerFrequency) || centerFrequency <= 0.0) {
+        return;
+    }
+    const double minHz = static_cast<double>(*std::min_element(frequencies.begin(), frequencies.end()));
+    const double maxHz = static_cast<double>(*std::max_element(frequencies.begin(), frequencies.end()));
+    if (targetHz < minHz || targetHz > maxHz) {
+        return;
+    }
+
+    if (!gnssSpurWatchTimer.isValid()) {
+        gnssSpurWatchTimer.start();
+    }
+    if (!gnssSpurLogTimer.isValid()) {
+        gnssSpurLogTimer.start();
+    }
+
+    constexpr double watchSpanHz = 25000000.0;
+    constexpr double binHz = 10000.0;
+    QVector<QPair<int, float>> peaks;
+    double average = 0.0;
+    int averageCount = 0;
+    for (int i = 0; i < static_cast<int>(frequencies.size()); ++i) {
+        const double frequency = static_cast<double>(frequencies[static_cast<std::size_t>(i)]);
+        const float level = magnitudes[static_cast<std::size_t>(i)];
+        if (!std::isfinite(frequency) || !std::isfinite(level) ||
+            std::abs(frequency - targetHz) > watchSpanHz) {
+            continue;
+        }
+        average += static_cast<double>(level);
+        ++averageCount;
+    }
+    if (averageCount <= 0) {
+        return;
+    }
+    average /= static_cast<double>(averageCount);
+
+    for (int i = 1; i + 1 < static_cast<int>(frequencies.size()); ++i) {
+        const double frequency = static_cast<double>(frequencies[static_cast<std::size_t>(i)]);
+        const float level = magnitudes[static_cast<std::size_t>(i)];
+        if (!std::isfinite(frequency) || !std::isfinite(level) ||
+            std::abs(frequency - targetHz) > watchSpanHz ||
+            level < average + 8.0f) {
+            continue;
+        }
+        const float prev = magnitudes[static_cast<std::size_t>(i - 1)];
+        const float next = magnitudes[static_cast<std::size_t>(i + 1)];
+        if (level < prev || level < next) {
+            continue;
+        }
+        peaks.append(qMakePair(i, level));
+    }
+    std::sort(peaks.begin(), peaks.end(), [](const auto &a, const auto &b) {
+        return a.second > b.second;
+    });
+    while (peaks.size() > 8) {
+        peaks.removeLast();
+    }
+
+    const qint64 nowMs = gnssSpurWatchTimer.elapsed();
+    for (const auto &peak : std::as_const(peaks)) {
+        const double frequency = static_cast<double>(frequencies[static_cast<std::size_t>(peak.first)]);
+        const qint64 bin = static_cast<qint64>(std::llround((frequency - targetHz) / binHz));
+        GnssSpurWatchBin &entry = gnssSpurWatchBins[bin];
+        entry.averageDb = entry.hits == 0
+                              ? peak.second
+                              : static_cast<float>(entry.averageDb * 0.85f + peak.second * 0.15f);
+        entry.hits = (std::min)(9999, entry.hits + 1);
+        entry.lastSeenMs = nowMs;
+    }
+
+    if (gnssSpurLogTimer.elapsed() < 3000) {
+        return;
+    }
+    gnssSpurLogTimer.restart();
+
+    QStringList summary;
+    for (auto it = gnssSpurWatchBins.begin(); it != gnssSpurWatchBins.end();) {
+        if (nowMs - it.value().lastSeenMs > 15000) {
+            it = gnssSpurWatchBins.erase(it);
+            continue;
+        }
+        const double offsetHz = static_cast<double>(it.key()) * binHz;
+        summary << QStringLiteral("%1k/%2dB/h%3")
+                       .arg(offsetHz / 1000.0, 0, 'f', 1)
+                       .arg(it.value().averageDb, 0, 'f', 1)
+                       .arg(it.value().hits);
+        ++it;
+    }
+    if (summary.isEmpty()) {
+        return;
+    }
+    qDebug() << "[GNSS spur watch]"
+             << "system" << preset.id
+             << "targetHz" << targetHz
+             << "centerHz" << centerFrequency
+             << "averageDb" << average
+             << "peaks" << summary.join(QStringLiteral(", "));
+}
+
 void YourClassName::saveAgileScanPreset() {
     if (!agileScanPresetCombo) {
         return;
@@ -6467,6 +7879,11 @@ void YourClassName::ensureDefaultFrequencyPresets() {
         addMissingFrequencyPreset(QStringLiteral("FPV video %1 MHz").arg(mhz, 0, 'f', 0),
                                   mhz * 1000000.0);
     }
+    addMissingFrequencyPreset(QStringLiteral("GNSS L1 compact center 1583 MHz"), GNSS_L1_LISTENING_SCAN_CENTER_HZ);
+    addMissingFrequencyPreset(QStringLiteral("GNSS L1 band center 1584.5 MHz"), GNSS_L1_BAND_CENTER_HZ);
+    addMissingFrequencyPreset(QStringLiteral("GPS/Galileo L1 1575.42 MHz"), GNSS_GPS_L1_HZ);
+    addMissingFrequencyPreset(QStringLiteral("BeiDou B1I 1561.098 MHz"), GNSS_BEIDOU_B1I_HZ);
+    addMissingFrequencyPreset(QStringLiteral("GLONASS L1 center 1602 MHz"), GNSS_GLONASS_L1_CENTER_HZ);
     if (bandwidthValuePresets.isEmpty()) {
         bandwidthValuePresets[QStringLiteral("CW 500 Hz")] = 500.0;
         bandwidthValuePresets[QStringLiteral("SSB 2.7 kHz")] = 2700.0;
@@ -6494,6 +7911,10 @@ void YourClassName::ensureDefaultFrequencyPresets() {
     addMissingBandwidthPreset(QStringLiteral("ATV 5 MHz"), 5000000.0);
     addMissingBandwidthPreset(QStringLiteral("FPV 8 MHz"), 8000000.0);
     addMissingBandwidthPreset(QStringLiteral("FPV 10 MHz"), 10000000.0);
+    addMissingBandwidthPreset(QStringLiteral("GNSS C/A 2.046 MHz"), GNSS_RAW_BANDWIDTH_HZ);
+    addMissingBandwidthPreset(QStringLiteral("GNSS raw 4.092 MHz"), 4092000.0);
+    addMissingBandwidthPreset(QStringLiteral("GLONASS L1OF 9 MHz"), 9000000.0);
+    addMissingBandwidthPreset(QStringLiteral("GNSS L1 survey 50 MHz"), GNSS_USEFUL_STANDARD_SPAN_HZ);
 }
 
 void YourClassName::ensureDefaultBandMarkers() {
@@ -6601,6 +8022,2521 @@ void YourClassName::setControlsPanelVisible(bool visible) {
         addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
     }
     controlsDock->show();
+}
+
+void YourClassName::updateQthControls() {
+    qthLatitude = (std::clamp)(qthLatitude, -90.0, 90.0);
+    qthLongitude = (std::clamp)(qthLongitude, -180.0, 180.0);
+    const QthOnlineProviderPreset currentOnlineProvider = qthOnlineProviderPreset(qthOnlineProviderId);
+    const int qthMaxZoom = (std::clamp)(currentOnlineProvider.maxZoom, 0, 19);
+    qthMapZoom = (std::clamp)(qthMapZoom, 0, qthMaxZoom);
+    const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+
+    if (qthSourceCombo) {
+        QSignalBlocker blocker(qthSourceCombo);
+        const int index = qthSourceCombo->findData(qthSource);
+        qthSourceCombo->setCurrentIndex(index >= 0 ? index : qthSourceCombo->findData(QStringLiteral("manual")));
+    }
+    if (gnssSystemCombo) {
+        QSignalBlocker blocker(gnssSystemCombo);
+        const int index = gnssSystemCombo->findData(gnssSystemId);
+        gnssSystemCombo->setCurrentIndex(index >= 0 ? index : gnssSystemCombo->findData(QStringLiteral("gps_l1_ca")));
+    }
+    if (qthLatitudeSpin) {
+        QSignalBlocker blocker(qthLatitudeSpin);
+        qthLatitudeSpin->setValue(qthLatitude);
+    }
+    if (qthLongitudeSpin) {
+        QSignalBlocker blocker(qthLongitudeSpin);
+        qthLongitudeSpin->setValue(qthLongitude);
+    }
+    if (qthLocatorLabel) {
+        qthLocatorLabel->setText(locator);
+    }
+    if (gnssMonitorCheckbox) {
+        QSignalBlocker blocker(gnssMonitorCheckbox);
+        gnssMonitorCheckbox->setChecked(gnssMonitorEnabled);
+    }
+    if (gnssMonitorStatusLabel && !gnssSignalMonitor.lastReport().valid) {
+        gnssMonitorStatusLabel->setText(gnssMonitorEnabled
+                                            ? uiText(QStringLiteral("gnss_iq_monitor_waiting"),
+                                                     QStringLiteral("GNSS IQ monitor: waiting for IQ samples"))
+                                            : uiText(QStringLiteral("gnss_iq_monitor_idle"),
+                                                     QStringLiteral("GNSS IQ monitor: off")));
+    }
+    if (qthMapWidget) {
+        qthMapWidget->setUiLanguage(uiLanguage);
+        qthMapWidget->setPosition(qthLatitude, qthLongitude);
+        qthMapWidget->setTileLayerMode(qthMapLayer == 1
+                                           ? QthMapWidget::TileLayerMode::LocalXyz
+                                           : (qthMapLayer == 2
+                                                  ? QthMapWidget::TileLayerMode::OnlineXyz
+                                                  : QthMapWidget::TileLayerMode::GridOnly));
+        qthMapWidget->setTileDirectory(qthTileDirectory);
+        qthMapWidget->setOnlineTileTemplate(resolvedQthOnlineTileUrlTemplate());
+        qthMapWidget->setOnlineAttribution(qthOnlineAttribution);
+        qthMapWidget->setOnlineDiskCacheEnabled(!qthOnlineNoDiskCache);
+        qthMapWidget->setMapZoomRange(0, qthMaxZoom);
+        qthMapWidget->setMapZoom(qthMapZoom);
+        qthMapWidget->setGridPrecision(qthGridPrecision);
+        qthMapWidget->setUserMarkers(qthUserMarkers);
+    }
+    updateQthMapControls();
+    if (qthStatusLabel) {
+        const bool manual = qthSource == QStringLiteral("manual") || qthSource.isEmpty();
+        if (manual) {
+            qthStatusLabel->setText(uiText(QStringLiteral("qth_status_manual"),
+                                           QStringLiteral("Manual QTH. Use Save GNSS IQ to write the current raw IQ snapshot.")));
+        } else if (qthSource == QStringLiteral("nmea")) {
+            qthStatusLabel->setText(uiText(QStringLiteral("qth_status_nmea"),
+                                           QStringLiteral("NMEA QTH is active. Paste GGA/RMC text to update coordinates.")));
+        } else {
+            qthStatusLabel->setText(uiText(QStringLiteral("qth_status_future_source"),
+                                           QStringLiteral("This position source is planned; manual coordinates are used for now.")));
+        }
+    }
+}
+
+void YourClassName::applyQthOnlineProviderPreset(const QString &providerId, bool applyTemplate) {
+    const QthOnlineProviderPreset preset = qthOnlineProviderPreset(providerId.trimmed());
+    qthOnlineProviderId = preset.id;
+    if (applyTemplate && preset.id != QStringLiteral("custom")) {
+        qthOnlineTileUrlTemplate = preset.urlTemplate;
+        qthOnlineAttribution = preset.attribution;
+        qthOnlineNoDiskCache = preset.noDiskCache;
+    }
+}
+
+QString YourClassName::resolvedQthOnlineTileUrlTemplate() const {
+    QString urlTemplate = qthOnlineTileUrlTemplate.trimmed();
+    if (urlTemplate.isEmpty()) {
+        return {};
+    }
+    const bool needsKey = qthOnlineTemplateNeedsKey(urlTemplate);
+    const QString key = qthOnlineApiKey.trimmed();
+    if (needsKey && key.isEmpty()) {
+        return {};
+    }
+    const QString encodedKey = QString::fromLatin1(QUrl::toPercentEncoding(key));
+    urlTemplate.replace(QStringLiteral("{key}"), encodedKey, Qt::CaseInsensitive);
+    urlTemplate.replace(QStringLiteral("{token}"), encodedKey, Qt::CaseInsensitive);
+    return urlTemplate;
+}
+
+void YourClassName::applyQthPositionFromUi() {
+    if (qthLatitudeSpin) {
+        qthLatitude = qthLatitudeSpin->value();
+    }
+    if (qthLongitudeSpin) {
+        qthLongitude = qthLongitudeSpin->value();
+    }
+    if (qthSourceCombo) {
+        qthSource = qthSourceCombo->currentData().toString();
+        if (qthSource.isEmpty()) {
+            qthSource = QStringLiteral("manual");
+        }
+    }
+    updateQthControls();
+    savePersistentSettings();
+}
+
+void YourClassName::pasteNmeaPositionFromClipboard() {
+    QClipboard *clipboard = QApplication::clipboard();
+    const QString text = clipboard ? clipboard->text() : QString();
+    QString status;
+    if (!applyNmeaPositionText(text, &status) && status.isEmpty()) {
+        status = uiText(QStringLiteral("nmea_parse_failed"),
+                        QStringLiteral("NMEA: no valid GGA/RMC position found in clipboard."));
+    }
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(status);
+    }
+}
+
+bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMessage) {
+    const QString trimmed = text.trimmed();
+    if (trimmed.isEmpty()) {
+        if (statusMessage) {
+            *statusMessage = uiText(QStringLiteral("nmea_parse_failed"),
+                                    QStringLiteral("NMEA: no valid GGA/RMC position found in clipboard."));
+        }
+        return false;
+    }
+
+    const QStringList lines = trimmed.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                                            Qt::SkipEmptyParts);
+    ParsedNmeaPosition parsed;
+    bool found = false;
+    for (const QString &line : lines) {
+        if (parseNmeaPositionSentence(line, &parsed)) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        if (statusMessage) {
+            *statusMessage = uiText(QStringLiteral("nmea_parse_failed"),
+                                    QStringLiteral("NMEA: no valid GGA/RMC position found in clipboard."));
+        }
+        qDebug() << "[GNSS NMEA] parse failed" << "chars" << trimmed.size() << "lines" << lines.size();
+        return false;
+    }
+
+    qthLatitude = parsed.latitude;
+    qthLongitude = parsed.longitude;
+    qthSource = QStringLiteral("nmea");
+    const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+    updateQthControls();
+    if (qthMapWidget) {
+        qthMapWidget->centerOn(qthLatitude, qthLongitude);
+    }
+    savePersistentSettings();
+
+    const QString status = uiText(QStringLiteral("nmea_position_applied"),
+                                  QStringLiteral("NMEA QTH: %1 %2, %3 (%4)"))
+                               .arg(QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence))
+                               .arg(qthLatitude, 0, 'f', 6)
+                               .arg(qthLongitude, 0, 'f', 6)
+                               .arg(locator);
+    if (statusMessage) {
+        *statusMessage = status;
+    }
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(status);
+    }
+    qDebug() << "[GNSS NMEA] position applied"
+             << "sentence" << QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence)
+             << "lat" << qthLatitude
+             << "lon" << qthLongitude
+             << "qth" << locator
+             << "utc" << parsed.utc;
+    return true;
+}
+
+void YourClassName::updateQthMapControls() {
+    if (qthMapLayerCombo) {
+        QSignalBlocker blocker(qthMapLayerCombo);
+        const int index = qthMapLayerCombo->findData(qthMapLayer);
+        if (index >= 0) {
+            qthMapLayerCombo->setCurrentIndex(index);
+        }
+    }
+    if (qthOnlineProviderCombo) {
+        QSignalBlocker blocker(qthOnlineProviderCombo);
+        const int index = qthOnlineProviderCombo->findData(qthOnlineProviderId);
+        qthOnlineProviderCombo->setCurrentIndex(index >= 0
+                                                    ? index
+                                                    : qthOnlineProviderCombo->findData(QStringLiteral("custom")));
+    }
+    if (qthMapZoomSpin) {
+        QSignalBlocker blocker(qthMapZoomSpin);
+        const int maxZoom = (std::clamp)(qthOnlineProviderPreset(qthOnlineProviderId).maxZoom, 0, 19);
+        qthMapZoomSpin->setRange(0, maxZoom);
+        qthMapZoom = (std::clamp)(qthMapZoom, 0, maxZoom);
+        qthMapZoomSpin->setValue((std::clamp)(qthMapZoom, 0, 19));
+    }
+    if (qthGridPrecisionCombo) {
+        QSignalBlocker blocker(qthGridPrecisionCombo);
+        const int index = qthGridPrecisionCombo->findData(qthGridPrecision);
+        qthGridPrecisionCombo->setCurrentIndex(index >= 0 ? index : qthGridPrecisionCombo->findData(6));
+    }
+    if (qthTileDirectoryEdit) {
+        QSignalBlocker blocker(qthTileDirectoryEdit);
+        qthTileDirectoryEdit->setText(qthTileDirectory);
+    }
+    if (qthOnlineTileUrlEdit) {
+        QSignalBlocker blocker(qthOnlineTileUrlEdit);
+        qthOnlineTileUrlEdit->setText(qthOnlineTileUrlTemplate);
+    }
+    if (qthOnlineAttributionEdit) {
+        QSignalBlocker blocker(qthOnlineAttributionEdit);
+        qthOnlineAttributionEdit->setText(qthOnlineAttribution);
+    }
+    if (qthOnlineApiKeyEdit) {
+        QSignalBlocker blocker(qthOnlineApiKeyEdit);
+        qthOnlineApiKeyEdit->setText(qthOnlineApiKey);
+    }
+    if (qthOnlineNoDiskCacheCheckbox) {
+        QSignalBlocker blocker(qthOnlineNoDiskCacheCheckbox);
+        qthOnlineNoDiskCacheCheckbox->setChecked(qthOnlineNoDiskCache);
+    }
+    if (qthMapStatusLabel) {
+        const bool localLayer = qthMapLayer == 1;
+        const bool onlineLayer = qthMapLayer == 2;
+        const bool folderOk = !qthTileDirectory.trimmed().isEmpty() && QDir(qthTileDirectory).exists();
+        const QthOnlineProviderPreset provider = qthOnlineProviderPreset(qthOnlineProviderId);
+        const QString providerName = uiText(provider.textKey, provider.fallbackName);
+        QString text;
+        if (!localLayer) {
+            if (onlineLayer) {
+                if (qthOnlineTemplateNeedsKey(qthOnlineTileUrlTemplate) && qthOnlineApiKey.trimmed().isEmpty()) {
+                    text = uiText(QStringLiteral("qth_map_online_key_required"),
+                                  QStringLiteral("%1 requires an API key/token. Enter it before loading tiles."))
+                               .arg(providerName);
+                } else {
+                    text = uiText(qthOnlineNoDiskCache
+                                      ? QStringLiteral("qth_map_online_memory_status")
+                                      : QStringLiteral("qth_map_online_status"),
+                                  qthOnlineNoDiskCache
+                                      ? QStringLiteral("%1 online tiles are fetched only for the current view and kept in memory only.")
+                                      : QStringLiteral("%1 online tiles are fetched only for the current view and cached locally."))
+                               .arg(providerName);
+                }
+            } else {
+                text = uiText(QStringLiteral("qth_map_grid_status"),
+                              QStringLiteral("Grid-only map works offline without tile files."));
+            }
+        } else if (folderOk) {
+            text = uiText(QStringLiteral("qth_map_tiles_status"),
+                          QStringLiteral("Offline XYZ tiles: %1"))
+                       .arg(QDir::toNativeSeparators(qthTileDirectory));
+        } else {
+            text = uiText(QStringLiteral("qth_map_tiles_missing_status"),
+                          QStringLiteral("Select an offline XYZ tile folder with z/x/y.png files."));
+        }
+        qthMapStatusLabel->setText(text);
+    }
+}
+
+void YourClassName::selectQthTileDirectory() {
+    const QString startDir = !qthTileDirectory.isEmpty() && QDir(qthTileDirectory).exists()
+                                 ? qthTileDirectory
+                                 : QDir::homePath();
+    const QString directory =
+        QFileDialog::getExistingDirectory(this,
+                                          uiText(QStringLiteral("select_offline_tiles"),
+                                                 QStringLiteral("Select offline map tiles")),
+                                          startDir);
+    if (directory.isEmpty()) {
+        return;
+    }
+
+    qthTileDirectory = QDir::fromNativeSeparators(directory);
+    qthMapLayer = 1;
+    if (qthMapWidget) {
+        qthMapWidget->setTileLayerMode(QthMapWidget::TileLayerMode::LocalXyz);
+        qthMapWidget->setTileDirectory(qthTileDirectory);
+    }
+    updateQthMapControls();
+    savePersistentSettings();
+}
+
+void YourClassName::openQthTileDirectory() {
+    if (qthTileDirectory.trimmed().isEmpty()) {
+        selectQthTileDirectory();
+        return;
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(qthTileDirectory));
+}
+
+void YourClassName::openQthMapWindow() {
+    if (!qthMapDialog) {
+        qthMapDialog = new QDialog(this);
+        qthMapDialog->setAttribute(Qt::WA_DeleteOnClose);
+        qthMapDialog->setWindowTitle(uiText(QStringLiteral("qth_map_title"),
+                                            QStringLiteral("QTH Map")));
+        qthMapDialog->resize(780, 520);
+
+        QVBoxLayout *rootLayout = new QVBoxLayout(qthMapDialog);
+
+        QGridLayout *mapControlLayout = new QGridLayout();
+        mapControlLayout->setContentsMargins(0, 0, 0, 0);
+        mapControlLayout->setHorizontalSpacing(6);
+        mapControlLayout->setVerticalSpacing(4);
+
+        QLabel *layerLabel = new QLabel(uiText(QStringLiteral("map_layer"),
+                                               QStringLiteral("Layer:")),
+                                        qthMapDialog);
+        qthMapLayerCombo = new QComboBox(qthMapDialog);
+        qthMapLayerCombo->addItem(uiText(QStringLiteral("qth_grid_only"),
+                                         QStringLiteral("QTH grid only")),
+                                  0);
+        qthMapLayerCombo->addItem(uiText(QStringLiteral("offline_xyz_tiles"),
+                                         QStringLiteral("Offline XYZ tiles")),
+                                  1);
+        qthMapLayerCombo->addItem(uiText(QStringLiteral("online_xyz_tiles"),
+                                         QStringLiteral("Online XYZ tiles")),
+                                  2);
+        QLabel *providerLabel = new QLabel(uiText(QStringLiteral("provider"),
+                                                  QStringLiteral("Provider:")),
+                                           qthMapDialog);
+        qthOnlineProviderCombo = new QComboBox(qthMapDialog);
+        for (const QthOnlineProviderPreset &preset : qthOnlineProviderPresets()) {
+            qthOnlineProviderCombo->addItem(uiText(preset.textKey, preset.fallbackName), preset.id);
+        }
+
+        QLabel *zoomLabel = new QLabel(uiText(QStringLiteral("zoom"),
+                                              QStringLiteral("Zoom:")),
+                                       qthMapDialog);
+        qthMapZoomSpin = new QSpinBox(qthMapDialog);
+        qthMapZoomSpin->setRange(0, 19);
+        qthMapZoomSpin->setValue(qthMapZoom);
+
+        QLabel *gridLabel = new QLabel(uiText(QStringLiteral("qth_grid"),
+                                              QStringLiteral("QTH grid:")),
+                                       qthMapDialog);
+        qthGridPrecisionCombo = new QComboBox(qthMapDialog);
+        qthGridPrecisionCombo->addItem(QStringLiteral("2"), 2);
+        qthGridPrecisionCombo->addItem(QStringLiteral("4"), 4);
+        qthGridPrecisionCombo->addItem(QStringLiteral("6"), 6);
+
+        QLabel *tilesLabel = new QLabel(uiText(QStringLiteral("offline_tiles"),
+                                               QStringLiteral("Offline tiles:")),
+                                        qthMapDialog);
+        qthTileDirectoryEdit = new QLineEdit(qthMapDialog);
+        qthTileDirectoryEdit->setPlaceholderText(uiText(QStringLiteral("offline_tiles_placeholder"),
+                                                        QStringLiteral("Folder with z/x/y.png tiles")));
+        qthSelectTilesButton = new QPushButton(uiText(QStringLiteral("browse"),
+                                                      QStringLiteral("Browse...")),
+                                               qthMapDialog);
+        qthOpenTilesButton = new QPushButton(uiText(QStringLiteral("open_folder"),
+                                                   QStringLiteral("Open folder")),
+                                            qthMapDialog);
+        qthCenterMapButton = new QPushButton(uiText(QStringLiteral("center_map"),
+                                                    QStringLiteral("Center")),
+                                             qthMapDialog);
+        QLabel *onlineUrlLabel = new QLabel(uiText(QStringLiteral("online_tiles_url"),
+                                                   QStringLiteral("Online URL:")),
+                                            qthMapDialog);
+        qthOnlineTileUrlEdit = new QLineEdit(qthMapDialog);
+        qthOnlineTileUrlEdit->setPlaceholderText(QStringLiteral("https://tile.openstreetmap.org/{z}/{x}/{y}.png"));
+        QLabel *apiKeyLabel = new QLabel(uiText(QStringLiteral("api_key_token"),
+                                                QStringLiteral("API key/token:")),
+                                         qthMapDialog);
+        qthOnlineApiKeyEdit = new QLineEdit(qthMapDialog);
+        qthOnlineApiKeyEdit->setPlaceholderText(uiText(QStringLiteral("api_key_optional_placeholder"),
+                                                       QStringLiteral("Only for providers that require it")));
+        qthOnlineApiKeyEdit->setEchoMode(QLineEdit::PasswordEchoOnEdit);
+        qthOnlineNoDiskCacheCheckbox =
+            new QCheckBox(uiText(QStringLiteral("memory_only_tiles"),
+                                 QStringLiteral("Memory only")),
+                          qthMapDialog);
+        qthOnlineNoDiskCacheCheckbox->setToolTip(uiText(
+            QStringLiteral("memory_only_tiles_tooltip"),
+            QStringLiteral("Do not store online tiles in the disk cache; useful for satellite providers.")));
+        QLabel *onlineAttributionLabel = new QLabel(uiText(QStringLiteral("attribution"),
+                                                           QStringLiteral("Attribution:")),
+                                                    qthMapDialog);
+        qthOnlineAttributionEdit = new QLineEdit(qthMapDialog);
+        qthUseOsmButton = new QPushButton(uiText(QStringLiteral("apply_provider"),
+                                                 QStringLiteral("Apply")),
+                                          qthMapDialog);
+        QLabel *searchLabel = new QLabel(uiText(QStringLiteral("map_search"),
+                                                QStringLiteral("Search:")),
+                                         qthMapDialog);
+        qthMapSearchEdit = new QLineEdit(qthMapDialog);
+        qthMapSearchEdit->setPlaceholderText(uiText(QStringLiteral("map_search_placeholder"),
+                                                    QStringLiteral("QTH locator or lat, lon")));
+        qthMapSearchButton = new QPushButton(uiText(QStringLiteral("find"),
+                                                    QStringLiteral("Find")),
+                                             qthMapDialog);
+        qthMapStatusLabel = new QLabel(qthMapDialog);
+        qthMapStatusLabel->setWordWrap(true);
+        qthMapStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+        mapControlLayout->addWidget(layerLabel, 0, 0);
+        mapControlLayout->addWidget(qthMapLayerCombo, 0, 1);
+        mapControlLayout->addWidget(zoomLabel, 0, 2);
+        mapControlLayout->addWidget(qthMapZoomSpin, 0, 3);
+        mapControlLayout->addWidget(gridLabel, 0, 4);
+        mapControlLayout->addWidget(qthGridPrecisionCombo, 0, 5);
+        mapControlLayout->addWidget(tilesLabel, 1, 0);
+        mapControlLayout->addWidget(qthTileDirectoryEdit, 1, 1, 1, 3);
+        mapControlLayout->addWidget(qthSelectTilesButton, 1, 4);
+        mapControlLayout->addWidget(qthOpenTilesButton, 1, 5);
+        mapControlLayout->addWidget(providerLabel, 2, 0);
+        mapControlLayout->addWidget(qthOnlineProviderCombo, 2, 1);
+        mapControlLayout->addWidget(apiKeyLabel, 2, 2);
+        mapControlLayout->addWidget(qthOnlineApiKeyEdit, 2, 3);
+        mapControlLayout->addWidget(qthOnlineNoDiskCacheCheckbox, 2, 4);
+        mapControlLayout->addWidget(qthUseOsmButton, 2, 5);
+        mapControlLayout->addWidget(onlineUrlLabel, 3, 0);
+        mapControlLayout->addWidget(qthOnlineTileUrlEdit, 3, 1, 1, 4);
+        mapControlLayout->addWidget(qthCenterMapButton, 3, 5);
+        mapControlLayout->addWidget(onlineAttributionLabel, 4, 0);
+        mapControlLayout->addWidget(qthOnlineAttributionEdit, 4, 1, 1, 5);
+        mapControlLayout->addWidget(searchLabel, 5, 0);
+        mapControlLayout->addWidget(qthMapSearchEdit, 5, 1, 1, 4);
+        mapControlLayout->addWidget(qthMapSearchButton, 5, 5);
+        rootLayout->addLayout(mapControlLayout);
+        rootLayout->addWidget(qthMapStatusLabel);
+
+        qthMapWidget = new QthMapWidget(qthMapDialog);
+        qthMapWidget->setUiLanguage(uiLanguage);
+        qthMapWidget->setPosition(qthLatitude, qthLongitude);
+        qthMapWidget->setTileLayerMode(qthMapLayer == 1
+                                           ? QthMapWidget::TileLayerMode::LocalXyz
+                                           : (qthMapLayer == 2
+                                                  ? QthMapWidget::TileLayerMode::OnlineXyz
+                                                  : QthMapWidget::TileLayerMode::GridOnly));
+        qthMapWidget->setTileDirectory(qthTileDirectory);
+        qthMapWidget->setOnlineTileTemplate(resolvedQthOnlineTileUrlTemplate());
+        qthMapWidget->setOnlineAttribution(qthOnlineAttribution);
+        qthMapWidget->setOnlineDiskCacheEnabled(!qthOnlineNoDiskCache);
+        qthMapWidget->setMapZoom(qthMapZoom);
+        qthMapWidget->setGridPrecision(qthGridPrecision);
+        qthMapWidget->setUserMarkers(qthUserMarkers);
+        rootLayout->addWidget(qthMapWidget, 1);
+
+        QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Close, qthMapDialog);
+        QPushButton *openOsmButton =
+            buttonBox->addButton(uiText(QStringLiteral("open_osm"),
+                                        QStringLiteral("Open OSM")),
+                                 QDialogButtonBox::ActionRole);
+        QPushButton *copyButton =
+            buttonBox->addButton(uiText(QStringLiteral("copy_qth"),
+                                        QStringLiteral("Copy QTH")),
+                                 QDialogButtonBox::ActionRole);
+        if (QPushButton *closeButton = buttonBox->button(QDialogButtonBox::Close)) {
+            closeButton->setText(uiText(QStringLiteral("close"), QStringLiteral("Close")));
+        }
+        rootLayout->addWidget(buttonBox);
+
+        connect(qthMapLayerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), qthMapDialog, [this](int) {
+            qthMapLayer = qthMapLayerCombo ? qthMapLayerCombo->currentData().toInt() : 0;
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthOnlineProviderCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), qthMapDialog, [this](int) {
+            const QString providerId =
+                qthOnlineProviderCombo ? qthOnlineProviderCombo->currentData().toString() : QStringLiteral("custom");
+            applyQthOnlineProviderPreset(providerId, true);
+            qthMapLayer = 2;
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthMapZoomSpin, QOverload<int>::of(&QSpinBox::valueChanged), qthMapDialog, [this](int value) {
+            qthMapZoom = value;
+            if (qthMapWidget) {
+                qthMapWidget->setMapZoom(qthMapZoom);
+            }
+            updateQthMapControls();
+            savePersistentSettings();
+        });
+        connect(qthGridPrecisionCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), qthMapDialog, [this](int) {
+            qthGridPrecision = qthGridPrecisionCombo ? qthGridPrecisionCombo->currentData().toInt() : 6;
+            if (qthMapWidget) {
+                qthMapWidget->setGridPrecision(qthGridPrecision);
+            }
+            updateQthMapControls();
+            savePersistentSettings();
+        });
+        connect(qthTileDirectoryEdit, &QLineEdit::editingFinished, qthMapDialog, [this]() {
+            qthTileDirectory = qthTileDirectoryEdit
+                                   ? QDir::fromNativeSeparators(qthTileDirectoryEdit->text().trimmed())
+                                   : QString();
+            if (!qthTileDirectory.isEmpty()) {
+                qthMapLayer = 1;
+    }
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthOnlineTileUrlEdit, &QLineEdit::editingFinished, qthMapDialog, [this]() {
+            qthOnlineTileUrlTemplate = qthOnlineTileUrlEdit
+                                           ? qthOnlineTileUrlEdit->text().trimmed()
+                                           : QString();
+            qthOnlineProviderId = QStringLiteral("custom");
+            if (!qthOnlineTileUrlTemplate.isEmpty()) {
+                qthMapLayer = 2;
+            }
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthOnlineAttributionEdit, &QLineEdit::editingFinished, qthMapDialog, [this]() {
+            qthOnlineAttribution = qthOnlineAttributionEdit
+                                       ? qthOnlineAttributionEdit->text().trimmed()
+                                       : QString();
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthOnlineApiKeyEdit, &QLineEdit::editingFinished, qthMapDialog, [this]() {
+            qthOnlineApiKey = qthOnlineApiKeyEdit ? qthOnlineApiKeyEdit->text().trimmed() : QString();
+            if (!qthOnlineTileUrlTemplate.trimmed().isEmpty()) {
+                qthMapLayer = 2;
+            }
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthOnlineNoDiskCacheCheckbox, &QCheckBox::toggled, qthMapDialog, [this](bool checked) {
+            qthOnlineNoDiskCache = checked;
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthUseOsmButton, &QPushButton::clicked, qthMapDialog, [this]() {
+            const QString providerId =
+                qthOnlineProviderCombo ? qthOnlineProviderCombo->currentData().toString() : qthOnlineProviderId;
+            applyQthOnlineProviderPreset(providerId, true);
+            qthMapLayer = 2;
+            updateQthControls();
+            savePersistentSettings();
+        });
+        connect(qthSelectTilesButton, &QPushButton::clicked, this, &YourClassName::selectQthTileDirectory);
+        connect(qthOpenTilesButton, &QPushButton::clicked, this, &YourClassName::openQthTileDirectory);
+        connect(qthMapSearchEdit, &QLineEdit::returnPressed, this, &YourClassName::applyQthMapSearch);
+        connect(qthMapSearchButton, &QPushButton::clicked, this, &YourClassName::applyQthMapSearch);
+        connect(qthCenterMapButton, &QPushButton::clicked, qthMapDialog, [this]() {
+            if (qthMapWidget) {
+                qthMapWidget->centerOnPosition();
+            }
+        });
+        connect(qthMapWidget, &QthMapWidget::mapZoomChanged, qthMapDialog, [this](int zoom) {
+            qthMapZoom = zoom;
+            updateQthMapControls();
+            savePersistentSettings();
+        });
+        connect(qthMapWidget, &QthMapWidget::userMarkersChanged, qthMapDialog, [this]() {
+            if (qthMapWidget) {
+                qthUserMarkers = qthMapWidget->userMarkerList();
+            }
+            savePersistentSettings();
+        });
+        connect(qthMapWidget,
+                &QthMapWidget::userMarkerAdded,
+                qthMapDialog,
+                [this](double markerLat, double markerLon, const QString &markerLabel, int) {
+                    if (qthMapStatusLabel) {
+                        qthMapStatusLabel->setText(
+                            uiText(QStringLiteral("qth_custom_marker_added"),
+                                   QStringLiteral("Marker: %1  %2, %3"))
+                                .arg(markerLabel,
+                                     QString::number(markerLat, 'f', 6),
+                                     QString::number(markerLon, 'f', 6)));
+                    }
+                });
+        connect(qthMapWidget,
+                &QthMapWidget::userMarkerRemoved,
+                qthMapDialog,
+                [this](double markerLat, double markerLon, const QString &markerLabel, int) {
+                    if (qthMapStatusLabel) {
+                        qthMapStatusLabel->setText(
+                            uiText(QStringLiteral("qth_custom_marker_removed"),
+                                   QStringLiteral("Marker removed: %1  %2, %3"))
+                                .arg(markerLabel,
+                                     QString::number(markerLat, 'f', 6),
+                                     QString::number(markerLon, 'f', 6)));
+                    }
+                });
+        connect(openOsmButton, &QPushButton::clicked, qthMapDialog, [this]() {
+            const QString lat = QString::number(qthLatitude, 'f', 6);
+            const QString lon = QString::number(qthLongitude, 'f', 6);
+            QDesktopServices::openUrl(QUrl(QStringLiteral("https://www.openstreetmap.org/?mlat=%1&mlon=%2#map=12/%1/%2")
+                                               .arg(lat, lon)));
+        });
+        connect(copyButton, &QPushButton::clicked, this, &YourClassName::copyQthLocator);
+        connect(buttonBox, &QDialogButtonBox::rejected, qthMapDialog, &QDialog::close);
+        connect(qthMapDialog, &QObject::destroyed, this, [this]() {
+            qthMapDialog = nullptr;
+            qthMapWidget = nullptr;
+            qthMapLayerCombo = nullptr;
+            qthMapZoomSpin = nullptr;
+            qthGridPrecisionCombo = nullptr;
+            qthTileDirectoryEdit = nullptr;
+            qthOnlineProviderCombo = nullptr;
+            qthOnlineTileUrlEdit = nullptr;
+            qthOnlineAttributionEdit = nullptr;
+            qthOnlineApiKeyEdit = nullptr;
+            qthOnlineNoDiskCacheCheckbox = nullptr;
+            qthSelectTilesButton = nullptr;
+            qthOpenTilesButton = nullptr;
+            qthCenterMapButton = nullptr;
+            qthUseOsmButton = nullptr;
+            qthMapSearchEdit = nullptr;
+            qthMapSearchButton = nullptr;
+            qthMapStatusLabel = nullptr;
+        });
+    }
+
+    updateQthControls();
+    qthMapDialog->show();
+    qthMapDialog->raise();
+    qthMapDialog->activateWindow();
+}
+
+void YourClassName::applyQthMapSearch() {
+    if (!qthMapWidget || !qthMapSearchEdit) {
+        return;
+    }
+
+    const QString query = qthMapSearchEdit->text().trimmed();
+    if (query.isEmpty()) {
+        if (qthMapStatusLabel) {
+            qthMapStatusLabel->setText(uiText(QStringLiteral("qth_search_not_found"),
+                                             QStringLiteral("Search: enter a QTH locator or lat, lon")));
+        }
+        return;
+    }
+
+    bool found = false;
+    double searchLat = 0.0;
+    double searchLon = 0.0;
+    QString label;
+
+    const qth::GeoBounds bounds = qth::maidenheadBounds(query);
+    if (bounds.valid) {
+        searchLat = (bounds.minLatitude + bounds.maxLatitude) * 0.5;
+        searchLon = (bounds.minLongitude + bounds.maxLongitude) * 0.5;
+        label = query.trimmed().toUpper();
+        found = true;
+    }
+
+    if (!found) {
+        const QRegularExpression coordRegex(
+            QStringLiteral("^\\s*([+-]?\\d+(?:[\\.,]\\d+)?)\\s*[,;\\s]+\\s*([+-]?\\d+(?:[\\.,]\\d+)?)\\s*$"));
+        const QRegularExpressionMatch match = coordRegex.match(query);
+        if (match.hasMatch()) {
+            bool latOk = false;
+            bool lonOk = false;
+            searchLat = QString(match.captured(1)).replace(QLatin1Char(','), QLatin1Char('.')).toDouble(&latOk);
+            searchLon = QString(match.captured(2)).replace(QLatin1Char(','), QLatin1Char('.')).toDouble(&lonOk);
+            found = latOk && lonOk && qth::isValidLatitude(searchLat) && qth::isValidLongitude(searchLon);
+            if (found) {
+                label = qth::maidenheadLocator(searchLat, searchLon, 6);
+            }
+        }
+    }
+
+    if (!found) {
+        if (qthMapStatusLabel) {
+            qthMapStatusLabel->setText(uiText(QStringLiteral("qth_search_not_found"),
+                                             QStringLiteral("Search: enter a QTH locator or lat, lon")));
+        }
+        return;
+    }
+
+    qthMapWidget->setSearchMarker(searchLat, searchLon, label);
+    qthMapWidget->centerOn(searchLat, searchLon);
+    if (qthMapStatusLabel) {
+        qthMapStatusLabel->setText(
+            uiText(QStringLiteral("qth_search_result"),
+                   QStringLiteral("Search: %1  %2, %3"))
+                .arg(label,
+                     QString::number(searchLat, 'f', 6),
+                     QString::number(searchLon, 'f', 6)));
+    }
+}
+
+void YourClassName::copyQthLocator() {
+    const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+    if (QClipboard *clipboard = QApplication::clipboard()) {
+        clipboard->setText(locator);
+    }
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(uiText(QStringLiteral("qth_copied"),
+                                       QStringLiteral("QTH copied: %1"))
+                                    .arg(locator));
+    }
+}
+
+void YourClassName::updateGnssSystemSelection() {
+    if (gnssSystemCombo) {
+        const QString selected = gnssSystemCombo->currentData().toString().trimmed();
+        if (!selected.isEmpty()) {
+            gnssSystemId = gnssSystemPreset(selected).id;
+        }
+    }
+    const GnssSystemPreset preset = gnssSystemPreset(gnssSystemId);
+    gnssSystemId = preset.id;
+
+    if (gnssAcquireStatusLabel) {
+        const QString systemName = uiText(preset.textKey, preset.fallbackName);
+        const QString status = preset.acquisitionKind == GnssAcquisitionKind::GpsL1Ca
+                                   ? uiText(QStringLiteral("gnss_acq_selected_gps"),
+                                            QStringLiteral("Acquisition selected: %1, GPS C/A correlator ready"))
+                                         .arg(systemName)
+                                   : uiText(QStringLiteral("gnss_acq_selected_planned"),
+                                            QStringLiteral("Acquisition selected: %1, parser planned; RF tune/scan and IQ logging are ready"))
+                                         .arg(systemName);
+        gnssAcquireStatusLabel->setText(status);
+    }
+}
+
+void YourClassName::applyGnssSystemPresetToReceiver(const QString &systemId) {
+    const GnssSystemPreset preset = gnssSystemPreset(systemId);
+    gnssSystemId = preset.id;
+    if (gnssSystemCombo) {
+        QSignalBlocker blocker(gnssSystemCombo);
+        const int index = gnssSystemCombo->findData(gnssSystemId);
+        if (index >= 0) {
+            gnssSystemCombo->setCurrentIndex(index);
+        }
+    }
+
+    const RadioSettings previousSettings = pendingSettings;
+    pendingSettings.inputMode = INPUT_RF;
+    pendingSettings.centerFrequency = preset.centerHz;
+    pendingSettings.actualFrequency = preset.centerHz;
+    pendingSettings.listeningFrequency = preset.targetHz > 0.0 ? preset.targetHz : preset.centerHz;
+    pendingSettings.bandwidth = preset.bandwidthHz > 0.0 ? preset.bandwidthHz : GNSS_RAW_BANDWIDTH_HZ;
+
+    if (isIdle() && sampleBox) {
+        int bestIndex = -1;
+        double bestRate = 0.0;
+        for (int i = 0; i < sampleBox->count(); ++i) {
+            bool ok = false;
+            const double rate = sampleBox->itemData(i).toDouble(&ok);
+            if (ok &&
+                rate > bestRate &&
+                rate <= GNSS_USEFUL_STANDARD_SPAN_HZ + 0.5) {
+                bestRate = rate;
+                bestIndex = i;
+            }
+        }
+        if (bestIndex >= 0 && std::abs(pendingSettings.sampleRate - bestRate) > 0.5) {
+            pendingSettings.sampleRate = bestRate;
+            QSignalBlocker blocker(sampleBox);
+            sampleBox->setCurrentIndex(bestIndex);
+        }
+    }
+
+    normalizeTuning(pendingSettings);
+    publishSettingsToGlobals();
+    updateUiFromPendingSettings();
+
+    if (runState == RadioRunState::Running && hasActiveFobosDevice()) {
+        applyCenterFrequencyToHardwareIfNeeded(previousSettings, "GNSS system preset");
+        updateIqFrameProducerSettings();
+    }
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+
+    const QString systemName = uiText(preset.textKey, preset.fallbackName);
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(
+            uiText(QStringLiteral("gnss_system_tuned"),
+                   QStringLiteral("%1 tuned: center %2 MHz, target %3 MHz, bandwidth %4 MHz."))
+                .arg(systemName,
+                     QString::number(pendingSettings.centerFrequency / 1000000.0, 'f', 6),
+                     QString::number(pendingSettings.listeningFrequency / 1000000.0, 'f', 6),
+                     QString::number(pendingSettings.bandwidth / 1000000.0, 'f', 3)));
+    }
+    qDebug() << "[GNSS] system preset"
+             << "system" << preset.id
+             << "name" << systemName
+             << "centerHz" << pendingSettings.centerFrequency
+             << "targetHz" << pendingSettings.listeningFrequency
+             << "bandwidthHz" << pendingSettings.bandwidth
+             << "sampleRate" << pendingSettings.sampleRate
+             << "qth" << qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+    savePersistentSettings();
+}
+
+void YourClassName::tuneGnssL1Preset() {
+    updateGnssSystemSelection();
+    applyGnssSystemPresetToReceiver(gnssSystemId);
+}
+
+void YourClassName::applyGnssScanPreset() {
+    updateGnssSystemSelection();
+    const GnssSystemPreset preset = gnssSystemPreset(gnssSystemId);
+    const RadioSettings previousSettings = pendingSettings;
+    const QString systemName = uiText(preset.textKey, preset.fallbackName);
+    const QString agileName = QStringLiteral("GNSS %1 agile").arg(systemName);
+    const QString standardName = QStringLiteral("GNSS %1 standard").arg(systemName);
+    const QString listeningName = QStringLiteral("GNSS %1 listening").arg(systemName);
+    agileScanPresets[agileName] =
+        agileScanPresetSpec(preset.agileScanRangesMhz, GNSS_USEFUL_STANDARD_SPAN_HZ / 1000000.0);
+    if (preset.id != QStringLiteral("all_l1")) {
+        standardScanPresets[standardName] =
+            standardScanPresetSpec(preset.standardScanCentersMhz,
+                                   (std::clamp)(preset.standardDwellMs,
+                                                STANDARD_SCAN_MIN_DWELL_MS,
+                                                STANDARD_SCAN_MAX_DWELL_MS),
+                                   (std::clamp)(preset.standardSettleMs,
+                                                STANDARD_SCAN_MIN_SETTLE_MS,
+                                                STANDARD_SCAN_MAX_SETTLE_MS));
+    }
+
+    agileScanRangesMhz = agileScanPresetRanges(agileScanPresets.value(agileName));
+    agileScanStepMhz = agileScanPresetStepMhz(agileScanPresets.value(agileName), 50.0);
+    if (standardScanPresets.contains(standardName)) {
+        standardScanCentersMhz = standardScanPresetCenters(standardScanPresets.value(standardName));
+        standardScanDwellMs = standardScanPresetDwellMs(standardScanPresets.value(standardName), standardScanDwellMs);
+        standardScanSettleMs = standardScanPresetSettleMs(standardScanPresets.value(standardName), standardScanSettleMs);
+    } else {
+        standardScanCentersMhz = preset.standardScanCentersMhz;
+        standardScanDwellMs = (std::clamp)(preset.standardDwellMs,
+                                           STANDARD_SCAN_MIN_DWELL_MS,
+                                           STANDARD_SCAN_MAX_DWELL_MS);
+        standardScanSettleMs = (std::clamp)(preset.standardSettleMs,
+                                            STANDARD_SCAN_MIN_SETTLE_MS,
+                                            STANDARD_SCAN_MAX_SETTLE_MS);
+    }
+    const QStringList rangeParts = preset.agileScanRangesMhz.split(QLatin1Char('-'));
+    if (rangeParts.size() == 2) {
+        standardScanRangeStartMhz = rangeParts.at(0).trimmed();
+        standardScanRangeEndMhz = rangeParts.at(1).trimmed();
+    }
+    pendingSettings.inputMode = INPUT_RF;
+    pendingSettings.centerFrequency = preset.centerHz;
+    pendingSettings.actualFrequency = preset.centerHz;
+    pendingSettings.listeningFrequency = preset.targetHz > 0.0 ? preset.targetHz : preset.centerHz;
+    pendingSettings.bandwidth = preset.bandwidthHz > 0.0 ? preset.bandwidthHz : GNSS_RAW_BANDWIDTH_HZ;
+    if (preset.id == QStringLiteral("all_l1")) {
+        const QString targets = QStringLiteral("1561.098, 1575.420, 1602.000");
+        listeningScanPresets[listeningName] =
+            listeningScanPresetSpec(targets, preset.standardDwellMs, preset.standardSettleMs);
+        listeningScanTargetsMhz = targets;
+        listeningScanDwellMs = (std::clamp)(preset.standardDwellMs,
+                                            LISTENING_SCAN_MIN_DWELL_MS,
+                                            LISTENING_SCAN_MAX_DWELL_MS);
+        listeningScanSettleMs = (std::clamp)(preset.standardSettleMs,
+                                             LISTENING_SCAN_MIN_SETTLE_MS,
+                                             LISTENING_SCAN_MAX_SETTLE_MS);
+        listeningScanEnabled = true;
+        standardScanEnabled = false;
+        agileScanEnabled = false;
+    } else {
+        listeningScanPresets[listeningName] =
+            listeningScanPresetSpec(QString::number(preset.targetHz / 1000000.0, 'f', 6),
+                                    preset.standardDwellMs,
+                                    preset.standardSettleMs);
+    }
+
+    if (isIdle() && sampleBox) {
+        int bestIndex = -1;
+        double bestRate = 0.0;
+        for (int i = 0; i < sampleBox->count(); ++i) {
+            bool ok = false;
+            const double rate = sampleBox->itemData(i).toDouble(&ok);
+            if (ok &&
+                rate > bestRate &&
+                rate <= GNSS_USEFUL_STANDARD_SPAN_HZ + 0.5) {
+                bestRate = rate;
+                bestIndex = i;
+            }
+        }
+        if (bestIndex >= 0 && std::abs(pendingSettings.sampleRate - bestRate) > 0.5) {
+            pendingSettings.sampleRate = bestRate;
+            QSignalBlocker blocker(sampleBox);
+            sampleBox->setCurrentIndex(bestIndex);
+        }
+    }
+
+    normalizeStandardScanCentersUi(false);
+    normalizeTuning(pendingSettings);
+    publishSettingsToGlobals();
+    updateUiFromPendingSettings();
+    updateFrequencyPresetControls();
+    if (runState == RadioRunState::Running && hasActiveFobosDevice()) {
+        applyCenterFrequencyToHardwareIfNeeded(previousSettings, "GNSS scan preset");
+        updateIqFrameProducerSettings();
+        applyListeningScanSettings(false);
+    } else if (listeningScanEnabled) {
+        applyListeningScanSettings(false);
+    }
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(
+            uiText(QStringLiteral("gnss_scan_applied"),
+                   QStringLiteral("%1 scan preset applied: centers %2, listening targets %3, dwell %4 ms. Use <=50 MHz sample rate on standard firmware."))
+                .arg(systemName,
+                     standardScanCentersMhz,
+                     listeningScanTargetsMhz,
+                     QString::number(listeningScanDwellMs)));
+    }
+    qDebug() << "[GNSS] scan preset"
+             << "system" << preset.id
+             << "name" << systemName
+             << "agileRanges" << agileScanRangesMhz
+             << "agileStepMhz" << agileScanStepMhz
+             << "standardCenters" << standardScanCentersMhz
+             << "standardDwellMs" << standardScanDwellMs
+             << "standardSettleMs" << standardScanSettleMs
+             << "listeningTargets" << listeningScanTargetsMhz
+             << "listeningEnabled" << listeningScanEnabled
+             << "sampleRate" << pendingSettings.sampleRate;
+    savePersistentSettings();
+}
+
+void YourClassName::logGnssRawContext() {
+    const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+    std::vector<float> snapshot;
+    std::uint64_t sequence = 0;
+    const bool haveSnapshot =
+        IqBuffer::snapshotRecent(snapshot, GNSS_QUICK_SNAPSHOT_MAX_FLOATS, &sequence) &&
+        snapshot.size() >= 2;
+    const double measuredSampleRate = IqBuffer::sampleRateEstimate();
+    const double configuredSampleRate = pendingSettings.sampleRate;
+    const bool haveConfiguredSampleRate =
+        std::isfinite(configuredSampleRate) && configuredSampleRate > 0.0;
+    const bool haveMeasuredSampleRate =
+        std::isfinite(measuredSampleRate) && measuredSampleRate > 0.0;
+    double snapshotSampleRate = haveConfiguredSampleRate ? configuredSampleRate : measuredSampleRate;
+    const QString sampleRateSource =
+        haveConfiguredSampleRate ? QStringLiteral("configured") : QStringLiteral("measured");
+    qDebug() << "[GNSS raw]"
+             << "system" << gnssSystemId
+             << "centerHz" << pendingSettings.centerFrequency
+             << "actualHz" << pendingSettings.actualFrequency
+             << "listeningHz" << pendingSettings.listeningFrequency
+             << "sampleRate" << snapshotSampleRate
+             << "sampleRateSource" << sampleRateSource
+             << "configuredSampleRate" << configuredSampleRate
+             << "measuredSampleRate" << measuredSampleRate
+             << "bandwidthHz" << pendingSettings.bandwidth
+             << "gnssIntegrationMs" << gnssAcquisitionIntegrationMs
+             << "gnssChannelFilterCutoffHz" << gnssChannelFilterCutoffHz
+             << "inputMode" << pendingSettings.inputMode
+             << "standardScanCentersMhz" << standardScanCentersMhz
+             << "agileScanRangesMhz" << agileScanRangesMhz
+             << "listeningScanTargetsMhz" << listeningScanTargetsMhz
+             << "listeningScanEnabled" << listeningScanEnabled
+             << "qth" << locator
+             << "lat" << qthLatitude
+             << "lon" << qthLongitude
+             << "snapshotSequence" << sequence
+             << "snapshotFloats" << static_cast<int>(snapshot.size())
+             << "recording" << "GNSS IQ snapshot WAV";
+    if (!haveSnapshot || !std::isfinite(snapshotSampleRate) || snapshotSampleRate <= 0.0) {
+        if (qthStatusLabel) {
+            qthStatusLabel->setText(uiText(QStringLiteral("gnss_raw_no_iq"),
+                                           QStringLiteral("GNSS IQ snapshot: no IQ data yet.")));
+        }
+        return;
+    }
+
+    const int iqSamples = static_cast<int>(snapshot.size() / 2);
+    const quint64 dataBytes64 = static_cast<quint64>(iqSamples) * 2U * sizeof(qint16);
+    if (dataBytes64 == 0 || dataBytes64 > 0xffffffffULL) {
+        if (qthStatusLabel) {
+            qthStatusLabel->setText(uiText(QStringLiteral("gnss_raw_save_failed"),
+                                           QStringLiteral("GNSS IQ snapshot save failed: %1"))
+                                        .arg(QStringLiteral("snapshot is too large")));
+        }
+        return;
+    }
+
+    QDir recordingsDir(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recordings")));
+    if (!recordingsDir.exists() && !recordingsDir.mkpath(QStringLiteral("."))) {
+        if (qthStatusLabel) {
+            qthStatusLabel->setText(uiText(QStringLiteral("gnss_raw_save_failed"),
+                                           QStringLiteral("GNSS IQ snapshot save failed: %1"))
+                                        .arg(QStringLiteral("cannot create recordings folder")));
+        }
+        return;
+    }
+
+    const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+    const QString fileName = QStringLiteral("FobosAPP_%1_gnss_iq.wav").arg(timestamp);
+    const QString wavPath = recordingsDir.filePath(fileName);
+    QFile wavFile(wavPath);
+    if (!wavFile.open(QIODevice::WriteOnly)) {
+        if (qthStatusLabel) {
+            qthStatusLabel->setText(uiText(QStringLiteral("gnss_raw_save_failed"),
+                                           QStringLiteral("GNSS IQ snapshot save failed: %1"))
+                                        .arg(wavFile.errorString()));
+        }
+        return;
+    }
+
+    const int wavRate = static_cast<int>((std::max)(1.0, std::round(snapshotSampleRate)));
+    wavFile.write(fixedPcm16StereoWavHeader(wavRate, static_cast<quint32>(dataBytes64)));
+
+    QByteArray chunk;
+    chunk.reserve(64 * 1024);
+    for (int n = 0; n < iqSamples; ++n) {
+        appendLe16(chunk, static_cast<quint16>(pcm16FromFloat(snapshot[static_cast<std::size_t>(2 * n)])));
+        appendLe16(chunk, static_cast<quint16>(pcm16FromFloat(snapshot[static_cast<std::size_t>(2 * n + 1)])));
+        if (chunk.size() >= 64 * 1024) {
+            wavFile.write(chunk);
+            chunk.clear();
+        }
+    }
+    if (!chunk.isEmpty()) {
+        wavFile.write(chunk);
+    }
+    wavFile.close();
+
+    QJsonObject metadata;
+    metadata["app"] = QStringLiteral("FobosAPP");
+    metadata["mode"] = QStringLiteral("gnss_iq_snapshot");
+    metadata["gnssSystemId"] = gnssSystemId;
+    metadata["fileName"] = fileName;
+    metadata["filePath"] = QFileInfo(wavPath).absoluteFilePath();
+    metadata["recordedAtLocal"] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    metadata["sampleRate"] = snapshotSampleRate;
+    metadata["sampleRateSource"] = sampleRateSource;
+    metadata["configuredSampleRate"] = haveConfiguredSampleRate ? configuredSampleRate : 0.0;
+    metadata["measuredSampleRate"] = haveMeasuredSampleRate ? measuredSampleRate : 0.0;
+    metadata["waveSampleRate"] = wavRate;
+    metadata["iqSamples"] = iqSamples;
+    metadata["dataBytes"] = static_cast<double>(dataBytes64);
+    metadata["snapshotSequence"] = static_cast<double>(sequence);
+    metadata["centerFrequency"] = pendingSettings.centerFrequency;
+    metadata["actualFrequency"] = pendingSettings.actualFrequency;
+    metadata["listeningFrequency"] = pendingSettings.listeningFrequency;
+    metadata["bandwidth"] = pendingSettings.bandwidth;
+    metadata["gnssAcquisitionIntegrationMs"] = gnssAcquisitionIntegrationMs;
+    metadata["gnssChannelFilterCutoffHz"] = gnssChannelFilterCutoffHz;
+    metadata["inputMode"] = pendingSettings.inputMode;
+    metadata["lnaGain"] = pendingSettings.lnaGain;
+    metadata["vgaGain"] = pendingSettings.vgaGain;
+    metadata["qth"] = locator;
+    metadata["latitude"] = qthLatitude;
+    metadata["longitude"] = qthLongitude;
+
+    const QString jsonPath =
+        recordingsDir.filePath(QFileInfo(fileName).completeBaseName() + QStringLiteral(".json"));
+    QFile jsonFile(jsonPath);
+    if (jsonFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        jsonFile.write(QJsonDocument(metadata).toJson(QJsonDocument::Indented));
+        jsonFile.close();
+    } else {
+        qDebug() << "[GNSS raw] failed to write sidecar"
+                 << jsonPath
+                 << jsonFile.errorString();
+    }
+
+    qDebug() << "[GNSS raw saved]"
+             << "path" << wavPath
+             << "json" << jsonPath
+             << "sampleRate" << snapshotSampleRate
+             << "sampleRateSource" << sampleRateSource
+             << "measuredSampleRate" << measuredSampleRate
+             << "iqSamples" << iqSamples
+             << "dataBytes" << dataBytes64;
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(uiText(QStringLiteral("gnss_raw_saved"),
+                                       QStringLiteral("GNSS IQ snapshot saved: %1"))
+                                    .arg(fileName));
+    }
+}
+
+bool YourClassName::isGnssMonitorActive() const {
+    return gnssMonitorEnabled &&
+           (!gnssMonitorCheckbox || gnssMonitorCheckbox->isChecked());
+}
+
+void YourClassName::resetGnssMonitor() {
+    gnssSignalMonitor.reset();
+    gnssMonitorSnapshotTimer.invalidate();
+    gnssMonitorLogTimer.invalidate();
+    gnssMonitorUiTimer.invalidate();
+    if (gnssMonitorStatusLabel) {
+        gnssMonitorStatusLabel->setText(isGnssMonitorActive()
+                                            ? uiText(QStringLiteral("gnss_iq_monitor_waiting"),
+                                                     QStringLiteral("GNSS IQ monitor: waiting for IQ samples"))
+                                            : uiText(QStringLiteral("gnss_iq_monitor_idle"),
+                                                     QStringLiteral("GNSS IQ monitor: off")));
+    }
+    qDebug() << "[GNSS IQ] monitor reset"
+             << "enabled" << isGnssMonitorActive()
+             << "centerHz" << pendingSettings.centerFrequency
+             << "sampleRate" << pendingSettings.sampleRate;
+}
+
+void YourClassName::processGnssIqSnapshot(const RadioSettings &settings) {
+    if (!isGnssMonitorActive()) {
+        return;
+    }
+    if (gnssMonitorSnapshotTimer.isValid() &&
+        gnssMonitorSnapshotTimer.elapsed() < 500) {
+        return;
+    }
+    gnssMonitorSnapshotTimer.restart();
+
+    std::vector<float> snapshot;
+    std::uint64_t sequence = 0;
+    if (!IqBuffer::snapshotRecent(snapshot, GNSS_QUICK_SNAPSHOT_MAX_FLOATS, &sequence) ||
+        snapshot.size() < 4) {
+        return;
+    }
+    if (sequence != 0 && sequence == gnssSignalMonitor.lastSnapshotSequence()) {
+        return;
+    }
+
+    double sampleRate = settings.sampleRate;
+    if (!std::isfinite(sampleRate) || sampleRate <= 0.0) {
+        sampleRate = IqBuffer::sampleRateEstimate();
+    }
+    const GnssSignalReport report =
+        gnssSignalMonitor.analyzeFloatSnapshot(snapshot, sampleRate, settings, sequence);
+    updateGnssMonitorStatus(report);
+}
+
+void YourClassName::processGnssPackedIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount) {
+    if (!isGnssMonitorActive() || iqData.isEmpty()) {
+        return;
+    }
+    const bool channelized = sampleCount > 0 && iqData.size() >= sampleCount * 4;
+    RadioSettings settings = pendingSettings;
+    settings.sampleRate = sampleRate > 0.0 ? sampleRate : settings.sampleRate;
+    if (channelized) {
+        settings.centerFrequency = pendingSettings.listeningFrequency;
+        settings.actualFrequency = pendingSettings.listeningFrequency;
+    }
+    const GnssSignalReport report =
+        gnssSignalMonitor.analyzePackedIqFrame(iqData,
+                                               settings.sampleRate,
+                                               sampleCount,
+                                               channelized,
+                                               settings);
+    updateGnssMonitorStatus(report);
+}
+
+void YourClassName::updateGnssMonitorStatus(const GnssSignalReport &report, bool forceLog) {
+    if (!report.valid) {
+        return;
+    }
+
+    const bool updateUi =
+        forceLog ||
+        !gnssMonitorUiTimer.isValid() ||
+        gnssMonitorUiTimer.elapsed() >= 500;
+    if (updateUi) {
+        gnssMonitorUiTimer.restart();
+        if (gnssMonitorStatusLabel) {
+            const double centerMhz = report.centerFrequency / 1000000.0;
+            const double rateMhz = report.sampleRate / 1000000.0;
+            const QString source = report.fromSnapshot
+                                       ? uiText(QStringLiteral("live_snapshot"),
+                                                QStringLiteral("live snapshot"))
+                                       : uiText(QStringLiteral("iq_frame"),
+                                                QStringLiteral("IQ frame"));
+            QString statusText = uiText(
+                QStringLiteral("gnss_iq_monitor_status"),
+                QStringLiteral("%1: %2, center %3 MHz, rate %4 MHz, RMS %5 dBFS, peak %6 dBFS, DC/RMS %7 dB, clip %8%, I/Q %9 dB, frames %10"));
+            statusText = statusText.arg(source)
+                             .arg(report.sampleFormat)
+                             .arg(QString::number(centerMhz, 'f', 6))
+                             .arg(QString::number(rateMhz, 'f', 3))
+                             .arg(QString::number(report.rmsDbfs, 'f', 1))
+                             .arg(QString::number(report.peakDbfs, 'f', 1))
+                             .arg(QString::number(report.dcToRmsDb, 'f', 1))
+                             .arg(QString::number(report.clippingPercent, 'f', 3))
+                             .arg(QString::number(report.iqBalanceDb, 'f', 1))
+                             .arg(QString::number(report.frames));
+            gnssMonitorStatusLabel->setText(statusText);
+        }
+    }
+
+    if (forceLog ||
+        !gnssMonitorLogTimer.isValid() ||
+        gnssMonitorLogTimer.elapsed() >= 3000) {
+        gnssMonitorLogTimer.restart();
+        qDebug() << "[GNSS IQ]"
+                 << "source" << (report.fromSnapshot ? "snapshot" : "frame")
+                 << "format" << report.sampleFormat
+                 << "frames" << report.frames
+                 << "samples" << report.samples
+                 << "sampleRate" << report.sampleRate
+                 << "centerHz" << report.centerFrequency
+                 << "listeningHz" << report.listeningFrequency
+                 << "rmsDbfs" << report.rmsDbfs
+                 << "peakDbfs" << report.peakDbfs
+                 << "dcDbfs" << report.dcDbfs
+                 << "dcToRmsDb" << report.dcToRmsDb
+                 << "clipPercent" << report.clippingPercent
+                 << "crestDb" << report.crestDb
+                 << "iqBalanceDb" << report.iqBalanceDb
+                 << "meanI" << report.meanI
+                 << "meanQ" << report.meanQ;
+    }
+}
+
+void YourClassName::requestGnssNetworkTime() {
+    if (!gnssNtpSocket) {
+        return;
+    }
+
+    QByteArray packet(48, '\0');
+    packet[0] = static_cast<char>(0x1b);
+    gnssNtpSocket->abort();
+    gnssNtpSocket->setProperty("ntpPending", true);
+    if (gnssAcquireStatusLabel) {
+        gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_ntp_querying"),
+                                              QStringLiteral("NTP UTC: querying pool.ntp.org")));
+    }
+
+    const QString server = QStringLiteral("pool.ntp.org");
+    const QHostInfo hostInfo = QHostInfo::fromName(server);
+    QHostAddress serverAddress;
+    if (hostInfo.error() == QHostInfo::NoError) {
+        const QList<QHostAddress> addresses = hostInfo.addresses();
+        for (const QHostAddress &address : addresses) {
+            if (address.protocol() == QAbstractSocket::IPv4Protocol) {
+                serverAddress = address;
+                break;
+            }
+        }
+        if (serverAddress.isNull() && !addresses.isEmpty()) {
+            serverAddress = addresses.first();
+        }
+    }
+
+    if (serverAddress.isNull()) {
+        gnssNtpSocket->setProperty("ntpPending", false);
+        const QString errorText =
+            uiText(QStringLiteral("gnss_ntp_lookup_failed"),
+                   QStringLiteral("NTP UTC: DNS lookup failed for %1"))
+                .arg(server);
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(errorText);
+        }
+        qDebug() << "[GNSS NTP] lookup failed"
+                 << "server" << server
+                 << "error" << hostInfo.errorString();
+        return;
+    }
+
+    const qint64 written = gnssNtpSocket->writeDatagram(packet, serverAddress, 123);
+    if (written < 0) {
+        gnssNtpSocket->setProperty("ntpPending", false);
+        const QString errorText =
+            uiText(QStringLiteral("gnss_ntp_send_failed"),
+                   QStringLiteral("NTP UTC: request send failed: %1"))
+                .arg(gnssNtpSocket->errorString());
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(errorText);
+        }
+        qDebug() << "[GNSS NTP] send failed"
+                 << "server" << server
+                 << "address" << serverAddress.toString()
+                 << "error" << gnssNtpSocket->errorString();
+        return;
+    }
+
+    QTimer::singleShot(3500, this, [this]() {
+        if (!gnssNtpSocket || !gnssNtpSocket->property("ntpPending").toBool()) {
+            return;
+        }
+        gnssNtpSocket->setProperty("ntpPending", false);
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(
+                uiText(QStringLiteral("gnss_ntp_timeout"),
+                       QStringLiteral("NTP UTC: no response; network or UDP/123 may be blocked")));
+        }
+        qDebug() << "[GNSS NTP] timeout";
+    });
+
+    qDebug() << "[GNSS NTP] query"
+             << "bytes" << written
+             << "server" << server
+             << "address" << serverAddress.toString();
+}
+
+void YourClassName::handleGnssNetworkTimeResponse() {
+    if (!gnssNtpSocket) {
+        return;
+    }
+    while (gnssNtpSocket->hasPendingDatagrams()) {
+        gnssNtpSocket->setProperty("ntpPending", false);
+        QByteArray datagram;
+        datagram.resize(static_cast<int>(gnssNtpSocket->pendingDatagramSize()));
+        gnssNtpSocket->readDatagram(datagram.data(), datagram.size());
+        if (datagram.size() < 48) {
+            continue;
+        }
+        auto byteAt = [&datagram](int index) -> quint32 {
+            return static_cast<quint8>(datagram.at(index));
+        };
+        const quint32 seconds =
+            (byteAt(40) << 24) | (byteAt(41) << 16) | (byteAt(42) << 8) | byteAt(43);
+        const quint32 fraction =
+            (byteAt(44) << 24) | (byteAt(45) << 16) | (byteAt(46) << 8) | byteAt(47);
+        constexpr quint64 kNtpUnixEpochDeltaSeconds = 2208988800ULL;
+        if (seconds < kNtpUnixEpochDeltaSeconds) {
+            continue;
+        }
+        const qint64 unixSeconds = static_cast<qint64>(seconds - kNtpUnixEpochDeltaSeconds);
+        const qint64 unixMillis =
+            unixSeconds * 1000LL +
+            static_cast<qint64>((static_cast<double>(fraction) * 1000.0) / 4294967296.0);
+        const QDateTime networkUtc = QDateTime::fromMSecsSinceEpoch(unixMillis, Qt::UTC);
+        const qint64 localOffsetMs =
+            networkUtc.msecsTo(QDateTime::currentDateTimeUtc());
+        const QString text =
+            uiText(QStringLiteral("gnss_ntp_result"),
+                   QStringLiteral("NTP UTC: %1, local offset %2 ms"))
+                .arg(networkUtc.toString(Qt::ISODateWithMs),
+                     QString::number(localOffsetMs));
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(text);
+        }
+        qDebug() << "[GNSS NTP] result"
+                 << "utc" << networkUtc.toString(Qt::ISODateWithMs)
+                 << "localOffsetMs" << localOffsetMs;
+    }
+}
+
+void YourClassName::updateGnssAcquisitionPlot(const GnssAcquisitionResult &result) {
+    if (!gnssAcquisitionPlotLabel) {
+        return;
+    }
+
+    const int width = (std::max)(520, gnssAcquisitionPlotLabel->width());
+    const int height = 220;
+    QPixmap pixmap(width, height);
+    pixmap.fill(QColor(18, 22, 27));
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(QColor(210, 218, 224));
+    painter.setFont(QFont(QStringLiteral("Segoe UI"), 8));
+
+    const QRect heatRect(42, 22, width - 74, 88);
+    const QRect corrRect(42, 128, width - 220, 68);
+    const QRect histRect(width - 150, 128, 118, 68);
+
+    painter.drawText(heatRect.left(), 14, QStringLiteral("GPS acquisition PRN x Doppler"));
+    painter.drawText(corrRect.left(), 122, QStringLiteral("Best code-phase correlation"));
+    painter.drawText(histRect.left(), 122, QStringLiteral("Peak history"));
+
+    const int dopplerCount = result.dopplerBinsHz.size();
+    const int metricCount = result.prnDopplerMetricDb.size();
+    const bool haveHeatmap = dopplerCount > 0 && metricCount >= 32 * dopplerCount;
+    if (haveHeatmap) {
+        double minMetric = std::numeric_limits<double>::max();
+        double maxMetric = -std::numeric_limits<double>::max();
+        for (const double value : result.prnDopplerMetricDb) {
+            if (!std::isfinite(value)) {
+                continue;
+            }
+            minMetric = (std::min)(minMetric, value);
+            maxMetric = (std::max)(maxMetric, value);
+        }
+        if (!std::isfinite(minMetric) || !std::isfinite(maxMetric) || maxMetric <= minMetric) {
+            minMetric = 0.0;
+            maxMetric = 20.0;
+        }
+        for (int prn = 0; prn < 32; ++prn) {
+            const int y0 = heatRect.top() + (prn * heatRect.height()) / 32;
+            const int y1 = heatRect.top() + ((prn + 1) * heatRect.height()) / 32;
+            for (int doppler = 0; doppler < dopplerCount; ++doppler) {
+                const int x0 = heatRect.left() + (doppler * heatRect.width()) / dopplerCount;
+                const int x1 = heatRect.left() + ((doppler + 1) * heatRect.width()) / dopplerCount;
+                const double value = result.prnDopplerMetricDb.at(prn * dopplerCount + doppler);
+                painter.fillRect(QRect(QPoint(x0, y0), QPoint((std::max)(x0, x1 - 1), (std::max)(y0, y1 - 1))),
+                                 gnssHeatColor(value, minMetric, maxMetric));
+            }
+        }
+        painter.setPen(QColor(130, 142, 154));
+        painter.drawRect(heatRect);
+        painter.drawText(4, heatRect.top() + 12, QStringLiteral("PRN 1"));
+        painter.drawText(4, heatRect.bottom(), QStringLiteral("PRN 32"));
+        painter.drawText(heatRect.left(), heatRect.bottom() + 14,
+                         QStringLiteral("%1 Hz").arg(result.dopplerBinsHz.first(), 0, 'f', 0));
+        painter.drawText(heatRect.right() - 60, heatRect.bottom() + 14,
+                         QStringLiteral("%1 Hz").arg(result.dopplerBinsHz.last(), 0, 'f', 0));
+        painter.drawText(heatRect.center().x() - 28, heatRect.bottom() + 14, QStringLiteral("Doppler"));
+        painter.drawText(heatRect.right() - 92, 14,
+                         QStringLiteral("%1..%2 dB").arg(minMetric, 0, 'f', 1).arg(maxMetric, 0, 'f', 1));
+    } else {
+        painter.setPen(QColor(120, 130, 140));
+        painter.drawRect(heatRect);
+        painter.drawText(heatRect.adjusted(8, 8, -8, -8),
+                         Qt::AlignCenter,
+                         uiText(QStringLiteral("gnss_acq_plot_waiting"),
+                                QStringLiteral("Run GPS C/A accumulation to draw correlation diagnostics.")));
+    }
+
+    painter.setPen(QColor(130, 142, 154));
+    painter.drawRect(corrRect);
+    if (!result.bestCorrelationProfileDb.isEmpty()) {
+        QPolygonF polyline;
+        polyline.reserve(result.bestCorrelationProfileDb.size());
+        constexpr double minDb = -36.0;
+        constexpr double maxDb = 0.0;
+        for (int i = 0; i < result.bestCorrelationProfileDb.size(); ++i) {
+            const double x = corrRect.left() +
+                             (static_cast<double>(i) / (std::max)(1, result.bestCorrelationProfileDb.size() - 1)) *
+                                 corrRect.width();
+            const double clamped = (std::clamp)(static_cast<double>(result.bestCorrelationProfileDb.at(i)), minDb, maxDb);
+            const double y = corrRect.bottom() -
+                             ((clamped - minDb) / (maxDb - minDb)) * corrRect.height();
+            polyline << QPointF(x, y);
+        }
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(QPen(QColor(250, 205, 80), 1.5));
+        painter.drawPolyline(polyline);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        if (!result.topCandidates.isEmpty()) {
+            const GnssAcquisitionCandidate best = result.topCandidates.first();
+            const int x = corrRect.left() +
+                          (best.codePhaseSamples * corrRect.width()) /
+                              (std::max)(1, result.bestCorrelationProfileDb.size());
+            painter.setPen(QPen(QColor(255, 255, 255, 180), 1));
+            painter.drawLine(x, corrRect.top(), x, corrRect.bottom());
+        }
+    }
+
+    painter.setPen(QColor(130, 142, 154));
+    painter.drawRect(histRect);
+    if (!gnssPeakToSecondHistoryDb.isEmpty()) {
+        QPolygonF polyline;
+        const int n = gnssPeakToSecondHistoryDb.size();
+        for (int i = 0; i < n; ++i) {
+            const double value = (std::clamp)(gnssPeakToSecondHistoryDb.at(i), 0.0, 24.0);
+            const double x = histRect.left() + (static_cast<double>(i) / (std::max)(1, n - 1)) * histRect.width();
+            const double y = histRect.bottom() - (value / 24.0) * histRect.height();
+            polyline << QPointF(x, y);
+        }
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(QPen(QColor(125, 220, 135), 1.6));
+        painter.drawPolyline(polyline);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        painter.setPen(QColor(170, 180, 190));
+        painter.drawText(histRect.left(), histRect.top() + 12, QStringLiteral("24 dB"));
+        painter.drawText(histRect.left(), histRect.bottom() - 2, QStringLiteral("0"));
+    }
+
+    if (!result.topCandidates.isEmpty()) {
+        const GnssAcquisitionCandidate best = result.topCandidates.first();
+        const double metricDb = 10.0 * std::log10((std::max)(best.metric, std::numeric_limits<double>::min()));
+        const double peakToSecondDb = 10.0 * std::log10((std::max)(best.peakToSecond, std::numeric_limits<double>::min()));
+        painter.setPen(QColor(225, 230, 235));
+        painter.drawText(heatRect.left(), height - 8,
+                         QStringLiteral("Best PRN %1  Doppler %2 Hz  Code %3  Metric %4 dB  Peak2 %5 dB")
+                             .arg(best.prn)
+                             .arg(best.dopplerHz, 0, 'f', 0)
+                             .arg(best.codePhaseSamples)
+                             .arg(metricDb, 0, 'f', 1)
+                             .arg(peakToSecondDb, 0, 'f', 1));
+    }
+
+    gnssAcquisitionPlotLabel->setPixmap(pixmap);
+}
+
+void YourClassName::runGnssAcquisitionTest() {
+    if (gnssAcquisitionRunning) {
+        return;
+    }
+
+    updateGnssSystemSelection();
+    if (gnssIntegrationSpin) {
+        gnssAcquisitionIntegrationMs =
+            (std::clamp)(gnssIntegrationSpin->value(),
+                         GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                         GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    }
+    if (gnssChannelFilterSpin) {
+        const double cutoffHz = gnssChannelFilterSpin->value() * 1000000.0;
+        gnssChannelFilterCutoffHz =
+            (std::clamp)(std::isfinite(cutoffHz) ? cutoffHz : 1800000.0,
+                         GNSS_CHANNEL_FILTER_MIN_HZ,
+                         GNSS_CHANNEL_FILTER_MAX_HZ);
+    }
+    if (gnssDopplerSpanSpin) {
+        gnssDopplerSpanHz = (std::clamp)(gnssDopplerSpanSpin->value(), 1, 50) * 1000;
+    }
+    if (gnssDopplerStepSpin) {
+        gnssDopplerStepHz = (std::clamp)(gnssDopplerStepSpin->value(), 250, 5000);
+    }
+    const GnssSystemPreset selectedPreset = gnssSystemPreset(gnssSystemId);
+    const bool allSystemsMode = selectedPreset.id == QStringLiteral("all_l1");
+    const GnssSystemPreset acquisitionPreset =
+        allSystemsMode ? gnssSystemPreset(QStringLiteral("gps_l1_ca")) : selectedPreset;
+    const QString selectedName = uiText(selectedPreset.textKey, selectedPreset.fallbackName);
+    const QString acquisitionName = uiText(acquisitionPreset.textKey, acquisitionPreset.fallbackName);
+    if (acquisitionPreset.acquisitionKind != GnssAcquisitionKind::GpsL1Ca) {
+        const QString status =
+            uiText(QStringLiteral("gnss_acq_not_implemented"),
+                   QStringLiteral("%1 acquisition parser is not implemented yet. RF tune/scan, IQ monitor and IQ saving are ready."))
+                .arg(selectedName);
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(status);
+        }
+        qDebug() << "[GNSS acquisition] skipped"
+                 << "system" << selectedPreset.id
+                 << "name" << selectedName
+                 << "reason" << "parser-not-implemented";
+        return;
+    }
+
+    const double measuredSampleRate = IqBuffer::sampleRateEstimate();
+    const double configuredSampleRate = pendingSettings.sampleRate;
+    const bool haveConfiguredSampleRate =
+        std::isfinite(configuredSampleRate) && configuredSampleRate > 0.0;
+    const bool haveMeasuredSampleRate =
+        std::isfinite(measuredSampleRate) && measuredSampleRate > 0.0;
+    double sampleRate = haveConfiguredSampleRate ? configuredSampleRate : measuredSampleRate;
+    const QString sampleRateSource =
+        haveConfiguredSampleRate ? QStringLiteral("configured") : QStringLiteral("measured");
+    const double centerFrequency = pendingSettings.centerFrequency > 0.0
+                                       ? pendingSettings.centerFrequency
+                                       : pendingSettings.actualFrequency;
+    const double targetFrequency = acquisitionPreset.targetHz;
+    if (!std::isfinite(sampleRate) || sampleRate <= 0.0 ||
+        !std::isfinite(centerFrequency) || centerFrequency <= 0.0 ||
+        !std::isfinite(targetFrequency) || targetFrequency <= 0.0) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gps_ca_scan_no_iq"),
+                                                  QStringLiteral("GPS C/A accumulation: no IQ snapshot yet")));
+        }
+        return;
+    }
+    const double targetOffsetHz = targetFrequency - centerFrequency;
+    if (std::abs(targetOffsetHz) > sampleRate * 0.48) {
+        const QString status =
+            uiText(QStringLiteral("gnss_acq_target_out_of_span"),
+                   QStringLiteral("%1 target %2 MHz is outside the current IQ span. Tune this system or wait for its scan center."))
+                .arg(acquisitionName,
+                     QString::number(targetFrequency / 1000000.0, 'f', 6));
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(status);
+        }
+        qDebug() << "[GNSS acquisition] skipped"
+                 << "system" << selectedPreset.id
+                 << "acquisitionSystem" << acquisitionPreset.id
+                 << "targetHz" << targetFrequency
+                 << "centerHz" << centerFrequency
+                 << "sampleRate" << sampleRate
+                 << "sampleRateSource" << sampleRateSource
+                 << "configuredSampleRate" << configuredSampleRate
+                 << "measuredSampleRate" << measuredSampleRate
+                 << "reason" << "target-out-of-span";
+        return;
+    }
+
+    const int requestedIntegrationMs =
+        (std::clamp)(gnssAcquisitionIntegrationMs,
+                     GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                     GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    const QString acquisitionSource =
+        requestedIntegrationMs >= GNSS_DEEP_ACQUISITION_MS
+            ? QStringLiteral("deep-live")
+            : QStringLiteral("live");
+    gnssAcquisitionSource = acquisitionSource;
+    const double requestedIqSamplesDouble =
+        std::ceil((sampleRate * static_cast<double>(requestedIntegrationMs)) / 1000.0) +
+        8192.0;
+    const std::size_t requestedSnapshotFloats =
+        static_cast<std::size_t>((std::max)(8192.0, requestedIqSamplesDouble)) * 2U;
+    std::vector<float> snapshot;
+    std::uint64_t sequence = 0;
+    if (!IqBuffer::snapshotRecent(snapshot, requestedSnapshotFloats, &sequence) ||
+        snapshot.size() < 2 * 4092) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gps_ca_scan_no_iq"),
+                                                  QStringLiteral("GPS C/A accumulation: no IQ snapshot yet")));
+        }
+        return;
+    }
+    const double snapshotMs =
+        (static_cast<double>(snapshot.size() / 2) / sampleRate) * 1000.0;
+
+    auto cancelFlag = std::make_shared<std::atomic_bool>(false);
+    gnssAcquisitionCancelFlag = cancelFlag;
+    gnssAcquisitionRunning = true;
+    if (gnssAcquireButton) {
+        gnssAcquireButton->setEnabled(false);
+    }
+    if (gnssDeepAcquireButton) {
+        gnssDeepAcquireButton->setEnabled(false);
+    }
+    if (gnssOfflineAcquireButton) {
+        gnssOfflineAcquireButton->setEnabled(false);
+    }
+    if (gnssSelfTestButton) {
+        gnssSelfTestButton->setEnabled(false);
+    }
+    if (gnssAcquireStatusLabel) {
+        gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gps_ca_scan_running"),
+                                              QStringLiteral("GPS C/A accumulation: running")));
+    }
+
+    qDebug() << "[GNSS acquisition] start"
+             << "system" << selectedPreset.id
+             << "systemName" << selectedName
+             << "acquisitionSystem" << acquisitionPreset.id
+             << "acquisitionName" << acquisitionName
+             << "sequence" << sequence
+             << "inputSamples" << static_cast<int>(snapshot.size() / 2)
+             << "snapshotMs" << snapshotMs
+             << "requestedSnapshotFloats" << static_cast<qulonglong>(requestedSnapshotFloats)
+             << "sampleRate" << sampleRate
+             << "sampleRateSource" << sampleRateSource
+             << "configuredSampleRate" << configuredSampleRate
+             << "measuredSampleRate" << measuredSampleRate
+             << "centerHz" << centerFrequency
+             << "targetHz" << targetFrequency
+             << "requestedIntegrationMs" << requestedIntegrationMs
+             << "channelFilterCutoffHz" << gnssChannelFilterCutoffHz
+             << "dopplerMinHz" << -gnssDopplerSpanHz
+             << "dopplerMaxHz" << gnssDopplerSpanHz
+             << "dopplerStepHz" << gnssDopplerStepHz;
+
+    QPointer<YourClassName> self(this);
+    QtConcurrent::run([self,
+                       snapshot = std::move(snapshot),
+                       sampleRate,
+                       centerFrequency,
+                       targetFrequency,
+                       integrationMs = requestedIntegrationMs,
+                       channelFilterCutoffHz = gnssChannelFilterCutoffHz,
+                       dopplerSpanHz = gnssDopplerSpanHz,
+                       dopplerStepHz = gnssDopplerStepHz,
+                       acquisitionSource,
+                       cancelFlag]() mutable {
+        QElapsedTimer acquisitionTimer;
+        acquisitionTimer.start();
+        GnssAcquisitionResult result =
+            GnssAcquisition::acquireGpsL1Ca(snapshot,
+                                           sampleRate,
+                                           centerFrequency,
+                                           targetFrequency,
+                                           integrationMs,
+                                           channelFilterCutoffHz,
+                                           cancelFlag.get(),
+                                           -dopplerSpanHz,
+                                           dopplerSpanHz,
+                                           dopplerStepHz);
+        result.processingElapsedMs = acquisitionTimer.elapsed();
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self.data(), [self, result, acquisitionSource, cancelFlag]() {
+            if (!self) {
+                return;
+            }
+            self->gnssAcquisitionRunning = false;
+            if (self->gnssAcquisitionCancelFlag == cancelFlag) {
+                self->gnssAcquisitionCancelFlag.reset();
+            }
+            if (self->gnssAcquireButton) {
+                self->gnssAcquireButton->setEnabled(true);
+            }
+            if (self->gnssDeepAcquireButton) {
+                self->gnssDeepAcquireButton->setEnabled(true);
+            }
+            if (self->gnssOfflineAcquireButton) {
+                self->gnssOfflineAcquireButton->setEnabled(true);
+            }
+            if (self->gnssSelfTestButton) {
+                self->gnssSelfTestButton->setEnabled(true);
+            }
+            self->gnssAcquisitionSource = acquisitionSource;
+            self->updateGnssAcquisitionStatus(result);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void YourClassName::runGnssDeepAcquisitionTest() {
+    if (gnssAcquisitionRunning) {
+        return;
+    }
+    gnssAcquisitionIntegrationMs = GNSS_DEEP_ACQUISITION_MS;
+    if (gnssIntegrationSpin) {
+        QSignalBlocker blocker(gnssIntegrationSpin);
+        gnssIntegrationSpin->setValue(gnssAcquisitionIntegrationMs);
+    }
+    qDebug() << "[GNSS acquisition] deep requested"
+             << "integrationMs" << gnssAcquisitionIntegrationMs;
+    savePersistentSettings();
+    runGnssAcquisitionTest();
+}
+
+void YourClassName::runGnssOfflineReplayTest() {
+    if (gnssAcquisitionRunning) {
+        return;
+    }
+
+    const QString path = selectedPlaybackFilePath();
+    if (path.isEmpty()) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_replay_no_file"),
+                                                  QStringLiteral("GNSS replay: select a Channel IQ WAV recording.")));
+        }
+        return;
+    }
+
+    PlaybackManager::WavInfo info;
+    QString errorMessage;
+    if (!PlaybackManager::readWavInfo(path, info, &errorMessage) ||
+        info.mode != PlaybackManager::Mode::ChannelIqWav ||
+        info.channels != 2 ||
+        info.bitsPerSample != 16 ||
+        info.sampleRate <= 0) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_replay_bad_file"),
+                                                  QStringLiteral("GNSS replay: selected file is not a supported stereo IQ WAV.")));
+        }
+        qDebug() << "[GNSS replay] bad file" << path << errorMessage;
+        return;
+    }
+
+    updateGnssSystemSelection();
+    if (gnssIntegrationSpin) {
+        gnssAcquisitionIntegrationMs =
+            (std::clamp)(gnssIntegrationSpin->value(),
+                         GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                         GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    }
+    if (gnssChannelFilterSpin) {
+        const double cutoffHz = gnssChannelFilterSpin->value() * 1000000.0;
+        gnssChannelFilterCutoffHz =
+            (std::clamp)(std::isfinite(cutoffHz) ? cutoffHz : 1800000.0,
+                         GNSS_CHANNEL_FILTER_MIN_HZ,
+                         GNSS_CHANNEL_FILTER_MAX_HZ);
+    }
+    if (gnssDopplerSpanSpin) {
+        gnssDopplerSpanHz = (std::clamp)(gnssDopplerSpanSpin->value(), 1, 50) * 1000;
+    }
+    if (gnssDopplerStepSpin) {
+        gnssDopplerStepHz = (std::clamp)(gnssDopplerStepSpin->value(), 250, 5000);
+    }
+
+    const GnssSystemPreset selectedPreset = gnssSystemPreset(gnssSystemId);
+    const GnssSystemPreset acquisitionPreset =
+        selectedPreset.id == QStringLiteral("all_l1")
+            ? gnssSystemPreset(QStringLiteral("gps_l1_ca"))
+            : selectedPreset;
+    const QString acquisitionName = uiText(acquisitionPreset.textKey, acquisitionPreset.fallbackName);
+    if (acquisitionPreset.acquisitionKind != GnssAcquisitionKind::GpsL1Ca) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(
+                uiText(QStringLiteral("gnss_acq_not_implemented"),
+                       QStringLiteral("%1 acquisition parser is not implemented yet. RF tune/scan, IQ monitor and IQ saving are ready."))
+                    .arg(acquisitionName));
+        }
+        return;
+    }
+
+    double centerFrequency = 0.0;
+    double targetFrequency = acquisitionPreset.targetHz;
+    QFileInfo wavInfo(path);
+    const QString sidecarPath = wavInfo.dir().filePath(wavInfo.completeBaseName() + QStringLiteral(".json"));
+    QFile sidecar(sidecarPath);
+    if (sidecar.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        const QJsonDocument document = QJsonDocument::fromJson(sidecar.readAll());
+        if (document.isObject()) {
+            const QJsonObject metadata = document.object();
+            centerFrequency = metadata.value(QStringLiteral("centerFrequency")).toDouble(centerFrequency);
+            const double listening = metadata.value(QStringLiteral("listeningFrequency")).toDouble(0.0);
+            if (centerFrequency <= 0.0 && listening > 0.0) {
+                centerFrequency = listening;
+            }
+            const QString sidecarSystem = metadata.value(QStringLiteral("gnssSystemId")).toString();
+            if (!sidecarSystem.isEmpty() && gnssSystemCombo && gnssSystemCombo->findData(sidecarSystem) >= 0) {
+                gnssSystemId = sidecarSystem;
+                updateGnssSystemSelection();
+            }
+        }
+    }
+    if (centerFrequency <= 0.0 && info.hasRadioSettings) {
+        const bool looksLikeChannelIq =
+            info.radioSettings.sampleRate > 0.0 &&
+            std::abs(static_cast<double>(info.sampleRate) - info.radioSettings.sampleRate) > 0.5;
+        centerFrequency = looksLikeChannelIq && info.radioSettings.listeningFrequency > 0.0
+                              ? info.radioSettings.listeningFrequency
+                              : info.radioSettings.centerFrequency;
+    }
+    if (centerFrequency <= 0.0) {
+        centerFrequency = pendingSettings.centerFrequency > 0.0
+                              ? pendingSettings.centerFrequency
+                              : pendingSettings.listeningFrequency;
+    }
+
+    const double sampleRate = static_cast<double>(info.sampleRate);
+    if (!std::isfinite(centerFrequency) || centerFrequency <= 0.0 ||
+        !std::isfinite(targetFrequency) || targetFrequency <= 0.0 ||
+        std::abs(targetFrequency - centerFrequency) > sampleRate * 0.48) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(
+                uiText(QStringLiteral("gnss_acq_target_out_of_span"),
+                       QStringLiteral("%1 target %2 MHz is outside the current IQ span. Tune this system or wait for its scan center."))
+                    .arg(acquisitionName,
+                         QString::number(targetFrequency / 1000000.0, 'f', 6)));
+        }
+        qDebug() << "[GNSS replay] target out of span"
+                 << "path" << path
+                 << "centerHz" << centerFrequency
+                 << "targetHz" << targetFrequency
+                 << "sampleRate" << sampleRate;
+        return;
+    }
+
+    const int requestedIntegrationMs =
+        (std::clamp)(gnssAcquisitionIntegrationMs,
+                     GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                     GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    const quint64 requestedSamples =
+        static_cast<quint64>(std::ceil(sampleRate * static_cast<double>(requestedIntegrationMs) / 1000.0)) +
+        8192ULL;
+    const quint64 availableSamples = info.dataSize / 4ULL;
+    const quint64 samplesToRead = (std::min)(availableSamples, (std::max<quint64>)(4092ULL, requestedSamples));
+    if (samplesToRead < 4092ULL) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_replay_too_short"),
+                                                  QStringLiteral("GNSS replay: recording is too short for one GPS C/A millisecond.")));
+        }
+        return;
+    }
+
+    QFile wavFile(path);
+    if (!wavFile.open(QIODevice::ReadOnly) ||
+        !wavFile.seek(static_cast<qint64>(info.dataOffset))) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_replay_read_failed"),
+                                                  QStringLiteral("GNSS replay: cannot read selected WAV.")));
+        }
+        return;
+    }
+    const quint64 bytesToRead = samplesToRead * 4ULL;
+    QByteArray pcm = wavFile.read(static_cast<qint64>((std::min<quint64>)(bytesToRead, 128ULL * 1024ULL * 1024ULL)));
+    wavFile.close();
+    const int iqSamples = pcm.size() / 4;
+    if (iqSamples < 4092) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_replay_too_short"),
+                                                  QStringLiteral("GNSS replay: recording is too short for one GPS C/A millisecond.")));
+        }
+        return;
+    }
+
+    std::vector<float> snapshot;
+    snapshot.reserve(static_cast<std::size_t>(iqSamples) * 2U);
+    for (int offset = 0; offset + 3 < pcm.size(); offset += 4) {
+        const qint16 iSample = readLeI16(pcm.constData() + offset);
+        const qint16 qSample = readLeI16(pcm.constData() + offset + 2);
+        snapshot.push_back(static_cast<float>(iSample) / 32768.0f);
+        snapshot.push_back(static_cast<float>(qSample) / 32768.0f);
+    }
+
+    auto cancelFlag = std::make_shared<std::atomic_bool>(false);
+    gnssAcquisitionCancelFlag = cancelFlag;
+    gnssAcquisitionRunning = true;
+    const QString acquisitionSource = QStringLiteral("replay");
+    gnssAcquisitionSource = acquisitionSource;
+    if (gnssAcquireButton) {
+        gnssAcquireButton->setEnabled(false);
+    }
+    if (gnssDeepAcquireButton) {
+        gnssDeepAcquireButton->setEnabled(false);
+    }
+    if (gnssOfflineAcquireButton) {
+        gnssOfflineAcquireButton->setEnabled(false);
+    }
+    if (gnssSelfTestButton) {
+        gnssSelfTestButton->setEnabled(false);
+    }
+    if (gnssAcquireStatusLabel) {
+        gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gnss_replay_running"),
+                                              QStringLiteral("GNSS replay: running acquisition on selected WAV")));
+    }
+
+    qDebug() << "[GNSS replay] start"
+             << "path" << path
+             << "sidecar" << sidecarPath
+             << "inputSamples" << iqSamples
+             << "requestedIntegrationMs" << requestedIntegrationMs
+             << "sampleRate" << sampleRate
+             << "centerHz" << centerFrequency
+             << "targetHz" << targetFrequency
+             << "channelFilterCutoffHz" << gnssChannelFilterCutoffHz
+             << "dopplerMinHz" << -gnssDopplerSpanHz
+             << "dopplerMaxHz" << gnssDopplerSpanHz
+             << "dopplerStepHz" << gnssDopplerStepHz;
+
+    QPointer<YourClassName> self(this);
+    QtConcurrent::run([self,
+                       snapshot = std::move(snapshot),
+                       sampleRate,
+                       centerFrequency,
+                       targetFrequency,
+                       integrationMs = requestedIntegrationMs,
+                       channelFilterCutoffHz = gnssChannelFilterCutoffHz,
+                       dopplerSpanHz = gnssDopplerSpanHz,
+                       dopplerStepHz = gnssDopplerStepHz,
+                       acquisitionSource,
+                       cancelFlag]() mutable {
+        QElapsedTimer acquisitionTimer;
+        acquisitionTimer.start();
+        GnssAcquisitionResult result =
+            GnssAcquisition::acquireGpsL1Ca(snapshot,
+                                           sampleRate,
+                                           centerFrequency,
+                                           targetFrequency,
+                                           integrationMs,
+                                           channelFilterCutoffHz,
+                                           cancelFlag.get(),
+                                           -dopplerSpanHz,
+                                           dopplerSpanHz,
+                                           dopplerStepHz);
+        result.processingElapsedMs = acquisitionTimer.elapsed();
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self.data(), [self, result, acquisitionSource, cancelFlag]() {
+            if (!self) {
+                return;
+            }
+            self->gnssAcquisitionRunning = false;
+            if (self->gnssAcquisitionCancelFlag == cancelFlag) {
+                self->gnssAcquisitionCancelFlag.reset();
+            }
+            if (self->gnssAcquireButton) {
+                self->gnssAcquireButton->setEnabled(true);
+            }
+            if (self->gnssDeepAcquireButton) {
+                self->gnssDeepAcquireButton->setEnabled(true);
+            }
+            if (self->gnssOfflineAcquireButton) {
+                self->gnssOfflineAcquireButton->setEnabled(true);
+            }
+            if (self->gnssSelfTestButton) {
+                self->gnssSelfTestButton->setEnabled(true);
+            }
+            self->gnssAcquisitionSource = acquisitionSource;
+            self->updateGnssAcquisitionStatus(result);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void YourClassName::runGnssSyntheticSelfTest() {
+    if (gnssAcquisitionRunning) {
+        return;
+    }
+
+    if (gnssIntegrationSpin) {
+        gnssAcquisitionIntegrationMs =
+            (std::clamp)(gnssIntegrationSpin->value(),
+                         GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                         GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    }
+    if (gnssChannelFilterSpin) {
+        const double cutoffHz = gnssChannelFilterSpin->value() * 1000000.0;
+        gnssChannelFilterCutoffHz =
+            (std::clamp)(std::isfinite(cutoffHz) ? cutoffHz : 1800000.0,
+                         GNSS_CHANNEL_FILTER_MIN_HZ,
+                         GNSS_CHANNEL_FILTER_MAX_HZ);
+    }
+
+    const int syntheticPrn = 7;
+    const double syntheticDopplerHz = 3500.0;
+    const int integrationMs =
+        (std::clamp)(gnssAcquisitionIntegrationMs,
+                     GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                     GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    double sampleRate = pendingSettings.sampleRate;
+    if (!std::isfinite(sampleRate) || sampleRate <= 0.0) {
+        sampleRate = 50000000.0;
+    }
+    const double targetFrequency = GNSS_GPS_L1_HZ;
+    double centerFrequency = pendingSettings.centerFrequency;
+    if (!std::isfinite(centerFrequency) || centerFrequency <= 0.0 ||
+        std::abs(targetFrequency - centerFrequency) > sampleRate * 0.45) {
+        centerFrequency = GNSS_L1_LISTENING_SCAN_CENTER_HZ;
+    }
+
+    auto cancelFlag = std::make_shared<std::atomic_bool>(false);
+    gnssAcquisitionCancelFlag = cancelFlag;
+    gnssAcquisitionRunning = true;
+    const QString acquisitionSource = QStringLiteral("synthetic-iq");
+    gnssAcquisitionSource = acquisitionSource;
+    if (gnssAcquireButton) {
+        gnssAcquireButton->setEnabled(false);
+    }
+    if (gnssDeepAcquireButton) {
+        gnssDeepAcquireButton->setEnabled(false);
+    }
+    if (gnssOfflineAcquireButton) {
+        gnssOfflineAcquireButton->setEnabled(false);
+    }
+    if (gnssSelfTestButton) {
+        gnssSelfTestButton->setEnabled(false);
+    }
+    if (gnssAcquireStatusLabel) {
+        gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gps_ca_self_test_running"),
+                                              QStringLiteral("GPS self-test: running")));
+    }
+
+    qDebug() << "[GNSS self-test] start"
+             << "expectedPrn" << syntheticPrn
+             << "expectedDopplerHz" << syntheticDopplerHz
+             << "inputSampleRate" << sampleRate
+             << "centerHz" << centerFrequency
+             << "targetHz" << targetFrequency
+             << "integrationMs" << integrationMs
+             << "channelFilterCutoffHz" << gnssChannelFilterCutoffHz
+             << "dopplerMinHz" << -gnssDopplerSpanHz
+             << "dopplerMaxHz" << gnssDopplerSpanHz
+             << "dopplerStepHz" << gnssDopplerStepHz;
+
+    QPointer<YourClassName> self(this);
+    QtConcurrent::run([self,
+                       sampleRate,
+                       centerFrequency,
+                       targetFrequency,
+                       syntheticPrn,
+                       syntheticDopplerHz,
+                       integrationMs,
+                       channelFilterCutoffHz = gnssChannelFilterCutoffHz,
+                       dopplerSpanHz = gnssDopplerSpanHz,
+                       dopplerStepHz = gnssDopplerStepHz,
+                       acquisitionSource,
+                       cancelFlag]() {
+        QElapsedTimer timer;
+        timer.start();
+        std::vector<float> syntheticIq =
+            GnssAcquisition::makeSyntheticGpsL1CaIq(sampleRate,
+                                                    centerFrequency,
+                                                    targetFrequency,
+                                                    syntheticPrn,
+                                                    syntheticDopplerHz,
+                                                    integrationMs,
+                                                    0.25);
+        GnssAcquisitionResult result =
+            GnssAcquisition::acquireGpsL1Ca(syntheticIq,
+                                           sampleRate,
+                                           centerFrequency,
+                                           targetFrequency,
+                                           integrationMs,
+                                           channelFilterCutoffHz,
+                                           cancelFlag.get(),
+                                           -dopplerSpanHz,
+                                           dopplerSpanHz,
+                                           dopplerStepHz);
+        result.processingElapsedMs = timer.elapsed();
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self.data(), [self, result, syntheticPrn, syntheticDopplerHz, acquisitionSource, cancelFlag]() {
+            if (!self) {
+                return;
+            }
+            self->gnssAcquisitionRunning = false;
+            if (self->gnssAcquisitionCancelFlag == cancelFlag) {
+                self->gnssAcquisitionCancelFlag.reset();
+            }
+            if (self->gnssAcquireButton) {
+                self->gnssAcquireButton->setEnabled(true);
+            }
+            if (self->gnssDeepAcquireButton) {
+                self->gnssDeepAcquireButton->setEnabled(true);
+            }
+            if (self->gnssOfflineAcquireButton) {
+                self->gnssOfflineAcquireButton->setEnabled(true);
+            }
+            if (self->gnssSelfTestButton) {
+                self->gnssSelfTestButton->setEnabled(true);
+            }
+            self->gnssAcquisitionSource = acquisitionSource;
+            if (!result.topCandidates.isEmpty()) {
+                const GnssAcquisitionCandidate best = result.topCandidates.first();
+                const double metricDb =
+                    10.0 * std::log10((std::max)(best.metric,
+                                                 std::numeric_limits<double>::min()));
+                const double peakToSecondDb =
+                    10.0 * std::log10((std::max)(best.peakToSecond,
+                                                 std::numeric_limits<double>::min()));
+                qDebug() << "[GNSS self-test] finished"
+                         << "expectedPrn" << syntheticPrn
+                         << "expectedDopplerHz" << syntheticDopplerHz
+                         << "bestPrn" << best.prn
+                         << "bestDopplerHz" << best.dopplerHz
+                         << "bestCodePhase" << best.codePhaseSamples
+                         << "bestMetricDb" << metricDb
+                         << "bestPeakToSecondDb" << peakToSecondDb
+                         << "processingMs" << result.processingElapsedMs
+                         << "prnMatch" << (best.prn == syntheticPrn);
+            } else {
+                qDebug() << "[GNSS self-test] finished"
+                         << "valid" << result.valid
+                         << "status" << result.status
+                         << "processingMs" << result.processingElapsedMs;
+            }
+            self->updateGnssAcquisitionStatus(result);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void YourClassName::runGnssPositionSelfTest() {
+    double truthLat = qthLatitude;
+    double truthLon = qthLongitude;
+    if (!qth::isValidLatitude(truthLat) ||
+        !qth::isValidLongitude(truthLon) ||
+        (std::abs(truthLat) < 0.000001 && std::abs(truthLon) < 0.000001)) {
+        truthLat = 50.4501;
+        truthLon = 30.5234;
+    }
+    constexpr double truthAltMeters = 180.0;
+    constexpr double receiverClockBiasMeters = 72000.0;
+    const Vec3d truthEcef = geodeticToEcef(truthLat, truthLon, truthAltMeters);
+
+    Vec3d east;
+    Vec3d north;
+    Vec3d up;
+    enuBasis(truthLat, truthLon, &east, &north, &up);
+
+    struct SyntheticSatelliteDirection {
+        double azimuthDeg = 0.0;
+        double elevationDeg = 0.0;
+        double slantMeters = 0.0;
+        double noiseMeters = 0.0;
+    };
+    const std::array<SyntheticSatelliteDirection, 6> directions = {{
+        {15.0, 62.0, 21400000.0, 0.8},
+        {82.0, 48.0, 22100000.0, -0.4},
+        {145.0, 54.0, 23200000.0, 0.2},
+        {218.0, 38.0, 24600000.0, -0.7},
+        {292.0, 44.0, 22900000.0, 0.5},
+        {335.0, 27.0, 25500000.0, -0.3}
+    }};
+
+    QVector<SyntheticPseudorange> measurements;
+    measurements.reserve(static_cast<int>(directions.size()));
+    for (const SyntheticSatelliteDirection &direction : directions) {
+        const double az = direction.azimuthDeg * kDegToRad;
+        const double el = direction.elevationDeg * kDegToRad;
+        const Vec3d los =
+            east * (std::sin(az) * std::cos(el)) +
+            north * (std::cos(az) * std::cos(el)) +
+            up * std::sin(el);
+        SyntheticPseudorange measurement;
+        measurement.satellite = truthEcef + los * direction.slantMeters;
+        measurement.pseudorangeMeters =
+            norm(measurement.satellite - truthEcef) +
+            receiverClockBiasMeters +
+            direction.noiseMeters;
+        measurements.append(measurement);
+    }
+
+    const double initialLat = (std::clamp)(truthLat + 3.0, -80.0, 80.0);
+    double initialLon = truthLon - 4.0;
+    if (initialLon < -180.0) {
+        initialLon += 360.0;
+    }
+    const Vec3d initialEcef = geodeticToEcef(initialLat, initialLon, 0.0);
+    const SyntheticPositionResult result =
+        solveSyntheticPosition(measurements, truthEcef, initialEcef);
+
+    if (!result.valid) {
+        const QString status = uiText(QStringLiteral("gnss_position_self_test_failed"),
+                                      QStringLiteral("GNSS position self-test failed: solver did not converge."));
+        if (qthStatusLabel) {
+            qthStatusLabel->setText(status);
+        }
+        qDebug() << "[GNSS position self-test] failed"
+                 << "truthLat" << truthLat
+                 << "truthLon" << truthLon
+                 << "satellites" << measurements.size();
+        return;
+    }
+
+    qthLatitude = result.latitude;
+    qthLongitude = result.longitude;
+    qthSource = QStringLiteral("manual");
+    const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+    updateQthControls();
+    openQthMapWindow();
+    if (qthMapWidget) {
+        const QString label =
+            uiText(QStringLiteral("gnss_position_self_test_marker"),
+                   QStringLiteral("GNSS synthetic"));
+        qthMapWidget->setSearchMarker(qthLatitude, qthLongitude, label);
+        qthMapWidget->centerOn(qthLatitude, qthLongitude);
+    }
+    savePersistentSettings();
+
+    const QString status =
+        uiText(QStringLiteral("gnss_position_self_test_result"),
+               QStringLiteral("GNSS position self-test: %1, %2 (%3), error %4 m, clock %5 m, %6 satellites"))
+            .arg(QString::number(qthLatitude, 'f', 6),
+                 QString::number(qthLongitude, 'f', 6),
+                 locator,
+                 QString::number(result.errorMeters, 'f', 2),
+                 QString::number(result.clockBiasMeters, 'f', 1),
+                 QString::number(result.satellites));
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(status);
+    }
+    qDebug() << "[GNSS position self-test] result"
+             << "truthLat" << truthLat
+             << "truthLon" << truthLon
+             << "solvedLat" << result.latitude
+             << "solvedLon" << result.longitude
+             << "altMeters" << result.altitudeMeters
+             << "errorMeters" << result.errorMeters
+             << "clockBiasMeters" << result.clockBiasMeters
+             << "expectedClockBiasMeters" << receiverClockBiasMeters
+             << "iterations" << result.iterations
+             << "satellites" << result.satellites
+             << "qth" << locator;
+}
+
+void YourClassName::saveGnssAcquisitionArtifacts(const GnssAcquisitionResult &result,
+                                                 const QString &sourceLabel) {
+    if (result.cancelled) {
+        return;
+    }
+
+    QDir baseDir(QCoreApplication::applicationDirPath());
+    if (!baseDir.mkpath(QStringLiteral("recordings/gnss_reports"))) {
+        qDebug() << "[GNSS acquisition artifacts] cannot create report directory"
+                 << baseDir.filePath(QStringLiteral("recordings/gnss_reports"));
+        return;
+    }
+
+    QDir reportDir(baseDir.filePath(QStringLiteral("recordings/gnss_reports")));
+    QString safeSource = sourceLabel.trimmed();
+    if (safeSource.isEmpty()) {
+        safeSource = QStringLiteral("unknown");
+    }
+    safeSource.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_-]+")),
+                       QStringLiteral("_"));
+
+    const QString stamp =
+        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+    const QString baseName = QStringLiteral("gnss_acq_%1_%2").arg(stamp, safeSource);
+    const QString reportName = baseName + QStringLiteral(".json");
+    const QString heatmapName = baseName + QStringLiteral("_heatmap.csv");
+    const QString profileName = baseName + QStringLiteral("_profile.csv");
+    const QString reportPath = reportDir.filePath(reportName);
+    const QString heatmapPath = reportDir.filePath(heatmapName);
+    const QString profilePath = reportDir.filePath(profileName);
+
+    auto finiteJson = [](double value) -> QJsonValue {
+        return std::isfinite(value) ? QJsonValue(value) : QJsonValue();
+    };
+    auto metricDb = [](double value) -> double {
+        return 10.0 * std::log10((std::max)(value, std::numeric_limits<double>::min()));
+    };
+
+    bool heatmapSaved = false;
+    if (!result.dopplerBinsHz.isEmpty() && !result.prnDopplerMetricDb.isEmpty()) {
+        QFile heatmapFile(heatmapPath);
+        if (heatmapFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&heatmapFile);
+            stream.setRealNumberNotation(QTextStream::FixedNotation);
+            stream.setRealNumberPrecision(3);
+            stream << "prn,doppler_hz,metric_db\n";
+            const int dopplerCount = result.dopplerBinsHz.size();
+            const int prnCount = result.prnDopplerMetricDb.size() / dopplerCount;
+            for (int prnIndex = 0; prnIndex < prnCount; ++prnIndex) {
+                for (int dopplerIndex = 0; dopplerIndex < dopplerCount; ++dopplerIndex) {
+                    const int metricIndex = prnIndex * dopplerCount + dopplerIndex;
+                    stream << (prnIndex + 1) << ','
+                           << result.dopplerBinsHz.at(dopplerIndex) << ','
+                           << result.prnDopplerMetricDb.at(metricIndex) << '\n';
+                }
+            }
+            heatmapSaved = true;
+        }
+    }
+
+    bool profileSaved = false;
+    if (!result.bestCorrelationProfileDb.isEmpty()) {
+        QFile profileFile(profilePath);
+        if (profileFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QTextStream stream(&profileFile);
+            stream.setRealNumberNotation(QTextStream::FixedNotation);
+            stream.setRealNumberPrecision(3);
+            stream << "code_phase_sample,relative_db\n";
+            for (int index = 0; index < result.bestCorrelationProfileDb.size(); ++index) {
+                stream << index << ',' << result.bestCorrelationProfileDb.at(index) << '\n';
+            }
+            profileSaved = true;
+        }
+    }
+
+    QJsonObject report;
+    report.insert(QStringLiteral("type"), QStringLiteral("gnss_acquisition_report"));
+    report.insert(QStringLiteral("createdAtLocal"),
+                  QDateTime::currentDateTime().toString(Qt::ISODateWithMs));
+    report.insert(QStringLiteral("source"), safeSource);
+    report.insert(QStringLiteral("systemId"), gnssSystemId);
+    report.insert(QStringLiteral("valid"), result.valid);
+    report.insert(QStringLiteral("status"), result.status);
+    report.insert(QStringLiteral("inputSamples"), result.inputSamples);
+    report.insert(QStringLiteral("usedInputSamples"), result.usedInputSamples);
+    report.insert(QStringLiteral("coherentMs"), result.coherentMs);
+    report.insert(QStringLiteral("processingElapsedMs"),
+                  static_cast<double>(result.processingElapsedMs));
+    report.insert(QStringLiteral("inputSampleRate"), finiteJson(result.inputSampleRate));
+    report.insert(QStringLiteral("acquisitionSampleRate"), finiteJson(result.acquisitionSampleRate));
+    report.insert(QStringLiteral("centerFrequency"), finiteJson(result.centerFrequency));
+    report.insert(QStringLiteral("targetFrequency"), finiteJson(result.targetFrequency));
+    report.insert(QStringLiteral("frequencyOffset"), finiteJson(result.frequencyOffset));
+    report.insert(QStringLiteral("channelFilterCutoffHz"), finiteJson(result.channelFilterCutoffHz));
+    report.insert(QStringLiteral("channelizerTaps"), result.channelizerTaps);
+    report.insert(QStringLiteral("millisecondAgc"), result.millisecondAgc);
+
+    QJsonObject qthObject;
+    qthObject.insert(QStringLiteral("latitude"), finiteJson(qthLatitude));
+    qthObject.insert(QStringLiteral("longitude"), finiteJson(qthLongitude));
+    qthObject.insert(QStringLiteral("source"), qthSource);
+    if (qth::isValidLatitude(qthLatitude) && qth::isValidLongitude(qthLongitude)) {
+        qthObject.insert(QStringLiteral("locator"), qth::maidenheadLocator(qthLatitude, qthLongitude, 6));
+    }
+    report.insert(QStringLiteral("qth"), qthObject);
+
+    QJsonObject settingsObject;
+    settingsObject.insert(QStringLiteral("gnssAcquisitionIntegrationMs"), gnssAcquisitionIntegrationMs);
+    settingsObject.insert(QStringLiteral("gnssChannelFilterCutoffHz"), finiteJson(gnssChannelFilterCutoffHz));
+    settingsObject.insert(QStringLiteral("gnssDopplerSpanHz"), gnssDopplerSpanHz);
+    settingsObject.insert(QStringLiteral("gnssDopplerStepHz"), gnssDopplerStepHz);
+    settingsObject.insert(QStringLiteral("pendingCenterFrequency"), finiteJson(pendingSettings.centerFrequency));
+    settingsObject.insert(QStringLiteral("pendingListeningFrequency"), finiteJson(pendingSettings.listeningFrequency));
+    settingsObject.insert(QStringLiteral("pendingSampleRate"), finiteJson(pendingSettings.sampleRate));
+    settingsObject.insert(QStringLiteral("pendingBandwidth"), finiteJson(pendingSettings.bandwidth));
+    settingsObject.insert(QStringLiteral("inputMode"), pendingSettings.inputMode);
+    settingsObject.insert(QStringLiteral("lnaGain"), pendingSettings.lnaGain);
+    settingsObject.insert(QStringLiteral("vgaGain"), pendingSettings.vgaGain);
+    report.insert(QStringLiteral("settings"), settingsObject);
+
+    QJsonArray dopplerBins;
+    for (double dopplerHz : result.dopplerBinsHz) {
+        dopplerBins.append(finiteJson(dopplerHz));
+    }
+    report.insert(QStringLiteral("dopplerBinsHz"), dopplerBins);
+
+    QJsonArray candidates;
+    bool likelyLock = false;
+    if (!result.topCandidates.isEmpty()) {
+        const GnssAcquisitionCandidate best = result.topCandidates.first();
+        const double bestMetricDb = metricDb(best.metric);
+        const double bestPeakToSecondDb = metricDb(best.peakToSecond);
+        likelyLock = result.coherentMs >= 8 &&
+                     bestMetricDb >= 10.0 &&
+                     bestPeakToSecondDb >= 6.0;
+    }
+    report.insert(QStringLiteral("likelyLock"), likelyLock);
+    for (const GnssAcquisitionCandidate &candidate : result.topCandidates) {
+        QJsonObject candidateObject;
+        candidateObject.insert(QStringLiteral("prn"), candidate.prn);
+        candidateObject.insert(QStringLiteral("dopplerHz"), finiteJson(candidate.dopplerHz));
+        candidateObject.insert(QStringLiteral("codePhaseSamples"), candidate.codePhaseSamples);
+        candidateObject.insert(QStringLiteral("metric"), finiteJson(candidate.metric));
+        candidateObject.insert(QStringLiteral("metricDb"), finiteJson(metricDb(candidate.metric)));
+        candidateObject.insert(QStringLiteral("peak"), finiteJson(candidate.peak));
+        candidateObject.insert(QStringLiteral("secondPeak"), finiteJson(candidate.secondPeak));
+        candidateObject.insert(QStringLiteral("peakToSecond"), finiteJson(candidate.peakToSecond));
+        candidateObject.insert(QStringLiteral("peakToSecondDb"), finiteJson(metricDb(candidate.peakToSecond)));
+        candidateObject.insert(QStringLiteral("average"), finiteJson(candidate.average));
+        candidates.append(candidateObject);
+    }
+    report.insert(QStringLiteral("topCandidates"), candidates);
+
+    QJsonObject artifactsObject;
+    artifactsObject.insert(QStringLiteral("reportJson"), reportName);
+    if (heatmapSaved) {
+        artifactsObject.insert(QStringLiteral("heatmapCsv"), heatmapName);
+    }
+    if (profileSaved) {
+        artifactsObject.insert(QStringLiteral("correlationProfileCsv"), profileName);
+    }
+    report.insert(QStringLiteral("artifacts"), artifactsObject);
+
+    QFile reportFile(reportPath);
+    if (!reportFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        qDebug() << "[GNSS acquisition artifacts] cannot write report" << reportPath;
+        return;
+    }
+    reportFile.write(QJsonDocument(report).toJson(QJsonDocument::Indented));
+    reportFile.close();
+
+    qDebug() << "[GNSS acquisition artifacts] saved"
+             << "source" << safeSource
+             << "report" << reportPath
+             << "heatmap" << (heatmapSaved ? heatmapPath : QStringLiteral("none"))
+             << "profile" << (profileSaved ? profilePath : QStringLiteral("none"));
+}
+
+void YourClassName::updateGnssAcquisitionStatus(const GnssAcquisitionResult &result) {
+    if (result.cancelled) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gps_ca_scan_cancelled"),
+                                                  QStringLiteral("GPS C/A accumulation: cancelled")));
+        }
+        qDebug() << "[GNSS acquisition] cancelled"
+                 << "inputSamples" << result.inputSamples
+                 << "usedInputSamples" << result.usedInputSamples
+                 << "coherentMs" << result.coherentMs
+                 << "processingMs" << result.processingElapsedMs;
+        return;
+    }
+
+    updateGnssAcquisitionPlot(result);
+    saveGnssAcquisitionArtifacts(result, gnssAcquisitionSource);
+
+    if (!result.valid || result.topCandidates.isEmpty()) {
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(result.status.isEmpty()
+                                               ? uiText(QStringLiteral("gps_ca_scan_no_candidate"),
+                                                        QStringLiteral("GPS C/A accumulation: no candidates"))
+                                               : result.status);
+        }
+        qDebug() << "[GNSS acquisition] finished"
+                 << "valid" << result.valid
+                 << "status" << result.status
+                 << "inputSamples" << result.inputSamples
+                 << "sampleRate" << result.inputSampleRate
+                 << "processingMs" << result.processingElapsedMs;
+        return;
+    }
+
+    const GnssAcquisitionCandidate best = result.topCandidates.first();
+    const double metricDb = 10.0 * std::log10((std::max)(best.metric, std::numeric_limits<double>::min()));
+    const double peakToSecondDb =
+        10.0 * std::log10((std::max)(best.peakToSecond, std::numeric_limits<double>::min()));
+    gnssPeakToSecondHistoryDb.push_back(peakToSecondDb);
+    while (gnssPeakToSecondHistoryDb.size() > 48) {
+        gnssPeakToSecondHistoryDb.pop_front();
+    }
+    updateGnssAcquisitionPlot(result);
+    constexpr double kGpsCaLikelyLockMetricDb = 10.0;
+    constexpr double kGpsCaLikelyLockPeakToSecondDb = 6.0;
+    constexpr int kGpsCaLikelyLockMinMs = 8;
+    const bool likelyLock = result.coherentMs >= kGpsCaLikelyLockMinMs &&
+                            metricDb >= kGpsCaLikelyLockMetricDb &&
+                            peakToSecondDb >= kGpsCaLikelyLockPeakToSecondDb;
+    const QString statusTemplate = likelyLock
+        ? uiText(QStringLiteral("gps_ca_scan_result"),
+                 QStringLiteral("GPS C/A: PRN %1, metric %2 dB, doppler %3 Hz, code %4, %5 ms accumulated"))
+        : uiText(QStringLiteral("gps_ca_scan_weak"),
+                 QStringLiteral("GPS C/A: weak/no lock, best PRN %1, metric %2 dB, doppler %3 Hz, code %4, %5 ms accumulated"));
+    const QString statusText = QString(statusTemplate)
+                                   .arg(best.prn)
+                                   .arg(QString::number(metricDb, 'f', 1))
+                                   .arg(QString::number(best.dopplerHz, 'f', 0))
+                                   .arg(best.codePhaseSamples)
+                                   .arg(result.coherentMs);
+    if (gnssAcquireStatusLabel) {
+        gnssAcquireStatusLabel->setText(statusText);
+    }
+
+    qDebug() << "[GNSS acquisition] finished"
+             << "inputSamples" << result.inputSamples
+             << "usedInputSamples" << result.usedInputSamples
+             << "inputSampleRate" << result.inputSampleRate
+             << "acquisitionSampleRate" << result.acquisitionSampleRate
+             << "channelFilterCutoffHz" << result.channelFilterCutoffHz
+             << "channelizerTaps" << result.channelizerTaps
+             << "millisecondAgc" << result.millisecondAgc
+             << "processingMs" << result.processingElapsedMs
+             << "centerHz" << result.centerFrequency
+             << "targetHz" << result.targetFrequency
+             << "offsetHz" << result.frequencyOffset
+             << "coherentMs" << result.coherentMs
+             << "likelyLock" << likelyLock
+             << "lockThresholdDb" << kGpsCaLikelyLockMetricDb
+             << "lockPeakToSecondThresholdDb" << kGpsCaLikelyLockPeakToSecondDb
+             << "lockMinCoherentMs" << kGpsCaLikelyLockMinMs
+             << "bestPrn" << best.prn
+             << "bestMetricDb" << metricDb
+             << "bestPeakToSecondDb" << peakToSecondDb
+             << "bestDopplerHz" << best.dopplerHz
+             << "bestCodePhase" << best.codePhaseSamples;
+
+    for (const GnssAcquisitionCandidate &candidate : result.topCandidates) {
+        const double candidateMetricDb =
+            10.0 * std::log10((std::max)(candidate.metric, std::numeric_limits<double>::min()));
+        const double candidatePeakToSecondDb =
+            10.0 * std::log10((std::max)(candidate.peakToSecond, std::numeric_limits<double>::min()));
+        qDebug() << "[GNSS acquisition candidate]"
+                 << "prn" << candidate.prn
+                 << "metricDb" << candidateMetricDb
+                 << "peakToSecondDb" << candidatePeakToSecondDb
+                 << "dopplerHz" << candidate.dopplerHz
+                 << "codePhase" << candidate.codePhaseSamples
+                 << "peak" << candidate.peak
+                 << "secondPeak" << candidate.secondPeak
+                 << "average" << candidate.average;
+    }
 }
 
 void YourClassName::openPresetManager() {
@@ -6766,6 +10702,61 @@ void YourClassName::openPresetManager() {
         return table;
     };
 
+    auto makeListeningScanTab = [this, &dialog](const QMap<QString, QString> &presets) -> QTableWidget * {
+        QWidget *page = new QWidget(&dialog);
+        QVBoxLayout *pageLayout = new QVBoxLayout(page);
+        QTableWidget *table = new QTableWidget(page);
+        table->setColumnCount(4);
+        table->setHorizontalHeaderLabels({uiText(QStringLiteral("name"), QStringLiteral("Name")),
+                                          uiText(QStringLiteral("targets_mhz_plain"), QStringLiteral("Targets MHz")),
+                                          uiText(QStringLiteral("dwell_ms"), QStringLiteral("Dwell ms")),
+                                          uiText(QStringLiteral("settle_ms"), QStringLiteral("Settle ms"))});
+        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table->setSelectionMode(QAbstractItemView::SingleSelection);
+        table->setRowCount(presets.size());
+        int row = 0;
+        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
+            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+            table->setItem(row, 1, new QTableWidgetItem(listeningScanPresetTargets(it.value())));
+            table->setItem(row, 2, new QTableWidgetItem(QString::number(listeningScanPresetDwellMs(it.value(), listeningScanDwellMs))));
+            table->setItem(row, 3, new QTableWidgetItem(QString::number(listeningScanPresetSettleMs(it.value(), listeningScanSettleMs))));
+        }
+
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
+        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
+        buttonLayout->addWidget(addButton);
+        buttonLayout->addWidget(removeButton);
+        buttonLayout->addStretch();
+        pageLayout->addWidget(table);
+        pageLayout->addLayout(buttonLayout);
+
+        QObject::connect(addButton, &QPushButton::clicked, table, [this, table]() {
+            const int row = table->rowCount();
+            table->insertRow(row);
+            table->setItem(row, 0, new QTableWidgetItem(uiText(QStringLiteral("new_listening_scan_preset"),
+                                                               QStringLiteral("New listening scan preset"))));
+            table->setItem(row, 1, new QTableWidgetItem(listeningScanTargetsMhz));
+            table->setItem(row, 2, new QTableWidgetItem(QString::number(listeningScanDwellMs)));
+            table->setItem(row, 3, new QTableWidgetItem(QString::number(listeningScanSettleMs)));
+            table->setCurrentCell(row, 0);
+            table->editItem(table->item(row, 0));
+        });
+        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
+            const int row = table->currentRow();
+            if (row >= 0) {
+                table->removeRow(row);
+            }
+        });
+
+        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
+        return table;
+    };
+
     auto makeBandMarkerTab = [this, &dialog](const QVector<GraphBandMarker> &markers) -> QTableWidget * {
         QWidget *page = new QWidget(&dialog);
         QVBoxLayout *pageLayout = new QVBoxLayout(page);
@@ -6842,6 +10833,77 @@ void YourClassName::openPresetManager() {
         return table;
     };
 
+    auto makeQthMarkerTab = [this, &dialog](const QVector<qth::UserMarker> &markers) -> QTableWidget * {
+        QWidget *page = new QWidget(&dialog);
+        QVBoxLayout *pageLayout = new QVBoxLayout(page);
+        QTableWidget *table = new QTableWidget(page);
+        table->setColumnCount(5);
+        table->setHorizontalHeaderLabels({uiText(QStringLiteral("number"), QStringLiteral("Number")),
+                                          uiText(QStringLiteral("name"), QStringLiteral("Name")),
+                                          uiText(QStringLiteral("latitude"), QStringLiteral("Latitude")),
+                                          uiText(QStringLiteral("longitude"), QStringLiteral("Longitude")),
+                                          uiText(QStringLiteral("description"), QStringLiteral("Description"))});
+        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+        table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table->setSelectionMode(QAbstractItemView::SingleSelection);
+
+        auto setMarkerRow = [table](int row, const qth::UserMarker &marker) {
+            table->setItem(row, 0, new QTableWidgetItem(QString::number(marker.number)));
+            table->setItem(row, 1, new QTableWidgetItem(marker.name));
+            table->setItem(row, 2, new QTableWidgetItem(QString::number(marker.latitude, 'f', 6)));
+            table->setItem(row, 3, new QTableWidgetItem(QString::number(marker.longitude, 'f', 6)));
+            table->setItem(row, 4, new QTableWidgetItem(marker.description));
+        };
+
+        table->setRowCount(markers.size());
+        for (int row = 0; row < markers.size(); ++row) {
+            setMarkerRow(row, markers.at(row));
+        }
+
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add_marker"), QStringLiteral("Add marker")), page);
+        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
+        buttonLayout->addWidget(addButton);
+        buttonLayout->addWidget(removeButton);
+        buttonLayout->addStretch();
+        pageLayout->addWidget(table);
+        pageLayout->addLayout(buttonLayout);
+
+        QObject::connect(addButton, &QPushButton::clicked, table, [this, table, setMarkerRow]() {
+            int nextNumber = 1;
+            for (int row = 0; row < table->rowCount(); ++row) {
+                bool ok = false;
+                const int number = table->item(row, 0) ? table->item(row, 0)->text().toInt(&ok) : 0;
+                if (ok) {
+                    nextNumber = (std::max)(nextNumber, number + 1);
+                }
+            }
+            qth::UserMarker marker;
+            marker.number = nextNumber;
+            marker.latitude = qthLatitude;
+            marker.longitude = qthLongitude;
+            marker.name = qth::maidenheadLocator(marker.latitude, marker.longitude, 6);
+            const int row = table->rowCount();
+            table->insertRow(row);
+            setMarkerRow(row, marker);
+            table->setCurrentCell(row, 1);
+            table->editItem(table->item(row, 1));
+        });
+        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
+            const int row = table->currentRow();
+            if (row >= 0) {
+                table->removeRow(row);
+            }
+        });
+
+        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
+        return table;
+    };
+
     QTableWidget *centerTable = makeNumericTab(centerFrequencyPresets,
                                               uiText(QStringLiteral("frequency_hz"), QStringLiteral("Frequency Hz")),
                                               0.0,
@@ -6856,7 +10918,9 @@ void YourClassName::openPresetManager() {
                                                  20000000.0);
     QTableWidget *agileTable = makeAgileTab(agileScanPresets);
     QTableWidget *standardScanTable = makeStandardScanTab(standardScanPresets);
+    QTableWidget *listeningScanTable = makeListeningScanTab(listeningScanPresets);
     QTableWidget *bandMarkerTable = makeBandMarkerTab(bandMarkers);
+    QTableWidget *qthMarkerTable = makeQthMarkerTab(qthUserMarkers);
 
     tabs->addTab(static_cast<QWidget*>(centerTable->property("pageWidget").value<void*>()),
                  uiText(QStringLiteral("preset_tab_center"), QStringLiteral("Center")));
@@ -6868,8 +10932,12 @@ void YourClassName::openPresetManager() {
                  uiText(QStringLiteral("agile_scan"), QStringLiteral("Agile scan")));
     tabs->addTab(static_cast<QWidget*>(standardScanTable->property("pageWidget").value<void*>()),
                  uiText(QStringLiteral("preset_tab_standard_scan"), QStringLiteral("Standard scan")));
+    tabs->addTab(static_cast<QWidget*>(listeningScanTable->property("pageWidget").value<void*>()),
+                 uiText(QStringLiteral("preset_tab_listening_scan"), QStringLiteral("Listening scan")));
     tabs->addTab(static_cast<QWidget*>(bandMarkerTable->property("pageWidget").value<void*>()),
                  uiText(QStringLiteral("general_band_markers"), QStringLiteral("Band markers")));
+    tabs->addTab(static_cast<QWidget*>(qthMarkerTable->property("pageWidget").value<void*>()),
+                 uiText(QStringLiteral("preset_tab_qth_markers"), QStringLiteral("QTH markers")));
 
     QLabel *hintLabel = new QLabel(uiText(QStringLiteral("presets_hint"),
                                           QStringLiteral("Values are stored in Hz for frequency/audio presets. Scan presets and band-marker ranges are edited in MHz. HAM defaults are Region-1-style hints; edit them for local rules.")),
@@ -6989,6 +11057,47 @@ void YourClassName::openPresetManager() {
         return true;
     };
 
+    auto readListeningScanTable = [](QTableWidget *table, QMap<QString, QString> &target, QString *error) {
+        QMap<QString, QString> next;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
+            const QString targets = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
+            const QString dwellText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
+            const QString settleText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
+            if (name.isEmpty() && targets.isEmpty() && dwellText.isEmpty() && settleText.isEmpty()) {
+                continue;
+            }
+            bool dwellOk = false;
+            bool settleOk = false;
+            const int dwellMs = dwellText.toInt(&dwellOk);
+            const int settleMs = settleText.toInt(&settleOk);
+            if (name.isEmpty() ||
+                targets.isEmpty() ||
+                !dwellOk ||
+                !settleOk ||
+                dwellMs < LISTENING_SCAN_MIN_DWELL_MS ||
+                dwellMs > LISTENING_SCAN_MAX_DWELL_MS ||
+                settleMs < LISTENING_SCAN_MIN_SETTLE_MS ||
+                settleMs > LISTENING_SCAN_MAX_SETTLE_MS) {
+                if (error) {
+                    *error = QStringLiteral("Bad listening scan preset at row %1").arg(row + 1);
+                }
+                return false;
+            }
+            QString parseError;
+            parseListeningScanTargetsMhz(targets, 0.0, RF_EXPERIMENTAL_MAX_FREQUENCY, 1, &parseError);
+            if (!parseError.isEmpty()) {
+                if (error) {
+                    *error = QStringLiteral("%1: %2").arg(name, parseError);
+                }
+                return false;
+            }
+            next[name] = listeningScanPresetSpec(targets, dwellMs, settleMs);
+        }
+        target = next;
+        return true;
+    };
+
     auto readBandMarkerTable = [](QTableWidget *table, QVector<GraphBandMarker> &target, QString *error) {
         QVector<GraphBandMarker> next;
         for (int row = 0; row < table->rowCount(); ++row) {
@@ -7030,6 +11139,57 @@ void YourClassName::openPresetManager() {
         return true;
     };
 
+    auto readQthMarkerTable = [this](QTableWidget *table, QVector<qth::UserMarker> &target, QString *error) {
+        QVector<qth::UserMarker> next;
+        QVector<int> usedNumbers;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const QString numberText = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
+            QString name = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
+            const QString latText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
+            const QString lonText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
+            const QString description = table->item(row, 4) ? table->item(row, 4)->text().trimmed() : QString();
+            if (numberText.isEmpty() && name.isEmpty() && latText.isEmpty() && lonText.isEmpty() && description.isEmpty()) {
+                continue;
+            }
+
+            bool numberOk = false;
+            bool latOk = false;
+            bool lonOk = false;
+            const int number = numberText.toInt(&numberOk);
+            const double latitude = latText.toDouble(&latOk);
+            const double longitude = lonText.toDouble(&lonOk);
+            if (!numberOk ||
+                number <= 0 ||
+                usedNumbers.contains(number) ||
+                !latOk ||
+                !lonOk ||
+                !qth::isValidLatitude(latitude) ||
+                !qth::isValidLongitude(longitude)) {
+                if (error) {
+                    *error = uiText(QStringLiteral("bad_qth_marker_row"),
+                                    QStringLiteral("Bad QTH marker at row %1"))
+                                 .arg(row + 1);
+                }
+                return false;
+            }
+
+            usedNumbers.append(number);
+            if (name.isEmpty()) {
+                name = qth::maidenheadLocator(latitude, longitude, 6);
+            }
+
+            qth::UserMarker marker;
+            marker.number = number;
+            marker.name = name.left(80);
+            marker.description = description.left(512);
+            marker.latitude = latitude;
+            marker.longitude = longitude;
+            next.append(marker);
+        }
+        target = next;
+        return true;
+    };
+
     connect(buttonBox, &QDialogButtonBox::accepted, &dialog, [&]() {
         QString error;
         QMap<QString, double> nextCenter = centerFrequencyPresets;
@@ -7037,13 +11197,17 @@ void YourClassName::openPresetManager() {
         QMap<QString, double> nextBandwidth = bandwidthValuePresets;
         QMap<QString, QString> nextAgile = agileScanPresets;
         QMap<QString, QString> nextStandardScan = standardScanPresets;
+        QMap<QString, QString> nextListeningScan = listeningScanPresets;
         QVector<GraphBandMarker> nextBandMarkers = bandMarkers;
+        QVector<qth::UserMarker> nextQthMarkers = qthUserMarkers;
         if (!readNumericTable(centerTable, nextCenter, &error) ||
             !readNumericTable(listeningTable, nextListening, &error) ||
             !readNumericTable(bandwidthTable, nextBandwidth, &error) ||
             !readAgileTable(agileTable, nextAgile, &error) ||
             !readStandardScanTable(standardScanTable, nextStandardScan, &error) ||
-            !readBandMarkerTable(bandMarkerTable, nextBandMarkers, &error)) {
+            !readListeningScanTable(listeningScanTable, nextListeningScan, &error) ||
+            !readBandMarkerTable(bandMarkerTable, nextBandMarkers, &error) ||
+            !readQthMarkerTable(qthMarkerTable, nextQthMarkers, &error)) {
             QMessageBox::warning(&dialog,
                                   uiText(QStringLiteral("preset_manager"), QStringLiteral("Preset Manager")),
                                   error);
@@ -7054,10 +11218,13 @@ void YourClassName::openPresetManager() {
         bandwidthValuePresets = nextBandwidth;
         agileScanPresets = nextAgile;
         standardScanPresets = nextStandardScan;
+        listeningScanPresets = nextListeningScan;
         bandMarkers = nextBandMarkers;
+        qthUserMarkers = nextQthMarkers;
         bandMarkersCustomized = true;
         updateFrequencyPresetControls();
         updateGraphBandMarkers();
+        updateQthControls();
         savePersistentSettings();
         dialog.accept();
     });
@@ -7104,6 +11271,29 @@ void YourClassName::openApplicationSettings() {
     generalLayout->addRow(uiText(QStringLiteral("fine_tune"), QStringLiteral("Fine tune")), fineTuneModeCombo);
     generalLayout->addRow(uiText(QStringLiteral("spectrum_update_interval"), QStringLiteral("Spectrum/waterfall update")), spectrumUpdateSpin);
     rootLayout->addLayout(generalLayout);
+
+    QGroupBox *settingsBackupBox = new QGroupBox(
+        uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+        &dialog);
+    QVBoxLayout *settingsBackupLayout = new QVBoxLayout(settingsBackupBox);
+    QLabel *settingsBackupHint = new QLabel(
+        uiText(QStringLiteral("settings_backup_hint"),
+               QStringLiteral("Export FobosAPP.ini before updating the app to keep custom presets, scan lists, map markers and UI settings.")),
+        settingsBackupBox);
+    settingsBackupHint->setWordWrap(true);
+    QHBoxLayout *settingsBackupButtons = new QHBoxLayout();
+    QPushButton *exportSettingsButton = new QPushButton(
+        uiText(QStringLiteral("export_settings"), QStringLiteral("Export settings...")),
+        settingsBackupBox);
+    QPushButton *importSettingsButton = new QPushButton(
+        uiText(QStringLiteral("import_settings"), QStringLiteral("Import settings...")),
+        settingsBackupBox);
+    settingsBackupButtons->addWidget(exportSettingsButton);
+    settingsBackupButtons->addWidget(importSettingsButton);
+    settingsBackupButtons->addStretch(1);
+    settingsBackupLayout->addWidget(settingsBackupHint);
+    settingsBackupLayout->addLayout(settingsBackupButtons);
+    rootLayout->addWidget(settingsBackupBox);
 
     QGroupBox *quickOptionsBox = new QGroupBox(uiText(QStringLiteral("quick_options"), QStringLiteral("Quick options")), &dialog);
     QGridLayout *quickOptionsLayout = new QGridLayout(quickOptionsBox);
@@ -7172,6 +11362,12 @@ void YourClassName::openApplicationSettings() {
     connect(spectrumUpdateSpin, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [applySpectrumUpdateInterval](int) {
         applySpectrumUpdateInterval();
     });
+    connect(exportSettingsButton, &QPushButton::clicked, &dialog, [this]() {
+        exportSettingsBackup();
+    });
+    connect(importSettingsButton, &QPushButton::clicked, &dialog, [this]() {
+        importSettingsBackup();
+    });
     connect(audioOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
         if (audioCheckbox) {
             audioCheckbox->setChecked(checked);
@@ -7222,6 +11418,139 @@ void YourClassName::openApplicationSettings() {
     connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
     dialog.exec();
+}
+
+void YourClassName::exportSettingsBackup() {
+    savePersistentSettings();
+
+    const QString sourcePath = persistentSettingsFilePath();
+    QFileInfo sourceInfo(sourcePath);
+    if (!sourceInfo.exists()) {
+        QMessageBox::warning(this,
+                             uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                             uiText(QStringLiteral("settings_export_failed"),
+                                    QStringLiteral("Settings export failed: %1"))
+                                 .arg(sourcePath));
+        return;
+    }
+
+    const QString defaultName =
+        QStringLiteral("FobosAPP-settings-%1.ini")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")));
+    const QString defaultPath = QDir(sourceInfo.absolutePath()).absoluteFilePath(defaultName);
+    const QString targetPath = QFileDialog::getSaveFileName(
+        this,
+        uiText(QStringLiteral("export_settings"), QStringLiteral("Export settings...")),
+        defaultPath,
+        uiText(QStringLiteral("settings_ini_filter"), QStringLiteral("INI settings (*.ini);;All files (*.*)")));
+    if (targetPath.isEmpty()) {
+        return;
+    }
+
+    QFile::remove(targetPath);
+    if (!QFile::copy(sourcePath, targetPath)) {
+        QMessageBox::warning(this,
+                             uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                             uiText(QStringLiteral("settings_export_failed"),
+                                    QStringLiteral("Settings export failed: %1"))
+                                 .arg(targetPath));
+        return;
+    }
+
+    QMessageBox::information(this,
+                             uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                             uiText(QStringLiteral("settings_export_done"),
+                                    QStringLiteral("Settings exported: %1"))
+                                 .arg(QDir::toNativeSeparators(targetPath)));
+}
+
+void YourClassName::importSettingsBackup() {
+    const QString currentPath = persistentSettingsFilePath();
+    const QString sourcePath = QFileDialog::getOpenFileName(
+        this,
+        uiText(QStringLiteral("import_settings"), QStringLiteral("Import settings...")),
+        QFileInfo(currentPath).absolutePath(),
+        uiText(QStringLiteral("settings_ini_filter"), QStringLiteral("INI settings (*.ini);;All files (*.*)")));
+    if (sourcePath.isEmpty()) {
+        return;
+    }
+
+    if (QFileInfo(sourcePath).canonicalFilePath() == QFileInfo(currentPath).canonicalFilePath()) {
+        QMessageBox::information(this,
+                                 uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                                 uiText(QStringLiteral("settings_import_same_file"),
+                                        QStringLiteral("Selected file is already the active settings file.")));
+        return;
+    }
+
+    const QMessageBox::StandardButton answer =
+        QMessageBox::question(this,
+                              uiText(QStringLiteral("settings_import_confirm_title"),
+                                     QStringLiteral("Import settings?")),
+                              uiText(QStringLiteral("settings_import_confirm"),
+                                     QStringLiteral("Importing settings will replace the current FobosAPP.ini. A timestamped backup of the current file will be created first.")),
+                              QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::No);
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+
+    savePersistentSettings();
+
+    const QFileInfo currentInfo(currentPath);
+    if (!currentInfo.absoluteDir().exists()) {
+        currentInfo.absoluteDir().mkpath(QStringLiteral("."));
+    }
+
+    QString backupPath;
+    if (QFileInfo::exists(currentPath)) {
+        backupPath = QDir(currentInfo.absolutePath()).absoluteFilePath(
+            QStringLiteral("FobosAPP-settings-before-import-%1.ini")
+                .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"))));
+        if (!QFile::copy(currentPath, backupPath)) {
+            QMessageBox::warning(this,
+                                 uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                                 uiText(QStringLiteral("settings_backup_failed"),
+                                        QStringLiteral("Could not create current settings backup: %1"))
+                                     .arg(backupPath));
+            return;
+        }
+    }
+
+    QFile::remove(currentPath);
+    if (!QFile::copy(sourcePath, currentPath)) {
+        if (!backupPath.isEmpty()) {
+            QFile::copy(backupPath, currentPath);
+        }
+        QMessageBox::warning(this,
+                             uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                             uiText(QStringLiteral("settings_import_failed"),
+                                    QStringLiteral("Settings import failed: %1"))
+                                 .arg(sourcePath));
+        return;
+    }
+
+    loadPersistentSettings();
+    publishSettingsToGlobals();
+    updateUiFromPendingSettings();
+    settingRange();
+    updateGraphBandMarkers();
+    updateFrequencyPresetControls();
+    updateQthControls();
+
+    QString message = uiText(QStringLiteral("settings_import_done"),
+                             QStringLiteral("Settings imported. Backup created: %1"))
+                          .arg(backupPath.isEmpty()
+                                   ? uiText(QStringLiteral("none"), QStringLiteral("none"))
+                                   : QDir::toNativeSeparators(backupPath));
+    if (!isIdle()) {
+        message += QStringLiteral("\n\n");
+        message += uiText(QStringLiteral("settings_import_restart_hint"),
+                          QStringLiteral("Some receiver settings are applied fully after Stop/Start or app restart."));
+    }
+    QMessageBox::information(this,
+                             uiText(QStringLiteral("settings_backup"), QStringLiteral("Settings backup")),
+                             message);
 }
 
 bool YourClassName::applyAgileScanSettings(bool forceStop) {
@@ -7583,6 +11912,151 @@ void YourClassName::advanceStandardScanIfNeeded() {
     applyStandardScanRetune(nextCenter, "standard scan advance");
 }
 
+void YourClassName::resetListeningScanState() {
+    listeningScanRunning = false;
+    activeListeningScanFrequencies.clear();
+    listeningScanIndex = 0;
+    listeningScanDwellTimer.invalidate();
+    listeningScanSettleTimer.invalidate();
+    if (listeningScanAdvanceTimer) {
+        listeningScanAdvanceTimer->stop();
+    }
+}
+
+bool YourClassName::applyListeningScanTarget(double targetFrequencyHz, const char *reason) {
+    if (!std::isfinite(targetFrequencyHz) || targetFrequencyHz <= 0.0) {
+        return false;
+    }
+
+    const QPair<double, double> span = listeningScanVisibleSpanHz(pendingSettings);
+    if (targetFrequencyHz < span.first - 0.5 || targetFrequencyHz > span.second + 0.5) {
+        if (listeningScanStatusLabel) {
+            listeningScanStatusLabel->setText(
+                uiText(QStringLiteral("listening_scan_target_out_of_span"),
+                       QStringLiteral("Listening scan target is outside the visible span: %1-%2 MHz"))
+                    .arg(span.first / 1000000.0, 0, 'f', 6)
+                    .arg(span.second / 1000000.0, 0, 'f', 6));
+        }
+        qDebug() << "[ListeningScan] target outside visible span"
+                 << "reason" << (reason ? reason : "")
+                 << "targetHz" << targetFrequencyHz
+                 << "spanLowHz" << span.first
+                 << "spanHighHz" << span.second
+                 << "centerHz" << pendingSettings.centerFrequency
+                 << "sampleRate" << pendingSettings.sampleRate;
+        return false;
+    }
+
+    pendingSettings.listeningFrequency = targetFrequencyHz;
+    normalizeTuning(pendingSettings, true);
+    publishSettingsToGlobals();
+    if (listeningFrequencyControl) {
+        QSignalBlocker blocker(listeningFrequencyControl);
+        listeningFrequencyControl->setValueHz(pendingSettings.listeningFrequency);
+    }
+    settingRange();
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand(80);
+    }
+
+    listeningScanSettleTimer.restart();
+    listeningScanDwellTimer.invalidate();
+    qDebug() << "[ListeningScan] target"
+             << "reason" << (reason ? reason : "")
+             << "index" << listeningScanIndex
+             << "targetHz" << targetFrequencyHz
+             << "dwellMs" << listeningScanDwellMs
+             << "settleMs" << listeningScanSettleMs
+             << "centerHz" << pendingSettings.centerFrequency
+             << "sampleRate" << pendingSettings.sampleRate;
+    updateListeningScanControls();
+    return true;
+}
+
+bool YourClassName::applyListeningScanSettings(bool forceStop) {
+    if (forceStop || !listeningScanEnabled) {
+        resetListeningScanState();
+        if (listeningScanStatusLabel) {
+            listeningScanStatusLabel->setText(uiText(QStringLiteral("listening_scan_off"),
+                                                    QStringLiteral("Listening scan: off")));
+        }
+        return true;
+    }
+
+    QString error;
+    const QVector<double> targets = listeningScanFrequencyList(&error);
+    if (!error.isEmpty() || targets.isEmpty()) {
+        resetListeningScanState();
+        if (listeningScanStatusLabel) {
+            listeningScanStatusLabel->setText(error.isEmpty()
+                                                  ? uiText(QStringLiteral("listening_scan_bad_list"),
+                                                           QStringLiteral("Bad listening scan list"))
+                                                  : error);
+        }
+        qDebug() << "[ListeningScan] invalid list" << error;
+        return false;
+    }
+
+    const bool listChanged = frequencyListChanged(activeListeningScanFrequencies, targets);
+    activeListeningScanFrequencies = targets;
+    if (listChanged) {
+        listeningScanIndex = 0;
+    } else {
+        listeningScanIndex = (std::clamp)(listeningScanIndex, 0, activeListeningScanFrequencies.size() - 1);
+    }
+    listeningScanRunning = true;
+
+    const double target = activeListeningScanFrequencies.at(listeningScanIndex);
+    if (!applyListeningScanTarget(target, listChanged ? "listening scan start" : "listening scan refresh")) {
+        resetListeningScanState();
+        return false;
+    }
+    if (listeningScanAdvanceTimer && !listeningScanAdvanceTimer->isActive()) {
+        listeningScanAdvanceTimer->start();
+    }
+
+    updateListeningScanControls();
+    return true;
+}
+
+void YourClassName::advanceListeningScanIfNeeded() {
+    if (!listeningScanRunning ||
+        !listeningScanEnabled ||
+        activeListeningScanFrequencies.isEmpty()) {
+        return;
+    }
+
+    if (listeningScanSettleTimer.isValid()) {
+        const qint64 settleMs = (std::clamp)(listeningScanSettleMs,
+                                             LISTENING_SCAN_MIN_SETTLE_MS,
+                                             LISTENING_SCAN_MAX_SETTLE_MS);
+        if (listeningScanSettleTimer.elapsed() < settleMs) {
+            return;
+        }
+        listeningScanSettleTimer.invalidate();
+        listeningScanDwellTimer.restart();
+        return;
+    }
+
+    if (!listeningScanDwellTimer.isValid()) {
+        listeningScanDwellTimer.start();
+        return;
+    }
+
+    const qint64 dwellMs = (std::clamp)(listeningScanDwellMs,
+                                        LISTENING_SCAN_MIN_DWELL_MS,
+                                        LISTENING_SCAN_MAX_DWELL_MS);
+    if (listeningScanDwellTimer.elapsed() < dwellMs) {
+        return;
+    }
+
+    listeningScanIndex = (listeningScanIndex + 1) % activeListeningScanFrequencies.size();
+    const double nextTarget = activeListeningScanFrequencies.at(listeningScanIndex);
+    if (!applyListeningScanTarget(nextTarget, "listening scan advance")) {
+        resetListeningScanState();
+    }
+}
+
 bool YourClassName::stopAgileScanForNormalRf(const char *reason) {
     if (activeFobosApiKind != FobosApiKind::Agile || !agileDevice) {
         agileScanRunning = false;
@@ -7791,6 +12265,93 @@ void YourClassName::refreshSettingsFromUi() {
     }
     if (standardScanRangeEndEdit) {
         standardScanRangeEndMhz = standardScanRangeEndEdit->text().trimmed();
+    }
+    if (listeningScanCheckbox) {
+        listeningScanEnabled = listeningScanCheckbox->isChecked();
+    }
+    if (listeningScanTargetsEdit) {
+        listeningScanTargetsMhz = listeningScanTargetsEdit->text().trimmed();
+    }
+    if (listeningScanDwellSpin) {
+        listeningScanDwellMs = (std::clamp)(listeningScanDwellSpin->value(),
+                                            LISTENING_SCAN_MIN_DWELL_MS,
+                                            LISTENING_SCAN_MAX_DWELL_MS);
+    }
+    if (listeningScanSettleSpin) {
+        listeningScanSettleMs = (std::clamp)(listeningScanSettleSpin->value(),
+                                             LISTENING_SCAN_MIN_SETTLE_MS,
+                                             LISTENING_SCAN_MAX_SETTLE_MS);
+    }
+    if (gnssIntegrationSpin) {
+        gnssAcquisitionIntegrationMs =
+            (std::clamp)(gnssIntegrationSpin->value(),
+                         GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                         GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    }
+    if (gnssChannelFilterSpin) {
+        const double cutoffHz = gnssChannelFilterSpin->value() * 1000000.0;
+        gnssChannelFilterCutoffHz =
+            (std::clamp)(std::isfinite(cutoffHz) ? cutoffHz : 1800000.0,
+                         GNSS_CHANNEL_FILTER_MIN_HZ,
+                         GNSS_CHANNEL_FILTER_MAX_HZ);
+    }
+    if (gnssDopplerSpanSpin) {
+        gnssDopplerSpanHz = (std::clamp)(gnssDopplerSpanSpin->value(), 1, 50) * 1000;
+    }
+    if (gnssDopplerStepSpin) {
+        gnssDopplerStepHz = (std::clamp)(gnssDopplerStepSpin->value(), 250, 5000);
+    }
+    if (qthLatitudeSpin) {
+        qthLatitude = qthLatitudeSpin->value();
+    }
+    if (qthLongitudeSpin) {
+        qthLongitude = qthLongitudeSpin->value();
+    }
+    if (qthSourceCombo) {
+        qthSource = qthSourceCombo->currentData().toString();
+        if (qthSource.isEmpty()) {
+            qthSource = QStringLiteral("manual");
+        }
+    }
+    if (gnssSystemCombo) {
+        gnssSystemId = gnssSystemCombo->currentData().toString().trimmed();
+        if (gnssSystemId.isEmpty()) {
+            gnssSystemId = QStringLiteral("gps_l1_ca");
+        }
+        gnssSystemId = gnssSystemPreset(gnssSystemId).id;
+    }
+    if (gnssMonitorCheckbox) {
+        gnssMonitorEnabled = gnssMonitorCheckbox->isChecked();
+    }
+    if (qthMapLayerCombo) {
+        qthMapLayer = qthMapLayerCombo->currentData().toInt();
+    }
+    if (qthOnlineProviderCombo) {
+        qthOnlineProviderId = qthOnlineProviderCombo->currentData().toString();
+        if (qthOnlineProviderId.isEmpty()) {
+            qthOnlineProviderId = QStringLiteral("custom");
+        }
+    }
+    if (qthMapZoomSpin) {
+        qthMapZoom = qthMapZoomSpin->value();
+    }
+    if (qthGridPrecisionCombo) {
+        qthGridPrecision = qthGridPrecisionCombo->currentData().toInt();
+    }
+    if (qthTileDirectoryEdit) {
+        qthTileDirectory = QDir::fromNativeSeparators(qthTileDirectoryEdit->text().trimmed());
+    }
+    if (qthOnlineTileUrlEdit) {
+        qthOnlineTileUrlTemplate = qthOnlineTileUrlEdit->text().trimmed();
+    }
+    if (qthOnlineAttributionEdit) {
+        qthOnlineAttribution = qthOnlineAttributionEdit->text().trimmed();
+    }
+    if (qthOnlineApiKeyEdit) {
+        qthOnlineApiKey = qthOnlineApiKeyEdit->text().trimmed();
+    }
+    if (qthOnlineNoDiskCacheCheckbox) {
+        qthOnlineNoDiskCache = qthOnlineNoDiskCacheCheckbox->isChecked();
     }
     if (agileScanEnabled && standardScanEnabled) {
         agileScanEnabled = false;
@@ -8612,6 +13173,42 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["standardScanSettleMs"] = standardScanSettleMs;
     settings["standardScanRangeStartMhz"] = standardScanRangeStartMhz;
     settings["standardScanRangeEndMhz"] = standardScanRangeEndMhz;
+    settings["listeningScanEnabled"] = listeningScanEnabled;
+    settings["listeningScanTargetsMhz"] = listeningScanTargetsMhz;
+    settings["listeningScanDwellMs"] = listeningScanDwellMs;
+    settings["listeningScanSettleMs"] = listeningScanSettleMs;
+    settings["qthLatitude"] = qthLatitude;
+    settings["qthLongitude"] = qthLongitude;
+    settings["qthSource"] = qthSource;
+    settings["qthTileDirectory"] = qthTileDirectory;
+    settings["qthMapLayer"] = qthMapLayer;
+    settings["qthMapZoom"] = qthMapZoom;
+    settings["qthGridPrecision"] = qthGridPrecision;
+    settings["qthOnlineProviderId"] = qthOnlineProviderId;
+    settings["qthOnlineTileUrlTemplate"] = qthOnlineTileUrlTemplate;
+    settings["qthOnlineAttribution"] = qthOnlineAttribution;
+    settings["qthOnlineApiKey"] = qthOnlineApiKey;
+    settings["qthOnlineNoDiskCache"] = qthOnlineNoDiskCache;
+    settings["gnssSystemId"] = gnssSystemId;
+    settings["gnssMonitorEnabled"] = gnssMonitorEnabled;
+    settings["gnssAcquisitionIntegrationMs"] = gnssAcquisitionIntegrationMs;
+    settings["gnssChannelFilterCutoffHz"] = gnssChannelFilterCutoffHz;
+    settings["gnssDopplerSpanHz"] = gnssDopplerSpanHz;
+    settings["gnssDopplerStepHz"] = gnssDopplerStepHz;
+    QJsonArray qthMarkers;
+    for (const qth::UserMarker &marker : qthUserMarkers) {
+        if (!qth::isValidLatitude(marker.latitude) || !qth::isValidLongitude(marker.longitude)) {
+            continue;
+        }
+        QJsonObject object;
+        object["number"] = marker.number;
+        object["name"] = marker.name.trimmed();
+        object["description"] = marker.description.trimmed();
+        object["latitude"] = marker.latitude;
+        object["longitude"] = marker.longitude;
+        qthMarkers.append(object);
+    }
+    settings["qthMarkers"] = qthMarkers;
     settings["spectrumUpdateIntervalMs"] = spectrumUpdateIntervalMs;
     settings["spurSuppressionEnabled"] = spurSuppressionEnabled;
     QJsonArray spurMask;
@@ -8780,6 +13377,85 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
         settingsJson.value("standardScanRangeStartMhz").toString(standardScanRangeStartMhz).trimmed();
     standardScanRangeEndMhz =
         settingsJson.value("standardScanRangeEndMhz").toString(standardScanRangeEndMhz).trimmed();
+    listeningScanEnabled = readBool("listeningScanEnabled", listeningScanEnabled);
+    listeningScanTargetsMhz =
+        settingsJson.value("listeningScanTargetsMhz").toString(listeningScanTargetsMhz).trimmed();
+    listeningScanDwellMs = (std::clamp)(readInt("listeningScanDwellMs", listeningScanDwellMs),
+                                        LISTENING_SCAN_MIN_DWELL_MS,
+                                        LISTENING_SCAN_MAX_DWELL_MS);
+    listeningScanSettleMs = (std::clamp)(readInt("listeningScanSettleMs", listeningScanSettleMs),
+                                         LISTENING_SCAN_MIN_SETTLE_MS,
+                                         LISTENING_SCAN_MAX_SETTLE_MS);
+    qthLatitude = (std::clamp)(readDouble("qthLatitude", qthLatitude), -90.0, 90.0);
+    qthLongitude = (std::clamp)(readDouble("qthLongitude", qthLongitude), -180.0, 180.0);
+    qthSource = settingsJson.value("qthSource").toString(qthSource).trimmed();
+    if (qthSource.isEmpty()) {
+        qthSource = QStringLiteral("manual");
+    }
+    qthTileDirectory = settingsJson.value("qthTileDirectory").toString(qthTileDirectory).trimmed();
+    qthMapLayer = (std::clamp)(readInt("qthMapLayer", qthMapLayer), 0, 2);
+    qthMapZoom = (std::clamp)(readInt("qthMapZoom", qthMapZoom), 0, 19);
+    qthOnlineProviderId =
+        settingsJson.value("qthOnlineProviderId").toString(qthOnlineProviderId).trimmed();
+    if (qthOnlineProviderId.isEmpty()) {
+        qthOnlineProviderId = QStringLiteral("custom");
+    }
+    qthOnlineTileUrlTemplate =
+        settingsJson.value("qthOnlineTileUrlTemplate").toString(qthOnlineTileUrlTemplate).trimmed();
+    qthOnlineAttribution =
+        settingsJson.value("qthOnlineAttribution").toString(qthOnlineAttribution).trimmed();
+    qthOnlineApiKey =
+        settingsJson.value("qthOnlineApiKey").toString(qthOnlineApiKey).trimmed();
+    qthOnlineNoDiskCache = readBool("qthOnlineNoDiskCache", qthOnlineNoDiskCache);
+    gnssSystemId =
+        gnssSystemPreset(settingsJson.value("gnssSystemId").toString(gnssSystemId).trimmed()).id;
+    gnssMonitorEnabled = readBool("gnssMonitorEnabled", gnssMonitorEnabled);
+    gnssAcquisitionIntegrationMs =
+        (std::clamp)(readInt("gnssAcquisitionIntegrationMs", gnssAcquisitionIntegrationMs),
+                     GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                     GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    gnssChannelFilterCutoffHz =
+        (std::clamp)(readDouble("gnssChannelFilterCutoffHz", gnssChannelFilterCutoffHz),
+                     GNSS_CHANNEL_FILTER_MIN_HZ,
+                     GNSS_CHANNEL_FILTER_MAX_HZ);
+    gnssDopplerSpanHz =
+        (std::clamp)(readInt("gnssDopplerSpanHz", gnssDopplerSpanHz), 1000, 50000);
+    gnssDopplerStepHz =
+        (std::clamp)(readInt("gnssDopplerStepHz", gnssDopplerStepHz), 250, 5000);
+    qthGridPrecision = readInt("qthGridPrecision", qthGridPrecision);
+    if (qthGridPrecision <= 2) {
+        qthGridPrecision = 2;
+    } else if (qthGridPrecision <= 4) {
+        qthGridPrecision = 4;
+    } else {
+        qthGridPrecision = 6;
+    }
+    if (settingsJson.contains(QStringLiteral("qthMarkers"))) {
+        QVector<qth::UserMarker> nextMarkers;
+        QVector<int> usedNumbers;
+        const QJsonArray markers = settingsJson.value(QStringLiteral("qthMarkers")).toArray();
+        for (const QJsonValue &value : markers) {
+            const QJsonObject object = value.toObject();
+            qth::UserMarker marker;
+            marker.number = object.value(QStringLiteral("number")).toInt(0);
+            marker.name = object.value(QStringLiteral("name")).toString().trimmed().left(80);
+            marker.description = object.value(QStringLiteral("description")).toString().trimmed().left(512);
+            marker.latitude = object.value(QStringLiteral("latitude")).toDouble(std::numeric_limits<double>::quiet_NaN());
+            marker.longitude = object.value(QStringLiteral("longitude")).toDouble(std::numeric_limits<double>::quiet_NaN());
+            if (marker.number <= 0 ||
+                usedNumbers.contains(marker.number) ||
+                !qth::isValidLatitude(marker.latitude) ||
+                !qth::isValidLongitude(marker.longitude)) {
+                continue;
+            }
+            if (marker.name.isEmpty()) {
+                marker.name = qth::maidenheadLocator(marker.latitude, marker.longitude, 6);
+            }
+            usedNumbers.append(marker.number);
+            nextMarkers.append(marker);
+        }
+        qthUserMarkers = nextMarkers;
+    }
     spectrumUpdateIntervalMs = (std::clamp)(readInt("spectrumUpdateIntervalMs", spectrumUpdateIntervalMs),
                                             SPECTRUM_UPDATE_AUTO_MS,
                                             SPECTRUM_UPDATE_MAX_MS);
@@ -8842,6 +13518,21 @@ void YourClassName::loadUiTranslations() {
         {"video", "Video"},
         {"settings_short", "Cfg"},
         {"settings", "Settings..."},
+        {"settings_backup", "Settings backup"},
+        {"settings_backup_hint", "Export FobosAPP.ini before updating the app to keep custom presets, scan lists, map markers and UI settings."},
+        {"export_settings", "Export settings..."},
+        {"import_settings", "Import settings..."},
+        {"settings_ini_filter", "INI settings (*.ini);;All files (*.*)"},
+        {"settings_export_done", "Settings exported: %1"},
+        {"settings_export_failed", "Settings export failed: %1"},
+        {"settings_import_confirm_title", "Import settings?"},
+        {"settings_import_confirm", "Importing settings will replace the current FobosAPP.ini. A timestamped backup of the current file will be created first."},
+        {"settings_import_done", "Settings imported. Backup created: %1"},
+        {"settings_import_failed", "Settings import failed: %1"},
+        {"settings_import_same_file", "Selected file is already the active settings file."},
+        {"settings_import_restart_hint", "Some receiver settings are applied fully after Stop/Start or app restart."},
+        {"settings_backup_failed", "Could not create current settings backup: %1"},
+        {"none", "none"},
         {"decode", "Decode"},
         {"dmr_lock", "Lock DMR"},
         {"clear", "Clear"},
@@ -8927,7 +13618,129 @@ void YourClassName::loadUiTranslations() {
         {"save", "Save"},
         {"delete_short", "Del"},
         {"ranges_mhz", "Ranges MHz:"},
-        {"step", "Step:"}
+        {"step", "Step:"},
+        {"gps_qth", "GPS / QTH"},
+        {"manual", "Manual"},
+        {"nmea_gps", "NMEA GPS"},
+        {"os_location", "OS location"},
+        {"gps_source_future_tooltip", "OS location input is planned; manual coordinates are used for now."},
+        {"paste_nmea", "Paste NMEA"},
+        {"nmea_paste_tooltip", "Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH."},
+        {"nmea_parse_failed", "NMEA: no valid GGA/RMC position found in clipboard."},
+        {"nmea_position_applied", "NMEA QTH: %1 %2, %3 (%4)"},
+        {"source", "Source:"},
+        {"gnss_system", "System:"},
+        {"gnss_system_tooltip", "Select which GNSS signal family the tune, scan and acquisition controls should target."},
+        {"gnss_acq_integration", "Accum:"},
+        {"gnss_acq_integration_tooltip", "How many milliseconds of GPS C/A code to accumulate from the current IQ snapshot."},
+        {"gnss_channel_lpf", "GPS LPF:"},
+        {"gnss_channel_lpf_tooltip", "Low-pass cutoff for the GPS L1 C/A IQ channelizer before PRN correlation."},
+        {"gnss_doppler", "Doppler:"},
+        {"gnss_doppler_span_tooltip", "GPS C/A acquisition Doppler search half-span. Lower values are faster; wider values tolerate larger clock/frequency error."},
+        {"gnss_doppler_step_tooltip", "GPS C/A acquisition Doppler bin spacing. Smaller values are slower but can refine weak candidates."},
+        {"gnss_system_all_l1", "All L1 systems"},
+        {"gnss_system_gps_l1_ca", "GPS L1 C/A"},
+        {"gnss_system_galileo_e1", "Galileo E1"},
+        {"gnss_system_beidou_b1i", "BeiDou B1I"},
+        {"gnss_system_glonass_l1of", "GLONASS L1OF"},
+        {"gnss_acq_selected_gps", "Acquisition selected: %1, GPS C/A correlator ready"},
+        {"gnss_acq_selected_planned", "Acquisition selected: %1, parser planned; RF tune/scan and IQ logging are ready"},
+        {"gnss_acq_not_implemented", "%1 acquisition parser is not implemented yet. RF tune/scan, IQ monitor and IQ saving are ready."},
+        {"gnss_acq_target_out_of_span", "%1 target %2 MHz is outside the current IQ span. Tune this system or wait for its scan center."},
+        {"gnss_system_tuned", "%1 tuned: center %2 MHz, target %3 MHz, bandwidth %4 MHz."},
+        {"latitude_short", "Lat:"},
+        {"longitude_short", "Lon:"},
+        {"qth_locator_short", "QTH:"},
+        {"qth_map", "QTH Map"},
+        {"copy_qth", "Copy QTH"},
+        {"tune_gnss_l1", "Tune GNSS L1"},
+        {"use_gnss_scan", "Use GNSS scan"},
+        {"gps_ca_scan", "GPS C/A accumulate"},
+        {"gps_ca_scan_tooltip", "Run accumulated GPS L1 C/A PRN correlation on the current IQ snapshot."},
+        {"gps_ca_deep_scan", "GPS deep"},
+        {"gps_ca_deep_scan_tooltip", "Run a 160 ms GPS L1 C/A acquisition using the extended live IQ buffer."},
+        {"gps_ca_replay_scan", "GPS replay"},
+        {"gps_ca_replay_scan_tooltip", "Run GPS L1 C/A acquisition directly on the selected Channel IQ WAV recording."},
+        {"gnss_replay_no_file", "GNSS replay: select a Channel IQ WAV recording."},
+        {"gnss_replay_bad_file", "GNSS replay: selected file is not a supported stereo IQ WAV."},
+        {"gnss_replay_too_short", "GNSS replay: recording is too short for one GPS C/A millisecond."},
+        {"gnss_replay_read_failed", "GNSS replay: cannot read selected WAV."},
+        {"gnss_replay_running", "GNSS replay: running acquisition on selected WAV"},
+        {"gps_ca_self_test", "GPS self-test"},
+        {"gps_ca_self_test_tooltip", "Generate an ideal GPS L1 C/A IQ signal and run it through the same acquisition path."},
+        {"gps_ca_self_test_running", "GPS self-test: running"},
+        {"gnss_position_self_test", "Position test"},
+        {"gnss_position_self_test_tooltip", "Solve a synthetic multi-satellite pseudorange fix and show the result on the QTH map."},
+        {"gnss_position_self_test_failed", "GNSS position self-test failed: solver did not converge."},
+        {"gnss_position_self_test_marker", "GNSS synthetic"},
+        {"gnss_position_self_test_result", "GNSS position self-test: %1, %2 (%3), error %4 m, clock %5 m, %6 satellites"},
+        {"gnss_ntp_time", "NTP time"},
+        {"gnss_ntp_time_tooltip", "Query an internet NTP server for UTC time. This is only an assisted-GNSS hint, not code-phase lock."},
+        {"gnss_ntp_querying", "NTP UTC: querying pool.ntp.org"},
+        {"gnss_ntp_result", "NTP UTC: %1, local offset %2 ms"},
+        {"gnss_ntp_lookup_failed", "NTP UTC: DNS lookup failed for %1"},
+        {"gnss_ntp_send_failed", "NTP UTC: request send failed: %1"},
+        {"gnss_ntp_timeout", "NTP UTC: no response; network or UDP/123 may be blocked"},
+        {"gnss_acq_plot_tooltip", "GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history."},
+        {"gnss_acq_plot_waiting", "Run GPS C/A accumulation to draw correlation diagnostics."},
+        {"gps_ca_scan_running", "GPS C/A accumulation: running"},
+        {"gps_ca_scan_no_iq", "GPS C/A accumulation: no IQ snapshot yet"},
+        {"gps_ca_scan_no_candidate", "GPS C/A accumulation: no candidates"},
+        {"gps_ca_scan_cancelling", "GPS C/A accumulation: cancelling"},
+        {"gps_ca_scan_cancelled", "GPS C/A accumulation: cancelled"},
+        {"gps_ca_scan_result", "GPS C/A: PRN %1, metric %2 dB, doppler %3 Hz, code %4, %5 ms accumulated"},
+        {"gps_ca_scan_weak", "GPS C/A: weak/no lock, best PRN %1, metric %2 dB, doppler %3 Hz, code %4, %5 ms accumulated"},
+        {"log_raw_context", "Save GNSS IQ"},
+        {"gnss_raw_context_tooltip", "Save the current live GNSS IQ snapshot as stereo PCM16 WAV and write its tuning context to the diagnostic log."},
+        {"gnss_raw_no_iq", "GNSS IQ snapshot: no IQ data yet."},
+        {"gnss_raw_save_failed", "GNSS IQ snapshot save failed: %1"},
+        {"gnss_raw_saved", "GNSS IQ snapshot saved: %1"},
+        {"gnss_iq_monitor", "GNSS IQ monitor"},
+        {"gnss_iq_monitor_tooltip", "Measure live/playback IQ level, DC offset, clipping and I/Q balance before attempting GNSS acquisition."},
+        {"gnss_iq_monitor_idle", "GNSS IQ monitor: off"},
+        {"gnss_iq_monitor_waiting", "GNSS IQ monitor: waiting for IQ samples"},
+        {"gnss_iq_monitor_status", "%1: %2, center %3 MHz, rate %4 MHz, RMS %5 dBFS, peak %6 dBFS, DC/RMS %7 dB, clip %8%, I/Q %9 dB, frames %10"},
+        {"live_snapshot", "live snapshot"},
+        {"iq_frame", "IQ frame"},
+        {"qth_status_manual", "Manual QTH. Use Save GNSS IQ to write the current raw IQ snapshot."},
+        {"qth_status_nmea", "NMEA QTH is active. Paste GGA/RMC text to update coordinates."},
+        {"qth_status_future_source", "This position source is planned; manual coordinates are used for now."},
+        {"qth_copied", "QTH copied: %1"},
+        {"qth_map_title", "QTH Map"},
+        {"open_osm", "Open OSM"},
+        {"map_search", "Search:"},
+        {"map_search_placeholder", "QTH locator or lat, lon"},
+        {"find", "Find"},
+        {"qth_search_result", "Search: %1  %2, %3"},
+        {"qth_search_not_found", "Search: enter a QTH locator or lat, lon"},
+        {"qth_custom_marker_added", "Marker: %1  %2, %3"},
+        {"qth_custom_marker_removed", "Marker removed: %1  %2, %3"},
+        {"number", "Number"},
+        {"latitude", "Latitude"},
+        {"longitude", "Longitude"},
+        {"description", "Description"},
+        {"add_marker", "Add marker"},
+        {"preset_tab_qth_markers", "QTH markers"},
+        {"bad_qth_marker_row", "Bad QTH marker at row %1"},
+        {"listening_scan", "Listening scan"},
+        {"enable_listening_scan", "Enable listening scan"},
+        {"listening_scan_tooltip", "Cycle only the listening/marker frequency inside the current visible IQ span."},
+        {"listening_scan_preset_tooltip", "Preset of listening target frequencies in MHz."},
+        {"listening_scan_targets_tooltip", "Listening target frequencies in MHz. They must fit inside the current center +/- sample-rate/2 span."},
+        {"listening_scan_dwell_tooltip", "How long to stay on each listening target."},
+        {"listening_scan_settle_tooltip", "Short mute/settle delay after moving the listening marker."},
+        {"targets_mhz", "Targets MHz:"},
+        {"targets_mhz_plain", "Targets MHz"},
+        {"preset_tab_listening_scan", "Listening scan"},
+        {"new_listening_scan_preset", "New listening scan preset"},
+        {"listening_scan_off", "Listening scan: off"},
+        {"listening_scan_list_points", "Listening scan: %1 targets"},
+        {"listening_scan_active", "Listening scan active: %1 targets, #%2 %3 MHz"},
+        {"listening_scan_bad_list", "Bad listening scan list"},
+        {"listening_scan_target_out_of_span", "Listening scan target is outside the visible span: %1-%2 MHz"},
+        {"gnss_l1_tuned", "GNSS L1 tuned: center 1583.0 MHz, GPS L1 1575.42 MHz, raw BW 2.046 MHz."},
+        {"gnss_scan_applied", "%1 scan preset applied: centers %2, listening targets %3, dwell %4 ms. Use <=50 MHz sample rate on standard firmware."},
+        {"gnss_raw_logged", "GNSS raw context written to the log."}
     });
     uiTranslations[QStringLiteral("uk")] = baseLanguage({
         {"controls", "Керування"},
@@ -9176,6 +13989,53 @@ void YourClassName::applyUiLanguage() {
                      static_cast<int>(RecordingManager::Mode::ChannelIqWav),
                      QStringLiteral("channel_iq_wav"),
                      QStringLiteral("Channel IQ WAV"));
+    setComboItemText(qthSourceCombo,
+                     QStringLiteral("manual"),
+                     QStringLiteral("manual"),
+                     QStringLiteral("Manual"));
+    setComboItemText(qthSourceCombo,
+                     QStringLiteral("nmea"),
+                     QStringLiteral("nmea_gps"),
+                     QStringLiteral("NMEA GPS"));
+    setComboItemText(qthSourceCombo,
+                     QStringLiteral("os"),
+                     QStringLiteral("os_location"),
+                     QStringLiteral("OS location"));
+    if (qthSourceCombo) {
+        qthSourceCombo->setItemData(1,
+                                    uiText(QStringLiteral("nmea_paste_tooltip"),
+                                           QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")),
+                                    Qt::ToolTipRole);
+        qthSourceCombo->setItemData(2,
+                                    uiText(QStringLiteral("gps_source_future_tooltip"),
+                                           QStringLiteral("OS location input is planned; manual coordinates are used for now.")),
+                                    Qt::ToolTipRole);
+    }
+    if (qthPasteNmeaButton) {
+        qthPasteNmeaButton->setToolTip(uiText(
+            QStringLiteral("nmea_paste_tooltip"),
+            QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
+    }
+    if (gnssDopplerSpanSpin) {
+        gnssDopplerSpanSpin->setToolTip(uiText(
+            QStringLiteral("gnss_doppler_span_tooltip"),
+            QStringLiteral("GPS C/A acquisition Doppler search half-span. Lower values are faster; wider values tolerate larger clock/frequency error.")));
+    }
+    if (gnssDopplerStepSpin) {
+        gnssDopplerStepSpin->setToolTip(uiText(
+            QStringLiteral("gnss_doppler_step_tooltip"),
+            QStringLiteral("GPS C/A acquisition Doppler bin spacing. Smaller values are slower but can refine weak candidates.")));
+    }
+    if (gnssOfflineAcquireButton) {
+        gnssOfflineAcquireButton->setToolTip(uiText(
+            QStringLiteral("gps_ca_replay_scan_tooltip"),
+            QStringLiteral("Run GPS L1 C/A acquisition directly on the selected Channel IQ WAV recording.")));
+    }
+    if (gnssPositionSelfTestButton) {
+        gnssPositionSelfTestButton->setToolTip(uiText(
+            QStringLiteral("gnss_position_self_test_tooltip"),
+            QStringLiteral("Solve a synthetic multi-satellite pseudorange fix and show the result on the QTH map.")));
+    }
     if (playbackFileCombo &&
         playbackFileCombo->count() == 1 &&
         playbackFileCombo->itemData(0).toString().isEmpty()) {
@@ -9230,6 +14090,7 @@ void YourClassName::applyUiLanguage() {
 
     updateAudioFilterLabels();
     updateHfNoiseCancelControls();
+    updateQthControls();
     applySpectrumHunterTranslations();
     updateAgileScanControls();
     updateScanMeasurementStatus();
@@ -9558,6 +14419,53 @@ void YourClassName::updateUiFromPendingSettings() {
         QSignalBlocker blocker(standardScanRangeEndEdit);
         standardScanRangeEndEdit->setText(standardScanRangeEndMhz);
     }
+    if (listeningScanCheckbox) {
+        QSignalBlocker blocker(listeningScanCheckbox);
+        listeningScanCheckbox->setChecked(listeningScanEnabled);
+    }
+    if (listeningScanTargetsEdit) {
+        QSignalBlocker blocker(listeningScanTargetsEdit);
+        listeningScanTargetsEdit->setText(listeningScanTargetsMhz);
+    }
+    if (listeningScanDwellSpin) {
+        QSignalBlocker blocker(listeningScanDwellSpin);
+        listeningScanDwellSpin->setValue(listeningScanDwellMs);
+    }
+    if (listeningScanSettleSpin) {
+        QSignalBlocker blocker(listeningScanSettleSpin);
+        listeningScanSettleSpin->setValue(listeningScanSettleMs);
+    }
+    if (qthSourceCombo) {
+        QSignalBlocker blocker(qthSourceCombo);
+        const int index = qthSourceCombo->findData(qthSource);
+        if (index >= 0) {
+            qthSourceCombo->setCurrentIndex(index);
+        }
+    }
+    if (gnssIntegrationSpin) {
+        QSignalBlocker blocker(gnssIntegrationSpin);
+        gnssIntegrationSpin->setValue(gnssAcquisitionIntegrationMs);
+    }
+    if (gnssChannelFilterSpin) {
+        QSignalBlocker blocker(gnssChannelFilterSpin);
+        gnssChannelFilterSpin->setValue(gnssChannelFilterCutoffHz / 1000000.0);
+    }
+    if (gnssDopplerSpanSpin) {
+        QSignalBlocker blocker(gnssDopplerSpanSpin);
+        gnssDopplerSpanSpin->setValue((std::clamp)(gnssDopplerSpanHz / 1000, 1, 50));
+    }
+    if (gnssDopplerStepSpin) {
+        QSignalBlocker blocker(gnssDopplerStepSpin);
+        gnssDopplerStepSpin->setValue((std::clamp)(gnssDopplerStepHz, 250, 5000));
+    }
+    if (qthLatitudeSpin) {
+        QSignalBlocker blocker(qthLatitudeSpin);
+        qthLatitudeSpin->setValue(qthLatitude);
+    }
+    if (qthLongitudeSpin) {
+        QSignalBlocker blocker(qthLongitudeSpin);
+        qthLongitudeSpin->setValue(qthLongitude);
+    }
     if (scanMeasurementCheckbox) {
         QSignalBlocker blocker(scanMeasurementCheckbox);
         scanMeasurementCheckbox->setChecked(scanMeasurementEnabled);
@@ -9592,6 +14500,7 @@ void YourClassName::updateUiFromPendingSettings() {
                                                    : uiText(QStringLiteral("bg_rec"), QStringLiteral("BG Rec")));
     }
     updateAgileScanControls();
+    updateQthControls();
     updateScanMeasurementStatus();
     updateDmrHunterControls();
     updateFpvHunterControls();
@@ -9716,6 +14625,90 @@ void YourClassName::loadPersistentSettings() {
                                         STANDARD_SCAN_MAX_SETTLE_MS);
     standardScanRangeStartMhz = settings.value("standardScan/rangeStartMhz", standardScanRangeStartMhz).toString().trimmed();
     standardScanRangeEndMhz = settings.value("standardScan/rangeEndMhz", standardScanRangeEndMhz).toString().trimmed();
+    listeningScanEnabled = settings.value("listeningScan/enabled", listeningScanEnabled).toBool();
+    listeningScanTargetsMhz = settings.value("listeningScan/targetsMhz", listeningScanTargetsMhz).toString().trimmed();
+    listeningScanDwellMs = (std::clamp)(settings.value("listeningScan/dwellMs", listeningScanDwellMs).toInt(),
+                                        LISTENING_SCAN_MIN_DWELL_MS,
+                                        LISTENING_SCAN_MAX_DWELL_MS);
+    listeningScanSettleMs = (std::clamp)(settings.value("listeningScan/settleMs", listeningScanSettleMs).toInt(),
+                                         LISTENING_SCAN_MIN_SETTLE_MS,
+                                         LISTENING_SCAN_MAX_SETTLE_MS);
+    qthLatitude = (std::clamp)(settings.value("gpsQth/latitude", qthLatitude).toDouble(), -90.0, 90.0);
+    qthLongitude = (std::clamp)(settings.value("gpsQth/longitude", qthLongitude).toDouble(), -180.0, 180.0);
+    qthSource = settings.value("gpsQth/source", qthSource).toString().trimmed();
+    if (qthSource.isEmpty()) {
+        qthSource = QStringLiteral("manual");
+    }
+    qthTileDirectory = settings.value("gpsQth/tileDirectory", qthTileDirectory).toString().trimmed();
+    qthMapLayer = (std::clamp)(settings.value("gpsQth/mapLayer", qthMapLayer).toInt(), 0, 2);
+    qthMapZoom = (std::clamp)(settings.value("gpsQth/mapZoom", qthMapZoom).toInt(), 0, 19);
+    qthOnlineProviderId =
+        settings.value("gpsQth/onlineProviderId", qthOnlineProviderId).toString().trimmed();
+    if (qthOnlineProviderId.isEmpty()) {
+        qthOnlineProviderId = QStringLiteral("custom");
+    }
+    qthOnlineTileUrlTemplate =
+        settings.value("gpsQth/onlineTileUrlTemplate", qthOnlineTileUrlTemplate).toString().trimmed();
+    qthOnlineAttribution =
+        settings.value("gpsQth/onlineAttribution", qthOnlineAttribution).toString().trimmed();
+    qthOnlineApiKey =
+        settings.value("gpsQth/onlineApiKey", qthOnlineApiKey).toString().trimmed();
+    qthOnlineNoDiskCache =
+        settings.value("gpsQth/onlineNoDiskCache", qthOnlineNoDiskCache).toBool();
+    gnssSystemId =
+        gnssSystemPreset(settings.value("gpsQth/gnssSystemId", gnssSystemId).toString().trimmed()).id;
+    gnssMonitorEnabled =
+        settings.value("gpsQth/gnssMonitorEnabled", gnssMonitorEnabled).toBool();
+    gnssAcquisitionIntegrationMs =
+        (std::clamp)(settings.value("gpsQth/gnssAcquisitionIntegrationMs",
+                                    gnssAcquisitionIntegrationMs).toInt(),
+                     GNSS_ACQUISITION_MIN_INTEGRATION_MS,
+                     GNSS_ACQUISITION_MAX_INTEGRATION_MS);
+    gnssChannelFilterCutoffHz =
+        (std::clamp)(settings.value("gpsQth/gnssChannelFilterCutoffHz",
+                                    gnssChannelFilterCutoffHz).toDouble(),
+                     GNSS_CHANNEL_FILTER_MIN_HZ,
+                     GNSS_CHANNEL_FILTER_MAX_HZ);
+    gnssDopplerSpanHz =
+        (std::clamp)(settings.value("gpsQth/gnssDopplerSpanHz", gnssDopplerSpanHz).toInt(),
+                     1000,
+                     50000);
+    gnssDopplerStepHz =
+        (std::clamp)(settings.value("gpsQth/gnssDopplerStepHz", gnssDopplerStepHz).toInt(),
+                     250,
+                     5000);
+    qthGridPrecision = settings.value("gpsQth/gridPrecision", qthGridPrecision).toInt();
+    if (qthGridPrecision <= 2) {
+        qthGridPrecision = 2;
+    } else if (qthGridPrecision <= 4) {
+        qthGridPrecision = 4;
+    } else {
+        qthGridPrecision = 6;
+    }
+    qthUserMarkers.clear();
+    QVector<int> qthMarkerNumbers;
+    const int qthMarkerCount = settings.beginReadArray(QStringLiteral("gpsQth/markers"));
+    for (int i = 0; i < qthMarkerCount; ++i) {
+        settings.setArrayIndex(i);
+        qth::UserMarker marker;
+        marker.number = settings.value(QStringLiteral("number")).toInt();
+        marker.name = settings.value(QStringLiteral("name")).toString().trimmed().left(80);
+        marker.description = settings.value(QStringLiteral("description")).toString().trimmed().left(512);
+        marker.latitude = settings.value(QStringLiteral("latitude")).toDouble();
+        marker.longitude = settings.value(QStringLiteral("longitude")).toDouble();
+        if (marker.number <= 0 ||
+            qthMarkerNumbers.contains(marker.number) ||
+            !qth::isValidLatitude(marker.latitude) ||
+            !qth::isValidLongitude(marker.longitude)) {
+            continue;
+        }
+        if (marker.name.isEmpty()) {
+            marker.name = qth::maidenheadLocator(marker.latitude, marker.longitude, 6);
+        }
+        qthMarkerNumbers.append(marker.number);
+        qthUserMarkers.append(marker);
+    }
+    settings.endArray();
     {
         bool adjusted = false;
         QString standardScanError;
@@ -9803,6 +14796,10 @@ void YourClassName::loadPersistentSettings() {
         agileScanPresets[QStringLiteral("Digital video sparse")] =
             agileScanPresetSpec(QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925"), 5.0);
     }
+    if (!agileScanPresets.contains(QStringLiteral("GNSS L1 1559-1610 50MHz"))) {
+        agileScanPresets[QStringLiteral("GNSS L1 1559-1610 50MHz")] =
+            agileScanPresetSpec(QStringLiteral("1559-1610"), GNSS_USEFUL_STANDARD_SPAN_HZ / 1000000.0);
+    }
 
     standardScanPresets.clear();
     const int standardScanPresetCount = settings.beginReadArray("standardScan/presets");
@@ -9828,6 +14825,44 @@ void YourClassName::loadPersistentSettings() {
             standardScanPresetSpec(QStringLiteral("100, 150, 200, 250, 300"), 120, 40);
         standardScanPresets[QStringLiteral("UHF broad 400-700 by 50MHz")] =
             standardScanPresetSpec(QStringLiteral("400, 450, 500, 550, 600, 650, 700"), 120, 40);
+    }
+    if (!standardScanPresets.contains(QStringLiteral("GNSS L1 two-center 50MHz useful"))) {
+        standardScanPresets[QStringLiteral("GNSS L1 two-center 50MHz useful")] =
+            standardScanPresetSpec(QStringLiteral("1575.420000, 1625.420000"), 300, 80);
+    }
+
+    listeningScanPresets.clear();
+    const int listeningScanPresetCount = settings.beginReadArray("listeningScan/presets");
+    for (int i = 0; i < listeningScanPresetCount; ++i) {
+        settings.setArrayIndex(i);
+        const QString name = settings.value("name").toString().trimmed();
+        const QString targets = settings.value("targetsMhz").toString().trimmed();
+        const int dwellMs = (std::clamp)(settings.value("dwellMs", listeningScanDwellMs).toInt(),
+                                         LISTENING_SCAN_MIN_DWELL_MS,
+                                         LISTENING_SCAN_MAX_DWELL_MS);
+        const int settleMs = (std::clamp)(settings.value("settleMs", listeningScanSettleMs).toInt(),
+                                          LISTENING_SCAN_MIN_SETTLE_MS,
+                                          LISTENING_SCAN_MAX_SETTLE_MS);
+        QString parseError;
+        parseListeningScanTargetsMhz(targets, 0.0, RF_EXPERIMENTAL_MAX_FREQUENCY, 1, &parseError);
+        if (!name.isEmpty() && parseError.isEmpty()) {
+            listeningScanPresets[name] = listeningScanPresetSpec(targets, dwellMs, settleMs);
+        }
+    }
+    settings.endArray();
+    if (listeningScanPresets.isEmpty()) {
+        listeningScanPresets[QStringLiteral("GNSS L1 main signals")] =
+            listeningScanPresetSpec(QStringLiteral("1561.098, 1575.420, 1602.000"), 3000, 100);
+        listeningScanPresets[QStringLiteral("FT8 HF common")] =
+            listeningScanPresetSpec(QStringLiteral("1.840, 3.573, 7.074, 10.136, 14.074, 18.100, 21.074, 24.915, 28.074, 50.313"), 5000, 100);
+    }
+    if (!listeningScanPresets.contains(QStringLiteral("GLONASS L1OF channels"))) {
+        listeningScanPresets[QStringLiteral("GLONASS L1OF channels")] =
+            listeningScanPresetSpec(QStringLiteral("1598.0625, 1598.625, 1599.1875, 1599.750, 1600.3125, 1600.875, 1601.4375, 1602.000, 1602.5625, 1603.125, 1603.6875, 1604.250, 1604.8125, 1605.375"), 2500, 100);
+    }
+    if (!listeningScanPresets.contains(QStringLiteral("GNSS L1 dense"))) {
+        listeningScanPresets[QStringLiteral("GNSS L1 dense")] =
+            listeningScanPresetSpec(QStringLiteral("1561.098, 1575.420, 1598.0625, 1598.625, 1599.1875, 1599.750, 1600.3125, 1600.875, 1601.4375, 1602.000, 1602.5625, 1603.125, 1603.6875, 1604.250, 1604.8125, 1605.375"), 2500, 100);
     }
 
     auto readFrequencyPresetArray = [&settings](const char *path, QMap<QString, double> &target) {
@@ -10106,6 +15141,44 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("standardScan/settleMs", standardScanSettleMs);
     settings.setValue("standardScan/rangeStartMhz", standardScanRangeStartMhz);
     settings.setValue("standardScan/rangeEndMhz", standardScanRangeEndMhz);
+    settings.setValue("listeningScan/enabled", listeningScanEnabled);
+    settings.setValue("listeningScan/targetsMhz", listeningScanTargetsMhz);
+    settings.setValue("listeningScan/dwellMs", listeningScanDwellMs);
+    settings.setValue("listeningScan/settleMs", listeningScanSettleMs);
+    settings.setValue("gpsQth/latitude", qthLatitude);
+    settings.setValue("gpsQth/longitude", qthLongitude);
+    settings.setValue("gpsQth/source", qthSource);
+    settings.setValue("gpsQth/tileDirectory", qthTileDirectory);
+    settings.setValue("gpsQth/mapLayer", qthMapLayer);
+    settings.setValue("gpsQth/mapZoom", qthMapZoom);
+    settings.setValue("gpsQth/gridPrecision", qthGridPrecision);
+    settings.setValue("gpsQth/onlineProviderId", qthOnlineProviderId);
+    settings.setValue("gpsQth/onlineTileUrlTemplate", qthOnlineTileUrlTemplate);
+    settings.setValue("gpsQth/onlineAttribution", qthOnlineAttribution);
+    settings.setValue("gpsQth/onlineApiKey", qthOnlineApiKey);
+    settings.setValue("gpsQth/onlineNoDiskCache", qthOnlineNoDiskCache);
+    settings.setValue("gpsQth/gnssSystemId", gnssSystemId);
+    settings.setValue("gpsQth/gnssMonitorEnabled", gnssMonitorEnabled);
+    settings.setValue("gpsQth/gnssAcquisitionIntegrationMs", gnssAcquisitionIntegrationMs);
+    settings.setValue("gpsQth/gnssChannelFilterCutoffHz", gnssChannelFilterCutoffHz);
+    settings.setValue("gpsQth/gnssDopplerSpanHz", gnssDopplerSpanHz);
+    settings.setValue("gpsQth/gnssDopplerStepHz", gnssDopplerStepHz);
+    settings.beginWriteArray(QStringLiteral("gpsQth/markers"));
+    int qthMarkerIndex = 0;
+    for (const qth::UserMarker &marker : qthUserMarkers) {
+        if (marker.number <= 0 ||
+            !qth::isValidLatitude(marker.latitude) ||
+            !qth::isValidLongitude(marker.longitude)) {
+            continue;
+        }
+        settings.setArrayIndex(qthMarkerIndex++);
+        settings.setValue(QStringLiteral("number"), marker.number);
+        settings.setValue(QStringLiteral("name"), marker.name.trimmed());
+        settings.setValue(QStringLiteral("description"), marker.description.trimmed());
+        settings.setValue(QStringLiteral("latitude"), marker.latitude);
+        settings.setValue(QStringLiteral("longitude"), marker.longitude);
+    }
+    settings.endArray();
     settings.setValue("agileScan/measurementEnabled", scanMeasurementEnabled);
     settings.setValue("agileScan/measurementBinMhz", scanMeasurementBinMhz);
     settings.setValue("dmrHunter/enabled", dmrHunterSettings.enabled);
@@ -10138,6 +15211,16 @@ void YourClassName::savePersistentSettings() {
         settings.setValue("centersMhz", standardScanPresetCenters(it.value()));
         settings.setValue("dwellMs", standardScanPresetDwellMs(it.value(), standardScanDwellMs));
         settings.setValue("settleMs", standardScanPresetSettleMs(it.value(), standardScanSettleMs));
+    }
+    settings.endArray();
+    settings.beginWriteArray("listeningScan/presets");
+    int listeningScanPresetIndex = 0;
+    for (auto it = listeningScanPresets.constBegin(); it != listeningScanPresets.constEnd(); ++it) {
+        settings.setArrayIndex(listeningScanPresetIndex++);
+        settings.setValue("name", it.key());
+        settings.setValue("targetsMhz", listeningScanPresetTargets(it.value()));
+        settings.setValue("dwellMs", listeningScanPresetDwellMs(it.value(), listeningScanDwellMs));
+        settings.setValue("settleMs", listeningScanPresetSettleMs(it.value(), listeningScanSettleMs));
     }
     settings.endArray();
 
@@ -10493,6 +15576,9 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         const bool previousStandardScanEnabled = standardScanEnabled;
         const QString previousStandardScanCentersMhz = standardScanCentersMhz;
         const int previousStandardScanDwellMs = standardScanDwellMs;
+        const bool previousListeningScanEnabled = listeningScanEnabled;
+        const QString previousListeningScanTargetsMhz = listeningScanTargetsMhz;
+        const int previousListeningScanDwellMs = listeningScanDwellMs;
         applySettingsFromJson(settingsJson);
         publishSettingsToGlobals();
         updateUiFromPendingSettings();
@@ -10513,6 +15599,10 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             previousStandardScanEnabled != standardScanEnabled ||
             previousStandardScanCentersMhz != standardScanCentersMhz ||
             previousStandardScanDwellMs != standardScanDwellMs;
+        const bool listeningScanChanged =
+            previousListeningScanEnabled != listeningScanEnabled ||
+            previousListeningScanTargetsMhz != listeningScanTargetsMhz ||
+            previousListeningScanDwellMs != listeningScanDwellMs;
 
         if (fftChanged) {
             applyFftLengthChange(pendingSettings.fftLength, false);
@@ -10543,6 +15633,9 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             restartStreamForHardwareChange();
         } else if (serverLocalOutputChanged && !isIdle()) {
             applyServerLocalOutputPolicy();
+        }
+        if (listeningScanChanged && !isIdle() && !restartRequired) {
+            applyListeningScanSettings(false);
         }
 
         if (processor && processor->isRunning()) {
@@ -11776,7 +16869,8 @@ void YourClassName::processVideoSnapshotFrame() {
 
     std::vector<float> snapshot;
     std::uint64_t sequence = 0;
-    if (!IqBuffer::snapshot(snapshot, &sequence) || snapshot.size() < 4) {
+    if (!IqBuffer::snapshotRecent(snapshot, VIDEO_SNAPSHOT_MAX_FLOATS, &sequence) ||
+        snapshot.size() < 4) {
         videoIqFramePending.store(false);
         return;
     }
@@ -12393,6 +17487,9 @@ void YourClassName::handlePlaybackIqFrame(const QByteArray &iqData, double sampl
     if (iqData.size() < static_cast<int>(2 * sizeof(qint16))) {
         return;
     }
+    processGnssPackedIqFrame(iqData,
+                             sampleRate,
+                             sampleCount > 0 ? sampleCount : iqData.size() / (2 * static_cast<int>(sizeof(qint16))));
     processVideoIqFrame(iqData,
                         sampleRate,
                         sampleCount > 0 ? sampleCount : iqData.size() / (2 * static_cast<int>(sizeof(qint16))));
@@ -12916,6 +18013,7 @@ bool YourClassName::openFobosSession() {
         agileScanRunning = false;
         activeAgileScanFrequencies.clear();
         resetStandardScanState(true);
+        resetListeningScanState();
         activeFobosApiKind = FobosApiKind::Standard;
         openedDeviceIndex = -1;
         openedNativeDeviceIndex = -1;
@@ -12992,6 +18090,7 @@ bool YourClassName::closeFobosSession(bool clearIq) {
     sampleRateReopenRequired = false;
     fobosCloseKnownUnsafe = false;
     resetStandardScanState(true);
+    resetListeningScanState();
     activeFobosApiKind = FobosApiKind::Standard;
     openedDeviceApiKind = FobosApiKind::Standard;
     qDebug() << "[FobosLifecycle] closeFobosSession exit";
@@ -13156,6 +18255,9 @@ bool YourClassName::applyFobosSettings() {
     if (!applyStandardScanSettings(false)) {
         qDebug() << "[FobosLifecycle] Standard scan settings failed";
         return false;
+    }
+    if (!applyListeningScanSettings(false)) {
+        qDebug() << "[FobosLifecycle] Listening scan settings failed";
     }
 
     appliedHardwareSettings = pendingSettings;
@@ -14306,6 +19408,7 @@ void YourClassName::updateSpectrum() {
         spectrumSettings.centerFrequency = scanCenterFrequency;
         spectrumSettings.actualFrequency = scanCenterFrequency;
     }
+    processGnssIqSnapshot(spectrumSettings);
     double fullMinFrequency = minFrequency;
     double fullMaxFrequency = maxFrequency;
     if (spectrumSettings.inputMode == INPUT_RF && spectrumSettings.sampleRate > 0.0) {
@@ -14376,6 +19479,7 @@ void YourClassName::updateSpectrum() {
     }
     updateSpurCalibration(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
     applySpurSuppression(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
+    updateGnssSpurWatch(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
     updateScanMeasurement(spectrumFrequencies, spectrumMagnitudes);
 
     std::vector<float> displayFrequencies = spectrumFrequencies;
@@ -15636,6 +20740,7 @@ void YourClassName::finishFobosStop(bool forcedRecovery) {
     if (streamWatchdogTimer) {
         streamWatchdogTimer->stop();
     }
+    resetListeningScanState();
 
     if (processor) {
         processor->finalizeStopped();
@@ -15855,6 +20960,18 @@ void YourClassName::stopFobosProcessing() {
              << "device" << activeFobosDevice()
              << "apiKind" << fobosApiKindName(activeFobosApiKind);
     logMemorySnapshot("before stop");
+    if (gnssAcquisitionCancelFlag) {
+        gnssAcquisitionCancelFlag->store(true, std::memory_order_relaxed);
+        if (gnssAcquireStatusLabel) {
+            gnssAcquireStatusLabel->setText(uiText(QStringLiteral("gps_ca_scan_cancelling"),
+                                                  QStringLiteral("GPS C/A accumulation: cancelling")));
+        }
+        qDebug() << "[GNSS acquisition] cancel requested"
+                 << "reason" << "stop"
+                 << "running" << gnssAcquisitionRunning;
+    }
+    resetListeningScanState();
+
     if (runState == RadioRunState::Idle && !deviceOpened && !(processor && processor->isRunning())) {
         qDebug() << "Stop ignored because radio is already idle.";
         return;
