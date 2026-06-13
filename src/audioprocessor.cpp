@@ -1327,7 +1327,8 @@ void AudioProcessor::SDRThread() {
             resetDemodulatorState();
         }
 
-        if (!IqBuffer::popBlock(iqBlock) || settings.sampleRate <= 0.0) {
+        std::uint64_t iqBlockSequence = 0;
+        if (!IqBuffer::popBlock(iqBlock, &iqBlockSequence) || settings.sampleRate <= 0.0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -1355,6 +1356,7 @@ void AudioProcessor::SDRThread() {
             (audioBlockCounter < 5 || (audioBlockCounter % 100) == 0)) {
             qDebug() << "[Audio] demod block"
                      << "blockCounter" << audioBlockCounter
+                     << "iqSequence" << static_cast<qulonglong>(iqBlockSequence)
                      << "iqFloats" << iqBlock.size()
                      << "configuredRate" << settings.sampleRate
                      << "estimatedRate" << IqBuffer::sampleRateEstimate()

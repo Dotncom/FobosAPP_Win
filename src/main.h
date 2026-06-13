@@ -35,6 +35,7 @@
 #include <QByteArray>
 #include <QJsonObject>
 #include <QList>
+#include <QStringList>
 #include <QVector>
 #include <QApplication>
 #include <QCoreApplication>
@@ -71,6 +72,8 @@
 #include "spectrumhuntercontrols.h"
 #include "scanvisualassembler.h"
 #include "frequencycontrol.h"
+#include "fobosbackend.h"
+#include "rtlsdrbackend.h"
 #include "gnssacquisition.h"
 #include "gnsssignalmonitor.h"
 #include "qthlocator.h"
@@ -171,6 +174,7 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 	void onWaterfallScaleChanged(int delta);
     void wheelEvent(QWheelEvent *event) override;
+    void closeEvent(QCloseEvent *event) override;
         //void closeEvent(QCloseEvent *event) override {
         //int reply = QMessageBox::question(this, "Acception", 
         //                                  "Close this program?",
@@ -199,7 +203,27 @@ private:
     void refreshFobosDeviceList(bool recoverUsb = false);
     QString formatFobosDeviceLabel(const FobosDeviceInfo &info) const;
     FobosDeviceInfo selectedFobosDeviceInfo() const;
+    bool isRtlTcpSelected() const;
+    bool isRtlSdrNativeSelected() const;
+    int selectedRtlSdrNativeIndex() const;
+    bool isSoapySdrSelected() const;
+    bool isRtlBackendSelected() const;
+    bool isExternalReceiverBackendSelected() const;
+    bool normalizeRtlSdrSettings();
+    ReceiverStreamDescriptor makeRtlTcpStreamDescriptor(bool queueAudioBlocks,
+                                                        bool publishIqSnapshot,
+                                                        bool emitIqFrames) const;
+    ReceiverStreamDescriptor makeRtlSdrNativeStreamDescriptor(bool queueAudioBlocks,
+                                                              bool publishIqSnapshot,
+                                                              bool emitIqFrames) const;
+    ReceiverStreamDescriptor makeSoapySdrStreamDescriptor(bool queueAudioBlocks,
+                                                          bool publishIqSnapshot,
+                                                          bool emitIqFrames) const;
     bool restartStreamForHardwareChange();
+    bool restartAgileReaderForCenterRetune(double previousFrequency,
+                                           double requestedFrequency,
+                                           const QString &reason);
+    void abandonFobosSessionWithoutClose(const char *reason);
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
     bool applyFobosSettings();
@@ -215,6 +239,8 @@ private:
     bool applyStandardScanRetune(double targetFrequencyHz, const char *reason);
     bool applyListeningScanTarget(double targetFrequencyHz, const char *reason);
     bool applyListeningScanSettings(bool forceStop = false);
+    bool scheduleLiveAgileCenterRetune(const QString &reason);
+    void flushQueuedLiveAgileCenterRetune();
     void advanceStandardScanIfNeeded();
     void advanceListeningScanIfNeeded();
     void normalizeStandardScanCentersUi(bool requireTwoCenters = false);
@@ -276,9 +302,11 @@ private:
     void updateFrequencyPresetControls();
     void updateGraphBandMarkers();
     void setControlsPanelVisible(bool visible);
-    QVector<QPair<QString, double>> presetMapToVector(const QMap<QString, double> &presets) const;
+    QVector<QPair<QString, double>> presetMapToVector(const QMap<QString, double> &presets,
+                                                      const QStringList &order) const;
     void openPresetManager();
     void openApplicationSettings();
+    void openApplicationHelp();
     void exportSettingsBackup();
     void importSettingsBackup();
     void updateQthControls();
@@ -354,9 +382,7 @@ private:
     void updateHfNoiseCancelControls();
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
     void handleDataProcessorFailure(int errorCode, bool stoppedByRequest);
-    void clearLiveSpectrumSnapshot(bool clearVisualHistory = false);
-    void schedulePostStartRetune(const QString &reason);
-    bool stabilizeAgileFrequencyBeforeStreaming(const char *reason);
+    void clearLiveSpectrumSnapshot(bool clearVisualHistory = false, uint64_t iqEpoch = 0);
     void connectDataProcessorSignals();
     void applyServerLocalOutputPolicy();
     bool applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings, const char *reason);
@@ -364,6 +390,7 @@ private:
     void resetNetworkIqReceptionState(bool clearGraph, bool clearWaterfall, bool restartAudioPrebuffer);
     void loadPersistentSettings();
     void savePersistentSettings();
+    void flushPendingPersistentSettingsSave();
     void startNetworkClientProcessing();
     void stopNetworkClientProcessing();
     void sendNetworkSpectrumFrame(const std::vector<float> &frequencies,
@@ -617,6 +644,8 @@ private:
     QTimer *standardScanAdvanceTimer = nullptr;
     QTimer *listeningScanAdvanceTimer = nullptr;
     QTimer *videoSnapshotTimer = nullptr;
+    QTimer *agileLiveRetuneTimer = nullptr;
+    QTimer *persistentSettingsSaveTimer = nullptr;
     QUdpSocket *gnssNtpSocket = nullptr;
 
     DataProcessor *processor = nullptr;
@@ -694,6 +723,7 @@ private:
     std::atomic<int> pendingDigitalDecoderFrames {0};
     std::atomic<int> droppedDigitalDecoderFramesSinceLog {0};
     bool videoDecodeEnabled = false;
+    bool closeShutdownInProgress = false;
     bool agileScanEnabled = false;
     bool agileScanRunning = false;
     bool standardScanEnabled = false;
@@ -709,11 +739,14 @@ private:
     QString standardScanRangeStartMhz;
     QString standardScanRangeEndMhz;
     QMap<QString, QString> standardScanPresets;
+    QStringList standardScanPresetOrder;
     QString listeningScanTargetsMhz = QStringLiteral("1561.098, 1575.420, 1602.000");
     int listeningScanDwellMs = 3000;
     int listeningScanSettleMs = 100;
     QMap<QString, QString> listeningScanPresets;
+    QStringList listeningScanPresetOrder;
     int spectrumUpdateIntervalMs = 0;
+    int waterfallRowsPerFrame = 2;
     bool scanMeasurementEnabled = false;
     bool scanMeasurementBaselineRecording = false;
     double scanMeasurementBinMhz = 0.1;
@@ -769,6 +802,7 @@ private:
     std::vector<DigitalVideoHunterCandidate> digitalVideoHunterCandidates;
     int digitalVideoHunterCandidateIndex = -1;
     QMap<QString, QString> agileScanPresets;
+    QStringList agileScanPresetOrder;
     QVector<double> activeAgileScanFrequencies;
     QVector<double> activeStandardScanFrequencies;
     QVector<double> activeListeningScanFrequencies;
@@ -816,6 +850,9 @@ private:
     QMap<QString, double> centerFrequencyPresets;
     QMap<QString, double> listeningFrequencyPresets;
     QMap<QString, double> bandwidthValuePresets;
+    QStringList centerFrequencyPresetOrder;
+    QStringList listeningFrequencyPresetOrder;
+    QStringList bandwidthPresetOrder;
     int centerFrequencyUnitIndex = 2;
     int listeningFrequencyUnitIndex = 2;
     int bandwidthUnitIndex = 1;
@@ -877,6 +914,13 @@ private:
     QElapsedTimer listeningScanSettleTimer;
     qint64 liveRetuneSettleDurationMs = 80;
     uint64_t liveCenterRetuneGeneration = 0;
+    uint64_t queuedLiveCenterRetuneGeneration = 0;
+    QString queuedLiveCenterRetuneReason;
+    QElapsedTimer agileLiveRetuneCommandTimer;
+    int agileLiveRetuneCommandIntervalMs = 120;
+    QElapsedTimer persistentSettingsLastSaveTimer;
+    bool persistentSettingsSaveDeferred = false;
+    bool persistentSettingsSaveInProgress = false;
     uint64_t networkSpectrumFrameSequence = 0;
     uint64_t networkIqFrameSequence = 0;
     uint64_t networkIqFramesDropped = 0;

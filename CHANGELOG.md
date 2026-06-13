@@ -1,5 +1,39 @@
 # Changelog
 
+## 4.2 - 2026-06-14
+
+### Added
+
+- Added a runtime receiver backend layer with the existing Fobos Standard and
+  Fobos Agile paths plus native RTL-SDR, rtl_tcp, and optional SoapySDR
+  backends.
+- Added Standard scan support for external live-retune backends, so native
+  RTL-SDR/rtl_tcp/Soapy paths can use the same explicit-center scan workflow.
+- Added ordered preset management controls, LTE/3G default presets, larger FFT
+  sizes, faster waterfall refresh options, and a built-in bilingual feature
+  guide from General settings.
+- Added a 4.2 default configuration snapshot.
+
+### Changed
+
+- Retune/start/stop handling now uses a safer IQ-buffer generation path after
+  the Fobos retune-offset investigation.
+- Spectrum/waterfall drawing avoids extra row copies in the hot path and can
+  duplicate rows for a faster visual waterfall.
+- Android is now labeled and versioned as the USB/Network client
+  (`4.2-usb-network`) because it includes the direct USB/OTG Fobos preview path
+  as well as the network client path.
+- Release packaging now documents optional RTL-SDR runtime files and keeps the
+  local RTL-SDR source checkout out of Raspberry/source packages.
+
+### Known Issues
+
+- Native RTL-SDR and optional SoapySDR support are new and much less tested
+  than the Fobos backends.
+- Android USB/OTG is still a diagnostic live preview, not a full Android
+  replacement for the desktop receiver pipeline.
+- DMR voice and GNSS acquisition remain laboratory features.
+
 ## 4.1 - 2026-06-13
 
 ### Added

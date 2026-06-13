@@ -1,10 +1,12 @@
-# FobosAPP Android Network Client
+# FobosAPP Android USB/Network Client
 
-This is an early Android network-client skeleton for FobosAPP. It is separate
-from the desktop Qt Widgets application on purpose: the first Android target is
-a lightweight remote client, not a direct USB receiver build.
+This is the Android USB/Network client for FobosAPP. It is separate from the
+desktop Qt Widgets application on purpose: Android can either work as a
+lightweight remote client for a desktop/Raspberry FobosAPP server, or run the
+current direct USB/OTG Fobos preview path on compatible phones, hubs, and
+Android USB stacks.
 
-## What Works In This Skeleton
+## What Works
 
 - Connects to a desktop/Linux/Raspberry FobosAPP instance running in
   `Network Settings -> Server` mode.
@@ -21,7 +23,7 @@ a lightweight remote client, not a direct USB receiver build.
 - Supports the multi-client observer/controller role messages at a basic level.
 - Uses a collapsible controls panel so the spectrum/waterfall can fill the
   screen, especially in landscape orientation.
-- Includes a USB sandbox panel for early direct-receiver work. It can list
+- Includes a USB/OTG panel for direct-receiver work. It can list
   Android-visible USB devices, request permission for a likely Fobos device, and
   safely open/close the device to verify Android USB Host access. It also has
   an experimental OTG session probe that claims the likely streaming interface,
@@ -31,11 +33,11 @@ a lightweight remote client, not a direct USB receiver build.
 
 ## Current Scope
 
-The normal Android client path still uses server-side processing. The USB
-sandbox now has a first direct-receiver preview path, but it is intentionally
-limited and diagnostic: 4096-bin FFT maximum, no local audio demodulation yet,
-and no full replacement for the desktop receiver pipeline. High sample rates
-are exposed for testing, but phone, hub, and USB stack limits still matter.
+The network path still uses server-side processing. The USB/OTG path has a
+first direct-receiver preview, but it is intentionally limited and diagnostic:
+4096-bin FFT maximum, no local audio demodulation yet, and no full replacement
+for the desktop receiver pipeline. High sample rates are exposed for testing,
+but phone, hub, and USB stack limits still matter.
 
 ## Build
 

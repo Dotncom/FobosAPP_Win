@@ -1,11 +1,23 @@
 #include "dataprocessor.h"
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
+#include "fobosbackend.h"
+#include "rtlsdrbackend.h"
+#include "soapysdrbackend.h"
 
-#include <fobos_sdr.h>
 #include <algorithm>
 #include <limits>
 #include <vector>
+#include <utility>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QStringList>
+#include <QTcpSocket>
 #ifdef _WIN32
 #include <Windows.h>
 #endif
@@ -32,6 +44,31 @@ constexpr int DMR_CHANNEL_CIC_STAGES = 2;
 constexpr qint64 STREAM_DIAGNOSTIC_REPORT_MS = 3000;
 constexpr qint64 STREAM_DIAGNOSTIC_INITIAL_REPORT_MS = 700;
 constexpr uint32_t STREAM_DIAGNOSTIC_MAX_INSPECT_SAMPLES = 4096;
+constexpr int RETUNE_RAW_DUMP_MAX_BLOCKS = 12;
+constexpr uint32_t RETUNE_RAW_DUMP_MAX_INSPECT_SAMPLES = 8192;
+constexpr int RTL_TCP_ERR_CONNECT = -12001;
+constexpr int RTL_TCP_ERR_CONFIGURE = -12002;
+constexpr int RTL_TCP_ERR_READ = -12003;
+constexpr int RTLSDR_NATIVE_ERR_OPEN = -13101;
+constexpr int RTLSDR_NATIVE_ERR_CONFIGURE = -13102;
+constexpr uint32_t RTLSDR_NATIVE_BLOCK_BYTES = 131072;
+constexpr int SOAPY_SDR_ERR_OPEN = -14101;
+constexpr int SOAPY_SDR_ERR_CONFIGURE = -14102;
+constexpr int SOAPY_SDR_ERR_STREAM = -14103;
+constexpr int SOAPY_SDR_TIMEOUT = -1;
+
+bool writeRtlTcpCommand(QTcpSocket &socket, quint8 command, quint32 parameter) {
+    char packet[5] = {};
+    packet[0] = static_cast<char>(command);
+    packet[1] = static_cast<char>((parameter >> 24) & 0xff);
+    packet[2] = static_cast<char>((parameter >> 16) & 0xff);
+    packet[3] = static_cast<char>((parameter >> 8) & 0xff);
+    packet[4] = static_cast<char>(parameter & 0xff);
+    if (socket.write(packet, sizeof(packet)) != sizeof(packet)) {
+        return false;
+    }
+    return socket.waitForBytesWritten(1000);
+}
 
 double clampDouble(double value, double low, double high) {
     return (std::max)(low, (std::min)(value, high));
@@ -45,6 +82,24 @@ bool shouldReportMeasuredSampleRate(double configuredRate, double measuredRate, 
     const double relativeError = std::abs(measuredRate - configuredRate) / configuredRate;
     return reportCount < SAMPLE_RATE_DIAGNOSTIC_INITIAL_REPORTS ||
            relativeError >= SAMPLE_RATE_DIAGNOSTIC_RELATIVE_WARN;
+}
+
+QString safeFileToken(QString value) {
+    value = value.trimmed();
+    if (value.isEmpty()) {
+        return QStringLiteral("retune");
+    }
+    value = value.left(48);
+    for (int i = 0; i < value.size(); ++i) {
+        const QChar ch = value.at(i);
+        if (!ch.isLetterOrNumber() && ch != QLatin1Char('-') && ch != QLatin1Char('_')) {
+            value[i] = QLatin1Char('_');
+        }
+    }
+    while (value.contains(QStringLiteral("__"))) {
+        value.replace(QStringLiteral("__"), QStringLiteral("_"));
+    }
+    return value;
 }
 
 double networkChannelTargetRate(const RadioSettings &settings) {
@@ -221,126 +276,6 @@ uint32_t asyncBufferCountForRate(double sampleRate) {
     return 32;
 }
 
-int stopSyncSafely(fobos_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_stop_sync(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_stop_sync(dev);
-#endif
-}
-
-int stopSyncAgileSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_stop_sync(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_stop_sync(dev);
-#endif
-}
-
-int startSyncSafely(fobos_dev_t *dev, uint32_t blockSamples) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_start_sync(dev, blockSamples);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_start_sync(dev, blockSamples);
-#endif
-}
-
-int startSyncAgileSafely(fobos_sdr_dev_t *dev, uint32_t blockSamples) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_start_sync(dev, blockSamples);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_start_sync(dev, blockSamples);
-#endif
-}
-
-int readSyncSafely(fobos_dev_t *dev, float *buf, uint32_t *actual_buf_length) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_read_sync(dev, buf, actual_buf_length);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_read_sync(dev, buf, actual_buf_length);
-#endif
-}
-
-int readSyncAgileSafely(fobos_sdr_dev_t *dev, float *buf, uint32_t *actual_buf_length) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_read_sync(dev, buf, actual_buf_length);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_read_sync(dev, buf, actual_buf_length);
-#endif
-}
-
-int cancelAsyncSafely(fobos_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_cancel_async(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_cancel_async(dev);
-#endif
-}
-
-int cancelAsyncAgileSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_cancel_async(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_cancel_async(dev);
-#endif
-}
-
 } // namespace
 
 DataProcessor::DataProcessor(QObject *parent)
@@ -354,15 +289,23 @@ DataProcessor::DataProcessor(QObject *parent)
       requestedChannelizeIqFrames(false),
       requestedAgileScanEnabled(false),
       networkIqResetRequested(false),
+      iqRetuneEpoch(1),
       requestedSampleRate(0.0),
+      requestedCenterFrequency(0.0),
       activeDevice(nullptr),
       activeApiKind(FobosApiKind::Standard),
+      activeBackendId(QStringLiteral("fobos-standard")),
+      activeBackendName(QStringLiteral("Fobos SDR")),
+      activeStreamDescriptor(),
       totalCallbackCounter(0) {
 }
 
 DataProcessor::~DataProcessor() {
-    stop();
-    wait();
+    requestStop();
+    if (QThread::isRunning() && !QThread::wait(1500)) {
+        forceStop(1000);
+    }
+    finalizeStopped();
 }
 
 void DataProcessor::startProcessing(void *device,
@@ -373,16 +316,32 @@ void DataProcessor::startProcessing(void *device,
                                     bool publishIqSnapshot,
                                     bool emitIqFrames,
                                     bool agileScanEnabled) {
+    const ReceiverStreamDescriptor stream = makeFobosStreamDescriptor(device,
+                                                                      apiKind,
+                                                                      syncEnabled,
+                                                                      sampleRate,
+                                                                      0.0,
+                                                                      queueAudioBlocks,
+                                                                      publishIqSnapshot,
+                                                                      emitIqFrames,
+                                                                      agileScanEnabled);
+    startProcessing(stream);
+}
+
+void DataProcessor::startProcessing(const ReceiverStreamDescriptor &stream) {
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] startProcessing enter"
-                 << "device" << device
-                 << "apiKind" << static_cast<int>(apiKind)
-                 << "syncEnabled" << syncEnabled
-                 << "sampleRate" << sampleRate
-                 << "queueAudioBlocks" << queueAudioBlocks
-                 << "publishIqSnapshot" << publishIqSnapshot
-                 << "emitIqFrames" << emitIqFrames
-                 << "agileScanEnabled" << agileScanEnabled
+                 << "backend" << stream.backendId
+                 << "backendName" << stream.backendName
+                 << "streamKind" << static_cast<int>(stream.kind)
+                 << "device" << stream.nativeDevice
+                 << "apiKind" << static_cast<int>(stream.fobosApiKind)
+                 << "syncEnabled" << stream.syncReader
+                 << "sampleRate" << stream.sampleRateHz
+                 << "queueAudioBlocks" << stream.queueAudioBlocks
+                 << "publishIqSnapshot" << stream.publishIqSnapshot
+                 << "emitIqFrames" << stream.emitIqFrames
+                 << "agileScanEnabled" << stream.agileScanEnabled
                  << "threadRunning" << QThread::isRunning()
                  << "runningFlag" << running.load();
     }
@@ -390,31 +349,48 @@ void DataProcessor::startProcessing(void *device,
         qDebug() << "Warning: DataProcessor is already running.";
         return;
     }
-    if (!device) {
+    const bool nativeDeviceRequired =
+        stream.kind == ReceiverBackendStreamKind::FobosStandard ||
+        stream.kind == ReceiverBackendStreamKind::FobosAgile;
+    if (nativeDeviceRequired && !stream.nativeDevice) {
         qDebug() << "Cannot start DataProcessor without an active device.";
         return;
     }
-    const bool useSyncReader = FORCE_SYNC_READER || syncEnabled;
-    activeDevice = device;
-    activeApiKind = apiKind;
-    requestedSampleRate = sampleRate;
-    requestedQueueAudioBlocks = queueAudioBlocks;
-    requestedPublishIqSnapshot = publishIqSnapshot;
-    requestedEmitIqFrames = emitIqFrames;
-    requestedAgileScanEnabled = agileScanEnabled;
+    const bool useSyncReader = FORCE_SYNC_READER || stream.syncReader;
+    activeDevice = stream.nativeDevice;
+    activeApiKind = stream.fobosApiKind;
+    activeStreamKind = stream.kind;
+    activeBackendId = stream.backendId;
+    activeBackendName = stream.backendName;
+    activeStreamDescriptor = stream;
+    const uint64_t streamEpoch = iqRetuneEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    requestedSampleRate = stream.sampleRateHz;
+    requestedCenterFrequency = stream.centerFrequencyHz;
+    requestedQueueAudioBlocks = stream.queueAudioBlocks;
+    requestedPublishIqSnapshot = stream.publishIqSnapshot;
+    requestedEmitIqFrames = stream.emitIqFrames;
+    requestedAgileScanEnabled = stream.agileScanEnabled;
     networkIqResetRequested = true;
+    asyncCancelRequested = false;
     requestedSyncMode = useSyncReader;
     activeSyncMode = useSyncReader;
     totalCallbackCounter = 0;
     asyncRateReportCount = 0;
     resetStreamDiagnostics();
+    if (fobosVerboseLoggingEnabled()) {
+        qDebug() << "[DataProcessor] IQ stream epoch"
+                 << "epoch" << static_cast<qulonglong>(streamEpoch)
+                 << "backend" << activeBackendId
+                 << "center" << stream.centerFrequencyHz
+                 << "sampleRate" << stream.sampleRateHz;
+    }
     if (FORCE_SYNC_READER) {
-        qDebug() << "Using SDR++-style sync Fobos reader for sample rate:" << sampleRate;
+        qDebug() << "Using SDR++-style sync reader for sample rate:" << stream.sampleRateHz;
     } else if (fobosVerboseLoggingEnabled()) {
-        if (syncEnabled) {
-            qDebug() << "Using sync Fobos reader for sample rate:" << sampleRate;
+        if (stream.syncReader) {
+            qDebug() << "Using sync reader for sample rate:" << stream.sampleRateHz;
         } else {
-            qDebug() << "Using async Fobos reader for sample rate:" << sampleRate;
+            qDebug() << "Using async reader for sample rate:" << stream.sampleRateHz;
         }
     }
     running = true;
@@ -436,8 +412,15 @@ void DataProcessor::run() {
     }
     void *readerDevice = activeDevice.load();
     const FobosApiKind readerApiKind = activeApiKind.load();
+    const ReceiverBackendStreamKind readerStreamKind = activeStreamKind;
+    const QString readerBackendId = activeBackendId;
+    const QString readerBackendName = activeBackendName;
+    const ReceiverStreamDescriptor readerStream = activeStreamDescriptor;
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] run state"
+                 << "backend" << readerBackendId
+                 << "backendName" << readerBackendName
+                 << "streamKind" << static_cast<int>(readerStreamKind)
                  << "readerDevice" << readerDevice
                  << "apiKind" << static_cast<int>(readerApiKind)
                  << "runningFlag" << running.load()
@@ -448,19 +431,40 @@ void DataProcessor::run() {
                  << "agileScanEnabled" << requestedAgileScanEnabled.load()
                  << "requestedSampleRate" << requestedSampleRate.load();
     }
-    if (!running.load() || !readerDevice) {
+    const bool nativeDeviceRequired =
+        readerStreamKind == ReceiverBackendStreamKind::FobosStandard ||
+        readerStreamKind == ReceiverBackendStreamKind::FobosAgile;
+    if (!running.load() || (nativeDeviceRequired && !readerDevice)) {
         qDebug() << "Cannot start DataProcessor without an active device.";
         running = false;
         return;
     }
     if (requestedQueueAudioBlocks.load() || requestedPublishIqSnapshot.load()) {
-        IqBuffer::clear();
+        IqBuffer::clear(iqRetuneEpoch.load(std::memory_order_acquire));
     }
     const bool useSyncReader = FORCE_SYNC_READER || requestedSyncMode.load();
     const double sampleRate = requestedSampleRate.load();
     uint32_t readBlockSamples = useSyncReader
                                     ? syncBlockSamplesForRate(sampleRate)
                                     : asyncBlockSamplesForRate(sampleRate);
+    if (readerStreamKind == ReceiverBackendStreamKind::RtlTcp) {
+        readBlockSamples = asyncBlockSamplesForRate(sampleRate);
+        activeSyncMode = false;
+        runRtlTcpReader(readerStream, readBlockSamples);
+        return;
+    }
+    if (readerStreamKind == ReceiverBackendStreamKind::RtlSdrNative) {
+        readBlockSamples = asyncBlockSamplesForRate(sampleRate);
+        activeSyncMode = false;
+        runRtlSdrNativeReader(readerStream, readBlockSamples);
+        return;
+    }
+    if (readerStreamKind == ReceiverBackendStreamKind::SoapySdr) {
+        readBlockSamples = asyncBlockSamplesForRate(sampleRate);
+        activeSyncMode = false;
+        runSoapySdrReader(readerStream, readBlockSamples);
+        return;
+    }
     if (readerApiKind == FobosApiKind::Agile && requestedAgileScanEnabled.load()) {
         readBlockSamples = (std::max)(readBlockSamples, MIN_SYNC_BLOCK_SAMPLES);
     }
@@ -470,12 +474,13 @@ void DataProcessor::run() {
         !requestedAgileScanEnabled.load()) {
         // uSDR keeps the agile normal-RF reader on fixed async parameters.
         // Matching that avoids unnecessary USB transfer topology changes.
-        readBlockSamples = 65536;
+        readBlockSamples = 262144;
         asyncBufferCount = 32;
     }
     activeSyncMode = useSyncReader;
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] selected reader"
+                 << "backend" << readerBackendId
                  << "useSyncReader" << useSyncReader
                  << "forceSync" << FORCE_SYNC_READER
                  << "buffers" << asyncBufferCount
@@ -496,28 +501,30 @@ void DataProcessor::run() {
         asyncRateTimer.restart();
         int ret = FOBOS_ERR_NOT_OPEN;
         if (readerApiKind == FobosApiKind::Agile) {
-            ret = fobos_sdr_read_async(static_cast<fobos_sdr_dev_t*>(readerDevice),
-                                       [](float *buf, uint32_t buf_length, fobos_sdr_dev_t *, void *ctx) {
+            ret = readFobosAgileAsyncSafely(static_cast<fobos_sdr_dev_t*>(readerDevice),
+                                            [](float *buf, uint32_t buf_length, fobos_sdr_dev_t *, void *ctx) {
+                                                auto *processor = static_cast<DataProcessor*>(ctx);
+                                                processor->handleData(buf, buf_length);
+                                            },
+                                            this,
+                                            asyncBufferCount,
+                                            readBlockSamples);
+        } else {
+            ret = readFobosAsyncSafely(static_cast<fobos_dev_t*>(readerDevice),
+                                       [](float *buf, uint32_t buf_length, void *ctx) {
                                            auto *processor = static_cast<DataProcessor*>(ctx);
                                            processor->handleData(buf, buf_length);
                                        },
                                        this,
                                        asyncBufferCount,
                                        readBlockSamples);
-        } else {
-            ret = fobos_rx_read_async(static_cast<fobos_dev_t*>(readerDevice),
-                                      [](float *buf, uint32_t buf_length, void *ctx) {
-                                          auto *processor = static_cast<DataProcessor*>(ctx);
-                                          processor->handleData(buf, buf_length);
-                                      },
-                                      this,
-                                      asyncBufferCount,
-                                      readBlockSamples);
         }
         const bool stoppedByRequest = !running.load();
-        qDebug() << "[DataProcessor] fobos_rx_read_async end"
-                 << "result" << ret
-                 << "stoppedByRequest" << stoppedByRequest;
+        if (!stoppedByRequest || fobosVerboseLoggingEnabled()) {
+            qDebug() << "[DataProcessor] fobos_rx_read_async end"
+                     << "result" << ret
+                     << "stoppedByRequest" << stoppedByRequest;
+        }
         if (!stoppedByRequest) {
             if (ret == FOBOS_ERR_OK) {
                 qDebug() << "[DataProcessor] async read ended unexpectedly with OK result";
@@ -540,8 +547,8 @@ void DataProcessor::run() {
                      << "blockSamples" << readBlockSamples;
         }
         int ret = readerApiKind == FobosApiKind::Agile
-                      ? startSyncAgileSafely(static_cast<fobos_sdr_dev_t*>(readerDevice), readBlockSamples)
-                      : startSyncSafely(static_cast<fobos_dev_t*>(readerDevice), readBlockSamples);
+                      ? startFobosAgileSyncSafely(static_cast<fobos_sdr_dev_t*>(readerDevice), readBlockSamples)
+                      : startFobosSyncSafely(static_cast<fobos_dev_t*>(readerDevice), readBlockSamples);
         qDebug() << "[DataProcessor] fobos_rx_start_sync end" << "result" << ret;
         if (ret != FOBOS_ERR_OK) {
             const bool stoppedByRequest = !running.load();
@@ -563,6 +570,7 @@ void DataProcessor::run() {
         uint64_t readCounter = 0;
         int syncRateReportCount = 0;
         while (running.load()) {
+            const uint64_t readEpoch = iqRetuneEpoch.load(std::memory_order_acquire);
             uint32_t actual_buf_length = 0;
             const bool logRead = readCounter < 5 || (readCounter % 400) == 0;
             if (logRead && fobosVerboseLoggingEnabled()) {
@@ -572,8 +580,8 @@ void DataProcessor::run() {
             QElapsedTimer readTimer;
             readTimer.start();
             ret = readerApiKind == FobosApiKind::Agile
-                      ? readSyncAgileSafely(static_cast<fobos_sdr_dev_t*>(readerDevice), syncBuffer.data(), &actual_buf_length)
-                      : readSyncSafely(static_cast<fobos_dev_t*>(readerDevice), syncBuffer.data(), &actual_buf_length);
+                      ? readFobosAgileSyncSafely(static_cast<fobos_sdr_dev_t*>(readerDevice), syncBuffer.data(), &actual_buf_length)
+                      : readFobosSyncSafely(static_cast<fobos_dev_t*>(readerDevice), syncBuffer.data(), &actual_buf_length);
             accumulatedReadMs += readTimer.elapsed();
             if ((logRead && fobosVerboseLoggingEnabled()) || ret != FOBOS_ERR_OK) {
                 qDebug() << "[DataProcessor] fobos_rx_read_sync end"
@@ -604,7 +612,13 @@ void DataProcessor::run() {
             const bool queueAudioBlocks = requestedQueueAudioBlocks.load();
             const bool publishIqSnapshot = requestedPublishIqSnapshot.load();
             if (queueAudioBlocks || publishIqSnapshot) {
-                IqBuffer::publish(syncBuffer.data(), floatCount, queueAudioBlocks, publishIqSnapshot);
+                if (!IqBuffer::publish(syncBuffer.data(),
+                                       floatCount,
+                                       queueAudioBlocks,
+                                       publishIqSnapshot,
+                                       readEpoch)) {
+                    continue;
+                }
             }
             updateStreamDiagnostics(syncBuffer.data(), actual_buf_length, "sync");
             if (requestedEmitIqFrames.load()) {
@@ -660,18 +674,453 @@ void DataProcessor::run() {
     }
 }
 
+void DataProcessor::runRtlTcpReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples) {
+    const QString host = stream.rtlTcpHost.isEmpty() ? QStringLiteral("127.0.0.1") : stream.rtlTcpHost;
+    const quint16 port = stream.rtlTcpPort == 0 ? 1234 : stream.rtlTcpPort;
+    const double sampleRate = stream.sampleRateHz > 0.0 ? stream.sampleRateHz : requestedSampleRate.load();
+    double appliedCenterFrequency = stream.centerFrequencyHz;
+    const uint32_t samplesPerBlock = (std::max)(blockSamples, MIN_ASYNC_BLOCK_SAMPLES);
+    const int bytesPerBlock = static_cast<int>(samplesPerBlock * FLOATS_PER_IQ_SAMPLE);
+    QByteArray byteBuffer;
+    byteBuffer.reserve(bytesPerBlock * 2);
+
+    qDebug() << "[RTL-TCP] connecting"
+             << "host" << host
+             << "port" << port
+             << "frequency" << appliedCenterFrequency
+             << "sampleRate" << sampleRate
+             << "blockSamples" << samplesPerBlock;
+
+    QTcpSocket socket;
+    socket.connectToHost(host, port);
+    if (!socket.waitForConnected(3000)) {
+        qDebug() << "[RTL-TCP] connect failed" << socket.errorString();
+        emit readerFailed(RTL_TCP_ERR_CONNECT, !running.load());
+        running = false;
+        return;
+    }
+
+    auto commandOrFail = [&socket](quint8 command, quint32 parameter, const char *name) {
+        const bool ok = writeRtlTcpCommand(socket, command, parameter);
+        if (!ok) {
+            qDebug() << "[RTL-TCP] command failed" << name << "parameter" << parameter << socket.errorString();
+        }
+        return ok;
+    };
+
+    bool configured = true;
+    if (appliedCenterFrequency > 0.0) {
+        configured = configured &&
+                     commandOrFail(0x01,
+                                   static_cast<quint32>((std::max)(0.0, appliedCenterFrequency)),
+                                   "set frequency");
+    }
+    if (sampleRate > 0.0) {
+        configured = configured &&
+                     commandOrFail(0x02,
+                                   static_cast<quint32>((std::max)(0.0, sampleRate)),
+                                   "set sample rate");
+    }
+    if (stream.rtlTcpTunerGainTenthsDb >= 0) {
+        configured = configured &&
+                     commandOrFail(0x03, 1, "manual gain mode") &&
+                     commandOrFail(0x04,
+                                   static_cast<quint32>(stream.rtlTcpTunerGainTenthsDb),
+                                   "set gain");
+    } else if (stream.rtlTcpAgc) {
+        configured = configured && commandOrFail(0x03, 0, "auto gain mode");
+    }
+
+    if (!configured) {
+        emit readerFailed(RTL_TCP_ERR_CONFIGURE, !running.load());
+        socket.disconnectFromHost();
+        running = false;
+        return;
+    }
+
+    IqBuffer::setSampleRateEstimate(sampleRate);
+    asyncMeasuredSamples = 0;
+    asyncCallbackCounter = 0;
+    asyncRateReportCount = 0;
+    asyncRateTimer.restart();
+    qDebug() << "[RTL-TCP] stream configured";
+
+    auto applyPendingRetune = [&]() {
+        const double requestedCenter = requestedCenterFrequency.load();
+        if (!std::isfinite(requestedCenter) ||
+            requestedCenter <= 0.0 ||
+            std::abs(requestedCenter - appliedCenterFrequency) <= 0.5) {
+            return true;
+        }
+        const bool ok = commandOrFail(0x01,
+                                      static_cast<quint32>((std::max)(0.0, requestedCenter)),
+                                      "live set frequency");
+        qDebug() << "[RTL-TCP] live center retune"
+                 << "requested" << requestedCenter
+                 << "previous" << appliedCenterFrequency
+                 << "ok" << ok;
+        if (ok) {
+            appliedCenterFrequency = requestedCenter;
+        }
+        return ok;
+    };
+
+    while (running.load()) {
+        applyPendingRetune();
+        if (!socket.waitForReadyRead(100)) {
+            if (socket.state() != QAbstractSocket::ConnectedState) {
+                qDebug() << "[RTL-TCP] disconnected while waiting" << socket.errorString();
+                emit readerFailed(RTL_TCP_ERR_READ, !running.load());
+                break;
+            }
+            continue;
+        }
+
+        byteBuffer.append(socket.readAll());
+        while (running.load() && byteBuffer.size() >= bytesPerBlock) {
+            const auto *raw = reinterpret_cast<const unsigned char*>(byteBuffer.constData());
+            handleUnsigned8IqData(raw, static_cast<uint32_t>(bytesPerBlock), "rtl_tcp");
+            byteBuffer.remove(0, bytesPerBlock);
+        }
+    }
+
+    const bool stoppedByRequest = !running.load();
+    socket.disconnectFromHost();
+    if (socket.state() != QAbstractSocket::UnconnectedState) {
+        socket.waitForDisconnected(500);
+    }
+    running = false;
+    qDebug() << "[RTL-TCP] stream finished" << "stoppedByRequest" << stoppedByRequest;
+}
+
+void DataProcessor::runRtlSdrNativeReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples) {
+    QString loadedPath;
+    QString errorMessage;
+    if (!rtlSdrLibraryAvailable(&loadedPath, &errorMessage)) {
+        qDebug() << "[RTL-SDR] native library unavailable" << errorMessage;
+        emit readerFailed(RTLSDR_NATIVE_ERR_OPEN, !running.load());
+        running = false;
+        return;
+    }
+
+    const QVector<RtlSdrDeviceInfo> devices = enumerateRtlSdrDevices();
+    QStringList deviceLabels;
+    deviceLabels.reserve(devices.size());
+    for (const RtlSdrDeviceInfo &deviceInfo : devices) {
+        deviceLabels.append(QStringLiteral("#%1 %2").arg(deviceInfo.nativeIndex).arg(deviceInfo.name));
+    }
+    qDebug() << "[RTL-SDR] enumerate before open"
+             << "count" << devices.size()
+             << "devices" << deviceLabels;
+
+    void *rtlDevice = nullptr;
+    int ret = openRtlSdrDeviceSafely(&rtlDevice, static_cast<uint32_t>((std::max)(0, stream.rtlSdrNativeDeviceIndex)));
+    qDebug() << "[RTL-SDR] open"
+             << "index" << stream.rtlSdrNativeDeviceIndex
+             << "result" << ret
+             << "device" << rtlDevice
+             << "library" << loadedPath;
+    if (ret != 0 || !rtlDevice) {
+        emit readerFailed(RTLSDR_NATIVE_ERR_OPEN, !running.load());
+        running = false;
+        return;
+    }
+
+    activeDevice = rtlDevice;
+    const double sampleRate = stream.sampleRateHz > 0.0 ? stream.sampleRateHz : requestedSampleRate.load();
+    const double centerFrequency = requestedCenterFrequency.load() > 0.0
+                                       ? requestedCenterFrequency.load()
+                                       : stream.centerFrequencyHz;
+    const uint32_t sampleRateHz = static_cast<uint32_t>((std::max)(0.0, sampleRate));
+    const uint32_t centerFrequencyHz = static_cast<uint32_t>((std::max)(0.0, centerFrequency));
+    bool configured = true;
+
+    ret = setRtlSdrCenterFrequencySafely(rtlDevice, centerFrequencyHz);
+    qDebug() << "[RTL-SDR] set center frequency" << centerFrequencyHz << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setRtlSdrDirectSamplingSafely(rtlDevice, 0);
+    qDebug() << "[RTL-SDR] set direct sampling off result" << ret;
+    configured = configured && ret == 0;
+    ret = setRtlSdrSampleRateSafely(rtlDevice, sampleRateHz);
+    qDebug() << "[RTL-SDR] set sample rate" << sampleRateHz << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setRtlSdrTunerGainModeSafely(rtlDevice, 1);
+    qDebug() << "[RTL-SDR] set manual gain mode result" << ret;
+    configured = configured && ret == 0;
+    ret = setRtlSdrTunerGainSafely(rtlDevice, (std::max)(0, stream.rtlTcpTunerGainTenthsDb));
+    qDebug() << "[RTL-SDR] set tuner gain" << (std::max)(0, stream.rtlTcpTunerGainTenthsDb) << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setRtlSdrAgcModeSafely(rtlDevice, stream.rtlTcpAgc ? 1 : 0);
+    qDebug() << "[RTL-SDR] set agc" << stream.rtlTcpAgc << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setRtlSdrFrequencyCorrectionSafely(rtlDevice, 0);
+    qDebug() << "[RTL-SDR] set frequency correction best-effort result" << ret;
+    ret = resetRtlSdrBufferSafely(rtlDevice);
+    qDebug() << "[RTL-SDR] reset buffer result" << ret;
+    configured = configured && ret == 0;
+
+    if (!running.load()) {
+        qDebug() << "[RTL-SDR] stop requested during configure; closing before read_async";
+        closeRtlSdrDeviceSafely(rtlDevice);
+        activeDevice = nullptr;
+        running = false;
+        return;
+    }
+
+    if (!configured) {
+        closeRtlSdrDeviceSafely(rtlDevice);
+        activeDevice = nullptr;
+        emit readerFailed(RTLSDR_NATIVE_ERR_CONFIGURE, !running.load());
+        running = false;
+        return;
+    }
+
+    IqBuffer::setSampleRateEstimate(sampleRate);
+    asyncMeasuredSamples = 0;
+    asyncCallbackCounter = 0;
+    asyncRateReportCount = 0;
+    asyncRateTimer.restart();
+
+    const uint32_t bytesPerBlock = (std::max)(blockSamples * FLOATS_PER_IQ_SAMPLE,
+                                              RTLSDR_NATIVE_BLOCK_BYTES);
+    const uint32_t bufferCount = asyncBufferCountForRate(sampleRate);
+    qDebug() << "[RTL-SDR] read_async begin"
+             << "buffers" << bufferCount
+             << "blockBytes" << bytesPerBlock
+             << "sampleRate" << sampleRate
+             << "center" << centerFrequency;
+    ret = readRtlSdrAsyncSafely(rtlDevice,
+                                [](unsigned char *buf, uint32_t len, void *ctx) {
+                                    auto *processor = static_cast<DataProcessor*>(ctx);
+                                    processor->handleUnsigned8IqData(buf, len, "rtl_native");
+                                },
+                                this,
+                                bufferCount,
+                                bytesPerBlock);
+    const bool stoppedByRequest = !running.load();
+    qDebug() << "[RTL-SDR] read_async end" << "result" << ret << "stoppedByRequest" << stoppedByRequest;
+    if (ret != 0 && !stoppedByRequest) {
+        emit readerFailed(ret, stoppedByRequest);
+    }
+
+    closeRtlSdrDeviceSafely(rtlDevice);
+    activeDevice = nullptr;
+    running = false;
+}
+
+void DataProcessor::runSoapySdrReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples) {
+    QString loadedPath;
+    QString errorMessage;
+    if (!soapySdrLibraryAvailable(&loadedPath, &errorMessage)) {
+        qDebug() << "[SoapySDR] runtime unavailable" << errorMessage;
+        emit readerFailed(SOAPY_SDR_ERR_OPEN, !running.load());
+        running = false;
+        return;
+    }
+
+    const QVector<SoapySdrDeviceInfo> devices = enumerateSoapySdrDevices();
+    QStringList deviceLabels;
+    deviceLabels.reserve(devices.size());
+    for (const SoapySdrDeviceInfo &deviceInfo : devices) {
+        deviceLabels.append(QStringLiteral("#%1 %2").arg(deviceInfo.nativeIndex).arg(deviceInfo.label));
+    }
+    qDebug() << "[SoapySDR] enumerate before open"
+             << "count" << devices.size()
+             << "devices" << deviceLabels;
+
+    void *soapyDevice = nullptr;
+    int ret = openSoapySdrDeviceSafely(&soapyDevice, stream.soapySdrDeviceIndex);
+    qDebug() << "[SoapySDR] open"
+             << "index" << stream.soapySdrDeviceIndex
+             << "result" << ret
+             << "device" << soapyDevice
+             << "runtime" << loadedPath;
+    if (ret != 0 || !soapyDevice) {
+        qDebug() << "[SoapySDR] open failed" << soapySdrLastErrorMessage();
+        emit readerFailed(SOAPY_SDR_ERR_OPEN, !running.load());
+        running = false;
+        return;
+    }
+
+    activeDevice = soapyDevice;
+    const double sampleRate = stream.sampleRateHz > 0.0 ? stream.sampleRateHz : requestedSampleRate.load();
+    const double centerFrequency = requestedCenterFrequency.load() > 0.0
+                                       ? requestedCenterFrequency.load()
+                                       : stream.centerFrequencyHz;
+    bool configured = true;
+
+    ret = setSoapySdrSampleRateSafely(soapyDevice, sampleRate);
+    qDebug() << "[SoapySDR] set sample rate" << sampleRate << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setSoapySdrCenterFrequencySafely(soapyDevice, centerFrequency);
+    qDebug() << "[SoapySDR] set center frequency" << centerFrequency << "result" << ret;
+    configured = configured && ret == 0;
+    if (stream.centerFrequencyHz > 0.0 && stream.sampleRateHz > 0.0) {
+        ret = setSoapySdrBandwidthSafely(soapyDevice, stream.sampleRateHz);
+        qDebug() << "[SoapySDR] set bandwidth best-effort" << stream.sampleRateHz << "result" << ret;
+    }
+
+    if (!running.load()) {
+        qDebug() << "[SoapySDR] stop requested during configure; closing device";
+        closeSoapySdrDeviceSafely(soapyDevice);
+        activeDevice = nullptr;
+        running = false;
+        return;
+    }
+
+    if (!configured) {
+        qDebug() << "[SoapySDR] configure failed" << soapySdrLastErrorMessage();
+        closeSoapySdrDeviceSafely(soapyDevice);
+        activeDevice = nullptr;
+        emit readerFailed(SOAPY_SDR_ERR_CONFIGURE, !running.load());
+        running = false;
+        return;
+    }
+
+    void *rxStream = setupSoapySdrRxStreamSafely(soapyDevice);
+    qDebug() << "[SoapySDR] setup RX stream" << rxStream;
+    if (!rxStream) {
+        qDebug() << "[SoapySDR] setup stream failed" << soapySdrLastErrorMessage();
+        closeSoapySdrDeviceSafely(soapyDevice);
+        activeDevice = nullptr;
+        emit readerFailed(SOAPY_SDR_ERR_STREAM, !running.load());
+        running = false;
+        return;
+    }
+
+    ret = activateSoapySdrStreamSafely(soapyDevice, rxStream);
+    qDebug() << "[SoapySDR] activate stream result" << ret;
+    if (ret != 0) {
+        qDebug() << "[SoapySDR] activate failed" << soapySdrLastErrorMessage();
+        closeSoapySdrStreamSafely(soapyDevice, rxStream);
+        closeSoapySdrDeviceSafely(soapyDevice);
+        activeDevice = nullptr;
+        emit readerFailed(SOAPY_SDR_ERR_STREAM, !running.load());
+        running = false;
+        return;
+    }
+
+    const uint32_t samplesPerBlock = (std::max)(blockSamples, MIN_ASYNC_BLOCK_SAMPLES);
+    std::vector<float> floatBuffer(static_cast<std::size_t>(samplesPerBlock) * FLOATS_PER_IQ_SAMPLE);
+    IqBuffer::setSampleRateEstimate(sampleRate);
+    asyncMeasuredSamples = 0;
+    asyncCallbackCounter = 0;
+    asyncRateReportCount = 0;
+    asyncRateTimer.restart();
+
+    qDebug() << "[SoapySDR] readStream begin"
+             << "blockSamples" << samplesPerBlock
+             << "sampleRate" << sampleRate
+             << "center" << centerFrequency;
+    while (running.load()) {
+        ret = readSoapySdrStreamSafely(soapyDevice,
+                                       rxStream,
+                                       floatBuffer.data(),
+                                       samplesPerBlock,
+                                       200000);
+        if (ret > 0) {
+            handleData(floatBuffer.data(), static_cast<uint32_t>(ret));
+            continue;
+        }
+        if (ret == SOAPY_SDR_TIMEOUT) {
+            continue;
+        }
+        const bool stoppedByRequest = !running.load();
+        qDebug() << "[SoapySDR] readStream returned"
+                 << "result" << ret
+                 << "stoppedByRequest" << stoppedByRequest
+                 << "error" << soapySdrLastErrorMessage();
+        if (!stoppedByRequest) {
+            emit readerFailed(ret, stoppedByRequest);
+        }
+        break;
+    }
+
+    const bool stoppedByRequest = !running.load();
+    qDebug() << "[SoapySDR] readStream end" << "stoppedByRequest" << stoppedByRequest;
+    deactivateSoapySdrStreamSafely(soapyDevice, rxStream);
+    closeSoapySdrStreamSafely(soapyDevice, rxStream);
+    closeSoapySdrDeviceSafely(soapyDevice);
+    activeDevice = nullptr;
+    running = false;
+}
+
+void DataProcessor::handleUnsigned8IqData(const unsigned char *buf, uint32_t byteCount, const char *readerMode) {
+    if (!running.load() || !buf || byteCount < 2) {
+        return;
+    }
+    const uint64_t callbackEpoch = iqRetuneEpoch.load(std::memory_order_acquire);
+    const uint32_t sampleCount = byteCount / FLOATS_PER_IQ_SAMPLE;
+    std::vector<float> floatBuffer(static_cast<size_t>(sampleCount) * FLOATS_PER_IQ_SAMPLE);
+    for (uint32_t i = 0; i < sampleCount; ++i) {
+        const int iByte = static_cast<int>(buf[i * 2]);
+        const int qByte = static_cast<int>(buf[i * 2 + 1]);
+        floatBuffer[i * 2] = (static_cast<float>(iByte) - 127.5f) / 127.5f;
+        floatBuffer[i * 2 + 1] = (static_cast<float>(qByte) - 127.5f) / 127.5f;
+    }
+
+    ++totalCallbackCounter;
+    ++asyncCallbackCounter;
+    asyncMeasuredSamples += sampleCount;
+    const bool queueAudioBlocks = requestedQueueAudioBlocks.load();
+    const bool publishIqSnapshot = requestedPublishIqSnapshot.load();
+    if (queueAudioBlocks || publishIqSnapshot) {
+        if (!IqBuffer::publish(floatBuffer.data(),
+                               floatBuffer.size(),
+                               queueAudioBlocks,
+                               publishIqSnapshot,
+                               callbackEpoch)) {
+            return;
+        }
+    }
+    updateStreamDiagnostics(floatBuffer.data(), sampleCount, readerMode);
+    if (requestedEmitIqFrames.load()) {
+        emitIqFrame(floatBuffer.data(), floatBuffer.size());
+    }
+
+    const double sampleRate = requestedSampleRate.load();
+    const qint64 elapsedMs = asyncRateTimer.elapsed();
+    if (elapsedMs >= 500) {
+        const double measuredRate =
+            static_cast<double>(asyncMeasuredSamples) * 1000.0 /
+            static_cast<double>((std::max)(qint64(1), elapsedMs));
+        IqBuffer::setSampleRateEstimate(measuredRate);
+        if (shouldReportMeasuredSampleRate(sampleRate, measuredRate, asyncRateReportCount)) {
+            const double errorPercent =
+                sampleRate > 0.0
+                    ? ((measuredRate - sampleRate) / sampleRate) * 100.0
+                    : 0.0;
+            qDebug() << "[RTL-SDR] sample-rate check"
+                     << "reader" << readerMode
+                     << "configured" << sampleRate
+                     << "measured" << measuredRate
+                     << "errorPercent" << errorPercent
+                     << "callbacks" << asyncCallbackCounter;
+            ++asyncRateReportCount;
+        }
+        asyncMeasuredSamples = 0;
+        asyncCallbackCounter = 0;
+        asyncRateTimer.restart();
+    }
+}
+
 void DataProcessor::handleData(float *buf, uint32_t buf_length) {
     if (!running.load()) {
         return;
     }
+    const uint64_t callbackEpoch = iqRetuneEpoch.load(std::memory_order_acquire);
     ++totalCallbackCounter;
+    captureRetuneRawDumpBlock(buf, buf_length, callbackEpoch);
     const bool queueAudioBlocks = requestedQueueAudioBlocks.load();
     const bool publishIqSnapshot = requestedPublishIqSnapshot.load();
     if (queueAudioBlocks || publishIqSnapshot) {
-        IqBuffer::publish(buf,
-                          static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE,
-                          queueAudioBlocks,
-                          publishIqSnapshot);
+        if (!IqBuffer::publish(buf,
+                               static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE,
+                               queueAudioBlocks,
+                               publishIqSnapshot,
+                               callbackEpoch)) {
+            return;
+        }
     }
     updateStreamDiagnostics(buf, buf_length, "async");
     if (requestedEmitIqFrames.load()) {
@@ -699,14 +1148,6 @@ void DataProcessor::handleData(float *buf, uint32_t buf_length) {
                      << "blockSamples" << buf_length;
             ++asyncRateReportCount;
         }
-        if (fobosVerboseLoggingEnabled()) {
-            qDebug() << "[DataProcessor] async measured sample rate"
-                     << "configured" << requestedSampleRate.load()
-                     << "measured" << measuredRate
-                     << "elapsedMs" << elapsedMs
-                     << "callbackCounter" << asyncCallbackCounter
-                     << "blockSamples" << buf_length;
-        }
         asyncMeasuredSamples = 0;
         asyncCallbackCounter = 0;
         asyncRateTimer.restart();
@@ -729,6 +1170,9 @@ void DataProcessor::resetStreamDiagnostics() {
     streamDiagnosticMeanI = 0.0;
     streamDiagnosticMeanQ = 0.0;
     streamDiagnosticPower = 0.0;
+    streamDiagnosticPhaseStepSum = 0.0;
+    streamDiagnosticPhaseStepAbsSum = 0.0;
+    streamDiagnosticPhaseStepCount = 0;
     streamDiagnosticInspectedSamples = 0;
     streamDiagnosticNonFiniteSamples = 0;
     streamDiagnosticClippedSamples = 0;
@@ -788,6 +1232,9 @@ void DataProcessor::updateStreamDiagnostics(const float *samples,
 
     const uint32_t inspectCount = (std::min)(sampleCount, STREAM_DIAGNOSTIC_MAX_INSPECT_SAMPLES);
     const uint32_t stride = (std::max)(uint32_t(1), sampleCount / inspectCount);
+    bool havePreviousPhaseSample = false;
+    double previousI = 0.0;
+    double previousQ = 0.0;
     for (uint32_t n = 0, inspected = 0; n < sampleCount && inspected < inspectCount; n += stride, ++inspected) {
         const float iSample = samples[static_cast<size_t>(n) * 2U];
         const float qSample = samples[static_cast<size_t>(n) * 2U + 1U];
@@ -800,6 +1247,21 @@ void DataProcessor::updateStreamDiagnostics(const float *samples,
         streamDiagnosticPower += static_cast<double>(iSample) * iSample +
                                  static_cast<double>(qSample) * qSample;
         ++streamDiagnosticInspectedSamples;
+        if (havePreviousPhaseSample) {
+            const double cross = previousI * static_cast<double>(qSample) -
+                                 previousQ * static_cast<double>(iSample);
+            const double dot = previousI * static_cast<double>(iSample) +
+                               previousQ * static_cast<double>(qSample);
+            const double phaseStep = std::atan2(cross, dot);
+            if (std::isfinite(phaseStep)) {
+                streamDiagnosticPhaseStepSum += phaseStep;
+                streamDiagnosticPhaseStepAbsSum += std::abs(phaseStep);
+                ++streamDiagnosticPhaseStepCount;
+            }
+        }
+        previousI = iSample;
+        previousQ = qSample;
+        havePreviousPhaseSample = true;
         if (std::abs(iSample) >= 0.999f || std::abs(qSample) >= 0.999f) {
             ++streamDiagnosticClippedSamples;
         }
@@ -823,6 +1285,10 @@ void DataProcessor::updateStreamDiagnostics(const float *samples,
     const double meanI = streamDiagnosticMeanI / inspected;
     const double meanQ = streamDiagnosticMeanQ / inspected;
     const double rms = std::sqrt((std::max)(0.0, streamDiagnosticPower / inspected * 0.5));
+    const double phaseCount =
+        static_cast<double>((std::max)(uint64_t(1), streamDiagnosticPhaseStepCount));
+    const double phaseStepMean = streamDiagnosticPhaseStepSum / phaseCount;
+    const double phaseStepAbsMean = streamDiagnosticPhaseStepAbsSum / phaseCount;
     const double clipPercent =
         100.0 * static_cast<double>(streamDiagnosticClippedSamples) / inspected;
     const double nonFinitePercent =
@@ -836,9 +1302,10 @@ void DataProcessor::updateStreamDiagnostics(const float *samples,
             : 0.0;
 
     qDebug() << "[IQ stream]"
-             << "mode" << readerMode
-             << "configuredRate" << configuredRate
-             << "measuredRate" << measuredRate
+              << "mode" << readerMode
+              << "configuredRate" << configuredRate
+              << "centerFrequency" << requestedCenterFrequency.load()
+              << "measuredRate" << measuredRate
              << "errorPercent" << errorPercent
              << "callbacks" << streamDiagnosticCallbacks
              << "samples" << streamDiagnosticSamples
@@ -852,11 +1319,13 @@ void DataProcessor::updateStreamDiagnostics(const float *samples,
              << "lateCallbacks" << streamDiagnosticLateCallbacks
              << "queuedBlocks" << IqBuffer::queuedBlocks()
              << "queuedFloats" << IqBuffer::queuedFloatCount()
-             << "rms" << rms
-             << "meanI" << meanI
-             << "meanQ" << meanQ
-             << "clipPercent" << clipPercent
-             << "nonFinitePercent" << nonFinitePercent;
+              << "rms" << rms
+              << "meanI" << meanI
+              << "meanQ" << meanQ
+              << "phaseStepMeanRad" << phaseStepMean
+              << "phaseStepAbsMeanRad" << phaseStepAbsMean
+              << "clipPercent" << clipPercent
+              << "nonFinitePercent" << nonFinitePercent;
 
     ++streamDiagnosticReportCount;
     streamDiagnosticTimer.restart();
@@ -873,6 +1342,9 @@ void DataProcessor::updateStreamDiagnostics(const float *samples,
     streamDiagnosticMeanI = 0.0;
     streamDiagnosticMeanQ = 0.0;
     streamDiagnosticPower = 0.0;
+    streamDiagnosticPhaseStepSum = 0.0;
+    streamDiagnosticPhaseStepAbsSum = 0.0;
+    streamDiagnosticPhaseStepCount = 0;
     streamDiagnosticInspectedSamples = 0;
     streamDiagnosticNonFiniteSamples = 0;
     streamDiagnosticClippedSamples = 0;
@@ -1193,6 +1665,296 @@ void DataProcessor::setSampleRateHint(double sampleRate) {
     IqBuffer::setSampleRateEstimate(sampleRate);
 }
 
+void DataProcessor::setCenterFrequencyHint(double centerFrequency) {
+    if (centerFrequency <= 0.0 || !std::isfinite(centerFrequency)) {
+        return;
+    }
+    requestedCenterFrequency = centerFrequency;
+}
+
+uint64_t DataProcessor::beginIqRetuneBarrier() {
+    const uint64_t epoch = iqRetuneEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    return epoch;
+}
+
+void DataProcessor::startRetuneRawDump(const QString &reason,
+                                       uint64_t epoch,
+                                       double previousCenterHz,
+                                       double requestedCenterHz,
+                                       double actualCenterHz,
+                                       int maxBlocks) {
+    if (!fobosVerboseLoggingEnabled()) {
+        return;
+    }
+
+    maxBlocks = (std::clamp)(maxBlocks, 1, RETUNE_RAW_DUMP_MAX_BLOCKS);
+    const QString appDirPath = QCoreApplication::applicationDirPath();
+    const QString baseDirPath = QDir(appDirPath.isEmpty()
+                                         ? QDir::currentPath()
+                                         : appDirPath)
+                                    .filePath(QStringLiteral("recordings/retune_raw"));
+    QDir baseDir(baseDirPath);
+    if (!baseDir.exists() && !baseDir.mkpath(QStringLiteral("."))) {
+        qDebug() << "[RetuneRawDump] failed to create directory" << baseDirPath;
+        return;
+    }
+
+    const QString timestamp = QDateTime::currentDateTime()
+                                  .toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+    const QString token = safeFileToken(reason);
+    const QString basePath =
+        baseDir.filePath(QStringLiteral("FobosAPP_retune_%1_epoch%2_%3")
+                             .arg(timestamp,
+                                  QString::number(static_cast<qulonglong>(epoch)),
+                                  token));
+
+    std::lock_guard<std::mutex> lock(retuneRawDumpMutex);
+    if (retuneRawDumpActive || !retuneRawDumpBytes.isEmpty()) {
+        finishRetuneRawDumpLocked(QStringLiteral("interrupted_by_new_retune"));
+    }
+
+    retuneRawDumpActive = true;
+    retuneRawDumpEpoch = epoch;
+    retuneRawDumpTriggerCallback = totalCallbackCounter.load();
+    retuneRawDumpBlocksRequested = maxBlocks;
+    retuneRawDumpBlocksRemaining = maxBlocks;
+    retuneRawDumpBlocksCaptured = 0;
+    retuneRawDumpSamplesCaptured = 0;
+    retuneRawDumpPreviousCenterHz = previousCenterHz;
+    retuneRawDumpRequestedCenterHz = requestedCenterHz;
+    retuneRawDumpActualCenterHz = actualCenterHz;
+    retuneRawDumpSampleRateHz = requestedSampleRate.load();
+    retuneRawDumpReason = reason;
+    retuneRawDumpBasePath = basePath;
+    retuneRawDumpBytes.clear();
+    retuneRawDumpBytes.reserve(maxBlocks * 262144 * FLOATS_PER_IQ_SAMPLE * static_cast<int>(sizeof(float)));
+    retuneRawDumpBlockStats = QJsonArray();
+
+    qDebug() << "[RetuneRawDump] armed"
+             << "path" << (basePath + QStringLiteral(".f32iq"))
+             << "epoch" << static_cast<qulonglong>(epoch)
+             << "blocks" << maxBlocks
+             << "previous" << previousCenterHz
+             << "requested" << requestedCenterHz
+             << "sampleRate" << retuneRawDumpSampleRateHz;
+}
+
+void DataProcessor::captureRetuneRawDumpBlock(const float *samples,
+                                              uint32_t sampleCount,
+                                              uint64_t callbackEpoch) {
+    if (!samples || sampleCount == 0 || !fobosVerboseLoggingEnabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(retuneRawDumpMutex);
+    if (!retuneRawDumpActive || retuneRawDumpBlocksRemaining <= 0) {
+        return;
+    }
+
+    const std::size_t floatCount =
+        static_cast<std::size_t>(sampleCount) * FLOATS_PER_IQ_SAMPLE;
+    const int byteCount = static_cast<int>((std::min)(
+        floatCount * sizeof(float),
+        static_cast<std::size_t>((std::numeric_limits<int>::max)())));
+    retuneRawDumpBytes.append(reinterpret_cast<const char*>(samples), byteCount);
+
+    double meanI = 0.0;
+    double meanQ = 0.0;
+    double power = 0.0;
+    double phaseStepSum = 0.0;
+    double phaseStepAbsSum = 0.0;
+    uint64_t inspectedSamples = 0;
+    uint64_t phaseStepCount = 0;
+    uint64_t nonFiniteSamples = 0;
+    uint64_t clippedSamples = 0;
+    bool havePreviousPhaseSample = false;
+    double previousI = 0.0;
+    double previousQ = 0.0;
+    const uint32_t inspectCount =
+        (std::min)(sampleCount, RETUNE_RAW_DUMP_MAX_INSPECT_SAMPLES);
+    const uint32_t stride = (std::max)(uint32_t(1), sampleCount / inspectCount);
+    for (uint32_t n = 0, inspected = 0; n < sampleCount && inspected < inspectCount; n += stride, ++inspected) {
+        const float iSample = samples[static_cast<std::size_t>(n) * 2U];
+        const float qSample = samples[static_cast<std::size_t>(n) * 2U + 1U];
+        if (!std::isfinite(iSample) || !std::isfinite(qSample)) {
+            ++nonFiniteSamples;
+            continue;
+        }
+        meanI += static_cast<double>(iSample);
+        meanQ += static_cast<double>(qSample);
+        power += static_cast<double>(iSample) * iSample +
+                 static_cast<double>(qSample) * qSample;
+        ++inspectedSamples;
+        if (havePreviousPhaseSample) {
+            const double cross = previousI * static_cast<double>(qSample) -
+                                 previousQ * static_cast<double>(iSample);
+            const double dot = previousI * static_cast<double>(iSample) +
+                               previousQ * static_cast<double>(qSample);
+            const double phaseStep = std::atan2(cross, dot);
+            if (std::isfinite(phaseStep)) {
+                phaseStepSum += phaseStep;
+                phaseStepAbsSum += std::abs(phaseStep);
+                ++phaseStepCount;
+            }
+        }
+        previousI = iSample;
+        previousQ = qSample;
+        havePreviousPhaseSample = true;
+        if (std::abs(iSample) >= 0.999f || std::abs(qSample) >= 0.999f) {
+            ++clippedSamples;
+        }
+    }
+
+    const double inspected = static_cast<double>((std::max)(uint64_t(1), inspectedSamples));
+    const double phaseCount = static_cast<double>((std::max)(uint64_t(1), phaseStepCount));
+    QJsonObject block;
+    block.insert(QStringLiteral("index"), retuneRawDumpBlocksCaptured);
+    block.insert(QStringLiteral("callback"), static_cast<double>(totalCallbackCounter.load()));
+    block.insert(QStringLiteral("epoch"), static_cast<double>(callbackEpoch));
+    block.insert(QStringLiteral("sampleCount"), static_cast<double>(sampleCount));
+    block.insert(QStringLiteral("centerFrequencyHint"), requestedCenterFrequency.load());
+    block.insert(QStringLiteral("meanI"), meanI / inspected);
+    block.insert(QStringLiteral("meanQ"), meanQ / inspected);
+    block.insert(QStringLiteral("rms"), std::sqrt((std::max)(0.0, power / inspected * 0.5)));
+    block.insert(QStringLiteral("phaseStepMeanRad"), phaseStepSum / phaseCount);
+    block.insert(QStringLiteral("phaseStepAbsMeanRad"), phaseStepAbsSum / phaseCount);
+    block.insert(QStringLiteral("nonFiniteSamples"), static_cast<double>(nonFiniteSamples));
+    block.insert(QStringLiteral("clippedSamples"), static_cast<double>(clippedSamples));
+    retuneRawDumpBlockStats.append(block);
+
+    ++retuneRawDumpBlocksCaptured;
+    retuneRawDumpSamplesCaptured += sampleCount;
+    --retuneRawDumpBlocksRemaining;
+    if (retuneRawDumpBlocksRemaining <= 0) {
+        finishRetuneRawDumpLocked(QStringLiteral("complete"));
+    }
+}
+
+void DataProcessor::finishRetuneRawDumpLocked(const QString &status) {
+    if (!retuneRawDumpActive && retuneRawDumpBytes.isEmpty()) {
+        return;
+    }
+
+    const QString rawPath = retuneRawDumpBasePath + QStringLiteral(".f32iq");
+    const QString jsonPath = retuneRawDumpBasePath + QStringLiteral(".json");
+    QJsonObject root;
+    root.insert(QStringLiteral("app"), QStringLiteral("FobosAPP"));
+    root.insert(QStringLiteral("version"), 1);
+    root.insert(QStringLiteral("status"), status);
+    root.insert(QStringLiteral("format"), QStringLiteral("float32_le_interleaved_iq"));
+    root.insert(QStringLiteral("rawFile"), QFileInfo(rawPath).fileName());
+    root.insert(QStringLiteral("jsonFile"), QFileInfo(jsonPath).fileName());
+    root.insert(QStringLiteral("reason"), retuneRawDumpReason);
+    root.insert(QStringLiteral("epoch"), static_cast<double>(retuneRawDumpEpoch));
+    root.insert(QStringLiteral("triggerCallback"), static_cast<double>(retuneRawDumpTriggerCallback));
+    root.insert(QStringLiteral("blocksRequested"), retuneRawDumpBlocksRequested);
+    root.insert(QStringLiteral("blocksCaptured"), retuneRawDumpBlocksCaptured);
+    root.insert(QStringLiteral("complexSamplesCaptured"), static_cast<double>(retuneRawDumpSamplesCaptured));
+    root.insert(QStringLiteral("floatCount"), static_cast<double>(retuneRawDumpBytes.size() / sizeof(float)));
+    root.insert(QStringLiteral("byteCount"), static_cast<double>(retuneRawDumpBytes.size()));
+    root.insert(QStringLiteral("sampleRateHz"), retuneRawDumpSampleRateHz);
+    root.insert(QStringLiteral("previousCenterHz"), retuneRawDumpPreviousCenterHz);
+    root.insert(QStringLiteral("requestedCenterHz"), retuneRawDumpRequestedCenterHz);
+    root.insert(QStringLiteral("actualCenterAtTriggerHz"), retuneRawDumpActualCenterHz);
+    root.insert(QStringLiteral("blocks"), retuneRawDumpBlockStats);
+
+    QByteArray rawBytes = std::move(retuneRawDumpBytes);
+    QByteArray jsonBytes = QJsonDocument(root).toJson(QJsonDocument::Indented);
+    const int blocksCaptured = retuneRawDumpBlocksCaptured;
+    const quint64 samplesCaptured = retuneRawDumpSamplesCaptured;
+
+    retuneRawDumpActive = false;
+    retuneRawDumpEpoch = 0;
+    retuneRawDumpTriggerCallback = 0;
+    retuneRawDumpBlocksRequested = 0;
+    retuneRawDumpBlocksRemaining = 0;
+    retuneRawDumpBlocksCaptured = 0;
+    retuneRawDumpSamplesCaptured = 0;
+    retuneRawDumpPreviousCenterHz = 0.0;
+    retuneRawDumpRequestedCenterHz = 0.0;
+    retuneRawDumpActualCenterHz = 0.0;
+    retuneRawDumpSampleRateHz = 0.0;
+    retuneRawDumpReason.clear();
+    retuneRawDumpBasePath.clear();
+    retuneRawDumpBlockStats = QJsonArray();
+
+    std::thread([rawPath,
+                 jsonPath,
+                 rawBytes = std::move(rawBytes),
+                 jsonBytes = std::move(jsonBytes),
+                 blocksCaptured,
+                 samplesCaptured]() mutable {
+        QFile rawFile(rawPath);
+        bool rawOk = false;
+        if (rawFile.open(QIODevice::WriteOnly)) {
+            rawOk = rawFile.write(rawBytes) == rawBytes.size();
+            rawFile.close();
+        }
+
+        QFile jsonFile(jsonPath);
+        bool jsonOk = false;
+        if (jsonFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            jsonOk = jsonFile.write(jsonBytes) == jsonBytes.size();
+            jsonFile.close();
+        }
+
+        qDebug() << "[RetuneRawDump] saved"
+                 << "raw" << rawPath
+                 << "rawOk" << rawOk
+                 << "json" << jsonPath
+                 << "jsonOk" << jsonOk
+                 << "blocks" << blocksCaptured
+                 << "samples" << static_cast<qulonglong>(samplesCaptured);
+    }).detach();
+}
+
+bool DataProcessor::retuneCenterFrequency(double centerFrequencyHz) {
+    if (!std::isfinite(centerFrequencyHz) || centerFrequencyHz <= 0.0) {
+        return false;
+    }
+
+    requestedCenterFrequency = centerFrequencyHz;
+    const ReceiverBackendStreamKind streamKind = activeStreamKind;
+    if (streamKind == ReceiverBackendStreamKind::RtlTcp) {
+        qDebug() << "[RTL-TCP] live center retune queued" << centerFrequencyHz;
+        return running.load();
+    }
+    if (streamKind == ReceiverBackendStreamKind::SoapySdr) {
+        void *soapyDevice = activeDevice.load();
+        if (!running.load() || !soapyDevice) {
+            qDebug() << "[SoapySDR] live center retune requested without active handle"
+                     << "frequency" << centerFrequencyHz
+                     << "running" << running.load()
+                     << "device" << soapyDevice;
+            return false;
+        }
+        const int result = setSoapySdrCenterFrequencySafely(soapyDevice, centerFrequencyHz);
+        qDebug() << "[SoapySDR] live center retune"
+                 << "frequency" << centerFrequencyHz
+                 << "result" << result;
+        return result == 0;
+    }
+    if (streamKind != ReceiverBackendStreamKind::RtlSdrNative) {
+        return false;
+    }
+
+    void *rtlDevice = activeDevice.load();
+    if (!running.load() || !rtlDevice) {
+        qDebug() << "[RTL-SDR] live center retune requested without active native handle"
+                 << "frequency" << centerFrequencyHz
+                 << "running" << running.load()
+                 << "device" << rtlDevice;
+        return false;
+    }
+
+    const uint32_t frequencyHz = static_cast<uint32_t>((std::max)(0.0, centerFrequencyHz));
+    const int result = setRtlSdrCenterFrequencySafely(rtlDevice, frequencyHz);
+    qDebug() << "[RTL-SDR] live center retune"
+             << "frequency" << frequencyHz
+             << "result" << result;
+    return result == 0;
+}
+
 void DataProcessor::requestStop() {
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[DataProcessor] requestStop enter"
@@ -1212,11 +1974,37 @@ void DataProcessor::requestStop() {
                 if (fobosVerboseLoggingEnabled()) {
                     qDebug() << "[DataProcessor] fobos_rx_cancel_async begin" << readerDevice;
                 }
-                const int ret = activeApiKind.load() == FobosApiKind::Agile
-                                    ? cancelAsyncAgileSafely(static_cast<fobos_sdr_dev_t*>(readerDevice))
-                                    : cancelAsyncSafely(static_cast<fobos_dev_t*>(readerDevice));
-                if (fobosVerboseLoggingEnabled() || ret != FOBOS_ERR_OK) {
-                    qDebug() << "[DataProcessor] fobos_rx_cancel_async end" << "result" << ret;
+                if (activeStreamKind == ReceiverBackendStreamKind::RtlTcp) {
+                    if (fobosVerboseLoggingEnabled()) {
+                        qDebug() << "[DataProcessor] rtl_tcp stop requested; socket reader will exit from running flag";
+                    }
+                } else if (activeStreamKind == ReceiverBackendStreamKind::SoapySdr) {
+                    if (fobosVerboseLoggingEnabled()) {
+                        qDebug() << "[DataProcessor] SoapySDR stop requested; readStream loop will exit after timeout";
+                    }
+                } else {
+                    bool expected = false;
+                    if (asyncCancelRequested.compare_exchange_strong(expected, true)) {
+                        const ReceiverBackendStreamKind streamKind = activeStreamKind;
+                        const FobosApiKind apiKind = activeApiKind.load();
+                        std::thread([readerDevice, streamKind, apiKind]() {
+                            int ret = FOBOS_ERR_OK;
+                            if (streamKind == ReceiverBackendStreamKind::RtlSdrNative) {
+                                ret = cancelRtlSdrAsyncSafely(readerDevice);
+                            } else {
+                                ret = apiKind == FobosApiKind::Agile
+                                          ? cancelFobosAgileAsyncSafely(static_cast<fobos_sdr_dev_t*>(readerDevice))
+                                          : cancelFobosAsyncSafely(static_cast<fobos_dev_t*>(readerDevice));
+                            }
+                            if (fobosVerboseLoggingEnabled() || ret != FOBOS_ERR_OK) {
+                                qDebug() << "[DataProcessor] async cancel worker finished"
+                                         << "streamKind" << static_cast<int>(streamKind)
+                                         << "result" << ret;
+                            }
+                        }).detach();
+                    } else if (fobosVerboseLoggingEnabled()) {
+                        qDebug() << "[DataProcessor] async cancel already requested";
+                    }
                 }
             }
         } else {
@@ -1225,8 +2013,8 @@ void DataProcessor::requestStop() {
                     qDebug() << "[DataProcessor] fobos_rx_stop_sync begin" << readerDevice;
                 }
                 const int ret = activeApiKind.load() == FobosApiKind::Agile
-                                    ? stopSyncAgileSafely(static_cast<fobos_sdr_dev_t*>(readerDevice))
-                                    : stopSyncSafely(static_cast<fobos_dev_t*>(readerDevice));
+                                    ? stopFobosAgileSyncSafely(static_cast<fobos_sdr_dev_t*>(readerDevice))
+                                    : stopFobosSyncSafely(static_cast<fobos_dev_t*>(readerDevice));
                 if (fobosVerboseLoggingEnabled() || ret != FOBOS_ERR_OK) {
                     qDebug() << "[DataProcessor] fobos_rx_stop_sync end" << "result" << ret;
                 }

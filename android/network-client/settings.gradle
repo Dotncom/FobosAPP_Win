@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = 'FobosAPP Android Network Client'
+rootProject.name = 'FobosAPP Android USB Network Client'
 include ':app'

@@ -38,6 +38,8 @@ The useful 4.1 candidate is a GNSS/QTH laboratory release:
 3. Acquisition attempts write repeatable artifacts to `recordings/gnss_reports`.
 4. Real GNSS positioning is not claimed until a real GPS L1 C/A lock is proven with better RF conditions.
 5. Receiver-backend abstraction and RTL-SDR support stay next after this GNSS/QTH checkpoint.
+6. Receiver-backend abstraction, RTL-SDR native/runtime loading, and optional SoapySDR runtime loading are now first-pass implemented.
+7. Startup/close freezes are tracked as a separate stability task; current logs show close can spend several seconds waiting while the IQ reader still receives blocks.
 
 ## Active Focus: GNSS/GPS
 
@@ -122,22 +124,33 @@ These come immediately after the current GNSS work, as requested.
    - lifecycle: enumerate, open, close, start stream, stop stream;
    - controls: set center frequency, sample rate, gain/input/clock;
    - streaming: IQ callback with format metadata and actual center/sample-rate values.
+   - Status: first boundary started after 4.1; generic backend contract, backend registry, Fobos safe-control wrappers, and Fobos stream safe wrappers are in place; `DataProcessor` now starts from a backend stream descriptor while keeping the live IQ read path behavior unchanged.
 2. Fobos backend adapter:
    - move existing standard and Agile Fobos behavior behind the interface without changing user-visible behavior.
 3. RTL-SDR through `rtl_tcp`:
    - first non-Fobos backend;
    - avoids direct USB/library deployment complexity;
    - useful for Raspberry Pi and remote receiver tests.
+   - Status: first client path implemented; the app can select `RTL-SDR via rtl_tcp`, configure center/sample-rate over the rtl_tcp command protocol, and convert unsigned 8-bit IQ into the existing float IQ pipeline. A separate `rtl_tcp` executable/server is still required.
 4. Direct RTL-SDR through `librtlsdr`:
    - add after `rtl_tcp` backend is working;
    - keep deployment and driver notes explicit.
+   - Status: native Windows path implemented with runtime `rtlsdr.dll`/`librtlsdr.dll` loading, device enumeration, center/sample-rate configuration, async IQ reading, and unsigned 8-bit IQ conversion into the existing float IQ pipeline. Local test DLLs can live next to `FobosAPP.exe`; release packaging/licensing notes still need to be finalized.
 5. Optional SoapySDR backend:
    - later path for Airspy, HackRF, SDRplay, LimeSDR, and similar receivers;
    - keep optional to avoid making the core package fragile.
+   - Status: first optional runtime path implemented with dynamic `SoapySDR.dll` loading, generic `SoapySDR auto` device selection, CF32 RX stream setup, center/sample-rate/bandwidth configuration, live retune, and IQ forwarding into the existing float IQ pipeline. This is theoretical/unverified because no non-Fobos Soapy hardware is currently available.
 
 ## Architecture And Reference Audit
 
 Goal: compare FobosAPP architecture against mature SDR applications and decide what to simplify, optimize, or isolate before the codebase becomes harder to move.
+
+Stability notes to keep:
+
+1. Startup and close can still freeze the UI:
+   - inspect `closeEvent`, `stopFobosProcessing`, `DataProcessor::requestStop`, async cancel, and IQ queue drain;
+   - avoid closing USB/device handles on the UI thread when the reader is still delivering callbacks;
+   - keep this separate from live-retune work, which is currently stable with a guarded retune interval.
 
 References to review:
 
@@ -220,15 +233,13 @@ Routine before each public build:
 
 ## Practical Priority
 
-1. Verify the raw IQ stream contract with live diagnostics before more decoder tuning.
-2. Continue GNSS acquisition investigation with the new diagnostic plot and saved IQ replays.
-3. Test saved Fobos IQ against GNSS-SDR or another mature GNSS reference receiver.
-4. Add GNSS non-coherent acquisition improvements.
-5. Add external/non-SDR location fallbacks: NMEA GPS, OS location, network/manual presets.
-6. Start receiver backend abstraction.
-7. Add RTL-SDR via `rtl_tcp`.
-8. Add direct RTL-SDR through `librtlsdr`.
-9. Add optional SoapySDR backend.
-10. Audit Gqrx, SDR++, GNU Radio, and GNSS-SDR architecture for useful refactors.
-11. Build the DMR external decoder bridge for comparison.
-12. Return to DMR voice only with a repeatable offline harness and clearer stage-by-stage metrics.
+1. Fix startup/stop/close freezes by moving unsafe waits/device teardown off the UI thread.
+2. Finalize release packaging/licensing notes for RTL-SDR and optional SoapySDR runtime/modules.
+3. Continue GNSS acquisition investigation with the new diagnostic plot and saved IQ replays.
+4. Test saved Fobos IQ against GNSS-SDR or another mature GNSS reference receiver.
+5. Add GNSS non-coherent acquisition improvements.
+6. Audit Gqrx, SDR++, GNU Radio, and GNSS-SDR architecture for useful refactors, including remaining IQ stream contract diagnostics such as sequence/timestamp, queue depth, and drop reporting.
+7. Add external/non-SDR location fallbacks: NMEA GPS, OS location, network/manual presets.
+8. Keep receiver backend abstraction Fobos-first; only polish RTL/Soapy enough that optional fallback backends do not disturb the Fobos path.
+9. Build the DMR external decoder bridge for comparison.
+10. Return to DMR voice only with a repeatable offline harness and clearer stage-by-stage metrics.

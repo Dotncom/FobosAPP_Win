@@ -5,6 +5,8 @@
 #include <cmath>
 #include <mutex>
 
+#include <QDebug>
+
 namespace {
 
 constexpr std::size_t MAX_QUEUED_BLOCKS = 256;
@@ -21,7 +23,34 @@ std::deque<std::vector<float>> g_iqBlocks;
 std::deque<std::uint64_t> g_iqBlockSequences;
 std::size_t g_iqQueuedFloatCount = 0;
 std::uint64_t g_iqSequence = 0;
+std::uint64_t g_iqEpoch = 1;
 double g_sampleRateEstimate = 0.0;
+std::uint64_t g_traceEpoch = 0;
+int g_tracePublishRemaining = 0;
+int g_traceRejectRemaining = 0;
+int g_traceSnapshotRemaining = 0;
+int g_tracePopRemaining = 0;
+
+bool traceMatchesCurrentEpoch() {
+    return g_traceEpoch != 0 && g_iqEpoch == g_traceEpoch;
+}
+
+bool traceMatchesPublishEpoch(std::uint64_t expectedEpoch) {
+    return g_traceEpoch != 0 &&
+           (g_iqEpoch == g_traceEpoch || expectedEpoch == g_traceEpoch);
+}
+
+void logTraceState(const char *event) {
+    qDebug() << "[IqBufferTrace]" << event
+             << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+             << "traceEpoch" << static_cast<qulonglong>(g_traceEpoch)
+             << "sequence" << static_cast<qulonglong>(g_iqSequence)
+             << "snapshotStart" << g_iqSnapshotStart
+             << "snapshotSize" << g_iqSnapshotSize
+             << "queuedBlocks" << g_iqBlocks.size()
+             << "queuedFloats" << g_iqQueuedFloatCount
+             << "sampleRateEstimate" << g_sampleRateEstimate;
+}
 
 void appendToSnapshot(const float *samples, std::size_t floatCount) {
     if (floatCount >= MAX_SNAPSHOT_FLOATS) {
@@ -48,11 +77,26 @@ void appendToSnapshot(const float *samples, std::size_t floatCount) {
 
 bool copySnapshotTail(std::vector<float> &out,
                       std::size_t maxFloatCount,
-                      std::uint64_t *sequence) {
+                      std::uint64_t *sequence,
+                      const char *source) {
+    const bool shouldTrace = traceMatchesCurrentEpoch() &&
+                             g_traceSnapshotRemaining > 0;
     if (g_iqSnapshotSize == 0 || maxFloatCount == 0) {
         out.clear();
         if (sequence) {
             *sequence = g_iqSequence;
+        }
+        if (shouldTrace) {
+            --g_traceSnapshotRemaining;
+            qDebug() << "[IqBufferTrace]" << source
+                     << "empty"
+                     << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                     << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                     << "maxFloatCount" << maxFloatCount
+                     << "snapshotStart" << g_iqSnapshotStart
+                     << "snapshotSize" << g_iqSnapshotSize
+                     << "queuedBlocks" << g_iqBlocks.size()
+                     << "queuedFloats" << g_iqQueuedFloatCount;
         }
         return false;
     }
@@ -64,6 +108,16 @@ bool copySnapshotTail(std::vector<float> &out,
         if (sequence) {
             *sequence = g_iqSequence;
         }
+        if (shouldTrace) {
+            --g_traceSnapshotRemaining;
+            qDebug() << "[IqBufferTrace]" << source
+                     << "zero-copy"
+                     << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                     << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                     << "maxFloatCount" << maxFloatCount
+                     << "snapshotStart" << g_iqSnapshotStart
+                     << "snapshotSize" << g_iqSnapshotSize;
+        }
         return false;
     }
 
@@ -71,6 +125,21 @@ bool copySnapshotTail(std::vector<float> &out,
     const std::size_t readStart = (g_iqSnapshotStart + tailOffset) % MAX_SNAPSHOT_FLOATS;
     out.resize(copyCount);
     const std::size_t firstCopy = (std::min)(copyCount, MAX_SNAPSHOT_FLOATS - readStart);
+    if (shouldTrace) {
+        --g_traceSnapshotRemaining;
+        qDebug() << "[IqBufferTrace]" << source
+                 << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                 << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                 << "maxFloatCount" << maxFloatCount
+                 << "snapshotStart" << g_iqSnapshotStart
+                 << "snapshotSize" << g_iqSnapshotSize
+                 << "tailOffset" << tailOffset
+                 << "readStart" << readStart
+                 << "copyCount" << copyCount
+                 << "firstCopy" << firstCopy
+                 << "queuedBlocks" << g_iqBlocks.size()
+                 << "queuedFloats" << g_iqQueuedFloatCount;
+    }
     std::copy(g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(readStart),
               g_iqSnapshot.begin() + static_cast<std::ptrdiff_t>(readStart + firstCopy),
               out.begin());
@@ -104,9 +173,13 @@ std::size_t maxQueuedFloatsForLiveAudio() {
 
 namespace IqBuffer {
 
-void publish(const float *samples, std::size_t floatCount, bool queueBlock, bool updateSnapshot) {
+bool publish(const float *samples,
+             std::size_t floatCount,
+             bool queueBlock,
+             bool updateSnapshot,
+             std::uint64_t expectedEpoch) {
     if (!samples || floatCount == 0) {
-        return;
+        return false;
     }
 
     std::vector<float> block;
@@ -115,6 +188,24 @@ void publish(const float *samples, std::size_t floatCount, bool queueBlock, bool
     }
 
     std::lock_guard<std::mutex> lock(g_iqMutex);
+    if (expectedEpoch != 0 && expectedEpoch != g_iqEpoch) {
+        if (traceMatchesPublishEpoch(expectedEpoch) && g_traceRejectRemaining > 0) {
+            --g_traceRejectRemaining;
+            qDebug() << "[IqBufferTrace] publish rejected"
+                     << "expectedEpoch" << static_cast<qulonglong>(expectedEpoch)
+                     << "currentEpoch" << static_cast<qulonglong>(g_iqEpoch)
+                     << "floatCount" << floatCount
+                     << "queueBlock" << queueBlock
+                     << "updateSnapshot" << updateSnapshot
+                     << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                     << "snapshotStart" << g_iqSnapshotStart
+                     << "snapshotSize" << g_iqSnapshotSize
+                     << "queuedBlocks" << g_iqBlocks.size()
+                     << "queuedFloats" << g_iqQueuedFloatCount;
+        }
+        return false;
+    }
+
     if (updateSnapshot) {
         appendToSnapshot(samples, floatCount);
         ++g_iqSequence;
@@ -124,7 +215,21 @@ void publish(const float *samples, std::size_t floatCount, bool queueBlock, bool
         g_iqBlocks.clear();
         g_iqBlockSequences.clear();
         g_iqQueuedFloatCount = 0;
-        return;
+        if (traceMatchesPublishEpoch(expectedEpoch) && g_tracePublishRemaining > 0) {
+            --g_tracePublishRemaining;
+            qDebug() << "[IqBufferTrace] publish accepted"
+                     << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                     << "expectedEpoch" << static_cast<qulonglong>(expectedEpoch)
+                     << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                     << "floatCount" << floatCount
+                     << "queueBlock" << queueBlock
+                     << "updateSnapshot" << updateSnapshot
+                     << "snapshotStart" << g_iqSnapshotStart
+                     << "snapshotSize" << g_iqSnapshotSize
+                     << "queuedBlocks" << g_iqBlocks.size()
+                     << "queuedFloats" << g_iqQueuedFloatCount;
+        }
+        return true;
     }
 
     g_iqQueuedFloatCount += block.size();
@@ -136,49 +241,112 @@ void publish(const float *samples, std::size_t floatCount, bool queueBlock, bool
         g_iqBlocks.pop_front();
         g_iqBlockSequences.pop_front();
     }
+    if (traceMatchesPublishEpoch(expectedEpoch) && g_tracePublishRemaining > 0) {
+        --g_tracePublishRemaining;
+        qDebug() << "[IqBufferTrace] publish accepted"
+                 << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                 << "expectedEpoch" << static_cast<qulonglong>(expectedEpoch)
+                 << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                 << "floatCount" << floatCount
+                 << "queueBlock" << queueBlock
+                 << "updateSnapshot" << updateSnapshot
+                 << "snapshotStart" << g_iqSnapshotStart
+                 << "snapshotSize" << g_iqSnapshotSize
+                 << "queuedBlocks" << g_iqBlocks.size()
+                 << "queuedFloats" << g_iqQueuedFloatCount
+                 << "maxQueuedFloats" << maxQueuedFloats;
+    }
+    return true;
 }
 
 bool snapshot(std::vector<float> &out, std::uint64_t *sequence) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
-    return copySnapshotTail(out, g_iqSnapshotSize, sequence);
+    return copySnapshotTail(out, g_iqSnapshotSize, sequence, "snapshot");
 }
 
 bool snapshotRecent(std::vector<float> &out,
                     std::size_t maxFloatCount,
                     std::uint64_t *sequence) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
-    return copySnapshotTail(out, maxFloatCount, sequence);
+    return copySnapshotTail(out, maxFloatCount, sequence, "snapshotRecent");
 }
 
 bool popBlock(std::vector<float> &out, std::uint64_t *sequence) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
+    const bool shouldTrace = traceMatchesCurrentEpoch() && g_tracePopRemaining > 0;
     if (g_iqBlocks.empty()) {
         out.clear();
         if (sequence) {
             *sequence = g_iqSequence;
         }
+        if (shouldTrace) {
+            --g_tracePopRemaining;
+            qDebug() << "[IqBufferTrace] popBlock empty"
+                     << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                     << "sequence" << static_cast<qulonglong>(g_iqSequence)
+                     << "snapshotStart" << g_iqSnapshotStart
+                     << "snapshotSize" << g_iqSnapshotSize
+                     << "queuedBlocks" << g_iqBlocks.size()
+                     << "queuedFloats" << g_iqQueuedFloatCount;
+        }
         return false;
     }
 
+    const std::uint64_t blockSequence =
+        g_iqBlockSequences.empty() ? g_iqSequence : g_iqBlockSequences.front();
     out = std::move(g_iqBlocks.front());
     g_iqQueuedFloatCount -= out.size();
     g_iqBlocks.pop_front();
 
     if (sequence) {
-        *sequence = g_iqBlockSequences.front();
+        *sequence = blockSequence;
     }
-    g_iqBlockSequences.pop_front();
+    if (!g_iqBlockSequences.empty()) {
+        g_iqBlockSequences.pop_front();
+    }
+    if (shouldTrace) {
+        --g_tracePopRemaining;
+        qDebug() << "[IqBufferTrace] popBlock"
+                 << "epoch" << static_cast<qulonglong>(g_iqEpoch)
+                 << "blockSequence" << static_cast<qulonglong>(blockSequence)
+                 << "blockFloats" << out.size()
+                 << "snapshotStart" << g_iqSnapshotStart
+                 << "snapshotSize" << g_iqSnapshotSize
+                 << "remainingBlocks" << g_iqBlocks.size()
+                 << "remainingFloats" << g_iqQueuedFloatCount;
+    }
     return true;
 }
 
-void clear() {
+void clear(std::uint64_t epoch) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
+    const std::uint64_t previousEpoch = g_iqEpoch;
+    const std::uint64_t previousSequence = g_iqSequence;
+    const std::size_t previousSnapshotStart = g_iqSnapshotStart;
+    const std::size_t previousSnapshotSize = g_iqSnapshotSize;
+    const std::size_t previousQueuedBlocks = g_iqBlocks.size();
+    const std::size_t previousQueuedFloats = g_iqQueuedFloatCount;
+    if (epoch != 0) {
+        g_iqEpoch = epoch;
+    }
     g_iqSnapshotStart = 0;
     g_iqSnapshotSize = 0;
     g_iqBlocks.clear();
     g_iqBlockSequences.clear();
     g_iqQueuedFloatCount = 0;
     ++g_iqSequence;
+    if (epoch != 0 && traceMatchesCurrentEpoch()) {
+        qDebug() << "[IqBufferTrace] clear"
+                 << "requestedEpoch" << static_cast<qulonglong>(epoch)
+                 << "previousEpoch" << static_cast<qulonglong>(previousEpoch)
+                 << "currentEpoch" << static_cast<qulonglong>(g_iqEpoch)
+                 << "sequenceBefore" << static_cast<qulonglong>(previousSequence)
+                 << "sequenceAfter" << static_cast<qulonglong>(g_iqSequence)
+                 << "previousSnapshotStart" << previousSnapshotStart
+                 << "previousSnapshotSize" << previousSnapshotSize
+                 << "previousQueuedBlocks" << previousQueuedBlocks
+                 << "previousQueuedFloats" << previousQueuedFloats;
+    }
 }
 
 std::size_t size() {
@@ -194,6 +362,37 @@ std::size_t queuedBlocks() {
 std::size_t queuedFloatCount() {
     std::lock_guard<std::mutex> lock(g_iqMutex);
     return g_iqQueuedFloatCount;
+}
+
+Stats stats() {
+    std::lock_guard<std::mutex> lock(g_iqMutex);
+    Stats result;
+    result.epoch = g_iqEpoch;
+    result.sequence = g_iqSequence;
+    result.snapshotStart = g_iqSnapshotStart;
+    result.snapshotSize = g_iqSnapshotSize;
+    result.queuedBlocks = g_iqBlocks.size();
+    result.queuedFloatCount = g_iqQueuedFloatCount;
+    result.sampleRateEstimate = g_sampleRateEstimate;
+    return result;
+}
+
+void armRetuneTrace(std::uint64_t epoch,
+                    int publishLogs,
+                    int snapshotLogs,
+                    int popLogs,
+                    int rejectLogs) {
+    if (epoch == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_iqMutex);
+    g_traceEpoch = epoch;
+    g_tracePublishRemaining = (std::max)(0, publishLogs);
+    g_traceSnapshotRemaining = (std::max)(0, snapshotLogs);
+    g_tracePopRemaining = (std::max)(0, popLogs);
+    g_traceRejectRemaining = (std::max)(0, rejectLogs);
+    logTraceState("armed");
 }
 
 void setSampleRateEstimate(double sampleRate) {

@@ -4,8 +4,8 @@
 #include "finetunewidget.h"
 #include "qthlocator.h"
 #include "qthmapwidget.h"
+#include "receiverbackendregistry.h"
 
-#include <fobos_sdr.h>
 #include <QApplication>
 #include <QClipboard>
 #include <QDateTime>
@@ -83,7 +83,7 @@ float* dataq = nullptr;
 double globalFrequency = 100000000; 
 double actualFrequency = 100000000; 
 double listeningFrequency = 100000000; 
-double globalSampleRate = 80000000;
+double globalSampleRate = 50000000;
 double globalBandwidth = 10000;
 double minFrequency = 60000000;
 double maxFrequency = 140000000;
@@ -118,6 +118,42 @@ constexpr int NETWORK_SPECTRUM_MAX_BINS = 2048;
 constexpr int NETWORK_CHANNEL_SPECTRUM_MAX_BINS = 768;
 constexpr int NETWORK_SPECTRUM_INTERVAL_MS = 100;
 constexpr int NETWORK_CHANNEL_SPECTRUM_INTERVAL_MS = 160;
+constexpr int RTL_TCP_DEVICE_INDEX = -1000;
+constexpr int RTLSDR_NATIVE_DEVICE_INDEX_BASE = -2000;
+constexpr int SOAPY_SDR_DEVICE_INDEX = -3000;
+constexpr const char *RTL_TCP_DEFAULT_HOST = "127.0.0.1";
+constexpr quint16 RTL_TCP_DEFAULT_PORT = 1234;
+constexpr double FOBOS_DEFAULT_SAMPLE_RATE = 50000000.0;
+constexpr double RTL_TCP_SAFE_SAMPLE_RATE = 2048000.0;
+
+int rtlSdrNativeComboValue(int nativeIndex) {
+    return RTLSDR_NATIVE_DEVICE_INDEX_BASE - nativeIndex;
+}
+
+bool isRtlSdrNativeComboValue(int value) {
+    return value <= RTLSDR_NATIVE_DEVICE_INDEX_BASE && value > RTLSDR_NATIVE_DEVICE_INDEX_BASE - 10000;
+}
+
+int rtlSdrNativeIndexFromComboValue(int value) {
+    return RTLSDR_NATIVE_DEVICE_INDEX_BASE - value;
+}
+
+bool isKnownRtlSampleRate(double value) {
+    static const double rtlRates[] = {
+        1024000.0,
+        1536000.0,
+        2048000.0,
+        2400000.0,
+        2560000.0,
+        3200000.0
+    };
+    for (double rate : rtlRates) {
+        if (std::abs(value - rate) < 0.5) {
+            return true;
+        }
+    }
+    return false;
+}
 constexpr int NETWORK_FULL_RESOLUTION_SPECTRUM_INTERVAL_MS = 50;
 constexpr qint64 NETWORK_IQ_MAX_PENDING_BYTES = 8 * 1024 * 1024;
 constexpr qint64 NETWORK_CHANNEL_IQ_LOW_LATENCY_PENDING_BYTES = 2 * 1024 * 1024;
@@ -159,6 +195,10 @@ constexpr qint64 AGILE_RF_MID_RATE_RETUNE_SETTLE_MS = 320;
 constexpr qint64 AGILE_RF_MID_RATE_SAMPLE_SETTLE_MS = 600;
 constexpr qint64 AGILE_RF_HIGH_RATE_RETUNE_SETTLE_MS = 160;
 constexpr qint64 AGILE_RF_HIGH_RATE_SAMPLE_SETTLE_MS = 280;
+constexpr int AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS = 120;
+constexpr int AGILE_LIVE_RETUNE_DEFAULT_COMMAND_INTERVAL_MS = 160;
+constexpr int AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS = 1000;
+constexpr int PERSISTENT_SETTINGS_MIN_SAVE_INTERVAL_MS = 750;
 constexpr qint64 STANDARD_SCAN_SETTLE_MS = 60;
 constexpr int STANDARD_SCAN_MIN_SETTLE_MS = 0;
 constexpr int STANDARD_SCAN_MAX_SETTLE_MS = 1000;
@@ -169,8 +209,11 @@ constexpr int LISTENING_SCAN_MAX_DWELL_MS = 600000;
 constexpr int LISTENING_SCAN_MIN_SETTLE_MS = 0;
 constexpr int LISTENING_SCAN_MAX_SETTLE_MS = 10000;
 constexpr int SPECTRUM_UPDATE_AUTO_MS = 0;
-constexpr int SPECTRUM_UPDATE_MIN_MS = 10;
+constexpr int SPECTRUM_UPDATE_MIN_MS = 5;
 constexpr int SPECTRUM_UPDATE_MAX_MS = 250;
+constexpr int WATERFALL_ROWS_PER_FRAME_MIN = 1;
+constexpr int WATERFALL_ROWS_PER_FRAME_DEFAULT = 2;
+constexpr int WATERFALL_ROWS_PER_FRAME_MAX = 8;
 constexpr double AGILE_RF_LOW_RATE_AUTO_BANDWIDTH_RATIO = 1.00;
 constexpr double AGILE_RF_MID_RATE_AUTO_BANDWIDTH_RATIO = 1.00;
 constexpr double AGILE_RF_HIGH_RATE_AUTO_BANDWIDTH_RATIO = 1.00;
@@ -797,6 +840,204 @@ QString persistentSettingsFilePath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/FobosAPP.ini");
 }
 
+QString applicationHelpText(const QString &language) {
+    if (language == QStringLiteral("uk")) {
+        return QString::fromUtf8(R"HELP(FobosAPP: короткий практичний довідник
+
+Призначення
+FobosAPP - SDR-програма для Fobos SDR, Fobos Agile, RTL-SDR, rtl_tcp і експериментального SoapySDR backend. Вона поєднує прийом IQ, спектр, водоспад, аудіодемодуляцію, сканування, записи, пресети, GNSS/QTH-мапу, мережевий режим і дослідні цифрові декодери.
+
+Основна логіка частот
+- Central Frequency - центральна частота приймача, тобто центр видимої IQ-смуги.
+- Listening Frequency - частота прослуховування/маркер демодулятора всередині поточної смуги.
+- Bandwidth - аудіо/канальна смуга для демодулятора.
+- У RF-режимі маркер має бути всередині центральна частота +/- половина sample rate.
+- У прямому HF-режимі центральна RF-частота не використовується так само, як в RF-режимі.
+
+Миша, жести і швидке налаштування
+- Колесо миші над спектром або водоспадом змінює масштаб видимого діапазону.
+- Середня кнопка миші/клік колесом по сигналу на спектрі або водоспаді автоматично ставить маркер на центр найближчого видимого сигналу.
+- Подвійний лівий клік по спектру або водоспаду робить те саме автоцентрування.
+- Правий клік по спектру або водоспаду відкриває меню: поставити центр сигналу, поставити край USB/LSB або перенести центральну частоту приймача.
+- Ліве перетягування по спектру показує вимірювання ширини сигналу.
+- Fine tune шкала або круглий регулятор рухає частоту прослуховування малими кроками.
+- F9 працює як тангента запису: утримуйте для запису, відпустіть для зупинки.
+
+Приймачі
+- Fobos Standard - основний режим для стандартної прошивки.
+- Fobos Agile - підтримує швидкий firmware scan і live-переналаштування.
+- RTL-SDR native спершу використовує rtlsdr\\rtlsdr.dll і сумісний rtlsdr\\libusb-1.0.dll; DLL у корені є тільки запасним варіантом.
+- rtl_tcp підключається до 127.0.0.1:1234.
+- SoapySDR backend доданий як теоретична сумісність, якщо на системі є SoapySDR.dll і модулі приймача.
+- Для Fobos типовий sample rate - 50 MHz. Для RTL типовий безпечний sample rate - 2.048 MHz.
+
+Спектр і водоспад
+- Spectrum/waterfall update у загальних налаштуваннях задає інтервал оновлення. Auto обирає безпечний режим.
+- Waterfall speed додає кількість рядків на один FFT-кадр: це робить водоспад візуально швидшим без додаткового FFT-навантаження.
+- FFT length впливає на деталізацію і навантаження. Великі FFT корисні для вузьких сигналів, але можуть вимагати повільнішого оновлення.
+- Band markers показують діапазони: загальні радіодіапазони, аматорські діапазони або компактний шар.
+- Spur suppression/Spur calibration допомагає позначати і приглушувати стабільні внутрішні спури.
+
+Аудіо і демодуляція
+- Audio вмикає локальне прослуховування.
+- Modulation обирає AM, FM/NFM/WFM, SSB, CW, DMR та інші режими.
+- Audio LPF/HPF у налаштуваннях фільтрує аудіо після демодуляції.
+- Для SSB можна через правий клік поставити край USB/LSB по видимому сигналу.
+- Якщо звук не відповідає сигналу після швидких переналаштувань, натисніть Stop/Start або змініть центральну частоту ще раз. Це має бути рідкісний аварійний сценарій.
+
+Сканування
+- Agile scan працює тільки з Fobos Agile firmware і сканує список діапазонів на рівні прошивки.
+- Standard scan працює через послідовне live-переналаштування центральної частоти. Він доступний для Fobos, RTL, rtl_tcp і Soapy, якщо backend підтримує retune.
+- У Standard scan користувач задає список центральних частот у MHz. Програма автоматично розсуває центри мінімум на sample rate, щоб смуги не накладалися.
+- Кнопки +/- додають або прибирають сусідні центри відносно найменшого/найбільшого значення.
+- Fill range створює список центрів з початкової і кінцевої частоти.
+- Dwell ms - скільки часу слухати одну центральну частоту.
+- Settle ms - пауза після переналаштування, щоб старі IQ-дані не змішувались з новими.
+- Listening scan не рухає центральну частоту, а перебирає частоти прослуховування всередині видимої смуги. Це корисно для GNSS L1, FT8, маяків і будь-яких наборів частот у межах одного IQ-вікна.
+- Lock listening frequency у скані фіксує частоту прослуховування, щоб маркер не стрибав між діапазонами.
+- Measure у скані збирає current/peak/baseline/delta по бінових ділянках спектра.
+
+Пресети
+- Presets відкриває менеджер частот, аудіосмуг, Agile scan, Standard scan, Listening scan, band markers і QTH markers.
+- Стрілки вгору/вниз у менеджері пресетів змінюють порядок показу.
+- Перед оновленням програми бажано експортувати FobosAPP.ini, щоб не втратити власні пресети, маркери карти і списки скану.
+- Import/Export settings у загальних налаштуваннях робить резервну копію або повертає збережені налаштування.
+
+GNSS, GPS і QTH
+- GPS/QTH блок зберігає своє місцеположення, показує Maidenhead/QTH locator і відкриває карту.
+- QTH Map підтримує offline/grid view, online tile providers і QTH-сітку.
+- Колесо миші масштабує карту навколо курсора, перетягування мишею рухає карту.
+- Правий клік по карті може ставити користувацький маркер; правий клік по маркеру видаляє його.
+- Маркери можна редагувати у Presets -> QTH markers.
+- Tune GNSS L1 і GNSS scan виставляють частоти для GPS/Galileo/BeiDou/GLONASS L1.
+- GPS C/A accumulate і GPS deep - дослідні корелятори для GPS L1 C/A. Для реального lock потрібен достатній сигнал, стабільна частота і хороша GNSS-антена.
+- Save GNSS IQ записує поточний IQ-снепшот у WAV і додає контекст у лог.
+
+Цифрові режими
+- Digital Audio містить DMR-дослідний декодер. Він може визначати частину метаданих і працювати з зовнішнім voice backend, але DMR-голос поки експериментальний.
+- Lock DMR фіксує обрані параметри DMR, корисно коли на частоті є різні color code/timeslot/contact.
+- DMR hunter, FPV hunter і Digital Video hunter шукають характерні сигнали на спектрі за шириною/порогом.
+- Video блок зараз дослідний; повноцінні відеодекодери можуть бути вимкнені у збірці.
+
+Запис і відтворення
+- Record пише Audio WAV або Channel IQ WAV залежно від вибраного режиму.
+- Hold F9/F9 утримання - швидкий momentary recording.
+- Playback дозволяє програти сумісні записи, коли приймач зупинений.
+- Реальні IQ-записи можуть бути великими; перед релізом не додавайте особисті записи, логи і тестові ефіри у репозиторій.
+
+Мережа
+- Network відкриває налаштування server/client режиму.
+- Server може передавати керування, спектр, аудіо або IQ залежно від режиму.
+- Full-IQ/Channel-IQ режими важкі для мережі і CPU, тому їх краще тестувати поступово.
+- Audio relay і Audio HTTP stream дозволяють передавати аудіо в інші програми або на інші пристрої.
+
+Корисні правила
+- Якщо щось виглядає дивно після зміни приймача або sample rate, натисніть Stop, перевірте backend/sample rate і запустіть знову.
+- Для слабких сигналів спершу добийтеся стабільного спектра і правильного центру, а вже потім ускладнюйте демодуляцію.
+- Для RTL не ставте занадто великий sample rate: 2.048 або 2.4 MHz зазвичай безпечніші.
+- Для Fobos Agile дуже малі інтервали live retune можуть перевантажувати USB/UI на слабкому комп'ютері. Збільшуйте Agile live retune interval, якщо бачите зависання.
+- Докладне логування вмикайте тільки на час тесту: воно корисне для діагностики, але може робити програму важчою.
+)HELP");
+    }
+
+    return QString::fromUtf8(R"HELP(FobosAPP: practical user guide
+
+Purpose
+FobosAPP is an SDR application for Fobos SDR, Fobos Agile, RTL-SDR, rtl_tcp and an experimental SoapySDR backend. It combines IQ reception, spectrum, waterfall, audio demodulation, scanning, recordings, presets, GNSS/QTH mapping, network mode and experimental digital decoders.
+
+Frequency model
+- Central Frequency is the SDR receiver center, the middle of the visible IQ span.
+- Listening Frequency is the demodulator marker inside the current span.
+- Bandwidth is the demodulator/audio channel width.
+- In RF mode the listening marker must stay inside center frequency +/- half of the sample rate.
+- In direct HF modes the RF center is not used the same way as in RF mode.
+
+Mouse actions and fast tuning
+- Mouse wheel over the spectrum or waterfall changes visible span/zoom.
+- Middle-click, usually clicking the mouse wheel, on a signal in the spectrum or waterfall snaps the listening marker to the nearest visible signal center.
+- Double left-click on the spectrum or waterfall does the same auto-centering.
+- Right-click on the spectrum or waterfall opens a tuning menu: tune signal center, set USB/LSB edge, or move receiver center here.
+- Left-drag on the spectrum shows a bandwidth measurement.
+- The fine-tune scale or round dial nudges the listening frequency in small steps.
+- F9 works as a push-to-record key: hold to record, release to stop.
+
+Receivers
+- Fobos Standard is the main mode for the standard firmware.
+- Fobos Agile supports firmware scan and live retuning.
+- RTL-SDR native first uses rtlsdr\\rtlsdr.dll and the matching rtlsdr\\libusb-1.0.dll; root-folder DLLs are only a fallback.
+- rtl_tcp connects to 127.0.0.1:1234.
+- SoapySDR is added as theoretical compatibility when SoapySDR.dll and device modules are installed.
+- The default Fobos sample rate is 50 MHz. The safe RTL default is 2.048 MHz.
+
+Spectrum and waterfall
+- Spectrum/waterfall update in Settings controls redraw interval. Auto keeps a safe FFT-dependent default.
+- Waterfall speed adds more rows per FFT frame. It makes the waterfall visually faster without increasing FFT load.
+- FFT length controls frequency detail and CPU load. Larger FFT sizes help with narrow signals but may need slower updates.
+- Band markers show general radio bands, amateur bands, or a compact combined layer.
+- Spur suppression and calibration can mark and reduce stable internal spurs.
+
+Audio and demodulation
+- Audio enables local playback.
+- Modulation selects AM, FM/NFM/WFM, SSB, CW, DMR and other modes.
+- Audio LPF/HPF in settings filters demodulated audio.
+- In SSB modes, right-click can align the USB or LSB edge to a visible signal.
+- If audio does not match the visible signal after aggressive retuning, use Stop/Start or retune once more. This should be a rare recovery path.
+
+Scanning
+- Agile scan works only with Fobos Agile firmware and scans ranges inside the firmware.
+- Standard scan works by live-retuning the receiver center through a list. It is available for Fobos, RTL, rtl_tcp and Soapy when the backend supports retune.
+- In Standard scan, enter center frequencies in MHz. The app keeps centers at least one sample rate apart to avoid overlapping spans.
+- +/- buttons add or remove neighboring centers from the low or high side.
+- Fill range generates a center list between the start and end frequencies.
+- Dwell ms is how long one center is observed.
+- Settle ms is the pause after retune, used to keep old IQ blocks from mixing with new ones.
+- Listening scan does not move the receiver center; it cycles listening frequencies inside the visible span. It is useful for GNSS L1, FT8, beacons and any fixed channel list inside one IQ window.
+- Lock listening frequency keeps the listening marker fixed while scan centers move.
+- Measure in scan mode collects current, peak, baseline and delta values for spectral coverage checks.
+
+Presets
+- Presets opens the manager for center frequencies, listening frequencies, audio bandwidths, Agile scan, Standard scan, Listening scan, band markers and QTH markers.
+- Up/down arrows in the preset manager change display order.
+- Before updating the app, export FobosAPP.ini if you want to keep custom presets, markers and scan lists.
+- Import/Export settings in Settings creates or restores a settings backup.
+
+GNSS, GPS and QTH
+- GPS/QTH stores your position, shows Maidenhead/QTH locator and opens the map.
+- QTH Map supports offline/grid view, online tile providers and a QTH grid overlay.
+- Mouse wheel zooms the map around the cursor; dragging pans the map.
+- Right-click on the map can place a user marker; right-click on a marker removes it.
+- Markers can be edited in Presets -> QTH markers.
+- Tune GNSS L1 and GNSS scan set receiver frequencies for GPS/Galileo/BeiDou/GLONASS L1.
+- GPS C/A accumulate and GPS deep are experimental GPS L1 C/A correlators. A real lock needs enough signal, stable tuning and a proper GNSS antenna.
+- Save GNSS IQ writes the current IQ snapshot to WAV and logs its tuning context.
+
+Digital modes
+- Digital Audio contains the experimental DMR decoder. It can detect some metadata and work with an external voice backend, but DMR voice is still experimental.
+- Lock DMR fixes selected DMR parameters, useful when several color code/timeslot/contact combinations share a frequency.
+- DMR hunter, FPV hunter and Digital Video hunter look for characteristic signals by width and threshold.
+- Video is currently experimental; full video decoders may be disabled in the build.
+
+Recording and playback
+- Record writes Audio WAV or Channel IQ WAV depending on selected recording mode.
+- Hold F9 is quick momentary recording.
+- Playback can play compatible recordings while the receiver is stopped.
+- Real IQ recordings can be huge; avoid adding personal recordings, logs and over-the-air tests to repository releases.
+
+Network
+- Network opens server/client settings.
+- Server mode can share control, spectrum, audio or IQ depending on processing mode.
+- Full-IQ and Channel-IQ modes are heavy for network and CPU, so test them gradually.
+- Audio relay and Audio HTTP stream can send demodulated audio to other programs or devices.
+
+Useful rules
+- If something looks wrong after changing receiver or sample rate, press Stop, check backend/sample rate and start again.
+- For weak signals, first get a stable spectrum and correct center, then tune the demodulator.
+- For RTL, avoid excessive sample rates. 2.048 or 2.4 MHz are usually safer.
+- On Fobos Agile, very small live-retune intervals can overload USB/UI on slower computers. Increase Agile live retune interval if you see stalls.
+- Enable detailed logging only while testing. It is valuable for diagnosis but can make the app heavier.
+)HELP");
+}
+
 void appendLe32(QByteArray &buffer, quint32 value) {
     buffer.append(static_cast<char>(value & 0xff));
     buffer.append(static_cast<char>((value >> 8) & 0xff));
@@ -911,34 +1152,10 @@ const char *runStateName(RadioRunState state) {
     return "Unknown";
 }
 
-const char *fobosApiKindName(FobosApiKind kind) {
-    switch (kind) {
-    case FobosApiKind::Standard:
-        return "standard";
-    case FobosApiKind::Agile:
-        return "agile";
-    }
-    return "unknown";
-}
-
-QString fobosApiDisplayName(FobosApiKind kind) {
-    return kind == FobosApiKind::Agile ? QStringLiteral("Agile") : QStringLiteral("Standard");
-}
-
 bool firmwareLooksAgile(const QString &firmwareVersion) {
     bool ok = false;
     const int major = firmwareVersion.trimmed().section('.', 0, 0).toInt(&ok);
     return ok && major >= 3;
-}
-
-void *activeFobosDevice() {
-    return activeFobosApiKind == FobosApiKind::Agile
-               ? static_cast<void*>(agileDevice)
-               : static_cast<void*>(device);
-}
-
-bool hasActiveFobosDevice() {
-    return activeFobosDevice() != nullptr;
 }
 
 double directMaxFrequency(double sampleRate) {
@@ -1090,8 +1307,6 @@ void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
 }
 
 constexpr double DMR_CENTER_REALIGN_THRESHOLD_HZ = 100000.0;
-constexpr double AGILE_PRE_STREAM_FREQUENCY_NUDGE_HZ = 1000000.0;
-
 bool shouldRealignDmrCenterToListening(const RadioSettings &settings) {
     return settings.inputMode == INPUT_RF &&
            settings.modulationType == MOD_DMR &&
@@ -1191,6 +1406,139 @@ int listeningScanPresetSettleMs(const QString &spec, int fallback) {
     bool ok = false;
     const int value = parts.at(2).toInt(&ok);
     return ok ? (std::clamp)(value, LISTENING_SCAN_MIN_SETTLE_MS, LISTENING_SCAN_MAX_SETTLE_MS) : fallback;
+}
+
+template <typename T>
+QStringList normalizedPresetOrder(const QStringList &requestedOrder,
+                                  const QMap<QString, T> &presets,
+                                  const QStringList &defaultOrder = QStringList()) {
+    QStringList normalized;
+    auto appendIfValid = [&normalized, &presets](const QString &rawName) {
+        const QString name = rawName.trimmed();
+        if (!name.isEmpty() &&
+            presets.contains(name) &&
+            !normalized.contains(name)) {
+            normalized.append(name);
+        }
+    };
+
+    const QStringList seedOrder = requestedOrder.isEmpty() ? defaultOrder : requestedOrder;
+    for (const QString &name : seedOrder) {
+        appendIfValid(name);
+    }
+
+    for (auto it = presets.constBegin(); it != presets.constEnd(); ++it) {
+        appendIfValid(it.key());
+    }
+    return normalized;
+}
+
+QStringList defaultCenterFrequencyPresetOrder() {
+    QStringList order;
+    order << QStringLiteral("FM broadcast 100 MHz")
+          << QStringLiteral("Airband 125 MHz")
+          << QStringLiteral("VHF 145 MHz")
+          << QStringLiteral("UHF 433 MHz")
+          << QStringLiteral("LTE 700 downlink 780.5 MHz")
+          << QStringLiteral("LTE 800 downlink 806 MHz")
+          << QStringLiteral("GSM/LTE 900 MHz")
+          << QStringLiteral("UMTS/LTE 1800 downlink 1842.5 MHz")
+          << QStringLiteral("UMTS/LTE 2100 downlink 2140 MHz")
+          << QStringLiteral("LTE 2600 downlink 2655 MHz")
+          << QStringLiteral("GNSS L1 compact center 1583 MHz")
+          << QStringLiteral("GNSS L1 band center 1584.5 MHz")
+          << QStringLiteral("GPS/Galileo L1 1575.42 MHz")
+          << QStringLiteral("BeiDou B1I 1561.098 MHz")
+          << QStringLiteral("GLONASS L1 center 1602 MHz")
+          << QStringLiteral("FPV 1.2 GHz")
+          << QStringLiteral("FPV 2.4 GHz")
+          << QStringLiteral("Experimental 7.0 GHz")
+          << QStringLiteral("Experimental 7.5 GHz");
+    return order;
+}
+
+QStringList defaultListeningFrequencyPresetOrder() {
+    QStringList order;
+    order << QStringLiteral("HF center 0 Hz")
+          << QStringLiteral("HF 500 kHz")
+          << QStringLiteral("HF 1.25 MHz")
+          << QStringLiteral("80 m 3.65 MHz")
+          << QStringLiteral("40 m 7.05 MHz")
+          << QStringLiteral("20 m FT8 14.074 MHz")
+          << QStringLiteral("VHF 145 MHz")
+          << QStringLiteral("UHF 433 MHz")
+          << QStringLiteral("LTE 700 downlink 780.5 MHz")
+          << QStringLiteral("LTE 800 downlink 806 MHz")
+          << QStringLiteral("GSM/LTE 900 MHz")
+          << QStringLiteral("UMTS/LTE 1800 downlink 1842.5 MHz")
+          << QStringLiteral("UMTS/LTE 2100 downlink 2140 MHz")
+          << QStringLiteral("LTE 2600 downlink 2655 MHz")
+          << QStringLiteral("GNSS L1 compact center 1583 MHz")
+          << QStringLiteral("GNSS L1 band center 1584.5 MHz")
+          << QStringLiteral("GPS/Galileo L1 1575.42 MHz")
+          << QStringLiteral("BeiDou B1I 1561.098 MHz")
+          << QStringLiteral("GLONASS L1 center 1602 MHz");
+    return order;
+}
+
+QStringList defaultBandwidthPresetOrder() {
+    QStringList order;
+    order << QStringLiteral("CW 500 Hz")
+          << QStringLiteral("SSB 2.7 kHz")
+          << QStringLiteral("FT8 3 kHz")
+          << QStringLiteral("AM 6 kHz")
+          << QStringLiteral("AM 10 kHz")
+          << QStringLiteral("NFM 12.5 kHz")
+          << QStringLiteral("DMR 12.5 kHz")
+          << QStringLiteral("WFM 200 kHz")
+          << QStringLiteral("SSTV 3 kHz")
+          << QStringLiteral("NOAA APT 40 kHz")
+          << QStringLiteral("WEFAX 3 kHz")
+          << QStringLiteral("LRPT 140 kHz")
+          << QStringLiteral("ATV 3 MHz")
+          << QStringLiteral("ATV 5 MHz")
+          << QStringLiteral("FPV 8 MHz")
+          << QStringLiteral("FPV 10 MHz")
+          << QStringLiteral("GNSS C/A 2.046 MHz")
+          << QStringLiteral("GNSS raw 4.092 MHz")
+          << QStringLiteral("GLONASS L1OF 9 MHz")
+          << QStringLiteral("GNSS L1 survey 50 MHz");
+    return order;
+}
+
+QStringList defaultAgileScanPresetOrder() {
+    QStringList order;
+    order << QStringLiteral("Narrow DMR example")
+          << QStringLiteral("VHF DMR 160-174 coarse")
+          << QStringLiteral("UHF DMR 400-470 coarse")
+          << QStringLiteral("REB broad check 300/600/5800")
+          << QStringLiteral("REB 300-400 1MHz")
+          << QStringLiteral("REB 600-1200 5MHz")
+          << QStringLiteral("Cellular LTE/3G downlinks sparse")
+          << QStringLiteral("Digital video sparse")
+          << QStringLiteral("REB 5.8GHz 5MHz")
+          << QStringLiteral("FPV 1.2/2.4 sparse")
+          << QStringLiteral("GNSS L1 1559-1610 50MHz");
+    return order;
+}
+
+QStringList defaultStandardScanPresetOrder() {
+    QStringList order;
+    order << QStringLiteral("RF 100-300 by 50MHz")
+          << QStringLiteral("UHF broad 400-700 by 50MHz")
+          << QStringLiteral("Cellular LTE/3G downlinks")
+          << QStringLiteral("GNSS L1 two-center 50MHz useful");
+    return order;
+}
+
+QStringList defaultListeningScanPresetOrder() {
+    QStringList order;
+    order << QStringLiteral("FT8 HF common")
+          << QStringLiteral("Cellular LTE/3G anchors")
+          << QStringLiteral("GNSS L1 main signals")
+          << QStringLiteral("GLONASS L1OF channels")
+          << QStringLiteral("GNSS L1 dense");
+    return order;
 }
 
 QVector<ScanVisualSegment> scanSegmentsFromFrame(const QJsonObject &frame) {
@@ -1852,6 +2200,15 @@ QImage createSstvTestPattern() {
     return image;
 }
 
+bool shouldWriteDiagnosticLogLine(QtMsgType type, const QString &message) {
+    if (type != QtDebugMsg || fobosVerboseLoggingEnabled()) {
+        return true;
+    }
+
+    return message.contains(QStringLiteral("[Log]")) ||
+           message.contains(QStringLiteral("[Crash]"));
+}
+
 void diagnosticMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &message) {
     const QString line = QString("%1 [%2] [tid 0x%3] %4%5")
                              .arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz"))
@@ -1860,7 +2217,8 @@ void diagnosticMessageHandler(QtMsgType type, const QMessageLogContext &context,
                              .arg(message)
                              .arg(context.file ? QString(" (%1:%2)").arg(context.file).arg(context.line) : QString());
 
-    {
+    const bool writeDiagnosticOutput = shouldWriteDiagnosticLogLine(type, message);
+    if (writeDiagnosticOutput) {
         QMutexLocker lock(&gLogMutex);
         if (gLogFile.isOpen()) {
             if (gLogBytesWritten >= DIAGNOSTIC_LOG_MAX_BYTES) {
@@ -1886,13 +2244,19 @@ void diagnosticMessageHandler(QtMsgType type, const QMessageLogContext &context,
         }
     }
 
-    const QByteArray localLine = line.toLocal8Bit();
-    std::fprintf(stderr, "%s\n", localLine.constData());
-    std::fflush(stderr);
+    const bool echoDebugOutput =
+        type != QtDebugMsg || fobosVerboseLoggingEnabled();
+    if (echoDebugOutput) {
+        const QByteArray localLine = line.toLocal8Bit();
+        std::fprintf(stderr, "%s\n", localLine.constData());
+        std::fflush(stderr);
+    }
 
 #ifdef _WIN32
-    const std::wstring debugLine = (line + "\n").toStdWString();
-    OutputDebugStringW(debugLine.c_str());
+    if (echoDebugOutput) {
+        const std::wstring debugLine = (line + "\n").toStdWString();
+        OutputDebugStringW(debugLine.c_str());
+    }
 #endif
 
     if (type == QtFatalMsg) {
@@ -1969,595 +2333,6 @@ void installCrashLogger() {
 #endif
     std::set_terminate(diagnosticTerminateHandler);
     qDebug() << "[Log] Crash logger installed";
-}
-
-int getFobosStandardApiInfoSafely(char *libVersion, char *driverVersion) {
-#ifdef _WIN32
-    __try {
-        return fobos_rx_get_api_info(libVersion, driverVersion);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_get_api_info(libVersion, driverVersion);
-#endif
-}
-
-int getFobosAgileApiInfoSafely(char *libVersion, char *driverVersion) {
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_get_api_info(libVersion, driverVersion);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_get_api_info(libVersion, driverVersion);
-#endif
-}
-
-int getFobosStandardDeviceCountSafely() {
-#ifdef _WIN32
-    __try {
-        return fobos_rx_get_device_count();
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
-    }
-#else
-    return fobos_rx_get_device_count();
-#endif
-}
-
-int getFobosAgileDeviceCountSafely() {
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_get_device_count();
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
-    }
-#else
-    return fobos_sdr_get_device_count();
-#endif
-}
-
-int openFobosDeviceSafely(fobos_dev_t **dev, uint32_t index) {
-    if (!dev) {
-        return FOBOS_ERR_BAD_PARAM;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_open(dev, index);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        *dev = nullptr;
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_open(dev, index);
-#endif
-}
-
-int openFobosAgileDeviceSafely(fobos_sdr_dev_t **dev, uint32_t index) {
-    if (!dev) {
-        return FOBOS_ERR_BAD_PARAM;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_open(dev, index);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        *dev = nullptr;
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_open(dev, index);
-#endif
-}
-
-int getFobosBoardInfoSafely(fobos_dev_t *dev,
-                            char *hwRevision,
-                            char *firmwareVersion,
-                            char *manufacturer,
-                            char *product,
-                            char *serial) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_get_board_info(dev, hwRevision, firmwareVersion, manufacturer, product, serial);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_get_board_info(dev, hwRevision, firmwareVersion, manufacturer, product, serial);
-#endif
-}
-
-int getFobosAgileBoardInfoSafely(fobos_sdr_dev_t *dev,
-                                 char *hwRevision,
-                                 char *firmwareVersion,
-                                 char *manufacturer,
-                                 char *product,
-                                 char *serial) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_get_board_info(dev, hwRevision, firmwareVersion, manufacturer, product, serial);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_get_board_info(dev, hwRevision, firmwareVersion, manufacturer, product, serial);
-#endif
-}
-
-int getFobosSampleRatesSafely(fobos_dev_t *dev, double *values, unsigned int *count) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_get_samplerates(dev, values, count);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_get_samplerates(dev, values, count);
-#endif
-}
-
-int getFobosAgileSampleRatesSafely(fobos_sdr_dev_t *dev, double *values, unsigned int *count) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_get_samplerates(dev, values, count);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_get_samplerates(dev, values, count);
-#endif
-}
-
-void logFobosApiInfo() {
-    char libVersion[256] = {};
-    char driverVersion[256] = {};
-    const int result = getFobosStandardApiInfoSafely(libVersion, driverVersion);
-    if (result == FOBOS_ERR_OK) {
-        qDebug() << "[FobosLifecycle] libfobos info"
-                 << "library" << libVersion
-                 << "driver" << driverVersion;
-    } else {
-        qDebug() << "[FobosLifecycle] libfobos info unavailable"
-                 << "result" << result;
-    }
-
-    char agileLibVersion[256] = {};
-    char agileDriverVersion[256] = {};
-    const int agileResult = getFobosAgileApiInfoSafely(agileLibVersion, agileDriverVersion);
-    if (agileResult == FOBOS_ERR_OK) {
-        qDebug() << "[FobosLifecycle] libfobos agile info"
-                 << "library" << agileLibVersion
-                 << "driver" << agileDriverVersion;
-    } else {
-        qDebug() << "[FobosLifecycle] libfobos agile info unavailable"
-                 << "result" << agileResult;
-    }
-}
-
-int closeFobosDeviceSafely(fobos_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_close(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_close(dev);
-#endif
-}
-
-int resetFobosDeviceSafely(fobos_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_close(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_reset(dev);
-#endif
-}
-
-int setFobosClockSourceSafely(fobos_dev_t *dev, unsigned int value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_clk_source(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_clk_source(dev, value);
-#endif
-}
-
-int setFobosDirectSamplingSafely(fobos_dev_t *dev, unsigned int enabled) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_direct_sampling(dev, enabled);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_direct_sampling(dev, enabled);
-#endif
-}
-
-int setFobosSampleRateSafely(fobos_dev_t *dev, double value, double *actual) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_samplerate(dev, value, actual);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_samplerate(dev, value, actual);
-#endif
-}
-
-int setFobosFrequencySafely(fobos_dev_t *dev, double value, double *actual) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_frequency(dev, value, actual);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_frequency(dev, value, actual);
-#endif
-}
-
-int setFobosLnaGainSafely(fobos_dev_t *dev, unsigned int value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_lna_gain(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_lna_gain(dev, value);
-#endif
-}
-
-int setFobosVgaGainSafely(fobos_dev_t *dev, unsigned int value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_vga_gain(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_vga_gain(dev, value);
-#endif
-}
-
-int setFobosGpoSafely(fobos_dev_t *dev, uint8_t value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_rx_set_user_gpo(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_rx_set_user_gpo(dev, value);
-#endif
-}
-
-int closeFobosAgileDeviceSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_close(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_close(dev);
-#endif
-}
-
-int resetFobosAgileDeviceSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_reset(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_reset(dev);
-#endif
-}
-
-int setFobosAgileClockSourceSafely(fobos_sdr_dev_t *dev, int value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_clk_source(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_clk_source(dev, value);
-#endif
-}
-
-int setFobosAgileDirectSamplingSafely(fobos_sdr_dev_t *dev, unsigned int enabled) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_direct_sampling(dev, enabled);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_direct_sampling(dev, enabled);
-#endif
-}
-
-int setFobosAgileSampleRateSafely(fobos_sdr_dev_t *dev, double value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_samplerate(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_samplerate(dev, value);
-#endif
-}
-
-int setFobosAgileFrequencySafely(fobos_sdr_dev_t *dev, double value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_frequency(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_frequency(dev, value);
-#endif
-}
-
-int setFobosAgileLnaGainSafely(fobos_sdr_dev_t *dev, unsigned int value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_lna_gain(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_lna_gain(dev, value);
-#endif
-}
-
-int setFobosAgileVgaGainSafely(fobos_sdr_dev_t *dev, unsigned int value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_vga_gain(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_vga_gain(dev, value);
-#endif
-}
-
-int setFobosAgileAutoBandwidthSafely(fobos_sdr_dev_t *dev, double value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_auto_bandwidth(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_auto_bandwidth(dev, value);
-#endif
-}
-
-int setFobosAgileGpoSafely(fobos_sdr_dev_t *dev, uint8_t value) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_set_user_gpo(dev, value);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_set_user_gpo(dev, value);
-#endif
-}
-
-int startFobosAgileScanSafely(fobos_sdr_dev_t *dev, double *frequencies, unsigned int count) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-    if (!frequencies ||
-        count < static_cast<unsigned int>(AGILE_SCAN_MIN_POINTS) ||
-        count > static_cast<unsigned int>(AGILE_SCAN_MAX_POINTS)) {
-        return FOBOS_ERR_UNSUPPORTED;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_start_scan(dev, frequencies, count);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_start_scan(dev, frequencies, count);
-#endif
-}
-
-int stopFobosAgileScanSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_stop_scan(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_stop_scan(dev);
-#endif
-}
-
-int isFobosAgileScanningSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_is_scanning(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_is_scanning(dev);
-#endif
-}
-
-int getFobosAgileScanIndexSafely(fobos_sdr_dev_t *dev) {
-    if (!dev) {
-        return FOBOS_ERR_NOT_OPEN;
-    }
-#ifdef _WIN32
-    __try {
-        return fobos_sdr_get_scan_index(dev);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return FOBOS_ERR_LIBUSB;
-    }
-#else
-    return fobos_sdr_get_scan_index(dev);
-#endif
-}
-
-int setActiveClockSourceSafely(int value) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        return setFobosAgileClockSourceSafely(agileDevice, value);
-    }
-    return setFobosClockSourceSafely(device, static_cast<unsigned int>(value));
-}
-
-int setActiveDirectSamplingSafely(unsigned int enabled) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        return setFobosAgileDirectSamplingSafely(agileDevice, enabled);
-    }
-    return setFobosDirectSamplingSafely(device, enabled);
-}
-
-int setActiveSampleRateSafely(double value, double *actual) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        if (!agileDevice) {
-            return FOBOS_ERR_NOT_OPEN;
-        }
-        const int result = setFobosAgileSampleRateSafely(agileDevice, value);
-        if (actual) {
-            *actual = value;
-        }
-        return result;
-    }
-    return setFobosSampleRateSafely(device, value, actual);
-}
-
-int setActiveFrequencySafely(double value, double *actual) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        if (!agileDevice) {
-            return FOBOS_ERR_NOT_OPEN;
-        }
-        const int result = setFobosAgileFrequencySafely(agileDevice, value);
-        if (actual) {
-            *actual = value;
-        }
-        return result;
-    }
-    return setFobosFrequencySafely(device, value, actual);
-}
-
-int setActiveLnaGainSafely(unsigned int value) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        return setFobosAgileLnaGainSafely(agileDevice, value);
-    }
-    return setFobosLnaGainSafely(device, value);
-}
-
-int setActiveVgaGainSafely(unsigned int value) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        return setFobosAgileVgaGainSafely(agileDevice, value);
-    }
-    return setFobosVgaGainSafely(device, value);
-}
-
-int setActiveGpoSafely(uint8_t value) {
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        return setFobosAgileGpoSafely(agileDevice, value);
-    }
-    return setFobosGpoSafely(device, value);
 }
 
 void logMemorySnapshot(const char *tag) {
@@ -2885,6 +2660,8 @@ YourClassName::YourClassName(QWidget *parent)
     fftComboBox->addItem("131072");
     fftComboBox->addItem("262144");
     fftComboBox->addItem("524288");
+    fftComboBox->addItem("1048576");
+    fftComboBox->addItem("2097152");
     fftComboBox->setCurrentIndex(4);
     
     lnaGainSlider = new QSlider(Qt::Horizontal, this);
@@ -2986,6 +2763,18 @@ YourClassName::YourClassName(QWidget *parent)
     comboBox->addItems(getFobosDevices());
     for (int i = 0; i < comboBox->count(); ++i) {
         comboBox->setItemData(i, i);
+    }
+    int comboDataIndex = availableFobosDevices.size();
+    if (comboBox->count() > comboDataIndex) {
+        comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(0));
+        ++comboDataIndex;
+    }
+    if (comboBox->count() > comboDataIndex) {
+        comboBox->setItemData(comboDataIndex, RTL_TCP_DEVICE_INDEX);
+        ++comboDataIndex;
+    }
+    if (comboBox->count() > comboDataIndex) {
+        comboBox->setItemData(comboDataIndex, SOAPY_SDR_DEVICE_INDEX);
     }
     modeBox->addItem("RF", INPUT_RF);
     modeBox->addItem("HF1 + HF2", INPUT_HF_COMBINED);
@@ -4242,6 +4031,10 @@ YourClassName::YourClassName(QWidget *parent)
     listeningScanAdvanceTimer->setInterval(25);
     videoSnapshotTimer = new QTimer(this);
     videoSnapshotTimer->setInterval(VIDEO_SNAPSHOT_INTERVAL_MS);
+    agileLiveRetuneTimer = new QTimer(this);
+    agileLiveRetuneTimer->setSingleShot(true);
+    persistentSettingsSaveTimer = new QTimer(this);
+    persistentSettingsSaveTimer->setSingleShot(true);
     
     connect(updateTimer, &QTimer::timeout, this, &YourClassName::updateSpectrum);
     connect(stopPollTimer, &QTimer::timeout, this, &YourClassName::pollStopCompletion);
@@ -4249,6 +4042,8 @@ YourClassName::YourClassName(QWidget *parent)
     connect(standardScanAdvanceTimer, &QTimer::timeout, this, &YourClassName::advanceStandardScanIfNeeded);
     connect(listeningScanAdvanceTimer, &QTimer::timeout, this, &YourClassName::advanceListeningScanIfNeeded);
     connect(videoSnapshotTimer, &QTimer::timeout, this, &YourClassName::processVideoSnapshotFrame);
+    connect(agileLiveRetuneTimer, &QTimer::timeout, this, &YourClassName::flushQueuedLiveAgileCenterRetune);
+    connect(persistentSettingsSaveTimer, &QTimer::timeout, this, &YourClassName::flushPendingPersistentSettingsSave);
     connect(graphCheckbox, &QCheckBox::toggled, this, &YourClassName::doubleGraphEnable);
     connect(colorCheckbox, &QCheckBox::toggled, this, &YourClassName::colorGraphEnable);
     connect(syncCheckbox, &QCheckBox::toggled, this, &YourClassName::syncEnable);
@@ -4439,6 +4234,9 @@ YourClassName::YourClassName(QWidget *parent)
         for (const FobosDeviceInfo &info : std::as_const(availableFobosDevices)) {
             deviceLabels << info.label;
         }
+        deviceLabels << QStringLiteral("RTL-SDR native #0 (rtlsdr.dll)");
+        deviceLabels << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
+        deviceLabels << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
         if (deviceLabels.isEmpty()) {
             deviceLabels << uiText(QStringLiteral("no_fobos_devices_detected"),
                                    QStringLiteral("No Fobos devices detected"));
@@ -4447,8 +4245,23 @@ YourClassName::YourClassName(QWidget *parent)
         for (int i = 0; i < availableFobosDevices.size() && i < comboBox->count(); ++i) {
             comboBox->setItemData(i, i);
         }
+        int comboDataIndex = availableFobosDevices.size();
+        if (comboBox->count() > comboDataIndex) {
+            comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(0));
+            ++comboDataIndex;
+        }
+        if (comboBox->count() > comboDataIndex) {
+            comboBox->setItemData(comboDataIndex, RTL_TCP_DEVICE_INDEX);
+            ++comboDataIndex;
+        }
+        if (comboBox->count() > comboDataIndex) {
+            comboBox->setItemData(comboDataIndex, SOAPY_SDR_DEVICE_INDEX);
+        }
         if (!availableFobosDevices.isEmpty()) {
             pendingSettings.deviceIndex = comboBox->currentData().toInt();
+            if (!isRtlBackendSelected() && isKnownRtlSampleRate(pendingSettings.sampleRate)) {
+                pendingSettings.sampleRate = FOBOS_DEFAULT_SAMPLE_RATE;
+            }
         }
         comboBox->blockSignals(false);
         if (sampleBox) {
@@ -4463,6 +4276,28 @@ YourClassName::YourClassName(QWidget *parent)
         bool ok = false;
         const int selectedIndex = comboBox->currentData().toInt(&ok);
         pendingSettings.deviceIndex = ok ? selectedIndex : index;
+        if (isRtlBackendSelected()) {
+            if (!isKnownRtlSampleRate(pendingSettings.sampleRate)) {
+                pendingSettings.sampleRate = RTL_TCP_SAFE_SAMPLE_RATE;
+            }
+        } else if (isSoapySdrSelected()) {
+            const QVector<double> soapyCommonRates = {
+                1000000.0, 1024000.0, 1536000.0, 2048000.0, 2400000.0,
+                3200000.0, 8000000.0, 10000000.0, 20000000.0, 50000000.0
+            };
+            bool knownSoapyRate = false;
+            for (const double rate : soapyCommonRates) {
+                if (std::abs(rate - pendingSettings.sampleRate) < 0.5) {
+                    knownSoapyRate = true;
+                    break;
+                }
+            }
+            if (!knownSoapyRate) {
+                pendingSettings.sampleRate = 2048000.0;
+            }
+        } else if (isKnownRtlSampleRate(pendingSettings.sampleRate)) {
+            pendingSettings.sampleRate = FOBOS_DEFAULT_SAMPLE_RATE;
+        }
         if (sampleBox) {
             sampleBox->clear();
             populateSampleRates();
@@ -4869,8 +4704,10 @@ YourClassName::YourClassName(QWidget *parent)
             scheduleRemoteSettingsCommand();
             return;
         }
-        if (applyNow && !isIdle() && hasActiveFobosDevice()) {
-            if (activeFobosApiKind == FobosApiKind::Agile &&
+        if (applyNow && !isIdle() && (hasActiveFobosDevice() || isExternalReceiverBackendSelected())) {
+            if (isExternalReceiverBackendSelected()) {
+                applyStandardScanSettings(false);
+            } else if (activeFobosApiKind == FobosApiKind::Agile &&
                 previousAgileScanEnabled != agileScanEnabled) {
                 restartStreamForHardwareChange();
             } else if (activeFobosApiKind == FobosApiKind::Standard &&
@@ -4943,6 +4780,9 @@ YourClassName::YourClassName(QWidget *parent)
         }
         listeningScanPresets[name] =
             listeningScanPresetSpec(listeningScanTargetsMhz, listeningScanDwellMs, listeningScanSettleMs);
+        if (!listeningScanPresetOrder.contains(name)) {
+            listeningScanPresetOrder.append(name);
+        }
         savePersistentSettings();
         updateListeningScanControls();
     });
@@ -4952,6 +4792,7 @@ YourClassName::YourClassName(QWidget *parent)
             return;
         }
         listeningScanPresets.remove(name);
+        listeningScanPresetOrder.removeAll(name);
         savePersistentSettings();
         updateListeningScanControls();
     });
@@ -5066,6 +4907,9 @@ YourClassName::YourClassName(QWidget *parent)
         }
         standardScanPresets[name] =
             standardScanPresetSpec(standardScanCentersMhz, standardScanDwellMs, standardScanSettleMs);
+        if (!standardScanPresetOrder.contains(name)) {
+            standardScanPresetOrder.append(name);
+        }
         savePersistentSettings();
         updateAgileScanControls();
     });
@@ -5075,6 +4919,7 @@ YourClassName::YourClassName(QWidget *parent)
             return;
         }
         standardScanPresets.remove(name);
+        standardScanPresetOrder.removeAll(name);
         savePersistentSettings();
         updateAgileScanControls();
     });
@@ -5664,6 +5509,74 @@ bool YourClassName::eventFilter(QObject *watched, QEvent *event) {
     return QMainWindow::eventFilter(watched, event);
 }
 
+void YourClassName::closeEvent(QCloseEvent *event) {
+    qDebug() << "[FobosLifecycle] closeEvent enter"
+             << "state" << runStateName(runState)
+             << "deviceOpened" << deviceOpened
+             << "processorRunning" << (processor && processor->isRunning())
+             << "device" << activeFobosDevice()
+             << "apiKind" << fobosApiKindName(activeFobosApiKind)
+             << "closeShutdownInProgress" << closeShutdownInProgress;
+
+    pendingAudioStartAfterStreamReady = false;
+    pendingNetworkAudioStartAfterIqPrebuffer = false;
+    pendingPlaybackAudioStartAfterIqPrebuffer = false;
+
+    const bool processorRunning = processor && processor->isRunning();
+    const bool needsAsyncStop =
+        processorRunning ||
+        runState == RadioRunState::Running ||
+        runState == RadioRunState::Starting ||
+        runState == RadioRunState::Stopping ||
+        deviceOpened;
+
+    if (needsAsyncStop) {
+        closeShutdownInProgress = true;
+        event->ignore();
+        if (runState != RadioRunState::Stopping) {
+            stopFobosProcessing();
+        } else if (stopPollTimer && !stopPollTimer->isActive()) {
+            stopElapsedTimer.restart();
+            stopCancelRetryCount = 0;
+            stopPollTimer->start();
+        }
+        qDebug() << "[FobosLifecycle] closeEvent deferred until reader stops";
+        return;
+    }
+
+    closeShutdownInProgress = true;
+    if (streamWatchdogTimer) {
+        streamWatchdogTimer->stop();
+    }
+    if (stopPollTimer) {
+        stopPollTimer->stop();
+    }
+    if (updateTimer) {
+        updateTimer->stop();
+    }
+    if (audioProcessor) {
+        audioProcessor->stopDemodulation();
+    }
+    if (processor) {
+        processor->finalizeStopped();
+    }
+    if (hasActiveFobosDevice()) {
+        abandonFobosSessionWithoutClose("window close");
+    }
+    deviceOpened = false;
+    runState = RadioRunState::Idle;
+    savePersistentSettings();
+    qDebug() << "[FobosLifecycle] closeEvent exit";
+    QMainWindow::closeEvent(event);
+}
+
+static void logIqBufferRetuneState(const char *stage,
+                                   const QString &reason,
+                                   std::uint64_t retuneEpoch,
+                                   double previousFrequency,
+                                   double requestedFrequency,
+                                   double actualFrequency);
+
 bool YourClassName::restartStreamForHardwareChange() {
     if (isChannelIqRecordingActive() &&
         networkMode != NetworkMode::Disabled &&
@@ -5740,16 +5653,6 @@ bool YourClassName::restartStreamForHardwareChange() {
         return false;
     }
 
-    if (!stabilizeAgileFrequencyBeforeStreaming("live hardware restart")) {
-        qDebug() << "[LiveHardware] Agile frequency settle failed before reader restart";
-        closeFobosSession(true);
-        clearLiveSpectrumSnapshot();
-        deviceOpened = false;
-        runState = RadioRunState::Idle;
-        updateUiForRunState();
-        return false;
-    }
-
     updateSpectrumTimerInterval();
     settingRange();
     spectrumTuningDebugFramesRemaining = 32;
@@ -5783,16 +5686,17 @@ bool YourClassName::restartStreamForHardwareChange() {
                                                serverChannelIqStreaming || channelIqRecording);
     }
 
-    processor->startProcessing(activeFobosDevice(),
-                               activeFobosApiKind,
-                               pendingSettings.syncEnabled,
-                               pendingSettings.sampleRate,
-                               queueAudioBlocks,
-                               publishIqSnapshot,
-                               serverIqStreaming || channelIqRecording,
-                               agileScanEnabled &&
-                                   !standardScanEnabled &&
-                                   activeFobosApiKind == FobosApiKind::Agile);
+    processor->startProcessing(makeFobosStreamDescriptor(activeFobosDevice(),
+                                                         activeFobosApiKind,
+                                                         pendingSettings.syncEnabled,
+                                                         pendingSettings.sampleRate,
+                                                         pendingSettings.centerFrequency,
+                                                         queueAudioBlocks,
+                                                         publishIqSnapshot,
+                                                         serverIqStreaming || channelIqRecording,
+                                                         agileScanEnabled &&
+                                                             !standardScanEnabled &&
+                                                             activeFobosApiKind == FobosApiKind::Agile));
 
     if (activeFobosApiKind == FobosApiKind::Agile &&
         pendingSettings.inputMode == INPUT_RF &&
@@ -5818,6 +5722,148 @@ bool YourClassName::restartStreamForHardwareChange() {
     runState = RadioRunState::Running;
     updateUiForRunState();
     applyServerLocalOutputPolicy();
+    return true;
+}
+
+bool YourClassName::restartAgileReaderForCenterRetune(double previousFrequency,
+                                                      double requestedFrequency,
+                                                      const QString &reason) {
+    if (runState != RadioRunState::Running ||
+        pendingSettings.inputMode != INPUT_RF ||
+        !hasActiveFobosDevice() ||
+        activeFobosApiKind != FobosApiKind::Agile ||
+        agileScanEnabled ||
+        !processor) {
+        qDebug() << "[LiveTune]" << reason
+                 << "Agile reader-only retune rejected"
+                 << "state" << static_cast<int>(runState)
+                 << "inputMode" << pendingSettings.inputMode
+                 << "hasDevice" << hasActiveFobosDevice()
+                 << "apiKind" << static_cast<int>(activeFobosApiKind)
+                 << "agileScan" << agileScanEnabled
+                 << "processor" << processor;
+        return false;
+    }
+
+    QElapsedTimer stageTimer;
+    QElapsedTimer totalTimer;
+    totalTimer.start();
+    stageTimer.start();
+    if (processor->isRunning()) {
+        processor->requestStop();
+        const uint64_t preRetuneIqEpoch = processor->beginIqRetuneBarrier();
+        clearLiveSpectrumSnapshot(false, preRetuneIqEpoch);
+        if (!processor->wait(1500)) {
+            qDebug() << "[LiveTune]" << reason
+                     << "Agile reader-only retune wait timed out; forcing DataProcessor stop"
+                     << "elapsedMs" << stageTimer.elapsed();
+            const bool forced = processor->forceStop(1000);
+            qDebug() << "[LiveTune]" << reason
+                     << "Agile reader-only retune forced stop result"
+                     << forced
+                     << "processorRunning" << processor->isRunning();
+            if (!forced || processor->isRunning()) {
+                return false;
+            }
+        }
+        processor->finalizeStopped();
+    }
+    const qint64 stopMs = stageTimer.elapsed();
+
+    const uint64_t preTuneIqEpoch = processor->beginIqRetuneBarrier();
+    clearLiveSpectrumSnapshot(false, preTuneIqEpoch);
+
+    double tunedFrequency = requestedFrequency;
+    stageTimer.restart();
+    const int tuneResult = setActiveFrequencySafely(requestedFrequency, &tunedFrequency);
+    const qint64 tuneMs = stageTimer.elapsed();
+    if (tuneResult != FOBOS_ERR_OK) {
+        qDebug() << "[LiveTune]" << reason
+                 << "Agile reader-only retune set frequency failed"
+                 << "requested" << requestedFrequency
+                 << "result" << tuneResult
+                 << "stopMs" << stopMs
+                 << "tuneMs" << tuneMs;
+        return false;
+    }
+
+    stageTimer.restart();
+    const double autoBandwidthRatio = agileRfAutoBandwidthRatio(pendingSettings.sampleRate);
+    const int bandwidthResult = setFobosAgileAutoBandwidthSafely(agileDevice, autoBandwidthRatio);
+    const qint64 bandwidthMs = stageTimer.elapsed();
+    if (bandwidthResult != FOBOS_ERR_OK) {
+        qDebug() << "[LiveTune]" << reason
+                 << "Agile reader-only retune auto bandwidth failed"
+                 << "ratio" << autoBandwidthRatio
+                 << "result" << bandwidthResult;
+    }
+
+    pendingSettings.actualFrequency = tunedFrequency;
+    actualFrequency = tunedFrequency;
+    if (hardwareSettingsApplied) {
+        appliedHardwareSettings.centerFrequency = requestedFrequency;
+        appliedHardwareSettings.actualFrequency = tunedFrequency;
+    }
+    publishSettingsToGlobals();
+    updateIqFrameProducerSettings();
+    networkSpectrumFrameMetadataValid = false;
+    networkSpectrumFrameMinFrequency = 0.0;
+    networkSpectrumFrameMaxFrequency = 0.0;
+    networkSpectrumFrameFftLength = 0;
+
+    const uint64_t postRetuneIqEpoch = processor->beginIqRetuneBarrier();
+    clearLiveSpectrumSnapshot(false, postRetuneIqEpoch);
+
+    const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
+    const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
+    const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
+    const bool channelIqRecording = isChannelIqRecordingActive();
+    const bool serverAudioStreamingForFullIq = serverFullIqStreaming && pendingSettings.audioEnabled;
+    const bool channelIqRecordingOnly = channelIqRecording && !serverIqStreaming;
+    const bool queueAudioBlocks =
+        !channelIqRecordingOnly &&
+        (!serverIqStreaming || serverAudioStreamingForFullIq);
+    const bool publishIqSnapshot = !channelIqRecordingOnly;
+
+    if ((serverIqStreaming || channelIqRecording) && processor) {
+        processor->configureNetworkIqStreaming(pendingSettings,
+                                               true,
+                                               serverChannelIqStreaming || channelIqRecording);
+    }
+
+    stageTimer.restart();
+    processor->startProcessing(makeFobosStreamDescriptor(activeFobosDevice(),
+                                                         activeFobosApiKind,
+                                                         pendingSettings.syncEnabled,
+                                                         pendingSettings.sampleRate,
+                                                         pendingSettings.centerFrequency,
+                                                         queueAudioBlocks,
+                                                         publishIqSnapshot,
+                                                         serverIqStreaming || channelIqRecording,
+                                                         false));
+    const qint64 startMs = stageTimer.elapsed();
+    if (processor) {
+        processor->setCenterFrequencyHint(tunedFrequency);
+    }
+
+    liveRetuneSettleDurationMs = 0;
+    liveRetuneSettleTimer.invalidate();
+    spectrumTuningDebugFramesRemaining = 0;
+    if (updateTimer && !updateTimer->isActive()) {
+        updateTimer->start();
+    }
+
+    qDebug() << "[LiveTune]" << reason
+             << "Agile reader-only retune done"
+             << "requested" << requestedFrequency
+             << "actual" << tunedFrequency
+             << "stopMs" << stopMs
+             << "tuneMs" << tuneMs
+             << "bandwidthMs" << bandwidthMs
+             << "startMs" << startMs
+             << "totalMs" << totalTimer.elapsed()
+             << "queueAudioBlocks" << queueAudioBlocks
+             << "publishIqSnapshot" << publishIqSnapshot;
     return true;
 }
 
@@ -6011,7 +6057,6 @@ double YourClassName::currentAgileScanCenterFrequencyHz() const {
 
 double YourClassName::currentStandardScanCenterFrequencyHz() const {
     if (!standardScanRunning ||
-        !hasActiveFobosDevice() ||
         activeStandardScanFrequencies.isEmpty()) {
         return std::numeric_limits<double>::quiet_NaN();
     }
@@ -6024,8 +6069,12 @@ void YourClassName::updateAgileScanControls() {
         const QString currentText = agileScanPresetCombo->currentText();
         QSignalBlocker blocker(agileScanPresetCombo);
         agileScanPresetCombo->clear();
-        for (auto it = agileScanPresets.constBegin(); it != agileScanPresets.constEnd(); ++it) {
-            agileScanPresetCombo->addItem(it.key(), it.key());
+        agileScanPresetOrder =
+            normalizedPresetOrder(agileScanPresetOrder,
+                                  agileScanPresets,
+                                  defaultAgileScanPresetOrder());
+        for (const QString &name : std::as_const(agileScanPresetOrder)) {
+            agileScanPresetCombo->addItem(name, name);
         }
         agileScanPresetCombo->setEditText(currentText);
     }
@@ -6033,15 +6082,21 @@ void YourClassName::updateAgileScanControls() {
         const QString currentText = standardScanPresetCombo->currentText();
         QSignalBlocker blocker(standardScanPresetCombo);
         standardScanPresetCombo->clear();
-        for (auto it = standardScanPresets.constBegin(); it != standardScanPresets.constEnd(); ++it) {
-            standardScanPresetCombo->addItem(it.key(), it.key());
+        standardScanPresetOrder =
+            normalizedPresetOrder(standardScanPresetOrder,
+                                  standardScanPresets,
+                                  defaultStandardScanPresetOrder());
+        for (const QString &name : std::as_const(standardScanPresetOrder)) {
+            standardScanPresetCombo->addItem(name, name);
         }
         standardScanPresetCombo->setEditText(currentText);
     }
 
     const FobosDeviceInfo selectedInfo = selectedFobosDeviceInfo();
     const bool agileScanSupported = selectedInfo.apiKind == FobosApiKind::Agile;
+    const bool externalBackendSelected = isExternalReceiverBackendSelected();
     const bool standardScanSupported =
+        externalBackendSelected ||
         selectedInfo.apiKind == FobosApiKind::Standard ||
         selectedInfo.apiKind == FobosApiKind::Agile;
     if (agileScanCheckbox) {
@@ -6063,7 +6118,7 @@ void YourClassName::updateAgileScanControls() {
                                              ? uiText(QStringLiteral("standard_scan_tooltip"),
                                                       QStringLiteral("Slow manual retune scan by cycling through listed center frequencies"))
                                              : uiText(QStringLiteral("standard_receiver_required"),
-                                                     QStringLiteral("Fobos receiver required")));
+                                                     QStringLiteral("Live-retune receiver required")));
         if (!standardScanSupported && standardScanCheckbox->isChecked()) {
             QSignalBlocker blocker(standardScanCheckbox);
             standardScanCheckbox->setChecked(false);
@@ -6174,7 +6229,7 @@ void YourClassName::updateAgileScanControls() {
                                         nullptr);
         if (!standardScanSupported) {
             standardScanStatusLabel->setText(uiText(QStringLiteral("standard_firmware_required"),
-                                                    QStringLiteral("Fobos receiver required")));
+                                                    QStringLiteral("Live-retune receiver required")));
         } else if (!standardError.isEmpty()) {
             standardScanStatusLabel->setText(standardError);
         } else if (standardScanChecked) {
@@ -6195,8 +6250,12 @@ void YourClassName::updateListeningScanControls() {
         const QString currentText = listeningScanPresetCombo->currentText();
         QSignalBlocker blocker(listeningScanPresetCombo);
         listeningScanPresetCombo->clear();
-        for (auto it = listeningScanPresets.constBegin(); it != listeningScanPresets.constEnd(); ++it) {
-            listeningScanPresetCombo->addItem(it.key(), it.key());
+        listeningScanPresetOrder =
+            normalizedPresetOrder(listeningScanPresetOrder,
+                                  listeningScanPresets,
+                                  defaultListeningScanPresetOrder());
+        for (const QString &name : std::as_const(listeningScanPresetOrder)) {
+            listeningScanPresetCombo->addItem(name, name);
         }
         listeningScanPresetCombo->setEditText(currentText);
     }
@@ -7822,6 +7881,9 @@ void YourClassName::saveAgileScanPreset() {
     }
     refreshSettingsFromUi();
     agileScanPresets[name] = agileScanPresetSpec(agileScanRangesMhz, agileScanStepMhz);
+    if (!agileScanPresetOrder.contains(name)) {
+        agileScanPresetOrder.append(name);
+    }
     agileScanPresetCombo->setEditText(name);
     updateAgileScanControls();
     savePersistentSettings();
@@ -7834,6 +7896,7 @@ void YourClassName::deleteAgileScanPreset() {
     const QString name = agileScanPresetCombo->currentText().trimmed();
     if (!name.isEmpty()) {
         agileScanPresets.remove(name);
+        agileScanPresetOrder.removeAll(name);
     }
     updateAgileScanControls();
     savePersistentSettings();
@@ -7869,6 +7932,11 @@ void YourClassName::ensureDefaultFrequencyPresets() {
             listeningFrequencyPresets[name] = valueHz;
         }
     };
+    addMissingFrequencyPreset(QStringLiteral("LTE 700 downlink 780.5 MHz"), 780500000.0);
+    addMissingFrequencyPreset(QStringLiteral("LTE 800 downlink 806 MHz"), 806000000.0);
+    addMissingFrequencyPreset(QStringLiteral("UMTS/LTE 1800 downlink 1842.5 MHz"), 1842500000.0);
+    addMissingFrequencyPreset(QStringLiteral("UMTS/LTE 2100 downlink 2140 MHz"), 2140000000.0);
+    addMissingFrequencyPreset(QStringLiteral("LTE 2600 downlink 2655 MHz"), 2655000000.0);
     const QVector<double> fpvVideoPresetMhz = {
         1440.0, 1450.0, 1600.0, 1620.0,
         4990.0, 5010.0, 5360.0, 5460.0,
@@ -7915,6 +7983,19 @@ void YourClassName::ensureDefaultFrequencyPresets() {
     addMissingBandwidthPreset(QStringLiteral("GNSS raw 4.092 MHz"), 4092000.0);
     addMissingBandwidthPreset(QStringLiteral("GLONASS L1OF 9 MHz"), 9000000.0);
     addMissingBandwidthPreset(QStringLiteral("GNSS L1 survey 50 MHz"), GNSS_USEFUL_STANDARD_SPAN_HZ);
+
+    centerFrequencyPresetOrder =
+        normalizedPresetOrder(centerFrequencyPresetOrder,
+                              centerFrequencyPresets,
+                              defaultCenterFrequencyPresetOrder());
+    listeningFrequencyPresetOrder =
+        normalizedPresetOrder(listeningFrequencyPresetOrder,
+                              listeningFrequencyPresets,
+                              defaultListeningFrequencyPresetOrder());
+    bandwidthPresetOrder =
+        normalizedPresetOrder(bandwidthPresetOrder,
+                              bandwidthValuePresets,
+                              defaultBandwidthPresetOrder());
 }
 
 void YourClassName::ensureDefaultBandMarkers() {
@@ -7945,10 +8026,16 @@ void YourClassName::ensureDefaultBandMarkers() {
     addMhz("UHF Satcom", 240.0, 270.0, false);
     addMhz("TETRA", 380.0, 430.0, false);
     addMhz("PMR446", 446.0, 446.2, false);
+    addMhz("LTE 700 DL", 758.0, 803.0, false);
+    addMhz("LTE 800 DL", 791.0, 821.0, false);
+    addMhz("GSM/LTE 900 DL", 925.0, 960.0, false);
     addMhz("ADS-B", 1089.5, 1090.5, false);
     addMhz("L-band Sat", 1525.0, 1660.5, false);
     addMhz("GNSS L1", 1559.0, 1610.0, false);
+    addMhz("UMTS/LTE 1800 DL", 1805.0, 1880.0, false);
+    addMhz("UMTS/LTE 2100 DL", 2110.0, 2170.0, false);
     addMhz("ISM 2.4", 2400.0, 2483.5, false);
+    addMhz("LTE 2600 DL", 2620.0, 2690.0, false);
     addMhz("FPV 5.8", 5650.0, 5925.0, false);
 
     addMhz("2200m", 0.1357, 0.1378, true);
@@ -7972,11 +8059,16 @@ void YourClassName::ensureDefaultBandMarkers() {
     addMhz("6cm", 5650.0, 5850.0, true);
 }
 
-QVector<QPair<QString, double>> YourClassName::presetMapToVector(const QMap<QString, double> &presets) const {
+QVector<QPair<QString, double>> YourClassName::presetMapToVector(const QMap<QString, double> &presets,
+                                                                 const QStringList &order) const {
     QVector<QPair<QString, double>> values;
     values.reserve(presets.size());
-    for (auto it = presets.constBegin(); it != presets.constEnd(); ++it) {
-        if (!it.key().trimmed().isEmpty() && std::isfinite(it.value())) {
+    const QStringList normalizedOrder = normalizedPresetOrder(order, presets);
+    for (const QString &name : normalizedOrder) {
+        auto it = presets.constFind(name);
+        if (it != presets.constEnd() &&
+            !it.key().trimmed().isEmpty() &&
+            std::isfinite(it.value())) {
             values.append(qMakePair(it.key(), it.value()));
         }
     }
@@ -7986,13 +8078,16 @@ QVector<QPair<QString, double>> YourClassName::presetMapToVector(const QMap<QStr
 void YourClassName::updateFrequencyPresetControls() {
     ensureDefaultFrequencyPresets();
     if (frequencyControl) {
-        frequencyControl->setValuePresets(presetMapToVector(centerFrequencyPresets));
+        frequencyControl->setValuePresets(presetMapToVector(centerFrequencyPresets,
+                                                            centerFrequencyPresetOrder));
     }
     if (listeningFrequencyControl) {
-        listeningFrequencyControl->setValuePresets(presetMapToVector(listeningFrequencyPresets));
+        listeningFrequencyControl->setValuePresets(presetMapToVector(listeningFrequencyPresets,
+                                                                     listeningFrequencyPresetOrder));
     }
     if (bandwidthControl) {
-        bandwidthControl->setValuePresets(presetMapToVector(bandwidthValuePresets));
+        bandwidthControl->setValuePresets(presetMapToVector(bandwidthValuePresets,
+                                                            bandwidthPresetOrder));
     }
     updateAgileScanControls();
 }
@@ -10550,10 +10645,51 @@ void YourClassName::openPresetManager() {
     QVBoxLayout *rootLayout = new QVBoxLayout(&dialog);
     QTabWidget *tabs = new QTabWidget(&dialog);
 
-    auto makeNumericTab = [this, &dialog](const QMap<QString, double> &presets,
-                                          const QString &valueHeader,
-                                          double minimum,
-                                          double maximum) -> QTableWidget * {
+    auto moveSelectedTableRow = [](QTableWidget *table, int direction) {
+        if (!table || direction == 0) {
+            return;
+        }
+        const int row = table->currentRow();
+        const int targetRow = row + direction;
+        if (row < 0 || targetRow < 0 || targetRow >= table->rowCount()) {
+            return;
+        }
+
+        const int columnCount = table->columnCount();
+        for (int column = 0; column < columnCount; ++column) {
+            QTableWidgetItem *current = table->takeItem(row, column);
+            QTableWidgetItem *target = table->takeItem(targetRow, column);
+            table->setItem(row, column, target);
+            table->setItem(targetRow, column, current);
+        }
+        table->setCurrentCell(targetRow, 0);
+        table->selectRow(targetRow);
+    };
+
+    auto addOrderButtons = [this, moveSelectedTableRow](QHBoxLayout *layout,
+                                                        QTableWidget *table,
+                                                        QWidget *page) {
+        QToolButton *moveUpButton = new QToolButton(page);
+        moveUpButton->setArrowType(Qt::UpArrow);
+        moveUpButton->setToolTip(uiText(QStringLiteral("move_up"), QStringLiteral("Move up")));
+        QToolButton *moveDownButton = new QToolButton(page);
+        moveDownButton->setArrowType(Qt::DownArrow);
+        moveDownButton->setToolTip(uiText(QStringLiteral("move_down"), QStringLiteral("Move down")));
+        layout->addWidget(moveUpButton);
+        layout->addWidget(moveDownButton);
+        QObject::connect(moveUpButton, &QToolButton::clicked, table, [table, moveSelectedTableRow]() {
+            moveSelectedTableRow(table, -1);
+        });
+        QObject::connect(moveDownButton, &QToolButton::clicked, table, [table, moveSelectedTableRow]() {
+            moveSelectedTableRow(table, 1);
+        });
+    };
+
+    auto makeNumericTab = [this, &dialog, addOrderButtons](const QMap<QString, double> &presets,
+                                                           const QStringList &order,
+                                                           const QString &valueHeader,
+                                                           double minimum,
+                                                           double maximum) -> QTableWidget * {
         QWidget *page = new QWidget(&dialog);
         QVBoxLayout *pageLayout = new QVBoxLayout(page);
         QTableWidget *table = new QTableWidget(page);
@@ -10564,16 +10700,23 @@ void YourClassName::openPresetManager() {
         table->setSelectionMode(QAbstractItemView::SingleSelection);
         table->setRowCount(presets.size());
         int row = 0;
-        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
-            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+        for (const QString &name : normalizedPresetOrder(order, presets)) {
+            auto it = presets.constFind(name);
+            if (it == presets.constEnd()) {
+                continue;
+            }
+            table->setItem(row, 0, new QTableWidgetItem(name));
             table->setItem(row, 1, new QTableWidgetItem(QString::number(it.value(), 'f', 3)));
+            ++row;
         }
+        table->setRowCount(row);
 
         QHBoxLayout *buttonLayout = new QHBoxLayout();
         QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
         QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
         buttonLayout->addWidget(addButton);
         buttonLayout->addWidget(removeButton);
+        addOrderButtons(buttonLayout, table, page);
         buttonLayout->addStretch();
         pageLayout->addWidget(table);
         pageLayout->addLayout(buttonLayout);
@@ -10599,7 +10742,8 @@ void YourClassName::openPresetManager() {
         return table;
     };
 
-    auto makeAgileTab = [this, &dialog](const QMap<QString, QString> &presets) -> QTableWidget * {
+    auto makeAgileTab = [this, &dialog, addOrderButtons](const QMap<QString, QString> &presets,
+                                                         const QStringList &order) -> QTableWidget * {
         QWidget *page = new QWidget(&dialog);
         QVBoxLayout *pageLayout = new QVBoxLayout(page);
         QTableWidget *table = new QTableWidget(page);
@@ -10612,17 +10756,24 @@ void YourClassName::openPresetManager() {
         table->setSelectionMode(QAbstractItemView::SingleSelection);
         table->setRowCount(presets.size());
         int row = 0;
-        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
-            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+        for (const QString &name : normalizedPresetOrder(order, presets)) {
+            auto it = presets.constFind(name);
+            if (it == presets.constEnd()) {
+                continue;
+            }
+            table->setItem(row, 0, new QTableWidgetItem(name));
             table->setItem(row, 1, new QTableWidgetItem(agileScanPresetRanges(it.value())));
             table->setItem(row, 2, new QTableWidgetItem(QString::number(agileScanPresetStepMhz(it.value(), 0.0125), 'f', 6)));
+            ++row;
         }
+        table->setRowCount(row);
 
         QHBoxLayout *buttonLayout = new QHBoxLayout();
         QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
         QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
         buttonLayout->addWidget(addButton);
         buttonLayout->addWidget(removeButton);
+        addOrderButtons(buttonLayout, table, page);
         buttonLayout->addStretch();
         pageLayout->addWidget(table);
         pageLayout->addLayout(buttonLayout);
@@ -10647,7 +10798,8 @@ void YourClassName::openPresetManager() {
         return table;
     };
 
-    auto makeStandardScanTab = [this, &dialog](const QMap<QString, QString> &presets) -> QTableWidget * {
+    auto makeStandardScanTab = [this, &dialog, addOrderButtons](const QMap<QString, QString> &presets,
+                                                                const QStringList &order) -> QTableWidget * {
         QWidget *page = new QWidget(&dialog);
         QVBoxLayout *pageLayout = new QVBoxLayout(page);
         QTableWidget *table = new QTableWidget(page);
@@ -10664,18 +10816,25 @@ void YourClassName::openPresetManager() {
         table->setSelectionMode(QAbstractItemView::SingleSelection);
         table->setRowCount(presets.size());
         int row = 0;
-        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
-            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+        for (const QString &name : normalizedPresetOrder(order, presets)) {
+            auto it = presets.constFind(name);
+            if (it == presets.constEnd()) {
+                continue;
+            }
+            table->setItem(row, 0, new QTableWidgetItem(name));
             table->setItem(row, 1, new QTableWidgetItem(standardScanPresetCenters(it.value())));
             table->setItem(row, 2, new QTableWidgetItem(QString::number(standardScanPresetDwellMs(it.value(), standardScanDwellMs))));
             table->setItem(row, 3, new QTableWidgetItem(QString::number(standardScanPresetSettleMs(it.value(), standardScanSettleMs))));
+            ++row;
         }
+        table->setRowCount(row);
 
         QHBoxLayout *buttonLayout = new QHBoxLayout();
         QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
         QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
         buttonLayout->addWidget(addButton);
         buttonLayout->addWidget(removeButton);
+        addOrderButtons(buttonLayout, table, page);
         buttonLayout->addStretch();
         pageLayout->addWidget(table);
         pageLayout->addLayout(buttonLayout);
@@ -10702,7 +10861,8 @@ void YourClassName::openPresetManager() {
         return table;
     };
 
-    auto makeListeningScanTab = [this, &dialog](const QMap<QString, QString> &presets) -> QTableWidget * {
+    auto makeListeningScanTab = [this, &dialog, addOrderButtons](const QMap<QString, QString> &presets,
+                                                                 const QStringList &order) -> QTableWidget * {
         QWidget *page = new QWidget(&dialog);
         QVBoxLayout *pageLayout = new QVBoxLayout(page);
         QTableWidget *table = new QTableWidget(page);
@@ -10719,18 +10879,25 @@ void YourClassName::openPresetManager() {
         table->setSelectionMode(QAbstractItemView::SingleSelection);
         table->setRowCount(presets.size());
         int row = 0;
-        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it, ++row) {
-            table->setItem(row, 0, new QTableWidgetItem(it.key()));
+        for (const QString &name : normalizedPresetOrder(order, presets)) {
+            auto it = presets.constFind(name);
+            if (it == presets.constEnd()) {
+                continue;
+            }
+            table->setItem(row, 0, new QTableWidgetItem(name));
             table->setItem(row, 1, new QTableWidgetItem(listeningScanPresetTargets(it.value())));
             table->setItem(row, 2, new QTableWidgetItem(QString::number(listeningScanPresetDwellMs(it.value(), listeningScanDwellMs))));
             table->setItem(row, 3, new QTableWidgetItem(QString::number(listeningScanPresetSettleMs(it.value(), listeningScanSettleMs))));
+            ++row;
         }
+        table->setRowCount(row);
 
         QHBoxLayout *buttonLayout = new QHBoxLayout();
         QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
         QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
         buttonLayout->addWidget(addButton);
         buttonLayout->addWidget(removeButton);
+        addOrderButtons(buttonLayout, table, page);
         buttonLayout->addStretch();
         pageLayout->addWidget(table);
         pageLayout->addLayout(buttonLayout);
@@ -10905,20 +11072,23 @@ void YourClassName::openPresetManager() {
     };
 
     QTableWidget *centerTable = makeNumericTab(centerFrequencyPresets,
+                                              centerFrequencyPresetOrder,
                                               uiText(QStringLiteral("frequency_hz"), QStringLiteral("Frequency Hz")),
                                               0.0,
                                               RF_EXPERIMENTAL_MAX_FREQUENCY);
     QTableWidget *listeningTable = makeNumericTab(listeningFrequencyPresets,
+                                                 listeningFrequencyPresetOrder,
                                                  uiText(QStringLiteral("frequency_hz"), QStringLiteral("Frequency Hz")),
                                                  -RF_EXPERIMENTAL_MAX_FREQUENCY,
                                                  RF_EXPERIMENTAL_MAX_FREQUENCY);
     QTableWidget *bandwidthTable = makeNumericTab(bandwidthValuePresets,
+                                                 bandwidthPresetOrder,
                                                  uiText(QStringLiteral("bandwidth_hz"), QStringLiteral("Bandwidth Hz")),
                                                  1.0,
                                                  20000000.0);
-    QTableWidget *agileTable = makeAgileTab(agileScanPresets);
-    QTableWidget *standardScanTable = makeStandardScanTab(standardScanPresets);
-    QTableWidget *listeningScanTable = makeListeningScanTab(listeningScanPresets);
+    QTableWidget *agileTable = makeAgileTab(agileScanPresets, agileScanPresetOrder);
+    QTableWidget *standardScanTable = makeStandardScanTab(standardScanPresets, standardScanPresetOrder);
+    QTableWidget *listeningScanTable = makeListeningScanTab(listeningScanPresets, listeningScanPresetOrder);
     QTableWidget *bandMarkerTable = makeBandMarkerTab(bandMarkers);
     QTableWidget *qthMarkerTable = makeQthMarkerTab(qthUserMarkers);
 
@@ -10953,6 +11123,20 @@ void YourClassName::openPresetManager() {
     rootLayout->addWidget(tabs);
     rootLayout->addWidget(hintLabel);
     rootLayout->addWidget(buttonBox);
+
+    auto tableNameOrder = [](QTableWidget *table) {
+        QStringList order;
+        if (!table) {
+            return order;
+        }
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
+            if (!name.isEmpty() && !order.contains(name)) {
+                order.append(name);
+            }
+        }
+        return order;
+    };
 
     auto readNumericTable = [](QTableWidget *table, QMap<QString, double> &target, QString *error) {
         QMap<QString, double> next;
@@ -11219,6 +11403,18 @@ void YourClassName::openPresetManager() {
         agileScanPresets = nextAgile;
         standardScanPresets = nextStandardScan;
         listeningScanPresets = nextListeningScan;
+        centerFrequencyPresetOrder =
+            normalizedPresetOrder(tableNameOrder(centerTable), centerFrequencyPresets);
+        listeningFrequencyPresetOrder =
+            normalizedPresetOrder(tableNameOrder(listeningTable), listeningFrequencyPresets);
+        bandwidthPresetOrder =
+            normalizedPresetOrder(tableNameOrder(bandwidthTable), bandwidthValuePresets);
+        agileScanPresetOrder =
+            normalizedPresetOrder(tableNameOrder(agileTable), agileScanPresets);
+        standardScanPresetOrder =
+            normalizedPresetOrder(tableNameOrder(standardScanTable), standardScanPresets);
+        listeningScanPresetOrder =
+            normalizedPresetOrder(tableNameOrder(listeningScanTable), listeningScanPresets);
         bandMarkers = nextBandMarkers;
         qthUserMarkers = nextQthMarkers;
         bandMarkersCustomized = true;
@@ -11228,6 +11424,30 @@ void YourClassName::openPresetManager() {
         savePersistentSettings();
         dialog.accept();
     });
+    connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    dialog.exec();
+}
+
+void YourClassName::openApplicationHelp() {
+    QWidget *parentWidget = QApplication::activeWindow();
+    QDialog dialog(parentWidget ? parentWidget : static_cast<QWidget*>(this));
+    dialog.setWindowTitle(uiText(QStringLiteral("program_help_title"),
+                                 QStringLiteral("FobosAPP feature guide")));
+    dialog.resize(760, 640);
+
+    QVBoxLayout *rootLayout = new QVBoxLayout(&dialog);
+    QPlainTextEdit *helpText = new QPlainTextEdit(&dialog);
+    helpText->setReadOnly(true);
+    helpText->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    helpText->setPlainText(applicationHelpText(uiLanguage));
+    rootLayout->addWidget(helpText, 1);
+
+    QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    if (QPushButton *closeButton = buttonBox->button(QDialogButtonBox::Close)) {
+        closeButton->setText(uiText(QStringLiteral("close"), QStringLiteral("Close")));
+    }
+    rootLayout->addWidget(buttonBox);
     connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
     dialog.exec();
@@ -11267,9 +11487,42 @@ void YourClassName::openApplicationSettings() {
         QStringLiteral("spectrum_update_interval_tooltip"),
         QStringLiteral("Spectrum and waterfall update interval. Auto keeps the FFT-dependent default.")));
 
+    QSpinBox *waterfallRowsSpin = new QSpinBox(&dialog);
+    waterfallRowsSpin->setRange(WATERFALL_ROWS_PER_FRAME_MIN, WATERFALL_ROWS_PER_FRAME_MAX);
+    waterfallRowsSpin->setSuffix(QStringLiteral(" rows/frame"));
+    waterfallRowsSpin->setSingleStep(1);
+    waterfallRowsSpin->setValue((std::clamp)(waterfallRowsPerFrame,
+                                             WATERFALL_ROWS_PER_FRAME_MIN,
+                                             WATERFALL_ROWS_PER_FRAME_MAX));
+    waterfallRowsSpin->setToolTip(uiText(
+        QStringLiteral("waterfall_speed_tooltip"),
+        QStringLiteral("Visual waterfall scroll speed. Higher values move more rows per FFT frame without increasing FFT load.")));
+
+    QSpinBox *agileLiveRetuneIntervalSpin = new QSpinBox(&dialog);
+    agileLiveRetuneIntervalSpin->setRange(AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
+                                          AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS);
+    agileLiveRetuneIntervalSpin->setSuffix(QStringLiteral(" ms"));
+    agileLiveRetuneIntervalSpin->setSingleStep(20);
+    agileLiveRetuneIntervalSpin->setValue((std::clamp)(agileLiveRetuneCommandIntervalMs,
+                                                       AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
+                                                       AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS));
+    agileLiveRetuneIntervalSpin->setToolTip(uiText(
+        QStringLiteral("agile_live_retune_interval_tooltip"),
+        QStringLiteral("Minimum interval between live Agile center-frequency commands. Lower values make tuning more responsive but can overload USB and UI.")));
+
+    QPushButton *helpButton = new QPushButton(
+        uiText(QStringLiteral("program_help"), QStringLiteral("Feature guide...")),
+        &dialog);
+    helpButton->setToolTip(uiText(
+        QStringLiteral("program_help_tooltip"),
+        QStringLiteral("Open a practical guide to FobosAPP controls, scanning, recordings, GNSS/QTH, network mode and mouse shortcuts.")));
+
     generalLayout->addRow(uiText(QStringLiteral("language"), QStringLiteral("Lang:")), languageCombo);
     generalLayout->addRow(uiText(QStringLiteral("fine_tune"), QStringLiteral("Fine tune")), fineTuneModeCombo);
     generalLayout->addRow(uiText(QStringLiteral("spectrum_update_interval"), QStringLiteral("Spectrum/waterfall update")), spectrumUpdateSpin);
+    generalLayout->addRow(uiText(QStringLiteral("waterfall_speed"), QStringLiteral("Waterfall speed")), waterfallRowsSpin);
+    generalLayout->addRow(uiText(QStringLiteral("agile_live_retune_interval"), QStringLiteral("Agile live retune interval")), agileLiveRetuneIntervalSpin);
+    generalLayout->addRow(helpButton);
     rootLayout->addLayout(generalLayout);
 
     QGroupBox *settingsBackupBox = new QGroupBox(
@@ -11352,6 +11605,24 @@ void YourClassName::openApplicationSettings() {
         updateSpectrumTimerInterval();
         savePersistentSettings();
     };
+    auto applyWaterfallRowsPerFrame = [this, waterfallRowsSpin]() {
+        waterfallRowsPerFrame = (std::clamp)(waterfallRowsSpin->value(),
+                                             WATERFALL_ROWS_PER_FRAME_MIN,
+                                             WATERFALL_ROWS_PER_FRAME_MAX);
+        if (waterfallWidget) {
+            waterfallWidget->setRowsPerFrame(waterfallRowsPerFrame);
+        }
+        savePersistentSettings();
+    };
+    auto applyAgileLiveRetuneInterval = [this, agileLiveRetuneIntervalSpin]() {
+        agileLiveRetuneCommandIntervalMs =
+            (std::clamp)(agileLiveRetuneIntervalSpin->value(),
+                         AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
+                         AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS);
+        savePersistentSettings();
+        qDebug() << "[LiveTune] Agile live retune command interval"
+                 << agileLiveRetuneCommandIntervalMs;
+    };
 
     connect(languageCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [applyLanguage](int) {
         applyLanguage();
@@ -11361,6 +11632,15 @@ void YourClassName::openApplicationSettings() {
     });
     connect(spectrumUpdateSpin, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [applySpectrumUpdateInterval](int) {
         applySpectrumUpdateInterval();
+    });
+    connect(waterfallRowsSpin, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [applyWaterfallRowsPerFrame](int) {
+        applyWaterfallRowsPerFrame();
+    });
+    connect(agileLiveRetuneIntervalSpin, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [applyAgileLiveRetuneInterval](int) {
+        applyAgileLiveRetuneInterval();
+    });
+    connect(helpButton, &QPushButton::clicked, &dialog, [this]() {
+        openApplicationHelp();
     });
     connect(exportSettingsButton, &QPushButton::clicked, &dialog, [this]() {
         exportSettingsBackup();
@@ -11700,9 +11980,11 @@ void YourClassName::resetStandardScanState(bool clearSegments) {
 }
 
 bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char *reason) {
-    if (!hasActiveFobosDevice() ||
+    const bool externalBackendSelected = isExternalReceiverBackendSelected();
+    const bool fobosBackendAvailable = hasActiveFobosDevice();
+    if ((!fobosBackendAvailable && !externalBackendSelected) ||
         pendingSettings.inputMode != INPUT_RF ||
-        (activeFobosApiKind == FobosApiKind::Agile && agileScanRunning) ||
+        (fobosBackendAvailable && activeFobosApiKind == FobosApiKind::Agile && agileScanRunning) ||
         !std::isfinite(targetFrequencyHz) ||
         targetFrequencyHz <= 0.0) {
         return false;
@@ -11712,6 +11994,91 @@ bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char
                                                    RF_MIN_CENTER_FREQUENCY,
                                                    RF_EXPERIMENTAL_MAX_FREQUENCY);
     double tunedFrequency = requestedFrequency;
+
+    if (externalBackendSelected) {
+        const bool streamRunning = processor && processor->isRunning();
+        const uint64_t preRetuneIqEpoch =
+            processor ? processor->beginIqRetuneBarrier() : 0;
+        if (streamRunning) {
+            clearLiveSpectrumSnapshot(false, preRetuneIqEpoch);
+            IqBuffer::armRetuneTrace(preRetuneIqEpoch, 6, 4, 6, 6);
+        }
+
+        QElapsedTimer retuneTimer;
+        retuneTimer.start();
+        const bool retuned =
+            !streamRunning ||
+            processor->retuneCenterFrequency(requestedFrequency);
+        const qint64 retuneCallMs = retuneTimer.elapsed();
+        if (!retuned) {
+            qDebug() << "[StandardScan] external retune failed"
+                     << "reason" << (reason ? reason : "")
+                     << "requested" << requestedFrequency
+                     << "callMs" << retuneCallMs;
+            if (standardScanStatusLabel) {
+                standardScanStatusLabel->setText(
+                    uiText(QStringLiteral("standard_scan_retune_failed"),
+                           QStringLiteral("Standard scan retune failed: %1"))
+                        .arg(-1));
+            }
+            return false;
+        }
+
+        pendingSettings.centerFrequency = requestedFrequency;
+        pendingSettings.actualFrequency = tunedFrequency;
+        actualFrequency = tunedFrequency;
+        const uint64_t postRetuneIqEpoch =
+            processor ? processor->beginIqRetuneBarrier() : 0;
+        if (streamRunning) {
+            clearLiveSpectrumSnapshot(false, postRetuneIqEpoch);
+            IqBuffer::armRetuneTrace(postRetuneIqEpoch);
+        }
+        if (hardwareSettingsApplied) {
+            appliedHardwareSettings.centerFrequency = requestedFrequency;
+            appliedHardwareSettings.actualFrequency = tunedFrequency;
+        }
+        publishSettingsToGlobals();
+        if (frequencyControl) {
+            QSignalBlocker blocker(frequencyControl);
+            frequencyControl->setValueHz(pendingSettings.centerFrequency);
+        }
+        if (!scanListeningLockEnabled) {
+            settingRange();
+        } else {
+            updateFineTuneLabel();
+        }
+
+        networkSpectrumFrameMetadataValid = false;
+        networkSpectrumFrameMinFrequency = 0.0;
+        networkSpectrumFrameMaxFrequency = 0.0;
+        networkSpectrumFrameFftLength = 0;
+        liveRetuneSettleDurationMs = (std::clamp)(standardScanSettleMs,
+                                                  STANDARD_SCAN_MIN_SETTLE_MS,
+                                                  STANDARD_SCAN_MAX_SETTLE_MS);
+        if (streamRunning) {
+            liveRetuneSettleTimer.start();
+        } else {
+            liveRetuneSettleTimer.invalidate();
+        }
+        standardScanDwellTimer.restart();
+        spectrumTuningDebugFramesRemaining =
+            fobosVerboseLoggingEnabled() ? 4 : spectrumTuningDebugFramesRemaining;
+
+        qDebug() << "[StandardScan] external retune"
+                 << "reason" << (reason ? reason : "")
+                 << "index" << standardScanIndex
+                 << "requested" << requestedFrequency
+                 << "actual" << tunedFrequency
+                 << "streamRunning" << streamRunning
+                 << "callMs" << retuneCallMs
+                 << "iqEpoch" << postRetuneIqEpoch
+                 << "settleMs" << liveRetuneSettleDurationMs;
+        return true;
+    }
+
+    const uint64_t preRetuneIqEpoch =
+        processor ? processor->beginIqRetuneBarrier() : 0;
+    IqBuffer::clear(preRetuneIqEpoch);
     QElapsedTimer retuneTimer;
     retuneTimer.start();
     const int result = setActiveFrequencySafely(requestedFrequency, &tunedFrequency);
@@ -11734,6 +12101,8 @@ bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char
     pendingSettings.centerFrequency = requestedFrequency;
     pendingSettings.actualFrequency = tunedFrequency;
     actualFrequency = tunedFrequency;
+    const uint64_t postRetuneIqEpoch =
+        processor ? processor->beginIqRetuneBarrier() : 0;
     if (hardwareSettingsApplied) {
         appliedHardwareSettings.centerFrequency = requestedFrequency;
         appliedHardwareSettings.actualFrequency = tunedFrequency;
@@ -11749,7 +12118,7 @@ bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char
         updateFineTuneLabel();
     }
 
-    IqBuffer::clear();
+    IqBuffer::clear(postRetuneIqEpoch);
     fftResult = std::make_unique<FFTResult>();
     networkSpectrumFrameMetadataValid = false;
     networkSpectrumFrameMinFrequency = 0.0;
@@ -11768,6 +12137,7 @@ bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char
              << "requested" << requestedFrequency
              << "actual" << tunedFrequency
              << "callMs" << retuneCallMs
+             << "iqEpoch" << postRetuneIqEpoch
              << "settleMs" << liveRetuneSettleDurationMs;
     return true;
 }
@@ -11782,16 +12152,20 @@ bool YourClassName::applyStandardScanSettings(bool forceStop) {
         return true;
     }
 
-    if (!hasActiveFobosDevice()) {
+    const bool standardScanBackendAvailable =
+        hasActiveFobosDevice() || isExternalReceiverBackendSelected();
+    if (!standardScanBackendAvailable) {
         resetStandardScanState(true);
         if (standardScanStatusLabel) {
             standardScanStatusLabel->setText(uiText(QStringLiteral("standard_firmware_required"),
-                                                    QStringLiteral("Fobos receiver required")));
+                                                    QStringLiteral("Live-retune receiver required")));
         }
         return true;
     }
 
-    if (activeFobosApiKind == FobosApiKind::Agile && agileScanRunning) {
+    if (hasActiveFobosDevice() &&
+        activeFobosApiKind == FobosApiKind::Agile &&
+        agileScanRunning) {
         resetStandardScanState(true);
         if (standardScanStatusLabel) {
             standardScanStatusLabel->setText(uiText(QStringLiteral("standard_scan_disable_agile"),
@@ -11874,11 +12248,11 @@ bool YourClassName::applyStandardScanSettings(bool forceStop) {
 void YourClassName::advanceStandardScanIfNeeded() {
     if (!standardScanRunning ||
         !standardScanEnabled ||
-        !hasActiveFobosDevice() ||
+        (!hasActiveFobosDevice() && !isExternalReceiverBackendSelected()) ||
         pendingSettings.inputMode != INPUT_RF ||
         activeStandardScanFrequencies.size() < AGILE_SCAN_MIN_POINTS ||
         runState != RadioRunState::Running ||
-        (activeFobosApiKind == FobosApiKind::Agile && agileScanRunning)) {
+        (hasActiveFobosDevice() && activeFobosApiKind == FobosApiKind::Agile && agileScanRunning)) {
         return;
     }
 
@@ -12575,15 +12949,20 @@ void YourClassName::handleDataProcessorFailure(int errorCode, bool stoppedByRequ
         streamWatchdogTimer->stop();
     }
     clearSpectrumAfterStop = true;
+    const bool externalBackendFailure = isExternalReceiverBackendSelected();
     const bool startupFailure =
         streamStartElapsedTimer.isValid() &&
         streamStartElapsedTimer.elapsed() < 2500 &&
+        !externalBackendFailure &&
         streamStartupRetryCount < 1;
     if (startupFailure) {
         ++streamStartupRetryCount;
         restartAfterStartupWatchdog = true;
         qDebug() << "[FobosLifecycle] reader startup failure will retry once"
                  << "retryCount" << streamStartupRetryCount
+                 << "error" << errorCode;
+    } else if (externalBackendFailure) {
+        qDebug() << "[FobosLifecycle] external receiver startup failure: automatic retry disabled"
                  << "error" << errorCode;
     }
 
@@ -12697,12 +13076,85 @@ void YourClassName::applyServerLocalOutputPolicy() {
     }
 }
 
+static void logIqBufferRetuneState(const char *stage,
+                                   const QString &reason,
+                                   std::uint64_t retuneEpoch,
+                                   double previousFrequency,
+                                   double requestedFrequency,
+                                   double actualFrequency) {
+    const IqBuffer::Stats stats = IqBuffer::stats();
+    qDebug() << "[LiveTuneIQ]" << stage
+             << "reason" << reason
+             << "retuneEpoch" << static_cast<qulonglong>(retuneEpoch)
+             << "bufferEpoch" << static_cast<qulonglong>(stats.epoch)
+             << "sequence" << static_cast<qulonglong>(stats.sequence)
+             << "previousHz" << previousFrequency
+             << "requestedHz" << requestedFrequency
+             << "actualHz" << actualFrequency
+             << "snapshotStart" << stats.snapshotStart
+             << "snapshotSize" << stats.snapshotSize
+             << "queuedBlocks" << stats.queuedBlocks
+             << "queuedFloats" << stats.queuedFloatCount
+             << "sampleRateEstimate" << stats.sampleRateEstimate;
+}
+
 bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &previousSettings,
                                                            const char *reason) {
     if (pendingSettings.inputMode != INPUT_RF ||
         isIdle() ||
-        !hasActiveFobosDevice() ||
         std::abs(previousSettings.centerFrequency - pendingSettings.centerFrequency) <= 0.5) {
+        return true;
+    }
+
+    const QString reasonText = QString::fromUtf8(reason ? reason : "");
+    if (isRtlBackendSelected()) {
+        const uint64_t preRetuneIqEpoch =
+            processor ? processor->beginIqRetuneBarrier() : 0;
+        clearLiveSpectrumSnapshot(false, preRetuneIqEpoch);
+        IqBuffer::armRetuneTrace(preRetuneIqEpoch, 6, 4, 6, 6);
+        logIqBufferRetuneState("rtl-pre-retune-clear",
+                               reasonText,
+                               preRetuneIqEpoch,
+                               previousSettings.centerFrequency,
+                               pendingSettings.centerFrequency,
+                               pendingSettings.actualFrequency);
+        const bool retuned =
+            processor &&
+            processor->isRunning() &&
+            processor->retuneCenterFrequency(pendingSettings.centerFrequency);
+        qDebug() << "[LiveTune]" << reason
+                 << "RTL center retune"
+                 << "previous" << previousSettings.centerFrequency
+                 << "requested" << pendingSettings.centerFrequency
+                 << "result" << retuned;
+        if (retuned) {
+            const uint64_t postRetuneIqEpoch =
+                processor ? processor->beginIqRetuneBarrier() : 0;
+            pendingSettings.actualFrequency = pendingSettings.centerFrequency;
+            if (hardwareSettingsApplied) {
+                appliedHardwareSettings.centerFrequency = pendingSettings.centerFrequency;
+                appliedHardwareSettings.actualFrequency = pendingSettings.actualFrequency;
+            }
+            networkSpectrumFrameMetadataValid = false;
+            networkSpectrumFrameMinFrequency = 0.0;
+            networkSpectrumFrameMaxFrequency = 0.0;
+            networkSpectrumFrameFftLength = 0;
+            clearLiveSpectrumSnapshot(false, postRetuneIqEpoch);
+            IqBuffer::armRetuneTrace(postRetuneIqEpoch);
+            logIqBufferRetuneState("rtl-post-retune-clear",
+                                   reasonText,
+                                   postRetuneIqEpoch,
+                                   previousSettings.centerFrequency,
+                                   pendingSettings.centerFrequency,
+                                   pendingSettings.actualFrequency);
+            liveRetuneSettleDurationMs = LIVE_RETUNE_SETTLE_MS;
+            liveRetuneSettleTimer.start();
+            spectrumTuningDebugFramesRemaining = 32;
+        }
+        return retuned;
+    }
+
+    if (!hasActiveFobosDevice()) {
         return true;
     }
 
@@ -12712,32 +13164,46 @@ bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &
         processor &&
         processor->isRunning();
     if (liveAgileRfRetune) {
-        const uint64_t generation = ++liveCenterRetuneGeneration;
-        qDebug() << "[LiveTune]" << reason
-                 << "center changed on Agile RF stream; applying live retune without reader restart"
-                 << "previous" << previousSettings.centerFrequency
-                 << "requested" << pendingSettings.centerFrequency
-                 << "generation" << generation;
-        return applyLiveAgileCenterRetune(generation, QString::fromUtf8(reason ? reason : "live"));
+        return scheduleLiveAgileCenterRetune(QString::fromUtf8(reason ? reason : "live"));
     }
 
+    const uint64_t preRetuneIqEpoch =
+        processor ? processor->beginIqRetuneBarrier() : 0;
+    clearLiveSpectrumSnapshot(false, preRetuneIqEpoch);
+    IqBuffer::armRetuneTrace(preRetuneIqEpoch, 6, 4, 6, 6);
+    logIqBufferRetuneState("fobos-pre-retune-clear",
+                           reasonText,
+                           preRetuneIqEpoch,
+                           previousSettings.centerFrequency,
+                           pendingSettings.centerFrequency,
+                           pendingSettings.actualFrequency);
     double tunedFrequency = pendingSettings.centerFrequency;
     const int result = setActiveFrequencySafely(pendingSettings.centerFrequency, &tunedFrequency);
     if (result == FOBOS_ERR_OK) {
+        const uint64_t postRetuneIqEpoch =
+            processor ? processor->beginIqRetuneBarrier() : 0;
+        clearLiveSpectrumSnapshot(false, postRetuneIqEpoch);
+        IqBuffer::armRetuneTrace(postRetuneIqEpoch);
         pendingSettings.actualFrequency = tunedFrequency;
         if (hardwareSettingsApplied) {
             appliedHardwareSettings.centerFrequency = pendingSettings.centerFrequency;
             appliedHardwareSettings.actualFrequency = tunedFrequency;
         }
+        logIqBufferRetuneState("fobos-post-retune-clear",
+                               reasonText,
+                               postRetuneIqEpoch,
+                               previousSettings.centerFrequency,
+                               pendingSettings.centerFrequency,
+                               tunedFrequency);
         qDebug() << "[LiveTune]" << reason
                  << "center applied"
                  << "requested" << pendingSettings.centerFrequency
-                 << "actual" << tunedFrequency;
+                 << "actual" << tunedFrequency
+                 << "iqEpoch" << postRetuneIqEpoch;
         networkSpectrumFrameMetadataValid = false;
         networkSpectrumFrameMinFrequency = 0.0;
         networkSpectrumFrameMaxFrequency = 0.0;
         networkSpectrumFrameFftLength = 0;
-        clearLiveSpectrumSnapshot(false);
         liveRetuneSettleDurationMs = LIVE_RETUNE_SETTLE_MS;
         liveRetuneSettleTimer.start();
         spectrumTuningDebugFramesRemaining = 32;
@@ -12752,6 +13218,61 @@ bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &
              << "requested" << pendingSettings.centerFrequency
              << "error" << result;
     return false;
+}
+
+bool YourClassName::scheduleLiveAgileCenterRetune(const QString &reason) {
+    const uint64_t generation = ++liveCenterRetuneGeneration;
+    const int commandIntervalMs = (std::clamp)(agileLiveRetuneCommandIntervalMs,
+                                               AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
+                                               AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS);
+    const qint64 elapsedMs = agileLiveRetuneCommandTimer.isValid()
+                                 ? agileLiveRetuneCommandTimer.elapsed()
+                                 : commandIntervalMs;
+    const bool timerActive = agileLiveRetuneTimer && agileLiveRetuneTimer->isActive();
+    if (commandIntervalMs <= 0 ||
+        (!timerActive && elapsedMs >= commandIntervalMs)) {
+        queuedLiveCenterRetuneGeneration = 0;
+        queuedLiveCenterRetuneReason.clear();
+        return applyLiveAgileCenterRetune(generation, reason);
+    }
+
+    queuedLiveCenterRetuneGeneration = generation;
+    queuedLiveCenterRetuneReason = reason;
+    const qint64 delayMs = (std::max<qint64>)(
+        1,
+        static_cast<qint64>(commandIntervalMs) - elapsedMs);
+    if (agileLiveRetuneTimer) {
+        agileLiveRetuneTimer->start(static_cast<int>((std::min<qint64>)(delayMs, 1000)));
+    }
+    return true;
+}
+
+void YourClassName::flushQueuedLiveAgileCenterRetune() {
+    const uint64_t generation = queuedLiveCenterRetuneGeneration;
+    if (generation == 0) {
+        return;
+    }
+
+    const int commandIntervalMs = (std::clamp)(agileLiveRetuneCommandIntervalMs,
+                                               AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
+                                               AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS);
+    const qint64 elapsedMs = agileLiveRetuneCommandTimer.isValid()
+                                 ? agileLiveRetuneCommandTimer.elapsed()
+                                 : commandIntervalMs;
+    if (elapsedMs < commandIntervalMs) {
+        const qint64 delayMs = (std::max<qint64>)(1, commandIntervalMs - elapsedMs);
+        if (agileLiveRetuneTimer) {
+            agileLiveRetuneTimer->start(static_cast<int>((std::min<qint64>)(delayMs, 1000)));
+        }
+        return;
+    }
+
+    const QString reason = queuedLiveCenterRetuneReason.isEmpty()
+                               ? QStringLiteral("queued live retune")
+                               : queuedLiveCenterRetuneReason;
+    queuedLiveCenterRetuneGeneration = 0;
+    queuedLiveCenterRetuneReason.clear();
+    applyLiveAgileCenterRetune(generation, reason);
 }
 
 bool YourClassName::applyLiveAgileCenterRetune(uint64_t generation, const QString &reason) {
@@ -12782,20 +13303,18 @@ bool YourClassName::applyLiveAgileCenterRetune(uint64_t generation, const QStrin
 
     if (liveRetuneSettleTimer.isValid()) {
         const qint64 elapsedMs = liveRetuneSettleTimer.elapsed();
-        const qint64 settleMs = liveRetuneSettleDurationMs > 0 ? liveRetuneSettleDurationMs : LIVE_RETUNE_SETTLE_MS;
+        const qint64 settleMs =
+            liveRetuneSettleDurationMs > 0 ? liveRetuneSettleDurationMs : LIVE_RETUNE_SETTLE_MS;
         if (elapsedMs < settleMs) {
-            const int delayMs = static_cast<int>((std::clamp)(settleMs - elapsedMs + 40, qint64(40), qint64(240)));
-            qDebug() << "[LiveTune]" << reason
-                     << "deferring Agile live retune until previous settle completes"
-                     << "generation" << generation
-                     << "delayMs" << delayMs
-                     << "elapsedMs" << elapsedMs
-                     << "settleMs" << settleMs;
-            QTimer::singleShot(delayMs, this, [this, generation, reason]() {
-                applyLiveAgileCenterRetune(generation, reason);
-            });
+            queuedLiveCenterRetuneGeneration = generation;
+            queuedLiveCenterRetuneReason = reason;
+            const qint64 delayMs = (std::max<qint64>)(1, settleMs - elapsedMs);
+            if (agileLiveRetuneTimer) {
+                agileLiveRetuneTimer->start(static_cast<int>((std::min<qint64>)(delayMs, 1000)));
+            }
             return true;
         }
+
         liveRetuneSettleTimer.invalidate();
     }
 
@@ -12806,52 +13325,22 @@ bool YourClassName::applyLiveAgileCenterRetune(uint64_t generation, const QStrin
         return false;
     }
 
+    const double previousFrequency = actualFrequency;
     const double requestedFrequency = pendingSettings.centerFrequency;
-    double tunedFrequency = requestedFrequency;
-    clearLiveSpectrumSnapshot(false);
-    const int result = setActiveFrequencySafely(requestedFrequency, &tunedFrequency);
-    if (result != FOBOS_ERR_OK) {
-        qDebug() << "[LiveTune]" << reason
-                 << "Agile live center retune failed"
-                 << "generation" << generation
-                 << "requested" << requestedFrequency
-                 << "error" << result;
+    agileLiveRetuneCommandTimer.restart();
+
+    const bool restarted = restartAgileReaderForCenterRetune(previousFrequency,
+                                                             requestedFrequency,
+                                                             reason);
+    if (!restarted) {
         return false;
     }
 
-    pendingSettings.actualFrequency = tunedFrequency;
-    actualFrequency = tunedFrequency;
-    if (hardwareSettingsApplied) {
-        appliedHardwareSettings.centerFrequency = requestedFrequency;
-        appliedHardwareSettings.actualFrequency = tunedFrequency;
-    }
-    publishSettingsToGlobals();
-    if (frequencyControl) {
-        QSignalBlocker blocker(frequencyControl);
-        frequencyControl->setValueHz(pendingSettings.centerFrequency);
-    }
-    settingRange();
-
-    networkSpectrumFrameMetadataValid = false;
-    networkSpectrumFrameMinFrequency = 0.0;
-    networkSpectrumFrameMaxFrequency = 0.0;
-    networkSpectrumFrameFftLength = 0;
-    clearLiveSpectrumSnapshot(false);
-    liveRetuneSettleDurationMs = agileRfLiveSettleMs(pendingSettings.sampleRate, false);
-    liveRetuneSettleTimer.start();
-    spectrumTuningDebugFramesRemaining = 32;
-
-    qDebug() << "[LiveTune]" << reason
-             << "Agile live center retune applied"
-             << "generation" << generation
-             << "requested" << requestedFrequency
-             << "actual" << tunedFrequency
-             << "settleMs" << liveRetuneSettleDurationMs;
     return true;
 }
 
-void YourClassName::clearLiveSpectrumSnapshot(bool clearVisualHistory) {
-    IqBuffer::clear();
+void YourClassName::clearLiveSpectrumSnapshot(bool clearVisualHistory, uint64_t iqEpoch) {
+    IqBuffer::clear(iqEpoch);
     fftResult = std::make_unique<FFTResult>();
     scanVisualAssembler.reset();
     networkSpectrumFrameMetadataValid = false;
@@ -12871,171 +13360,6 @@ void YourClassName::clearLiveSpectrumSnapshot(bool clearVisualHistory) {
         waterfallWidget->clearData();
         waterfallWidget->update();
     }
-}
-
-void YourClassName::schedulePostStartRetune(const QString &reason) {
-    if (pendingSettings.inputMode != INPUT_RF ||
-        !hasActiveFobosDevice() ||
-        standardScanEnabled ||
-        (activeFobosApiKind == FobosApiKind::Agile && agileScanEnabled)) {
-        return;
-    }
-
-    const double requestedFrequency = pendingSettings.centerFrequency;
-    if (!std::isfinite(requestedFrequency) || requestedFrequency <= 0.0) {
-        return;
-    }
-
-    if (activeFobosApiKind == FobosApiKind::Agile) {
-        const uint64_t generation = ++liveCenterRetuneGeneration;
-        constexpr std::array<int, 1> retuneDelaysMs = {120};
-        for (int attempt = 0; attempt < static_cast<int>(retuneDelaysMs.size()); ++attempt) {
-            QTimer::singleShot(retuneDelaysMs[attempt],
-                               this,
-                               [this, requestedFrequency, reason, generation, attempt]() {
-                if (runState != RadioRunState::Running ||
-                    !deviceOpened ||
-                    !hasActiveFobosDevice() ||
-                    activeFobosApiKind != FobosApiKind::Agile ||
-                    pendingSettings.inputMode != INPUT_RF ||
-                    agileScanEnabled ||
-                    std::abs(pendingSettings.centerFrequency - requestedFrequency) > 0.5) {
-                    return;
-                }
-
-                qDebug() << "[FobosLifecycle] post-start Agile same-frequency re-arm"
-                         << "attempt" << (attempt + 1)
-                         << "reason" << reason
-                         << "requested" << requestedFrequency
-                         << "generation" << generation;
-                applyLiveAgileCenterRetune(generation, reason + QStringLiteral(" post-start re-arm"));
-            });
-        }
-        return;
-    }
-
-    const FobosApiKind expectedApiKind = activeFobosApiKind;
-    constexpr std::array<int, 1> retuneDelaysMs = {700};
-    for (int attempt = 0; attempt < static_cast<int>(retuneDelaysMs.size()); ++attempt) {
-        QTimer::singleShot(retuneDelaysMs[attempt],
-                           this,
-                           [this, requestedFrequency, expectedApiKind, reason, attempt]() {
-            if (runState != RadioRunState::Running ||
-                !deviceOpened ||
-                !hasActiveFobosDevice() ||
-                activeFobosApiKind != expectedApiKind ||
-                pendingSettings.inputMode != INPUT_RF ||
-                (activeFobosApiKind == FobosApiKind::Agile && agileScanEnabled) ||
-                std::abs(pendingSettings.centerFrequency - requestedFrequency) > 0.5) {
-                return;
-            }
-
-            double tunedFrequency = requestedFrequency;
-            const int result = setActiveFrequencySafely(requestedFrequency, &tunedFrequency);
-            qDebug() << "[FobosLifecycle] post-start retune"
-                     << "attempt" << (attempt + 1)
-                     << "reason" << reason
-                     << "requested" << requestedFrequency
-                     << "result" << result
-                     << "actual" << tunedFrequency;
-
-            if (result != FOBOS_ERR_OK) {
-                return;
-            }
-
-            pendingSettings.actualFrequency = tunedFrequency;
-            actualFrequency = tunedFrequency;
-            if (hardwareSettingsApplied) {
-                appliedHardwareSettings.centerFrequency = requestedFrequency;
-                appliedHardwareSettings.actualFrequency = tunedFrequency;
-            }
-            publishSettingsToGlobals();
-            if (frequencyControl) {
-                QSignalBlocker blocker(frequencyControl);
-                frequencyControl->setValueHz(pendingSettings.centerFrequency);
-            }
-            settingRange();
-            networkSpectrumFrameMetadataValid = false;
-            networkSpectrumFrameMinFrequency = 0.0;
-            networkSpectrumFrameMaxFrequency = 0.0;
-            networkSpectrumFrameFftLength = 0;
-            clearLiveSpectrumSnapshot(false);
-            liveRetuneSettleDurationMs = agileRfLiveSettleMs(pendingSettings.sampleRate, false);
-            liveRetuneSettleTimer.start();
-            qDebug() << "[FobosLifecycle] post-start retune cleared live IQ; preserving visual history"
-                     << "attempt" << (attempt + 1)
-                     << "settleMs" << liveRetuneSettleDurationMs;
-        });
-    }
-}
-
-bool YourClassName::stabilizeAgileFrequencyBeforeStreaming(const char *reason) {
-    if (activeFobosApiKind != FobosApiKind::Agile ||
-        pendingSettings.inputMode != INPUT_RF ||
-        agileScanEnabled ||
-        !hasActiveFobosDevice()) {
-        return true;
-    }
-
-    const double requestedFrequency = pendingSettings.centerFrequency;
-    if (!std::isfinite(requestedFrequency) || requestedFrequency <= 0.0) {
-        return true;
-    }
-
-    if (!stopAgileScanForNormalRf("pre-stream frequency settle")) {
-        qDebug() << "[FobosLifecycle] Agile pre-stream frequency settle failed to leave scan mode"
-                 << "reason" << (reason ? reason : "")
-                 << "requested" << requestedFrequency;
-        return false;
-    }
-
-    double tunedFrequency = requestedFrequency;
-    qDebug() << "[FobosLifecycle] Agile pre-stream frequency settle begin"
-             << "reason" << (reason ? reason : "")
-             << "requested" << requestedFrequency;
-    int result = setActiveFrequencySafely(requestedFrequency, &tunedFrequency);
-    qDebug() << "[FobosLifecycle] Agile pre-stream frequency settle first"
-             << "result" << result
-             << "actual" << tunedFrequency;
-    if (result != FOBOS_ERR_OK) {
-        return false;
-    }
-
-    QThread::msleep(40);
-
-    double nudgeFrequency = requestedFrequency + AGILE_PRE_STREAM_FREQUENCY_NUDGE_HZ;
-    if (nudgeFrequency > RF_EXPERIMENTAL_MAX_FREQUENCY) {
-        nudgeFrequency = requestedFrequency - AGILE_PRE_STREAM_FREQUENCY_NUDGE_HZ;
-    }
-    if (nudgeFrequency >= RF_MIN_CENTER_FREQUENCY &&
-        nudgeFrequency <= RF_EXPERIMENTAL_MAX_FREQUENCY) {
-        double nudgeActualFrequency = nudgeFrequency;
-        result = setActiveFrequencySafely(nudgeFrequency, &nudgeActualFrequency);
-        qDebug() << "[FobosLifecycle] Agile pre-stream frequency settle nudge"
-                 << "requested" << nudgeFrequency
-                 << "result" << result
-                 << "actual" << nudgeActualFrequency;
-        if (result != FOBOS_ERR_OK) {
-            return false;
-        }
-        QThread::msleep(40);
-    }
-
-    double verifiedFrequency = requestedFrequency;
-    result = setActiveFrequencySafely(requestedFrequency, &verifiedFrequency);
-    qDebug() << "[FobosLifecycle] Agile pre-stream frequency settle verify"
-             << "result" << result
-             << "actual" << verifiedFrequency;
-    if (result != FOBOS_ERR_OK) {
-        return false;
-    }
-
-    pendingSettings.actualFrequency = verifiedFrequency;
-    actualFrequency = verifiedFrequency;
-    appliedHardwareSettings.centerFrequency = requestedFrequency;
-    appliedHardwareSettings.actualFrequency = verifiedFrequency;
-    publishSettingsToGlobals();
-    return true;
 }
 
 void YourClassName::resetNetworkIqReceptionState(bool clearGraph, bool clearWaterfall, bool restartAudioPrebuffer) {
@@ -13210,6 +13534,7 @@ QJsonObject YourClassName::settingsToJson() const {
     }
     settings["qthMarkers"] = qthMarkers;
     settings["spectrumUpdateIntervalMs"] = spectrumUpdateIntervalMs;
+    settings["waterfallRowsPerFrame"] = waterfallRowsPerFrame;
     settings["spurSuppressionEnabled"] = spurSuppressionEnabled;
     QJsonArray spurMask;
     for (const SpurMaskEntry &entry : spurMaskEntries) {
@@ -13462,6 +13787,12 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
     if (spectrumUpdateIntervalMs > 0 && spectrumUpdateIntervalMs < SPECTRUM_UPDATE_MIN_MS) {
         spectrumUpdateIntervalMs = SPECTRUM_UPDATE_MIN_MS;
     }
+    waterfallRowsPerFrame = (std::clamp)(readInt("waterfallRowsPerFrame", waterfallRowsPerFrame),
+                                         WATERFALL_ROWS_PER_FRAME_MIN,
+                                         WATERFALL_ROWS_PER_FRAME_MAX);
+    if (waterfallWidget) {
+        waterfallWidget->setRowsPerFrame(waterfallRowsPerFrame);
+    }
     {
         bool adjusted = false;
         QString standardScanError;
@@ -13532,6 +13863,9 @@ void YourClassName::loadUiTranslations() {
         {"settings_import_same_file", "Selected file is already the active settings file."},
         {"settings_import_restart_hint", "Some receiver settings are applied fully after Stop/Start or app restart."},
         {"settings_backup_failed", "Could not create current settings backup: %1"},
+        {"program_help", "Feature guide..."},
+        {"program_help_title", "FobosAPP feature guide"},
+        {"program_help_tooltip", "Open a practical guide to FobosAPP controls, scanning, recordings, GNSS/QTH, network mode and mouse shortcuts."},
         {"none", "none"},
         {"decode", "Decode"},
         {"dmr_lock", "Lock DMR"},
@@ -14150,8 +14484,19 @@ void YourClassName::applySpectrumHunterTranslations() {
 void YourClassName::updateUiFromPendingSettings() {
     if (comboBox) {
         comboBox->blockSignals(true);
-        if (pendingSettings.deviceIndex >= 0 && pendingSettings.deviceIndex < comboBox->count()) {
-            comboBox->setCurrentIndex(pendingSettings.deviceIndex);
+        int deviceComboIndex = comboBox->findData(pendingSettings.deviceIndex);
+        if (deviceComboIndex < 0 &&
+            pendingSettings.deviceIndex >= 0 &&
+            pendingSettings.deviceIndex < comboBox->count()) {
+            deviceComboIndex = pendingSettings.deviceIndex;
+        }
+        if (deviceComboIndex >= 0) {
+            comboBox->setCurrentIndex(deviceComboIndex);
+            bool ok = false;
+            const int selectedDevice = comboBox->itemData(deviceComboIndex).toInt(&ok);
+            if (ok) {
+                pendingSettings.deviceIndex = selectedDevice;
+            }
         }
         comboBox->blockSignals(false);
     }
@@ -14172,6 +14517,7 @@ void YourClassName::updateUiFromPendingSettings() {
         modeBox->blockSignals(false);
     }
     if (sampleBox) {
+        populateSampleRates();
         sampleBox->blockSignals(true);
         int bestIndex = -1;
         double bestDelta = std::numeric_limits<double>::max();
@@ -14581,7 +14927,7 @@ void YourClassName::loadPersistentSettings() {
         return;
     }
 
-    pendingSettings.deviceIndex = (std::max)(0, settings.value("receiver/deviceIndex", pendingSettings.deviceIndex).toInt());
+    pendingSettings.deviceIndex = settings.value("receiver/deviceIndex", pendingSettings.deviceIndex).toInt();
     pendingSettings.clockSource = settings.value("receiver/clockSource", pendingSettings.clockSource).toInt();
     pendingSettings.inputMode = (std::clamp)(settings.value("receiver/inputMode", pendingSettings.inputMode).toInt(),
                                              static_cast<int>(INPUT_RF),
@@ -14766,6 +15112,7 @@ void YourClassName::loadPersistentSettings() {
         }
     }
     settings.endArray();
+    agileScanPresetOrder = settings.value("agileScan/presetOrder").toStringList();
     if (agileScanPresets.isEmpty()) {
         agileScanPresets[QStringLiteral("Narrow DMR example")] =
             agileScanPresetSpec(QStringLiteral("430-432"), 0.0125);
@@ -14796,10 +15143,18 @@ void YourClassName::loadPersistentSettings() {
         agileScanPresets[QStringLiteral("Digital video sparse")] =
             agileScanPresetSpec(QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925"), 5.0);
     }
+    if (!agileScanPresets.contains(QStringLiteral("Cellular LTE/3G downlinks sparse"))) {
+        agileScanPresets[QStringLiteral("Cellular LTE/3G downlinks sparse")] =
+            agileScanPresetSpec(QStringLiteral("758-821\\925-960\\1805-1880\\2110-2170\\2620-2690"), 10.0);
+    }
     if (!agileScanPresets.contains(QStringLiteral("GNSS L1 1559-1610 50MHz"))) {
         agileScanPresets[QStringLiteral("GNSS L1 1559-1610 50MHz")] =
             agileScanPresetSpec(QStringLiteral("1559-1610"), GNSS_USEFUL_STANDARD_SPAN_HZ / 1000000.0);
     }
+    agileScanPresetOrder =
+        normalizedPresetOrder(agileScanPresetOrder,
+                              agileScanPresets,
+                              defaultAgileScanPresetOrder());
 
     standardScanPresets.clear();
     const int standardScanPresetCount = settings.beginReadArray("standardScan/presets");
@@ -14820,16 +15175,25 @@ void YourClassName::loadPersistentSettings() {
         }
     }
     settings.endArray();
+    standardScanPresetOrder = settings.value("standardScan/presetOrder").toStringList();
     if (standardScanPresets.isEmpty()) {
         standardScanPresets[QStringLiteral("RF 100-300 by 50MHz")] =
             standardScanPresetSpec(QStringLiteral("100, 150, 200, 250, 300"), 120, 40);
         standardScanPresets[QStringLiteral("UHF broad 400-700 by 50MHz")] =
             standardScanPresetSpec(QStringLiteral("400, 450, 500, 550, 600, 650, 700"), 120, 40);
     }
+    if (!standardScanPresets.contains(QStringLiteral("Cellular LTE/3G downlinks"))) {
+        standardScanPresets[QStringLiteral("Cellular LTE/3G downlinks")] =
+            standardScanPresetSpec(QStringLiteral("780.5, 942.5, 1842.5, 2140, 2655"), 180, 80);
+    }
     if (!standardScanPresets.contains(QStringLiteral("GNSS L1 two-center 50MHz useful"))) {
         standardScanPresets[QStringLiteral("GNSS L1 two-center 50MHz useful")] =
             standardScanPresetSpec(QStringLiteral("1575.420000, 1625.420000"), 300, 80);
     }
+    standardScanPresetOrder =
+        normalizedPresetOrder(standardScanPresetOrder,
+                              standardScanPresets,
+                              defaultStandardScanPresetOrder());
 
     listeningScanPresets.clear();
     const int listeningScanPresetCount = settings.beginReadArray("listeningScan/presets");
@@ -14850,11 +15214,16 @@ void YourClassName::loadPersistentSettings() {
         }
     }
     settings.endArray();
+    listeningScanPresetOrder = settings.value("listeningScan/presetOrder").toStringList();
     if (listeningScanPresets.isEmpty()) {
         listeningScanPresets[QStringLiteral("GNSS L1 main signals")] =
             listeningScanPresetSpec(QStringLiteral("1561.098, 1575.420, 1602.000"), 3000, 100);
         listeningScanPresets[QStringLiteral("FT8 HF common")] =
             listeningScanPresetSpec(QStringLiteral("1.840, 3.573, 7.074, 10.136, 14.074, 18.100, 21.074, 24.915, 28.074, 50.313"), 5000, 100);
+    }
+    if (!listeningScanPresets.contains(QStringLiteral("Cellular LTE/3G anchors"))) {
+        listeningScanPresets[QStringLiteral("Cellular LTE/3G anchors")] =
+            listeningScanPresetSpec(QStringLiteral("780.5, 806, 942.5, 1842.5, 2140, 2655"), 3000, 100);
     }
     if (!listeningScanPresets.contains(QStringLiteral("GLONASS L1OF channels"))) {
         listeningScanPresets[QStringLiteral("GLONASS L1OF channels")] =
@@ -14864,6 +15233,10 @@ void YourClassName::loadPersistentSettings() {
         listeningScanPresets[QStringLiteral("GNSS L1 dense")] =
             listeningScanPresetSpec(QStringLiteral("1561.098, 1575.420, 1598.0625, 1598.625, 1599.1875, 1599.750, 1600.3125, 1600.875, 1601.4375, 1602.000, 1602.5625, 1603.125, 1603.6875, 1604.250, 1604.8125, 1605.375"), 2500, 100);
     }
+    listeningScanPresetOrder =
+        normalizedPresetOrder(listeningScanPresetOrder,
+                              listeningScanPresets,
+                              defaultListeningScanPresetOrder());
 
     auto readFrequencyPresetArray = [&settings](const char *path, QMap<QString, double> &target) {
         target.clear();
@@ -14882,6 +15255,9 @@ void YourClassName::loadPersistentSettings() {
     readFrequencyPresetArray("frequencyPresets/center", centerFrequencyPresets);
     readFrequencyPresetArray("frequencyPresets/listening", listeningFrequencyPresets);
     readFrequencyPresetArray("frequencyPresets/bandwidth", bandwidthValuePresets);
+    centerFrequencyPresetOrder = settings.value("frequencyPresets/centerOrder").toStringList();
+    listeningFrequencyPresetOrder = settings.value("frequencyPresets/listeningOrder").toStringList();
+    bandwidthPresetOrder = settings.value("frequencyPresets/bandwidthOrder").toStringList();
     ensureDefaultFrequencyPresets();
     centerFrequencyUnitIndex = (std::clamp)(settings.value("frequencyControls/centerUnitIndex", centerFrequencyUnitIndex).toInt(), 0, 3);
     listeningFrequencyUnitIndex = (std::clamp)(settings.value("frequencyControls/listeningUnitIndex", listeningFrequencyUnitIndex).toInt(), 0, 3);
@@ -14977,6 +15353,19 @@ void YourClassName::loadPersistentSettings() {
     if (spectrumUpdateIntervalMs > 0 && spectrumUpdateIntervalMs < SPECTRUM_UPDATE_MIN_MS) {
         spectrumUpdateIntervalMs = SPECTRUM_UPDATE_MIN_MS;
     }
+    waterfallRowsPerFrame =
+        (std::clamp)(settings.value("ui/waterfallRowsPerFrame",
+                                    WATERFALL_ROWS_PER_FRAME_DEFAULT).toInt(),
+                     WATERFALL_ROWS_PER_FRAME_MIN,
+                     WATERFALL_ROWS_PER_FRAME_MAX);
+    if (waterfallWidget) {
+        waterfallWidget->setRowsPerFrame(waterfallRowsPerFrame);
+    }
+    agileLiveRetuneCommandIntervalMs =
+        (std::clamp)(settings.value("ui/agileLiveRetuneIntervalMs",
+                                    AGILE_LIVE_RETUNE_DEFAULT_COMMAND_INTERVAL_MS).toInt(),
+                     AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
+                     AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS);
     fineTuneScaleHoldMode = settings.value("ui/fineTuneScaleHoldMode", fineTuneScaleHoldMode).toBool();
 
     networkMode = NetworkMode::Disabled;
@@ -15102,10 +15491,45 @@ void YourClassName::loadPersistentSettings() {
              << "listening" << pendingSettings.listeningFrequency;
 }
 
+void YourClassName::flushPendingPersistentSettingsSave() {
+    if (!persistentSettingsSaveDeferred) {
+        return;
+    }
+    persistentSettingsSaveDeferred = false;
+    savePersistentSettings();
+}
+
 void YourClassName::savePersistentSettings() {
     if (!persistentSettingsReady) {
         return;
     }
+
+    const bool canDefer =
+        !persistentSettingsSaveInProgress &&
+        (runState == RadioRunState::Running || runState == RadioRunState::Stopping);
+    if (canDefer && persistentSettingsLastSaveTimer.isValid()) {
+        const qint64 elapsedMs = persistentSettingsLastSaveTimer.elapsed();
+        if (elapsedMs >= 0 && elapsedMs < PERSISTENT_SETTINGS_MIN_SAVE_INTERVAL_MS) {
+            persistentSettingsSaveDeferred = true;
+            if (persistentSettingsSaveTimer) {
+                const int delayMs = static_cast<int>(
+                    (std::clamp)(PERSISTENT_SETTINGS_MIN_SAVE_INTERVAL_MS - elapsedMs,
+                                 qint64(1),
+                                 qint64(PERSISTENT_SETTINGS_MIN_SAVE_INTERVAL_MS)));
+                if (!persistentSettingsSaveTimer->isActive() ||
+                    persistentSettingsSaveTimer->remainingTime() > delayMs) {
+                    persistentSettingsSaveTimer->start(delayMs);
+                }
+            }
+            return;
+        }
+    }
+
+    if (persistentSettingsSaveTimer) {
+        persistentSettingsSaveTimer->stop();
+    }
+    persistentSettingsSaveDeferred = false;
+    persistentSettingsSaveInProgress = true;
 
     QSettings settings(persistentSettingsFilePath(), QSettings::IniFormat);
     RadioSettings settingsToSave = pendingSettings;
@@ -15194,52 +15618,101 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("digitalVideoHunter/minWidthMhz", digitalVideoHunterSettings.minWidthMhz);
     settings.setValue("digitalVideoHunter/maxWidthMhz", digitalVideoHunterSettings.maxWidthMhz);
     settings.setValue("digitalVideoHunter/thresholdDb", digitalVideoHunterSettings.thresholdDb);
+    agileScanPresetOrder =
+        normalizedPresetOrder(agileScanPresetOrder,
+                              agileScanPresets,
+                              defaultAgileScanPresetOrder());
+    settings.setValue("agileScan/presetOrder", agileScanPresetOrder);
     settings.beginWriteArray("agileScan/presets");
     int scanPresetIndex = 0;
-    for (auto it = agileScanPresets.constBegin(); it != agileScanPresets.constEnd(); ++it) {
+    for (const QString &name : std::as_const(agileScanPresetOrder)) {
+        auto it = agileScanPresets.constFind(name);
+        if (it == agileScanPresets.constEnd()) {
+            continue;
+        }
         settings.setArrayIndex(scanPresetIndex++);
-        settings.setValue("name", it.key());
+        settings.setValue("name", name);
         settings.setValue("rangesMhz", agileScanPresetRanges(it.value()));
         settings.setValue("stepMhz", agileScanPresetStepMhz(it.value(), agileScanStepMhz));
     }
     settings.endArray();
+    standardScanPresetOrder =
+        normalizedPresetOrder(standardScanPresetOrder,
+                              standardScanPresets,
+                              defaultStandardScanPresetOrder());
+    settings.setValue("standardScan/presetOrder", standardScanPresetOrder);
     settings.beginWriteArray("standardScan/presets");
     int standardScanPresetIndex = 0;
-    for (auto it = standardScanPresets.constBegin(); it != standardScanPresets.constEnd(); ++it) {
+    for (const QString &name : std::as_const(standardScanPresetOrder)) {
+        auto it = standardScanPresets.constFind(name);
+        if (it == standardScanPresets.constEnd()) {
+            continue;
+        }
         settings.setArrayIndex(standardScanPresetIndex++);
-        settings.setValue("name", it.key());
+        settings.setValue("name", name);
         settings.setValue("centersMhz", standardScanPresetCenters(it.value()));
         settings.setValue("dwellMs", standardScanPresetDwellMs(it.value(), standardScanDwellMs));
         settings.setValue("settleMs", standardScanPresetSettleMs(it.value(), standardScanSettleMs));
     }
     settings.endArray();
+    listeningScanPresetOrder =
+        normalizedPresetOrder(listeningScanPresetOrder,
+                              listeningScanPresets,
+                              defaultListeningScanPresetOrder());
+    settings.setValue("listeningScan/presetOrder", listeningScanPresetOrder);
     settings.beginWriteArray("listeningScan/presets");
     int listeningScanPresetIndex = 0;
-    for (auto it = listeningScanPresets.constBegin(); it != listeningScanPresets.constEnd(); ++it) {
+    for (const QString &name : std::as_const(listeningScanPresetOrder)) {
+        auto it = listeningScanPresets.constFind(name);
+        if (it == listeningScanPresets.constEnd()) {
+            continue;
+        }
         settings.setArrayIndex(listeningScanPresetIndex++);
-        settings.setValue("name", it.key());
+        settings.setValue("name", name);
         settings.setValue("targetsMhz", listeningScanPresetTargets(it.value()));
         settings.setValue("dwellMs", listeningScanPresetDwellMs(it.value(), listeningScanDwellMs));
         settings.setValue("settleMs", listeningScanPresetSettleMs(it.value(), listeningScanSettleMs));
     }
     settings.endArray();
 
-    auto writeFrequencyPresetArray = [&settings](const char *path, const QMap<QString, double> &presets) {
+    centerFrequencyPresetOrder =
+        normalizedPresetOrder(centerFrequencyPresetOrder,
+                              centerFrequencyPresets,
+                              defaultCenterFrequencyPresetOrder());
+    listeningFrequencyPresetOrder =
+        normalizedPresetOrder(listeningFrequencyPresetOrder,
+                              listeningFrequencyPresets,
+                              defaultListeningFrequencyPresetOrder());
+    bandwidthPresetOrder =
+        normalizedPresetOrder(bandwidthPresetOrder,
+                              bandwidthValuePresets,
+                              defaultBandwidthPresetOrder());
+    settings.setValue("frequencyPresets/centerOrder", centerFrequencyPresetOrder);
+    settings.setValue("frequencyPresets/listeningOrder", listeningFrequencyPresetOrder);
+    settings.setValue("frequencyPresets/bandwidthOrder", bandwidthPresetOrder);
+
+    auto writeFrequencyPresetArray = [&settings](const char *path,
+                                                 const QMap<QString, double> &presets,
+                                                 const QStringList &order) {
         settings.beginWriteArray(QString::fromLatin1(path));
         int index = 0;
-        for (auto it = presets.constBegin(); it != presets.constEnd(); ++it) {
-            if (it.key().trimmed().isEmpty() || !std::isfinite(it.value())) {
+        const QStringList normalizedOrder = normalizedPresetOrder(order, presets);
+        for (const QString &name : normalizedOrder) {
+            auto it = presets.constFind(name);
+            if (it == presets.constEnd() ||
+                it.key().trimmed().isEmpty() ||
+                !std::isfinite(it.value())) {
                 continue;
             }
             settings.setArrayIndex(index++);
-            settings.setValue("name", it.key());
+            settings.setValue("name", name);
             settings.setValue("valueHz", it.value());
         }
         settings.endArray();
     };
-    writeFrequencyPresetArray("frequencyPresets/center", centerFrequencyPresets);
-    writeFrequencyPresetArray("frequencyPresets/listening", listeningFrequencyPresets);
-    writeFrequencyPresetArray("frequencyPresets/bandwidth", bandwidthValuePresets);
+    writeFrequencyPresetArray("frequencyPresets/center", centerFrequencyPresets, centerFrequencyPresetOrder);
+    writeFrequencyPresetArray("frequencyPresets/listening", listeningFrequencyPresets, listeningFrequencyPresetOrder);
+    writeFrequencyPresetArray("frequencyPresets/bandwidth", bandwidthValuePresets, bandwidthPresetOrder);
     if (frequencyControl) {
         settings.setValue("frequencyControls/centerUnitIndex", frequencyControl->selectedUnitIndex());
         settings.setValue("frequencyControls/centerStepName", frequencyControl->selectedStepName());
@@ -15304,6 +15777,8 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("ui/language", uiLanguage);
     settings.setValue("ui/fineTuneControlMode", fineTuneControlMode);
     settings.setValue("ui/spectrumUpdateIntervalMs", spectrumUpdateIntervalMs);
+    settings.setValue("ui/waterfallRowsPerFrame", waterfallRowsPerFrame);
+    settings.setValue("ui/agileLiveRetuneIntervalMs", agileLiveRetuneCommandIntervalMs);
     settings.setValue("ui/fineTuneScaleHoldMode", fineTuneScaleHoldMode);
     settings.setValue("audio/lowPassHz", pendingSettings.audioLowPassHz);
     settings.setValue("audio/highPassHz", pendingSettings.audioHighPassHz);
@@ -15360,11 +15835,15 @@ void YourClassName::savePersistentSettings() {
     settings.sync();
 
     if (settings.status() == QSettings::NoError) {
+        if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[Settings] saved" << persistentSettingsFilePath();
+        }
     } else {
         qDebug() << "[Settings] save failed" << persistentSettingsFilePath()
                  << "status" << settings.status();
     }
+    persistentSettingsSaveInProgress = false;
+    persistentSettingsLastSaveTimer.restart();
 }
 
 void YourClassName::applyLiveRemoteSettings(const RadioSettings &previousSettings) {
@@ -17884,7 +18363,11 @@ void YourClassName::updateSpectrumTimerInterval() {
     }
 
     int intervalMs = 33;
-    if (pendingSettings.fftLength >= 262144) {
+    if (pendingSettings.fftLength >= 2097152) {
+        intervalMs = 160;
+    } else if (pendingSettings.fftLength >= 1048576) {
+        intervalMs = 120;
+    } else if (pendingSettings.fftLength >= 262144) {
         intervalMs = 80;
     } else if (pendingSettings.fftLength >= 131072) {
         intervalMs = 50;
@@ -18095,6 +18578,31 @@ bool YourClassName::closeFobosSession(bool clearIq) {
     openedDeviceApiKind = FobosApiKind::Standard;
     qDebug() << "[FobosLifecycle] closeFobosSession exit";
     return closeOk;
+}
+
+void YourClassName::abandonFobosSessionWithoutClose(const char *reason) {
+    qDebug() << "[FobosLifecycle] abandoning Fobos session without USB close"
+             << "reason" << (reason ? reason : "")
+             << "device" << activeFobosDevice()
+             << "openedDeviceIndex" << openedDeviceIndex
+             << "openedNativeDeviceIndex" << openedNativeDeviceIndex
+             << "apiKind" << fobosApiDisplayName(openedDeviceApiKind);
+    device = nullptr;
+    agileDevice = nullptr;
+    agileScanRunning = false;
+    activeAgileScanFrequencies.clear();
+    scanVisualAssembler.reset();
+    openedDeviceIndex = -1;
+    openedNativeDeviceIndex = -1;
+    appliedSampleRate = 0.0;
+    appliedHardwareSettings = RadioSettings{};
+    hardwareSettingsApplied = false;
+    sampleRateReopenRequired = false;
+    fobosCloseKnownUnsafe = false;
+    resetStandardScanState(true);
+    resetListeningScanState();
+    activeFobosApiKind = FobosApiKind::Standard;
+    openedDeviceApiKind = FobosApiKind::Standard;
 }
 
 bool YourClassName::applyFobosSettings() {
@@ -19248,6 +19756,57 @@ void YourClassName::populateSampleRates() {
     }
 
     QSignalBlocker sampleBoxBlocker(sampleBox);
+    if (isSoapySdrSelected()) {
+        sampleBox->clear();
+        const QVector<double> soapyRates = {
+            1000000.0,
+            1024000.0,
+            1536000.0,
+            2048000.0,
+            2400000.0,
+            3200000.0,
+            8000000.0,
+            10000000.0,
+            20000000.0,
+            50000000.0
+        };
+        for (const double rate : soapyRates) {
+            sampleBox->addItem(formatSampleRate(rate), rate);
+        }
+        if (sampleBox->findData(pendingSettings.sampleRate) < 0) {
+            pendingSettings.sampleRate = 2048000.0;
+        }
+        const int index = sampleBox->findData(pendingSettings.sampleRate);
+        if (index >= 0) {
+            sampleBox->setCurrentIndex(index);
+        }
+        qDebug() << "[SoapySDR] using generic Soapy sample-rate list";
+        return;
+    }
+    if (isRtlBackendSelected()) {
+        sampleBox->clear();
+        const QVector<double> rtlRates = {
+            1024000.0,
+            1536000.0,
+            2048000.0,
+            2400000.0,
+            2560000.0,
+            3200000.0
+        };
+        for (const double rate : rtlRates) {
+            sampleBox->addItem(formatSampleRate(rate), rate);
+        }
+        if (sampleBox->findData(pendingSettings.sampleRate) < 0) {
+            pendingSettings.sampleRate = RTL_TCP_SAFE_SAMPLE_RATE;
+        }
+        const int index = sampleBox->findData(pendingSettings.sampleRate);
+        if (index >= 0) {
+            sampleBox->setCurrentIndex(index);
+        }
+        qDebug() << "[RTL-TCP] using RTL-SDR sample-rate list";
+        return;
+    }
+
     auto addDefaultSampleRates = [this]() {
         if (sampleBox->count() > 0) {
             return;
@@ -19316,6 +19875,28 @@ void YourClassName::populateSampleRates() {
     for (unsigned int i = 0; i < count; ++i) {
         QString formattedRate = formatSampleRate(sampleRates[i]);
         sampleBox->addItem(formattedRate, sampleRates[i]);
+    }
+    int selectedIndex = sampleBox->findData(pendingSettings.sampleRate);
+    if (selectedIndex < 0 || isKnownRtlSampleRate(pendingSettings.sampleRate)) {
+        int defaultIndex = sampleBox->findData(FOBOS_DEFAULT_SAMPLE_RATE);
+        if (defaultIndex < 0 && sampleBox->count() > 0) {
+            double bestDelta = std::numeric_limits<double>::max();
+            for (int i = 0; i < sampleBox->count(); ++i) {
+                const double rate = sampleBox->itemData(i).toDouble();
+                const double delta = std::abs(rate - FOBOS_DEFAULT_SAMPLE_RATE);
+                if (delta < bestDelta) {
+                    bestDelta = delta;
+                    defaultIndex = i;
+                }
+            }
+        }
+        if (defaultIndex >= 0) {
+            pendingSettings.sampleRate = sampleBox->itemData(defaultIndex).toDouble();
+            selectedIndex = defaultIndex;
+        }
+    }
+    if (selectedIndex >= 0) {
+        sampleBox->setCurrentIndex(selectedIndex);
     }
     if (openedForSampleRates) {
         if (sampleRateApiKind == FobosApiKind::Agile) {
@@ -19482,21 +20063,22 @@ void YourClassName::updateSpectrum() {
     updateGnssSpurWatch(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
     updateScanMeasurement(spectrumFrequencies, spectrumMagnitudes);
 
-    std::vector<float> displayFrequencies = spectrumFrequencies;
-    std::vector<float> displayMagnitudes = spectrumMagnitudes;
-    std::vector<float> displayReferenceMagnitudes = referenceMagnitudes;
-    std::vector<float> displayMeasurementFrequencies = spectrumFrequencies;
-    std::vector<float> dmrHunterFrequencies = spectrumFrequencies;
-    std::vector<float> dmrHunterMagnitudes = spectrumMagnitudes;
-    std::vector<float> fpvHunterFrequencies = spectrumFrequencies;
-    std::vector<float> fpvHunterMagnitudes = spectrumMagnitudes;
-    std::vector<float> digitalVideoHunterFrequencies = spectrumFrequencies;
-    std::vector<float> digitalVideoHunterMagnitudes = spectrumMagnitudes;
+    const std::vector<float> *displayFrequenciesPtr = &spectrumFrequencies;
+    const std::vector<float> *displayMagnitudesPtr = &spectrumMagnitudes;
+    const std::vector<float> *displayReferenceMagnitudesPtr = &referenceMagnitudes;
+    const std::vector<float> *displayMeasurementFrequenciesPtr = &spectrumFrequencies;
+    const std::vector<float> *dmrHunterFrequenciesPtr = &spectrumFrequencies;
+    const std::vector<float> *dmrHunterMagnitudesPtr = &spectrumMagnitudes;
+    const std::vector<float> *fpvHunterFrequenciesPtr = &spectrumFrequencies;
+    const std::vector<float> *fpvHunterMagnitudesPtr = &spectrumMagnitudes;
+    const std::vector<float> *digitalVideoHunterFrequenciesPtr = &spectrumFrequencies;
+    const std::vector<float> *digitalVideoHunterMagnitudesPtr = &spectrumMagnitudes;
     double displayCenterFrequency = spectrumSettings.centerFrequency;
     double displayMinFrequency = frameMinFrequency;
     double displayMaxFrequency = frameMaxFrequency;
-    int displayFftLength = static_cast<int>(displayFrequencies.size());
+    int displayFftLength = static_cast<int>(spectrumFrequencies.size());
     QVector<ScanVisualSegment> displayScanSegments;
+    ScanVisualFrame scanFrame;
     const bool agileScanVisualActive =
         agileScanRunning &&
         activeFobosApiKind == FobosApiKind::Agile &&
@@ -19520,34 +20102,43 @@ void YourClassName::updateSpectrum() {
         if (scanVisualAssembler.configure(scanVisualFrequencies,
                                           spectrumSettings.sampleRate,
                                           scanVisualBins)) {
-            const ScanVisualFrame scanFrame =
-                scanVisualAssembler.update(spectrumSettings.centerFrequency,
-                                           spectrumFrequencies,
-                                           spectrumMagnitudes,
-                                           referenceMagnitudes);
+            scanFrame = scanVisualAssembler.update(spectrumSettings.centerFrequency,
+                                                   spectrumFrequencies,
+                                                   spectrumMagnitudes,
+                                                   referenceMagnitudes);
             if (scanFrame.valid) {
-                displayFrequencies = scanFrame.frequencies;
-                displayMagnitudes = scanFrame.magnitudes;
-                displayReferenceMagnitudes = scanFrame.referenceMagnitudes;
-                displayMeasurementFrequencies = scanFrame.actualFrequencies;
+                displayFrequenciesPtr = &scanFrame.frequencies;
+                displayMagnitudesPtr = &scanFrame.magnitudes;
+                displayReferenceMagnitudesPtr = &scanFrame.referenceMagnitudes;
+                displayMeasurementFrequenciesPtr = &scanFrame.actualFrequencies;
                 displayCenterFrequency = scanFrame.centerFrequency;
                 displayMinFrequency = scanFrame.minFrequency;
                 displayMaxFrequency = scanFrame.maxFrequency;
                 displayFftLength = scanFrame.fftLength;
                 displayScanSegments = scanFrame.segments;
                 if (scanFrame.actualFrequencies.size() == scanFrame.magnitudes.size()) {
-                    dmrHunterFrequencies = scanFrame.actualFrequencies;
-                    dmrHunterMagnitudes = scanFrame.magnitudes;
-                    fpvHunterFrequencies = scanFrame.actualFrequencies;
-                    fpvHunterMagnitudes = scanFrame.magnitudes;
-                    digitalVideoHunterFrequencies = scanFrame.actualFrequencies;
-                    digitalVideoHunterMagnitudes = scanFrame.magnitudes;
+                    dmrHunterFrequenciesPtr = &scanFrame.actualFrequencies;
+                    dmrHunterMagnitudesPtr = &scanFrame.magnitudes;
+                    fpvHunterFrequenciesPtr = &scanFrame.actualFrequencies;
+                    fpvHunterMagnitudesPtr = &scanFrame.magnitudes;
+                    digitalVideoHunterFrequenciesPtr = &scanFrame.actualFrequencies;
+                    digitalVideoHunterMagnitudesPtr = &scanFrame.magnitudes;
                 }
             }
         }
     } else {
         scanVisualAssembler.reset();
     }
+    const std::vector<float> &displayFrequencies = *displayFrequenciesPtr;
+    const std::vector<float> &displayMagnitudes = *displayMagnitudesPtr;
+    const std::vector<float> &displayReferenceMagnitudes = *displayReferenceMagnitudesPtr;
+    const std::vector<float> &displayMeasurementFrequencies = *displayMeasurementFrequenciesPtr;
+    const std::vector<float> &dmrHunterFrequencies = *dmrHunterFrequenciesPtr;
+    const std::vector<float> &dmrHunterMagnitudes = *dmrHunterMagnitudesPtr;
+    const std::vector<float> &fpvHunterFrequencies = *fpvHunterFrequenciesPtr;
+    const std::vector<float> &fpvHunterMagnitudes = *fpvHunterMagnitudesPtr;
+    const std::vector<float> &digitalVideoHunterFrequencies = *digitalVideoHunterFrequenciesPtr;
+    const std::vector<float> &digitalVideoHunterMagnitudes = *digitalVideoHunterMagnitudesPtr;
     updateDmrHunter(dmrHunterFrequencies, dmrHunterMagnitudes);
     updateFpvHunter(fpvHunterFrequencies, fpvHunterMagnitudes);
     updateDigitalVideoHunter(digitalVideoHunterFrequencies, digitalVideoHunterMagnitudes);
@@ -19976,7 +20567,26 @@ void YourClassName::onFrequencyEntered() {
     const RadioSettings previousSettings = pendingSettings;
     if (pendingSettings.inputMode == INPUT_RF) {
         if (frequencyControl) {
-            pendingSettings.centerFrequency = frequencyControl->valueHz();
+            const double requestedCenterFrequency = frequencyControl->valueHz();
+            const double previousListeningFrequency = pendingSettings.listeningFrequency;
+            pendingSettings.centerFrequency = requestedCenterFrequency;
+            const double halfRate = pendingSettings.sampleRate > 0.0
+                                        ? pendingSettings.sampleRate * 0.5
+                                        : 0.0;
+            const bool listeningOutsideNewWindow =
+                halfRate > 0.0 &&
+                std::isfinite(previousListeningFrequency) &&
+                std::isfinite(requestedCenterFrequency) &&
+                (previousListeningFrequency < requestedCenterFrequency - halfRate ||
+                 previousListeningFrequency > requestedCenterFrequency + halfRate);
+            if (listeningOutsideNewWindow) {
+                qDebug() << "[Tune] center control reset listening after out-of-window center jump"
+                         << "previousCenter" << previousSettings.centerFrequency
+                         << "requestedCenter" << requestedCenterFrequency
+                         << "previousListening" << previousListeningFrequency
+                         << "sampleRate" << pendingSettings.sampleRate;
+                pendingSettings.listeningFrequency = requestedCenterFrequency;
+            }
             normalizeTuning(pendingSettings, true);
             applyCenterFrequencyToHardwareIfNeeded(previousSettings, "center control");
             publishSettingsToGlobals();
@@ -20002,7 +20612,14 @@ void YourClassName::onFrequencyEntered() {
         }
     }
     settingRange();
-    savePersistentSettings();
+    const bool deferSettingsSaveForLiveAgile =
+        runState == RadioRunState::Running &&
+        activeFobosApiKind == FobosApiKind::Agile &&
+        pendingSettings.inputMode == INPUT_RF &&
+        !agileScanEnabled;
+    if (!deferSettingsSaveForLiveAgile) {
+        savePersistentSettings();
+    }
     if (isNetworkClientMode()) {
         scheduleRemoteSettingsCommand();
     }
@@ -20198,7 +20815,8 @@ void YourClassName::refreshFobosDeviceList(bool recoverUsb) {
     qDebug() << "[FobosDevices] refreshed"
              << "standardCount" << standardCount
              << "agileCount" << agileCount
-             << "usable" << availableFobosDevices.size();
+             << "usable" << availableFobosDevices.size()
+             << "rtlNativeLazy" << true;
     updateAgileScanControls();
 }
 
@@ -20211,6 +20829,9 @@ QStringList YourClassName::getFobosDevices() {
     for (const FobosDeviceInfo &info : std::as_const(availableFobosDevices)) {
         deviceList << info.label;
     }
+    deviceList << QStringLiteral("RTL-SDR native #0 (rtlsdr.dll)");
+    deviceList << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
+    deviceList << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
     if (deviceList.isEmpty()) {
         deviceList << uiText(QStringLiteral("no_fobos_devices_detected"),
                              QStringLiteral("No Fobos devices detected"));
@@ -20236,6 +20857,147 @@ YourClassName::FobosDeviceInfo YourClassName::selectedFobosDeviceInfo() const {
     fallback.nativeIndex = std::max(0, selected);
     fallback.label = QString("Standard device #%1").arg(fallback.nativeIndex);
     return fallback;
+}
+
+bool YourClassName::isRtlTcpSelected() const {
+    int selected = pendingSettings.deviceIndex;
+    if (comboBox) {
+        bool ok = false;
+        const int value = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            selected = value;
+        }
+    }
+    return selected == RTL_TCP_DEVICE_INDEX;
+}
+
+bool YourClassName::isRtlSdrNativeSelected() const {
+    int selected = pendingSettings.deviceIndex;
+    if (comboBox) {
+        bool ok = false;
+        const int value = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            selected = value;
+        }
+    }
+    return isRtlSdrNativeComboValue(selected);
+}
+
+bool YourClassName::isSoapySdrSelected() const {
+    int selected = pendingSettings.deviceIndex;
+    if (comboBox) {
+        bool ok = false;
+        const int value = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            selected = value;
+        }
+    }
+    return selected == SOAPY_SDR_DEVICE_INDEX;
+}
+
+int YourClassName::selectedRtlSdrNativeIndex() const {
+    int selected = pendingSettings.deviceIndex;
+    if (comboBox) {
+        bool ok = false;
+        const int value = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            selected = value;
+        }
+    }
+    return isRtlSdrNativeComboValue(selected) ? rtlSdrNativeIndexFromComboValue(selected) : 0;
+}
+
+bool YourClassName::isRtlBackendSelected() const {
+    return isRtlTcpSelected() || isRtlSdrNativeSelected();
+}
+
+bool YourClassName::isExternalReceiverBackendSelected() const {
+    return isRtlBackendSelected() || isSoapySdrSelected();
+}
+
+bool YourClassName::normalizeRtlSdrSettings() {
+    if (!isRtlBackendSelected()) {
+        return false;
+    }
+
+    if (!isKnownRtlSampleRate(pendingSettings.sampleRate)) {
+        qDebug() << "[RTL-TCP] replacing non-RTL sample rate"
+                 << pendingSettings.sampleRate
+                 << "with" << RTL_TCP_SAFE_SAMPLE_RATE;
+        pendingSettings.sampleRate = RTL_TCP_SAFE_SAMPLE_RATE;
+        if (sampleBox) {
+            QSignalBlocker blocker(sampleBox);
+            const int index = sampleBox->findData(pendingSettings.sampleRate);
+            if (index >= 0) {
+                sampleBox->setCurrentIndex(index);
+            }
+        }
+        settingRange();
+        return true;
+    }
+    return false;
+}
+
+ReceiverStreamDescriptor YourClassName::makeRtlTcpStreamDescriptor(bool queueAudioBlocks,
+                                                                   bool publishIqSnapshot,
+                                                                   bool emitIqFrames) const {
+    ReceiverStreamDescriptor stream;
+    stream.kind = ReceiverBackendStreamKind::RtlTcp;
+    stream.backendId = QStringLiteral("rtl-tcp");
+    stream.backendName = QStringLiteral("RTL-SDR via rtl_tcp");
+    stream.nativeDevice = nullptr;
+    stream.sampleRateHz = pendingSettings.sampleRate;
+    stream.centerFrequencyHz = pendingSettings.centerFrequency;
+    stream.rtlTcpHost = QString::fromLatin1(RTL_TCP_DEFAULT_HOST);
+    stream.rtlTcpPort = RTL_TCP_DEFAULT_PORT;
+    stream.rtlTcpAgc = true;
+    stream.rtlTcpTunerGainTenthsDb = -1;
+    stream.syncReader = false;
+    stream.queueAudioBlocks = queueAudioBlocks;
+    stream.publishIqSnapshot = publishIqSnapshot;
+    stream.emitIqFrames = emitIqFrames;
+    stream.agileScanEnabled = false;
+    return stream;
+}
+
+ReceiverStreamDescriptor YourClassName::makeRtlSdrNativeStreamDescriptor(bool queueAudioBlocks,
+                                                                        bool publishIqSnapshot,
+                                                                        bool emitIqFrames) const {
+    ReceiverStreamDescriptor stream;
+    stream.kind = ReceiverBackendStreamKind::RtlSdrNative;
+    stream.backendId = QStringLiteral("rtl-sdr-native");
+    stream.backendName = QStringLiteral("RTL-SDR native");
+    stream.nativeDevice = nullptr;
+    stream.sampleRateHz = pendingSettings.sampleRate;
+    stream.centerFrequencyHz = pendingSettings.centerFrequency;
+    stream.rtlSdrNativeDeviceIndex = selectedRtlSdrNativeIndex();
+    stream.rtlTcpAgc = false;
+    stream.rtlTcpTunerGainTenthsDb = 0;
+    stream.syncReader = false;
+    stream.queueAudioBlocks = queueAudioBlocks;
+    stream.publishIqSnapshot = publishIqSnapshot;
+    stream.emitIqFrames = emitIqFrames;
+    stream.agileScanEnabled = false;
+    return stream;
+}
+
+ReceiverStreamDescriptor YourClassName::makeSoapySdrStreamDescriptor(bool queueAudioBlocks,
+                                                                     bool publishIqSnapshot,
+                                                                     bool emitIqFrames) const {
+    ReceiverStreamDescriptor stream;
+    stream.kind = ReceiverBackendStreamKind::SoapySdr;
+    stream.backendId = QStringLiteral("soapy-sdr");
+    stream.backendName = QStringLiteral("SoapySDR");
+    stream.nativeDevice = nullptr;
+    stream.sampleRateHz = pendingSettings.sampleRate;
+    stream.centerFrequencyHz = pendingSettings.centerFrequency;
+    stream.soapySdrDeviceIndex = 0;
+    stream.syncReader = false;
+    stream.queueAudioBlocks = queueAudioBlocks;
+    stream.publishIqSnapshot = publishIqSnapshot;
+    stream.emitIqFrames = emitIqFrames;
+    stream.agileScanEnabled = false;
+    return stream;
 }
 
 void YourClassName::listFobosDevices() {
@@ -20344,7 +21106,6 @@ void YourClassName::settingRange() {
     if (!scaleWidget || globalSampleRate <= 0.0) {
         return;
     }
-
     double newRange = globalSampleRate * (currentScale / 100.0);
     double overallMin = directMinFrequencyForMode(globalMode, globalSampleRate);
     double overallMax = directMaxFrequency(globalSampleRate);
@@ -20519,7 +21280,25 @@ void YourClassName::startFobosProcessing() {
         }
         settingRange();
     }
+    const bool rtlTcpSelected = isRtlTcpSelected();
+    const bool rtlSdrNativeSelected = isRtlSdrNativeSelected();
+    const bool soapySdrSelected = isSoapySdrSelected();
+    const bool rtlBackendSelected = rtlTcpSelected || rtlSdrNativeSelected;
+    const bool externalBackendSelected = rtlBackendSelected || soapySdrSelected;
+    if (rtlBackendSelected) {
+        normalizeRtlSdrSettings();
+    }
+    if (externalBackendSelected) {
+        if (hasActiveFobosDevice()) {
+            qDebug() << "[ReceiverBackend] closing idle Fobos USB session before external backend start"
+                     << "device" << activeFobosDevice()
+                     << "apiKind" << fobosApiKindName(activeFobosApiKind);
+            closeFobosSession(false);
+            QThread::msleep(250);
+        }
+    }
     const bool sampleRateDiffersFromOpenSession =
+        !externalBackendSelected &&
         hasActiveFobosDevice() && appliedSampleRate > 0.0 &&
         std::abs(appliedSampleRate - pendingSettings.sampleRate) > 0.5;
     if (sampleRateDiffersFromOpenSession) {
@@ -20577,31 +21356,45 @@ void YourClassName::startFobosProcessing() {
         QThread::msleep(500);
     }
 
-    qDebug() << "[FobosLifecycle] opening Fobos session";
-    if (!openFobosSession()) {
-        qDebug() << "[FobosLifecycle] openFobosSession failed";
-        clearLiveSpectrumSnapshot();
-        runState = RadioRunState::Idle;
-        updateUiForRunState();
-        return;
-    }
+    if (externalBackendSelected) {
+        qDebug() << "[ReceiverBackend] starting without Fobos USB session"
+                 << "native" << rtlSdrNativeSelected
+                 << "tcp" << rtlTcpSelected
+                 << "soapy" << soapySdrSelected
+                 << "host" << RTL_TCP_DEFAULT_HOST
+                 << "port" << RTL_TCP_DEFAULT_PORT
+                 << "frequency" << pendingSettings.centerFrequency
+                 << "sampleRate" << pendingSettings.sampleRate;
+        appliedSampleRate = pendingSettings.sampleRate;
+        appliedHardwareSettings = pendingSettings;
+        hardwareSettingsApplied = true;
+        sampleRateReopenRequired = false;
+        if (!applyStandardScanSettings(false)) {
+            qDebug() << "[ReceiverBackend] Standard scan settings failed before external backend start";
+            clearLiveSpectrumSnapshot();
+            runState = RadioRunState::Idle;
+            updateUiForRunState();
+            return;
+        }
+    } else {
+        qDebug() << "[FobosLifecycle] opening Fobos session";
+        if (!openFobosSession()) {
+            qDebug() << "[FobosLifecycle] openFobosSession failed";
+            clearLiveSpectrumSnapshot();
+            runState = RadioRunState::Idle;
+            updateUiForRunState();
+            return;
+        }
 
-    qDebug() << "[FobosLifecycle] applying Fobos settings";
-    if (!applyFobosSettings()) {
-        qDebug() << "Start aborted because Fobos settings could not be applied; closing Fobos session before retry.";
-        closeFobosSession(true);
-        clearLiveSpectrumSnapshot();
-        runState = RadioRunState::Idle;
-        updateUiForRunState();
-        return;
-    }
-    if (!stabilizeAgileFrequencyBeforeStreaming("start")) {
-        qDebug() << "Start aborted because Agile frequency settle failed; closing Fobos session before retry.";
-        closeFobosSession(true);
-        clearLiveSpectrumSnapshot();
-        runState = RadioRunState::Idle;
-        updateUiForRunState();
-        return;
+        qDebug() << "[FobosLifecycle] applying Fobos settings";
+        if (!applyFobosSettings()) {
+            qDebug() << "Start aborted because Fobos settings could not be applied; closing Fobos session before retry.";
+            closeFobosSession(true);
+            clearLiveSpectrumSnapshot();
+            runState = RadioRunState::Idle;
+            updateUiForRunState();
+            return;
+        }
     }
     clearLiveSpectrumSnapshot(false);
     digitalDecoderGeneration.fetch_add(1, std::memory_order_relaxed);
@@ -20651,8 +21444,10 @@ void YourClassName::startFobosProcessing() {
                                                serverChannelIqStreaming || channelIqRecording);
     }
     qDebug() << "[FobosLifecycle] starting DataProcessor"
+             << "backend" << (soapySdrSelected ? "soapy-sdr" :
+                               (rtlSdrNativeSelected ? "rtl-sdr-native" :
+                                (rtlTcpSelected ? "rtl_tcp" : fobosApiKindName(activeFobosApiKind))))
              << "device" << activeFobosDevice()
-             << "apiKind" << fobosApiKindName(activeFobosApiKind)
              << "sampleRate" << pendingSettings.sampleRate
              << "syncEnabled" << pendingSettings.syncEnabled
              << "queueAudioBlocks" << queueAudioBlocks
@@ -20660,17 +21455,33 @@ void YourClassName::startFobosProcessing() {
              << "serverIqStreaming" << serverIqStreaming
              << "serverChannelIqStreaming" << serverChannelIqStreaming
              << "channelIqRecording" << channelIqRecording;
-    processor->startProcessing(activeFobosDevice(),
-                               activeFobosApiKind,
-                               pendingSettings.syncEnabled,
-                               pendingSettings.sampleRate,
-                               queueAudioBlocks,
-                               publishIqSnapshot,
-                               serverIqStreaming || channelIqRecording,
-                               agileScanEnabled &&
-                                   !standardScanEnabled &&
-                                   activeFobosApiKind == FobosApiKind::Agile);
-    if (activeFobosApiKind == FobosApiKind::Agile &&
+    if (rtlSdrNativeSelected) {
+        processor->startProcessing(makeRtlSdrNativeStreamDescriptor(queueAudioBlocks,
+                                                                    publishIqSnapshot,
+                                                                    serverIqStreaming || channelIqRecording));
+    } else if (rtlTcpSelected) {
+        processor->startProcessing(makeRtlTcpStreamDescriptor(queueAudioBlocks,
+                                                              publishIqSnapshot,
+                                                              serverIqStreaming || channelIqRecording));
+    } else if (soapySdrSelected) {
+        processor->startProcessing(makeSoapySdrStreamDescriptor(queueAudioBlocks,
+                                                                publishIqSnapshot,
+                                                                serverIqStreaming || channelIqRecording));
+    } else {
+        processor->startProcessing(makeFobosStreamDescriptor(activeFobosDevice(),
+                                                             activeFobosApiKind,
+                                                             pendingSettings.syncEnabled,
+                                                             pendingSettings.sampleRate,
+                                                             pendingSettings.centerFrequency,
+                                                             queueAudioBlocks,
+                                                             publishIqSnapshot,
+                                                             serverIqStreaming || channelIqRecording,
+                                                             agileScanEnabled &&
+                                                                 !standardScanEnabled &&
+                                                                 activeFobosApiKind == FobosApiKind::Agile));
+    }
+    if (!externalBackendSelected &&
+        activeFobosApiKind == FobosApiKind::Agile &&
         pendingSettings.inputMode == INPUT_RF &&
         !agileScanEnabled) {
         liveRetuneSettleDurationMs = agileRfLiveSettleMs(pendingSettings.sampleRate, false);
@@ -20691,6 +21502,9 @@ void YourClassName::startFobosProcessing() {
     runState = RadioRunState::Running;
     qDebug() << "[FobosLifecycle] state changed" << runStateName(runState)
              << "processorRunning" << (processor && processor->isRunning());
+    if (externalBackendSelected && standardScanRunning) {
+        standardScanDwellTimer.restart();
+    }
     updateUiForRunState();
     qDebug() << "Fobos fft Started";
 
@@ -20746,46 +21560,47 @@ void YourClassName::finishFobosStop(bool forcedRecovery) {
         processor->finalizeStopped();
     }
 
+    if (closeShutdownInProgress) {
+        qDebug() << "[FobosLifecycle] finish stop for pending window close; skipping synchronous USB close";
+        if (hasActiveFobosDevice()) {
+            abandonFobosSessionWithoutClose("window close after reader stop");
+        }
+        if (clearSpectrumAfterStop) {
+            clearLiveSpectrumSnapshot();
+            clearSpectrumAfterStop = false;
+        }
+        deviceOpened = false;
+        runState = RadioRunState::Idle;
+        updateUiForRunState();
+        savePersistentSettings();
+        QTimer::singleShot(0, this, &QWidget::close);
+        return;
+    }
+
     bool closeSucceeded = true;
     if (forcedRecovery) {
         qDebug() << "[FobosLifecycle] forced stop recovery: abandoning Fobos session without close and recreating DataProcessor"
                  << "device" << activeFobosDevice()
                  << "apiKind" << fobosApiKindName(activeFobosApiKind);
-        device = nullptr;
-        agileDevice = nullptr;
-        agileScanRunning = false;
-        activeAgileScanFrequencies.clear();
-        activeFobosApiKind = FobosApiKind::Standard;
-        openedDeviceIndex = -1;
-        openedNativeDeviceIndex = -1;
-        appliedSampleRate = 0.0;
-        appliedHardwareSettings = RadioSettings{};
-        hardwareSettingsApplied = false;
-        sampleRateReopenRequired = false;
-        fobosCloseKnownUnsafe = false;
+        abandonFobosSessionWithoutClose("forced stop recovery");
         if (processor && !processor->isRunning()) {
             recreateDataProcessor();
         }
     } else if (hasActiveFobosDevice()) {
-        const bool keepIdleAgileSession =
-            activeFobosApiKind == FobosApiKind::Agile &&
-            pendingSettings.inputMode == INPUT_RF &&
-            !agileScanEnabled &&
-            !agileScanRunning;
-        if (keepIdleAgileSession) {
-            qDebug() << "[FobosLifecycle] clean Agile RF stop: keeping idle session open to avoid unsafe USB close"
-                     << activeFobosDevice()
-                     << "clearSpectrumAfterStop" << clearSpectrumAfterStop
-                     << "sampleRateReopenRequired" << sampleRateReopenRequired;
-            sampleRateReopenRequired = false;
-        } else {
-            qDebug() << "[FobosLifecycle] clean stop: closing Fobos session"
-                     << (clearSpectrumAfterStop ? "and clearing IQ snapshot" : "; IQ snapshot remains visible");
-            closeSucceeded = closeFobosSession(clearSpectrumAfterStop);
+        if (agileScanRunning && agileDevice) {
+            qDebug() << "[FobosLifecycle] clean stop: stopping Agile scan but keeping device session open";
+            const int stopScanResult = stopFobosAgileScanSafely(agileDevice);
+            qDebug() << "[FobosLifecycle] fobos_sdr_stop_scan end"
+                     << "result" << stopScanResult;
+            agileScanRunning = false;
+            activeAgileScanFrequencies.clear();
+            scanVisualAssembler.reset();
         }
-        if (!closeSucceeded) {
-            qDebug() << "[FobosLifecycle] clean stop: Fobos close returned an error; stale session pointer was abandoned";
-        }
+        qDebug() << "[FobosLifecycle] clean stop: keeping idle Fobos session open to avoid UI-thread USB close"
+                 << activeFobosDevice()
+                 << "apiKind" << fobosApiKindName(activeFobosApiKind)
+                 << "clearSpectrumAfterStop" << clearSpectrumAfterStop
+                 << "sampleRateReopenRequired" << sampleRateReopenRequired;
         if (processor && !processor->isRunning()) {
             recreateDataProcessor();
         }
@@ -20800,6 +21615,7 @@ void YourClassName::finishFobosStop(bool forcedRecovery) {
     runState = RadioRunState::Idle;
     qDebug() << "[FobosLifecycle] state changed" << runStateName(runState);
     updateUiForRunState();
+    savePersistentSettings();
     logMemorySnapshot("after stop");
     qDebug() << "Stop requested: complete.";
 
@@ -20835,7 +21651,6 @@ void YourClassName::checkStreamStartup() {
         if (streamWatchdogTimer) {
             streamWatchdogTimer->stop();
         }
-        schedulePostStartRetune(QStringLiteral("stream ready"));
         if (pendingAudioStartAfterStreamReady) {
             pendingAudioStartAfterStreamReady = false;
             if (deviceOpened && processor && processor->isRunning()) {
@@ -20868,12 +21683,16 @@ void YourClassName::checkStreamStartup() {
     clearSpectrumAfterStop = true;
 
     const bool directSamplingStartup = pendingSettings.inputMode != INPUT_RF;
-    if (streamStartupRetryCount < 1) {
+    const bool externalBackend = isExternalReceiverBackendSelected();
+    if (!externalBackend && streamStartupRetryCount < 1) {
         ++streamStartupRetryCount;
         restartAfterStartupWatchdog = true;
         qDebug() << "[FobosLifecycle] stream startup watchdog will retry once"
                  << "retryCount" << streamStartupRetryCount
                  << "directSampling" << directSamplingStartup;
+    } else if (externalBackend) {
+        restartAfterStartupWatchdog = false;
+        qDebug() << "[FobosLifecycle] external receiver stream startup watchdog: automatic retry disabled";
     } else {
         restartAfterStartupWatchdog = false;
         qDebug() << "[FobosLifecycle] stream startup watchdog retry already used; leaving receiver stopped";
@@ -21017,6 +21836,7 @@ int main(int argc, char *argv[]) {
     installDiagnosticLogger();
     installCrashLogger();
     logFobosApiInfo();
+    logReceiverBackendRegistry();
     YourClassName window;
     window.show(); 
 

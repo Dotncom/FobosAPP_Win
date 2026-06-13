@@ -24,6 +24,7 @@ public:
     ~MyWaterfallWidget();
     bool initialized;
     void setData(const std::vector<float> &xData, const std::vector<float> &yData, double minFrequency, double maxFrequency, int fftLength, bool secondGraph, float contrast, float sensitivity, float levelMin, float levelMax);
+    void setRowsPerFrame(int rows);
     void setLevelRange(float minLevel, float maxLevel);
     void setScanSegments(const QVector<ScanVisualSegment> &segments);
     void clearData();
@@ -50,9 +51,12 @@ private:
     double frequencyAtX(int x) const;
     double signalCenterNearFrequency(double frequency);
     mutable QMutex mutex;
-	QOpenGLBuffer waterfallVbo;
+    QOpenGLBuffer waterfallVbo;
     GLuint waterfallTexture;
     std::vector<unsigned char> lineData;
+    std::vector<float> pixelMaxData;
+    std::vector<float> pixelFrequencyData;
+    std::vector<float> pixelLevelData;
     QColor valueToColor(float value, float contrastFactor, float sensitivityFactor);
     QColor valueToColors(float value);
     float normalizedLevel(float value) const;
@@ -64,10 +68,12 @@ private:
     int textureWidth = 0;
     int textureHeight = 0;
     int waterfallWriteRow = 0;
+    int rowsPerFrame = 2;
     bool secondGraph;
     bool changebit;
     bool pendingTextureLine = false;
     bool textureClearRequested = false;
+    bool updateQueued = false;
     QVector<ScanVisualSegment> scanSegments;
 };
 

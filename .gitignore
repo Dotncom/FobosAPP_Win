@@ -92,6 +92,7 @@ fobos/
 fobos_agile/
 third_party/fobos-linux/
 third_party/firmware/
+third_party/rtl-sdr/
 third_party/src/
 third_party/dsd-fme/
 

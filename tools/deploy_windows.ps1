@@ -2,7 +2,7 @@ param(
     [string]$BuildDir = "build\Desktop_x86_windows_msvc2022_pe_64bit-Release",
     [string]$DeployDir = "release\bin",
     [string]$QtRoot = "C:\Qt\5.15.2\msvc2019_64",
-    [string]$VcRedistDir = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.40.33807\x64\Microsoft.VC143.CRT",
+    [string]$VcRedistDir = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT",
     [switch]$IncludeLabTools,
     [switch]$Sign,
     [string]$PfxPath = $env:FOBOSAPP_CODESIGN_PFX,
@@ -40,6 +40,15 @@ $RootFiles = @(
     @{ Source = Join-Path $VcRedistDir "VCRUNTIME140_1.dll"; Name = "VCRUNTIME140_1.dll" }
 )
 
+$RtlSdrRuntimeCandidates = @(
+    @{ Source = Join-Path $Workspace "rtlsdr\rtlsdr.dll"; Name = "rtlsdr.dll" },
+    @{ Source = Join-Path $Workspace "release\bin\rtlsdr.dll"; Name = "rtlsdr.dll" }
+)
+$RtlSdrRuntime = $RtlSdrRuntimeCandidates | Where-Object { Test-Path -LiteralPath $_.Source } | Select-Object -First 1
+if ($RtlSdrRuntime) {
+    $RootFiles += $RtlSdrRuntime
+}
+
 if ($IncludeLabTools) {
     $RootFiles += @{ Source = Join-Path $BuildPath "dmr_lab_replay.exe"; Name = "dmr_lab_replay.exe" }
 } else {
@@ -53,7 +62,11 @@ foreach ($File in $RootFiles) {
     if (-not (Test-Path -LiteralPath $File.Source)) {
         throw "Required deploy file not found: $($File.Source)"
     }
-    Copy-Item -LiteralPath $File.Source -Destination (Join-Path $DeployPath $File.Name) -Force
+    $Destination = Join-Path $DeployPath $File.Name
+    if ([System.IO.Path]::GetFullPath($File.Source) -ieq [System.IO.Path]::GetFullPath($Destination)) {
+        continue
+    }
+    Copy-Item -LiteralPath $File.Source -Destination $Destination -Force
 }
 
 $QWindows = Join-Path $QtRoot "plugins\platforms\qwindows.dll"
@@ -120,13 +133,37 @@ if (Test-Path -LiteralPath $ConfigDeployPath) {
 }
 New-Item -ItemType Directory -Path $ConfigDeployPath -Force | Out-Null
 $ReleaseConfigFiles = @(
-    "config\fobosapp_defaults_4.1.json",
+    "config\fobosapp_defaults_4.2.json",
     "config\dmr_backends.example.json"
 )
 foreach ($ConfigFile in $ReleaseConfigFiles) {
     $ConfigSource = Join-Path $Workspace $ConfigFile
     if (Test-Path -LiteralPath $ConfigSource) {
         Copy-Item -LiteralPath $ConfigSource -Destination (Join-Path $ConfigDeployPath (Split-Path -Leaf $ConfigSource)) -Force
+    }
+}
+
+$RtlDeployPath = Join-Path $DeployPath "rtlsdr"
+$RtlRuntimeFiles = @(
+    @{ Source = Join-Path $Workspace "rtlsdr\rtlsdr.dll"; Name = "rtlsdr.dll" },
+    @{ Source = Join-Path $Workspace "release\bin\rtlsdr\rtlsdr.dll"; Name = "rtlsdr.dll" },
+    @{ Source = Join-Path $Workspace "rtlsdr\libusb-1.0.dll"; Name = "libusb-1.0.dll" },
+    @{ Source = Join-Path $Workspace "release\bin\rtlsdr\libusb-1.0.dll"; Name = "libusb-1.0.dll" },
+    @{ Source = Join-Path $Workspace "rtlsdr\rtl_test.exe"; Name = "rtl_test.exe" },
+    @{ Source = Join-Path $Workspace "release\bin\rtlsdr\rtl_test.exe"; Name = "rtl_test.exe" }
+)
+$RtlSeenNames = @{}
+foreach ($RtlFile in $RtlRuntimeFiles) {
+    if ($RtlSeenNames.ContainsKey($RtlFile.Name)) {
+        continue
+    }
+    if (Test-Path -LiteralPath $RtlFile.Source) {
+        New-Item -ItemType Directory -Path $RtlDeployPath -Force | Out-Null
+        $RtlDestination = Join-Path $RtlDeployPath $RtlFile.Name
+        if ([System.IO.Path]::GetFullPath($RtlFile.Source) -ine [System.IO.Path]::GetFullPath($RtlDestination)) {
+            Copy-Item -LiteralPath $RtlFile.Source -Destination $RtlDestination -Force
+        }
+        $RtlSeenNames[$RtlFile.Name] = $true
     }
 }
 

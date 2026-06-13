@@ -1,6 +1,7 @@
 #include "MyWaterfallWidget.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -15,6 +16,61 @@ struct SignalSample {
     double frequency = 0.0;
     float level = 0.0f;
 };
+
+struct Rgb8 {
+    unsigned char r = 0;
+    unsigned char g = 0;
+    unsigned char b = 0;
+};
+
+constexpr std::array<Rgb8, 17> WATERFALL_PALETTE = {{
+    {0x00, 0x00, 0x20},
+    {0x00, 0x00, 0x50},
+    {0x00, 0x00, 0x90},
+    {0x00, 0x00, 0xF0},
+    {0x00, 0x00, 0xFF},
+    {0x50, 0xF0, 0x30},
+    {0x1E, 0x90, 0xFF},
+    {0xFF, 0xFF, 0xFF},
+    {0xFF, 0xFF, 0x00},
+    {0xFE, 0x6D, 0x16},
+    {0xFE, 0x6D, 0x16},
+    {0xFF, 0x00, 0x00},
+    {0xFF, 0x00, 0x00},
+    {0xC6, 0x00, 0x00},
+    {0x9F, 0x00, 0x00},
+    {0x75, 0x00, 0x00},
+    {0x4A, 0x00, 0x00},
+}};
+
+unsigned char clampByte(float value) {
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    return static_cast<unsigned char>((std::clamp)(std::lround(value), 0L, 255L));
+}
+
+void writeWaterfallColor(float normalizedValue,
+                         float contrastFactor,
+                         float sensitivityFactor,
+                         unsigned char *dest) {
+    if (!dest) {
+        return;
+    }
+    if (!std::isfinite(normalizedValue)) {
+        normalizedValue = 0.0f;
+    }
+    const float value = (std::clamp)(normalizedValue * sensitivityFactor, 0.0f, 1.0f);
+    const int index = (std::clamp)(
+        static_cast<int>(value * static_cast<float>(WATERFALL_PALETTE.size() - 1)),
+        0,
+        static_cast<int>(WATERFALL_PALETTE.size() - 1));
+    const Rgb8 base = WATERFALL_PALETTE[static_cast<std::size_t>(index)];
+    const float blue = static_cast<float>((static_cast<int>(base.g) + static_cast<int>(base.b)) / 3);
+    dest[0] = clampByte(static_cast<float>(base.r) * contrastFactor + blue * (1.0f - contrastFactor));
+    dest[1] = clampByte(static_cast<float>(base.g) * contrastFactor + blue * (1.0f - contrastFactor));
+    dest[2] = clampByte(static_cast<float>(base.b) * contrastFactor + blue * (1.0f - contrastFactor));
+}
 }
 
 MyWaterfallWidget::MyWaterfallWidget(QWidget *parent)
@@ -113,11 +169,12 @@ double MyWaterfallWidget::frequencyAtX(int x) const {
 
 double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
     QMutexLocker locker(&mutex);
-    if (!std::isfinite(frequency) || qFuzzyCompare(xMin, xMax) || xData.empty() || yData.empty() || fftLength <= 0) {
+    if (!std::isfinite(frequency) || qFuzzyCompare(xMin, xMax) || pixelFrequencyData.empty() || pixelLevelData.empty()) {
         return frequency;
     }
 
-    const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
+    const int dataCount = std::min(static_cast<int>(pixelFrequencyData.size()),
+                                   static_cast<int>(pixelLevelData.size()));
     if (dataCount <= 0) {
         return frequency;
     }
@@ -130,12 +187,12 @@ double MyWaterfallWidget::signalCenterNearFrequency(double frequency) {
     std::vector<SignalSample> samples;
     samples.reserve(256);
     for (int i = 0; i < dataCount; ++i) {
-        const double sampleFrequency = xData[i];
+        const double sampleFrequency = pixelFrequencyData[static_cast<std::size_t>(i)];
         if (!std::isfinite(sampleFrequency) ||
             std::abs(sampleFrequency - targetDisplayFrequency) > halfWindow) {
             continue;
         }
-        const float level = yData[(i + dataCount / 2) % dataCount];
+        const float level = pixelLevelData[static_cast<std::size_t>(i)];
         if (!std::isfinite(level)) {
             continue;
         }
@@ -232,6 +289,9 @@ void MyWaterfallWidget::ensureLineBuffer() {
     const size_t requiredSize = static_cast<size_t>(lineWidth) * 3;
     if (lineData.size() != requiredSize) {
         lineData.assign(requiredSize, 0);
+    }
+    if (pixelMaxData.size() != static_cast<std::size_t>(lineWidth)) {
+        pixelMaxData.resize(static_cast<std::size_t>(lineWidth));
     }
 }
 
@@ -335,11 +395,26 @@ void MyWaterfallWidget::resizeWaterfallTexturePreserve(int w, int h) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-void MyWaterfallWidget::setData(const std::vector<float> &xData, const std::vector<float> &yData, double xMin, double xMax, int fftLength, bool secondGraph, float contrast, float sensitivity, float levelMin, float levelMax) {
+void MyWaterfallWidget::setData(const std::vector<float> &sourceXData,
+                                const std::vector<float> &sourceYData,
+                                double xMin,
+                                double xMax,
+                                int fftLength,
+                                bool secondGraph,
+                                float contrast,
+                                float sensitivity,
+                                float levelMin,
+                                float levelMax) {
+    bool shouldScheduleUpdate = false;
     {
         QMutexLocker locker(&mutex);
-        this->xData = xData;
-        this->yData = yData;
+        if (secondGraph) {
+            this->xData = sourceXData;
+            this->yData = sourceYData;
+        } else {
+            this->xData.clear();
+            this->yData.clear();
+        }
         this->xMin = xMin;
         this->xMax = xMax;
         this->fftLength = std::max(0, fftLength);
@@ -354,9 +429,117 @@ void MyWaterfallWidget::setData(const std::vector<float> &xData, const std::vect
         }
 
         ensureLineBuffer();
+
+        const int lineWidth = std::max(1, width());
+        const int dataCount = std::min({this->fftLength,
+                                        static_cast<int>(sourceXData.size()),
+                                        static_cast<int>(sourceYData.size())});
+        const bool validFrame =
+            !lineData.empty() &&
+            dataCount > 0 &&
+            !qFuzzyCompare(this->xMin, this->xMax);
+
+        if (!validFrame) {
+            pixelFrequencyData.clear();
+            pixelLevelData.clear();
+            pendingTextureLine = false;
+        } else {
+            if (pixelMaxData.size() != static_cast<std::size_t>(lineWidth)) {
+                pixelMaxData.resize(static_cast<std::size_t>(lineWidth));
+            }
+            if (pixelFrequencyData.size() != static_cast<std::size_t>(lineWidth)) {
+                pixelFrequencyData.resize(static_cast<std::size_t>(lineWidth));
+            }
+            if (pixelLevelData.size() != static_cast<std::size_t>(lineWidth)) {
+                pixelLevelData.resize(static_cast<std::size_t>(lineWidth));
+            }
+
+            std::fill(pixelMaxData.begin(),
+                      pixelMaxData.end(),
+                      std::numeric_limits<float>::quiet_NaN());
+
+            for (int id = 0; id < dataCount; ++id) {
+                if (!std::isfinite(sourceXData[static_cast<std::size_t>(id)])) {
+                    continue;
+                }
+                const int x1 = static_cast<int>((sourceXData[static_cast<std::size_t>(id)] - this->xMin) *
+                                                lineWidth /
+                                                (this->xMax - this->xMin));
+                if (x1 < 0 || x1 >= lineWidth) {
+                    continue;
+                }
+                const int shiftedIndex = (id + dataCount / 2) % dataCount;
+                const float value = sourceYData[static_cast<std::size_t>(shiftedIndex)];
+                if (std::isfinite(value)) {
+                    float &pixelValue = pixelMaxData[static_cast<std::size_t>(x1)];
+                    pixelValue = std::isfinite(pixelValue) ? (std::max)(pixelValue, value) : value;
+                }
+            }
+
+            int previousFilled = -1;
+            float previousValue = this->levelMin;
+            for (int x = 0; x < lineWidth; ++x) {
+                const float value = pixelMaxData[static_cast<std::size_t>(x)];
+                if (!std::isfinite(value)) {
+                    continue;
+                }
+
+                if (previousFilled < 0) {
+                    for (int fill = 0; fill < x; ++fill) {
+                        pixelMaxData[static_cast<std::size_t>(fill)] = value;
+                    }
+                } else if (x - previousFilled > 1) {
+                    const int gap = x - previousFilled;
+                    for (int fill = previousFilled + 1; fill < x; ++fill) {
+                        const float t = static_cast<float>(fill - previousFilled) / static_cast<float>(gap);
+                        pixelMaxData[static_cast<std::size_t>(fill)] =
+                            previousValue + (value - previousValue) * t;
+                    }
+                }
+
+                previousFilled = x;
+                previousValue = value;
+            }
+
+            if (previousFilled < 0) {
+                std::fill(pixelMaxData.begin(), pixelMaxData.end(), this->levelMin);
+            } else {
+                for (int fill = previousFilled + 1; fill < lineWidth; ++fill) {
+                    pixelMaxData[static_cast<std::size_t>(fill)] = previousValue;
+                }
+            }
+
+            const float contrastFactor = this->contrast / 10.0f;
+            const float sensitivityFactor = this->sensitivity / 10.0f;
+            const double span = this->xMax - this->xMin;
+            for (int x = 0; x < lineWidth; ++x) {
+                const std::size_t index = static_cast<std::size_t>(x);
+                pixelFrequencyData[index] = static_cast<float>(
+                    this->xMin + (static_cast<double>(x) + 0.5) * span / static_cast<double>(lineWidth));
+                pixelLevelData[index] = pixelMaxData[index];
+                writeWaterfallColor(normalizedLevel(pixelMaxData[index]),
+                                    contrastFactor,
+                                    sensitivityFactor,
+                                    &lineData[index * 3]);
+            }
+            pendingTextureLine = true;
+        }
+
+        if (!updateQueued) {
+            updateQueued = true;
+            shouldScheduleUpdate = true;
+        }
     }
 
-    computeLineData();
+    if (shouldScheduleUpdate) {
+        QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
+    }
+}
+
+void MyWaterfallWidget::setRowsPerFrame(int rows) {
+    const int clampedRows = (std::clamp)(rows, 1, 8);
+    QMutexLocker locker(&mutex);
+    rowsPerFrame = clampedRows;
 }
 
 void MyWaterfallWidget::setLevelRange(float minLevel, float maxLevel) {
@@ -386,6 +569,8 @@ void MyWaterfallWidget::clearData() {
         QMutexLocker locker(&mutex);
         xData.clear();
         yData.clear();
+        pixelFrequencyData.clear();
+        pixelLevelData.clear();
         fftLength = 0;
         std::fill(lineData.begin(), lineData.end(), 0);
         pendingTextureLine = false;
@@ -395,82 +580,50 @@ void MyWaterfallWidget::clearData() {
 }
 
 void MyWaterfallWidget::computeLineData() {
+    bool shouldScheduleUpdate = false;
 	QMutexLocker locker(&mutex);
     ensureLineBuffer();
-    if (lineData.empty() || xData.empty() || yData.empty() || fftLength <= 0 || qFuzzyCompare(xMin, xMax)) {
-        QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
+    if (lineData.empty() || pixelLevelData.empty()) {
+        if (!updateQueued) {
+            updateQueued = true;
+            shouldScheduleUpdate = true;
+        }
+        locker.unlock();
+        if (shouldScheduleUpdate) {
+            QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
+        }
         return;
     }
-    std::fill(lineData.begin(), lineData.end(), 0);
 
 	float contrastFactor = contrast/10;
 	float sensitivityFactor = sensitivity/10;
     const int lineWidth = std::max(1, width());
-    const int dataCount = std::min({fftLength, static_cast<int>(xData.size()), static_cast<int>(yData.size())});
-    std::vector<float> pixelMax(static_cast<size_t>(lineWidth),
-                                std::numeric_limits<float>::quiet_NaN());
-    for (int id = 0; id < dataCount; ++id) {
-        if (!std::isfinite(xData[id])) {
-            continue;
-        }
-        const int x1 = static_cast<int>((xData[id] - xMin) * lineWidth / (xMax - xMin));
-        if (x1 < 0 || x1 >= lineWidth) {
-            continue;
-        }
-        const int shiftedIndex = (id + dataCount / 2) % dataCount;
-        const float value = yData[shiftedIndex];
-        if (std::isfinite(value)) {
-            float &pixelValue = pixelMax[static_cast<size_t>(x1)];
-            pixelValue = std::isfinite(pixelValue) ? (std::max)(pixelValue, value) : value;
-        }
+    const int dataCount = std::min(lineWidth, static_cast<int>(pixelLevelData.size()));
+    if (dataCount < lineWidth) {
+        std::fill(lineData.begin(), lineData.end(), 0);
     }
-
-    int previousFilled = -1;
-    float previousValue = levelMin;
-    for (int x = 0; x < lineWidth; ++x) {
-        const float value = pixelMax[static_cast<size_t>(x)];
-        if (!std::isfinite(value)) {
-            continue;
-        }
-
-        if (previousFilled < 0) {
-            for (int fill = 0; fill < x; ++fill) {
-                pixelMax[static_cast<size_t>(fill)] = value;
-            }
-        } else if (x - previousFilled > 1) {
-            const int gap = x - previousFilled;
-            for (int fill = previousFilled + 1; fill < x; ++fill) {
-                const float t = static_cast<float>(fill - previousFilled) / static_cast<float>(gap);
-                pixelMax[static_cast<size_t>(fill)] = previousValue + (value - previousValue) * t;
-            }
-        }
-
-        previousFilled = x;
-        previousValue = value;
-    }
-
-    if (previousFilled < 0) {
-        std::fill(pixelMax.begin(), pixelMax.end(), levelMin);
-    } else {
-        for (int fill = previousFilled + 1; fill < lineWidth; ++fill) {
-            pixelMax[static_cast<size_t>(fill)] = previousValue;
-        }
-    }
-
-    for (int x = 0; x < lineWidth; ++x) {
-        QColor color = valueToColor(normalizedLevel(pixelMax[static_cast<size_t>(x)]), contrastFactor, sensitivityFactor);
-        lineData[x * 3 + 0] = static_cast<unsigned char>(color.red());
-        lineData[x * 3 + 1] = static_cast<unsigned char>(color.green());
-        lineData[x * 3 + 2] = static_cast<unsigned char>(color.blue());
+    for (int x = 0; x < dataCount; ++x) {
+        writeWaterfallColor(normalizedLevel(pixelLevelData[static_cast<std::size_t>(x)]),
+                            contrastFactor,
+                            sensitivityFactor,
+                            &lineData[static_cast<std::size_t>(x) * 3]);
     }
     pendingTextureLine = true;
-    QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
+    if (!updateQueued) {
+        updateQueued = true;
+        shouldScheduleUpdate = true;
+    }
+    locker.unlock();
+    if (shouldScheduleUpdate) {
+        QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
+    }
 }
 
 void MyWaterfallWidget::paintGL() {
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     {
         QMutexLocker locker(&mutex);
+        updateQueued = false;
         if (width() <= 0 || height() <= 0) {
             return;
         }
@@ -530,8 +683,19 @@ void MyWaterfallWidget::paintGL() {
             resizeWaterfallTexturePreserve(texWidth, texHeight);
         }
         if (pendingTextureLine && !lineData.empty()) {
-            waterfallWriteRow = (waterfallWriteRow + textureHeight - 1) % textureHeight;
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, waterfallWriteRow, textureWidth, 1, GL_RGB, GL_UNSIGNED_BYTE, lineData.data());
+            const int rowsToWrite = (std::clamp)(rowsPerFrame, 1, (std::max)(1, textureHeight));
+            for (int row = 0; row < rowsToWrite; ++row) {
+                waterfallWriteRow = (waterfallWriteRow + textureHeight - 1) % textureHeight;
+                glTexSubImage2D(GL_TEXTURE_2D,
+                                0,
+                                0,
+                                waterfallWriteRow,
+                                textureWidth,
+                                1,
+                                GL_RGB,
+                                GL_UNSIGNED_BYTE,
+                                lineData.data());
+            }
             pendingTextureLine = false;
         }
         const float vStart = static_cast<float>(waterfallWriteRow) / static_cast<float>(textureHeight);

@@ -2,11 +2,12 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android network-client support work. Version 4.1 keeps the stable
+and Android USB/network client support work. Version 4.2 keeps the stable
 real-device, network, and video/image work from the 2.x/3.x line, expands the
-DMR laboratory monitor, adds optional GPL DMR voice backend modules, improves
-scan/measurement tooling, adds the GNSS/QTH laboratory workflow, and keeps the
-desktop, Raspberry Pi, and Android tuning controls current.
+receiver backend layer, adds native RTL-SDR/rtl_tcp and optional SoapySDR
+backends, improves scan/measurement tooling, keeps the GNSS/QTH laboratory
+workflow available, and keeps the desktop, Raspberry Pi, and Android tuning
+controls current.
 
 ## Windows Release Package
 
@@ -23,12 +24,12 @@ for map providers, and UI settings. The desktop app also provides
 `Settings... -> Settings backup -> Export settings... / Import settings...` for
 making a separate backup file.
 
-DMR voice in 4.1 is experimental. Windows packages may include optional
+DMR voice in 4.2 is experimental. Windows packages may include optional
 `dmr_voice_backends/fobos_dmr_voice_*.dll` GPL backend modules. See
 `THIRD_PARTY_LICENSES.txt` and `licenses/dmr_voice_backend/` before
 redistributing AMBE-capable binaries.
 
-GNSS/QTH work in 4.1 is a laboratory workflow, not a finished
+GNSS/QTH work in 4.2 is a laboratory workflow, not a finished
 navigation receiver. See `docs/gnss_preflight_4.1.md` for the recommended test
 order, RF notes, and the generated acquisition report files.
 
@@ -106,7 +107,8 @@ On Linux/Raspberry Pi the same backend project builds shared libraries with
   buttons.
 - Network server/client mode with remote control, audio/spectrum streaming,
   channel IQ streaming, full IQ client processing, and observer clients.
-- Standard Fobos API and Fobos SDR agile API device discovery.
+- Runtime-selectable receiver backend layer with Standard Fobos API, Fobos SDR
+  agile API, native RTL-SDR, rtl_tcp, and optional SoapySDR discovery.
 
 ## Build Notes
 
@@ -151,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File tools\package_windows_release.ps1
 
 The application icon is stored in `packaging/icons` and is embedded into the
 Windows executable, the Qt runtime resources, Linux desktop installs, and the
-Android network client launcher.
+Android USB/network client launcher.
 
 Optional Windows code signing requires a real code-signing certificate from a
 trusted certificate authority if you want Windows to show a verified publisher.
@@ -287,18 +289,17 @@ on the machine that demodulates audio. Open
 port as needed. This mode also carries 48 kHz mono PCM, but uses an ordinary
 HTTP WAV stream instead of the FobosAPP UDP framing.
 
-## Android Network Client
+## Android USB/Network Client
 
-An Android network client lives in `android/network-client`. It is a separate
-Android Studio project that talks to the existing FobosAPP network server over
-the TCP control channel. The current Android client supports remote
+An Android USB/network client lives in `android/network-client`. It is a
+separate Android Studio project that can talk to the existing FobosAPP network
+server over the TCP control channel or run the current direct USB/OTG Fobos
+preview path. The current Android client supports remote
 start/stop/settings, observer/controller role handling, spectrum/waterfall
 display, zoom/pan, tap-to-tune, frequency presets, band-marker overlays, and
-48 kHz mono ready-audio playback.
-
-Direct Android USB access to the Fobos receiver is still experimental
-preparation work; the reliable Android path for this release is network-client
-operation against a desktop or Raspberry Pi FobosAPP server.
+48 kHz mono ready-audio playback in network mode. The USB/OTG path can open a
+Fobos receiver through Android USB Host, apply basic receiver settings, and
+show an experimental live spectrum/waterfall preview on compatible hardware.
 
 Android debug APKs are signed by the normal Android debug key. For a signed
 release APK, set these environment variables before running

@@ -1,7 +1,6 @@
 #ifndef DATAPROCESSOR_H
 #define DATAPROCESSOR_H
 
-#include <fobos.h>
 #include <QObject>
 #include <QThread>
 #include <QMutex>
@@ -15,10 +14,14 @@
 #include <condition_variable>
 #include <QElapsedTimer>
 #include <QByteArray>
+#include <QJsonArray>
+#include <QString>
 #include <atomic>
 #include <array>
 #include <complex>
+#include <cstdint>
 #include "radiosettings.h"
+#include "receiverbackend.h"
 //#include <main.h>
 
 
@@ -40,12 +43,22 @@ public:
                          bool publishIqSnapshot = true,
                          bool emitIqFrames = false,
                          bool agileScanEnabled = false);
+    void startProcessing(const ReceiverStreamDescriptor &stream);
     void requestStop();
     void finalizeStopped();
     bool forceStop(int timeoutMs = 1000);
     bool stop(int timeoutMs = 5000);
     uint64_t callbackCount() const;
     void setSampleRateHint(double sampleRate);
+    void setCenterFrequencyHint(double centerFrequency);
+    uint64_t beginIqRetuneBarrier();
+    void startRetuneRawDump(const QString &reason,
+                            uint64_t epoch,
+                            double previousCenterHz,
+                            double requestedCenterHz,
+                            double actualCenterHz,
+                            int maxBlocks = 8);
+    bool retuneCenterFrequency(double centerFrequencyHz);
     void updateNetworkIqSettings(const RadioSettings &settings, bool channelizeFrames);
     void configureNetworkIqStreaming(const RadioSettings &settings, bool emitFrames, bool channelizeFrames);
 signals:
@@ -59,6 +72,12 @@ private:
     void resetNetworkIqState();
     void resetStreamDiagnostics();
     void updateStreamDiagnostics(const float *samples, uint32_t sampleCount, const char *readerMode);
+    void captureRetuneRawDumpBlock(const float *samples, uint32_t sampleCount, uint64_t callbackEpoch);
+    void finishRetuneRawDumpLocked(const QString &status);
+    void runRtlTcpReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
+    void runRtlSdrNativeReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
+    void runSoapySdrReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
+    void handleUnsigned8IqData(const unsigned char *buf, uint32_t byteCount, const char *readerMode);
 
 //signals:
     //void dataReady();
@@ -72,9 +91,16 @@ private:
     std::atomic<bool> requestedChannelizeIqFrames;
     std::atomic<bool> requestedAgileScanEnabled;
     std::atomic<bool> networkIqResetRequested;
+    std::atomic<bool> asyncCancelRequested{false};
+    std::atomic<uint64_t> iqRetuneEpoch;
     std::atomic<double> requestedSampleRate;
+    std::atomic<double> requestedCenterFrequency;
     std::atomic<void*> activeDevice;
     std::atomic<FobosApiKind> activeApiKind;
+    ReceiverBackendStreamKind activeStreamKind = ReceiverBackendStreamKind::FobosStandard;
+    QString activeBackendId;
+    QString activeBackendName;
+    ReceiverStreamDescriptor activeStreamDescriptor;
     std::mutex networkIqSettingsMutex;
     RadioSettings networkIqSettings;
     double networkIqNcoPhase = 0.0;
@@ -113,9 +139,28 @@ private:
     double streamDiagnosticMeanI = 0.0;
     double streamDiagnosticMeanQ = 0.0;
     double streamDiagnosticPower = 0.0;
+    double streamDiagnosticPhaseStepSum = 0.0;
+    double streamDiagnosticPhaseStepAbsSum = 0.0;
+    uint64_t streamDiagnosticPhaseStepCount = 0;
     uint64_t streamDiagnosticInspectedSamples = 0;
     uint64_t streamDiagnosticNonFiniteSamples = 0;
     uint64_t streamDiagnosticClippedSamples = 0;
+    std::mutex retuneRawDumpMutex;
+    bool retuneRawDumpActive = false;
+    uint64_t retuneRawDumpEpoch = 0;
+    uint64_t retuneRawDumpTriggerCallback = 0;
+    int retuneRawDumpBlocksRequested = 0;
+    int retuneRawDumpBlocksRemaining = 0;
+    int retuneRawDumpBlocksCaptured = 0;
+    quint64 retuneRawDumpSamplesCaptured = 0;
+    double retuneRawDumpPreviousCenterHz = 0.0;
+    double retuneRawDumpRequestedCenterHz = 0.0;
+    double retuneRawDumpActualCenterHz = 0.0;
+    double retuneRawDumpSampleRateHz = 0.0;
+    QString retuneRawDumpReason;
+    QString retuneRawDumpBasePath;
+    QByteArray retuneRawDumpBytes;
+    QJsonArray retuneRawDumpBlockStats;
 //int reti;
 };
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.1.0)
+project(FobosAPP VERSION 4.2.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -100,6 +100,8 @@ set(SOURCES
     src/frequencycontrol.h
     src/finetunewidget.cpp
     src/finetunewidget.h
+    src/fobosbackend.cpp
+    src/fobosbackend.h
     src/fpvhunterdetector.cpp
     src/fpvhunterdetector.h
     src/gnssacquisition.cpp
@@ -121,6 +123,11 @@ set(SOURCES
     src/recordingmanager.cpp
     src/recordingmanager.h
     src/radiosettings.h
+    src/receiverbackend.h
+    src/receiverbackendregistry.cpp
+    src/receiverbackendregistry.h
+    src/rtlsdrbackend.cpp
+    src/rtlsdrbackend.h
     src/spectrumhuntercontrols.cpp
     src/spectrumhuntercontrols.h
     src/videoprocessor.cpp
@@ -139,6 +146,8 @@ set(SOURCES
     src/scalewidget.h
     src/scanvisualassembler.cpp
     src/scanvisualassembler.h
+    src/soapysdrbackend.cpp
+    src/soapysdrbackend.h
     src/app_resources.qrc
 )
 

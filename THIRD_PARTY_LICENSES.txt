@@ -1,5 +1,5 @@
 FobosAPP third-party components
-Version: 4.0 beta release preparation
+Version: 4.2 release preparation
 
 FobosAPP is prepared for publication as a GPL project. The repository root
 contains the GNU General Public License version 2 text in LICENSE.
@@ -149,8 +149,49 @@ using AMBE-capable binaries.
    and the softdmr GPL license when distributing source or binaries that use
    this backend.
 
+11. RTL-SDR / librtlsdr optional runtime
+   Runtime files, when installed or copied next to FobosAPP:
+   - rtlsdr.dll
+   - rtlsdr/rtlsdr.dll
+   - rtlsdr/libusb-1.0.dll
+   - rtlsdr/rtl_test.exe
+
+   Upstream:
+   - https://github.com/steve-m/librtlsdr
+
+   FobosAPP loads rtlsdr.dll dynamically at runtime. Native RTL-SDR support is
+   optional and is not required to build or start FobosAPP. The alternative
+   rtl_tcp backend can also connect to an external rtl_tcp server without
+   loading the local DLL.
+
+   License: GNU General Public License version 2 or later for librtlsdr.
+   Local license text:
+   - licenses/rtl-sdr-COPYING.txt
+
+12. SoapySDR optional runtime
+   Runtime files, when installed or copied next to FobosAPP:
+   - SoapySDR.dll
+   - optional SoapySDR device modules/plugins
+
+   Upstream:
+   - https://github.com/pothosware/SoapySDR
+
+   FobosAPP loads SoapySDR dynamically at runtime. SoapySDR is not required to
+   build or start FobosAPP. If the runtime and device modules are available,
+   the optional SoapySDR receiver backend can open the first detected RX device
+   using a CF32 stream.
+
+   License: Boost Software License 1.0 for SoapySDR itself. Individual
+   SoapySDR device modules may use their own licenses and should be checked
+   separately before bundling them in a binary release.
+
 Release/source obligation note:
 If a binary release includes GPL DMR voice backend DLLs, publish the
 corresponding FobosAPP and FobosDMRVoiceBackend-gpl source, plus the exact
 mbelib-neo and softdmr/OpenDMR source revisions used to build those DLLs, or
 provide an equivalent GPL-compliant source offer.
+
+If a binary release includes rtlsdr.dll or rtl_test.exe, also publish the exact
+librtlsdr source revision used for those binaries, or provide an equivalent
+GPL-compliant source offer. The FobosAPP repository itself does not vendor the
+local RTL-SDR checkout used during development.

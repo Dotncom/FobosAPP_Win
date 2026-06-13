@@ -140,7 +140,7 @@ struct RadioSettings {
     double centerFrequency = 100000000.0;
     double actualFrequency = 100000000.0;
     double listeningFrequency = 100000000.0;
-    double sampleRate = 80000000.0;
+    double sampleRate = 50000000.0;
     double bandwidth = 10000.0;
     int modulationType = 0;
     int fftLength = 32768;

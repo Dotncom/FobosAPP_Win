@@ -1,0 +1,111 @@
+#ifndef RECEIVERBACKEND_H
+#define RECEIVERBACKEND_H
+
+#include "radiosettings.h"
+
+#include <QByteArray>
+#include <QFlags>
+#include <QList>
+#include <QString>
+#include <QVector>
+
+#include <cstdint>
+#include <functional>
+
+enum class ReceiverBackendFeature {
+    HardwareBandwidth = 0,
+    DirectSamplingHf1,
+    DirectSamplingHf2,
+    DirectSamplingHf1PlusHf2,
+    GpoControl,
+    FastRetune,
+    AgileScan,
+    BiasTee,
+    PpmCorrection
+};
+
+Q_DECLARE_FLAGS(ReceiverBackendFeatures, ReceiverBackendFeature)
+Q_DECLARE_OPERATORS_FOR_FLAGS(ReceiverBackendFeatures)
+
+enum class ReceiverBackendStreamKind {
+    FobosStandard = 0,
+    FobosAgile,
+    RtlSdrNative,
+    RtlTcp,
+    SoapySdr
+};
+
+struct ReceiverBackendDeviceInfo {
+    QString backendId;
+    QString backendName;
+    int nativeIndex = 0;
+    QString label;
+    QString serial;
+    QString hardwareRevision;
+    QString firmwareVersion;
+    QString product;
+    QString manufacturer;
+};
+
+struct ReceiverBackendCapabilities {
+    ReceiverBackendFeatures features;
+    QVector<double> sampleRatesHz;
+    double minFrequencyHz = 0.0;
+    double maxFrequencyHz = 0.0;
+};
+
+struct ReceiverIqFrame {
+    const float *floatIq = nullptr;
+    int floatCount = 0;
+    QByteArray packedIq;
+    double centerFrequencyHz = 0.0;
+    double actualFrequencyHz = 0.0;
+    double sampleRateHz = 0.0;
+    quint64 sequence = 0;
+    qint64 hostTimestampNs = 0;
+    QString backendId;
+    QString sampleFormat;
+};
+
+struct ReceiverStreamDescriptor {
+    ReceiverBackendStreamKind kind = ReceiverBackendStreamKind::FobosStandard;
+    void *nativeDevice = nullptr;
+    FobosApiKind fobosApiKind = FobosApiKind::Standard;
+    QString backendId = QStringLiteral("fobos");
+    QString backendName = QStringLiteral("Fobos SDR");
+    double sampleRateHz = 0.0;
+    double centerFrequencyHz = 0.0;
+    QString rtlTcpHost = QStringLiteral("127.0.0.1");
+    quint16 rtlTcpPort = 1234;
+    int rtlSdrNativeDeviceIndex = 0;
+    int soapySdrDeviceIndex = 0;
+    int rtlTcpTunerGainTenthsDb = -1;
+    bool rtlTcpAgc = true;
+    bool syncReader = false;
+    bool queueAudioBlocks = false;
+    bool publishIqSnapshot = true;
+    bool emitIqFrames = false;
+    bool agileScanEnabled = false;
+};
+
+using ReceiverIqCallback = std::function<void(const ReceiverIqFrame &)>;
+
+class ReceiverBackend {
+public:
+    virtual ~ReceiverBackend() = default;
+
+    virtual QString id() const = 0;
+    virtual QString displayName() const = 0;
+    virtual QList<ReceiverBackendDeviceInfo> enumerate() = 0;
+    virtual ReceiverBackendCapabilities capabilities() const = 0;
+
+    virtual bool open(int nativeIndex, QString *errorMessage = nullptr) = 0;
+    virtual void close() = 0;
+    virtual bool isOpen() const = 0;
+
+    virtual bool applySettings(const RadioSettings &settings, QString *errorMessage = nullptr) = 0;
+    virtual bool startStream(ReceiverIqCallback callback, QString *errorMessage = nullptr) = 0;
+    virtual void stopStream() = 0;
+};
+
+#endif // RECEIVERBACKEND_H
