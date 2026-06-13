@@ -138,6 +138,13 @@ int rtlSdrNativeIndexFromComboValue(int value) {
     return RTLSDR_NATIVE_DEVICE_INDEX_BASE - value;
 }
 
+QString rtlSdrNativeDeviceLabel(int nativeIndex, const QString &name) {
+    const QString cleanName = name.trimmed().isEmpty()
+                                  ? QStringLiteral("RTL-SDR")
+                                  : name.trimmed();
+    return QStringLiteral("RTL-SDR native #%1 (%2)").arg(nativeIndex).arg(cleanName);
+}
+
 bool isKnownRtlSampleRate(double value) {
     static const double rtlRates[] = {
         1024000.0,
@@ -2764,8 +2771,17 @@ YourClassName::YourClassName(QWidget *parent)
     for (int i = 0; i < comboBox->count(); ++i) {
         comboBox->setItemData(i, i);
     }
+    const QVector<RtlSdrDeviceInfo> initialRtlDevices = enumerateRtlSdrDevices();
     int comboDataIndex = availableFobosDevices.size();
-    if (comboBox->count() > comboDataIndex) {
+    if (!initialRtlDevices.isEmpty()) {
+        for (const RtlSdrDeviceInfo &rtlInfo : initialRtlDevices) {
+            if (comboBox->count() <= comboDataIndex) {
+                break;
+            }
+            comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(rtlInfo.nativeIndex));
+            ++comboDataIndex;
+        }
+    } else if (comboBox->count() > comboDataIndex) {
         comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(0));
         ++comboDataIndex;
     }
@@ -4234,7 +4250,14 @@ YourClassName::YourClassName(QWidget *parent)
         for (const FobosDeviceInfo &info : std::as_const(availableFobosDevices)) {
             deviceLabels << info.label;
         }
-        deviceLabels << QStringLiteral("RTL-SDR native #0 (rtlsdr.dll)");
+        const QVector<RtlSdrDeviceInfo> rtlDevices = enumerateRtlSdrDevices();
+        if (rtlDevices.isEmpty()) {
+            deviceLabels << QStringLiteral("RTL-SDR native auto (rtlsdr.dll)");
+        } else {
+            for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
+                deviceLabels << rtlSdrNativeDeviceLabel(rtlInfo.nativeIndex, rtlInfo.name);
+            }
+        }
         deviceLabels << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
         deviceLabels << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
         if (deviceLabels.isEmpty()) {
@@ -4246,7 +4269,15 @@ YourClassName::YourClassName(QWidget *parent)
             comboBox->setItemData(i, i);
         }
         int comboDataIndex = availableFobosDevices.size();
-        if (comboBox->count() > comboDataIndex) {
+        if (!rtlDevices.isEmpty()) {
+            for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
+                if (comboBox->count() <= comboDataIndex) {
+                    break;
+                }
+                comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(rtlInfo.nativeIndex));
+                ++comboDataIndex;
+            }
+        } else if (comboBox->count() > comboDataIndex) {
             comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(0));
             ++comboDataIndex;
         }
@@ -20829,7 +20860,14 @@ QStringList YourClassName::getFobosDevices() {
     for (const FobosDeviceInfo &info : std::as_const(availableFobosDevices)) {
         deviceList << info.label;
     }
-    deviceList << QStringLiteral("RTL-SDR native #0 (rtlsdr.dll)");
+    const QVector<RtlSdrDeviceInfo> rtlDevices = enumerateRtlSdrDevices();
+    if (rtlDevices.isEmpty()) {
+        deviceList << QStringLiteral("RTL-SDR native auto (rtlsdr.dll)");
+    } else {
+        for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
+            deviceList << rtlSdrNativeDeviceLabel(rtlInfo.nativeIndex, rtlInfo.name);
+        }
+    }
     deviceList << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
     deviceList << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
     if (deviceList.isEmpty()) {

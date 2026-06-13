@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.2.1 - 2026-06-14
+
+### Fixed
+
+- Fixed native RTL-SDR startup when `rtlsdr.dll` enumerates more than one
+  device and index `0` cannot be opened. FobosAPP now lists real native RTL-SDR
+  indices in the receiver combo and falls back to the next visible RTL-SDR
+  device if the selected one fails to open.
+
 ## 4.2 - 2026-06-14
 
 ### Added

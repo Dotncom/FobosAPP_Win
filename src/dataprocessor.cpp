@@ -813,18 +813,52 @@ void DataProcessor::runRtlSdrNativeReader(const ReceiverStreamDescriptor &stream
              << "count" << devices.size()
              << "devices" << deviceLabels;
 
+    QVector<int> openOrder;
+    auto appendOpenIndex = [&openOrder](int index) {
+        index = (std::max)(0, index);
+        if (!openOrder.contains(index)) {
+            openOrder.append(index);
+        }
+    };
+    appendOpenIndex(stream.rtlSdrNativeDeviceIndex);
+    for (const RtlSdrDeviceInfo &deviceInfo : devices) {
+        appendOpenIndex(deviceInfo.nativeIndex);
+    }
+
     void *rtlDevice = nullptr;
-    int ret = openRtlSdrDeviceSafely(&rtlDevice, static_cast<uint32_t>((std::max)(0, stream.rtlSdrNativeDeviceIndex)));
-    qDebug() << "[RTL-SDR] open"
-             << "index" << stream.rtlSdrNativeDeviceIndex
-             << "result" << ret
-             << "device" << rtlDevice
-             << "library" << loadedPath;
+    int ret = RTLSDR_NATIVE_ERR_OPEN;
+    int openedIndex = -1;
+    for (int candidateIndex : std::as_const(openOrder)) {
+        void *candidateDevice = nullptr;
+        const int candidateResult =
+            openRtlSdrDeviceSafely(&candidateDevice, static_cast<uint32_t>(candidateIndex));
+        qDebug() << "[RTL-SDR] open candidate"
+                 << "index" << candidateIndex
+                 << "requested" << stream.rtlSdrNativeDeviceIndex
+                 << "result" << candidateResult
+                 << "device" << candidateDevice
+                 << "library" << loadedPath;
+        if (candidateResult == 0 && candidateDevice) {
+            rtlDevice = candidateDevice;
+            ret = candidateResult;
+            openedIndex = candidateIndex;
+            break;
+        }
+        if (candidateDevice) {
+            closeRtlSdrDeviceSafely(candidateDevice);
+        }
+        ret = candidateResult;
+    }
     if (ret != 0 || !rtlDevice) {
         emit readerFailed(RTLSDR_NATIVE_ERR_OPEN, !running.load());
         running = false;
         return;
     }
+
+    qDebug() << "[RTL-SDR] opened"
+             << "index" << openedIndex
+             << "requested" << stream.rtlSdrNativeDeviceIndex
+             << "device" << rtlDevice;
 
     activeDevice = rtlDevice;
     const double sampleRate = stream.sampleRateHz > 0.0 ? stream.sampleRateHz : requestedSampleRate.load();
