@@ -41,6 +41,10 @@ The 2026-06-13 synthetic GPS self-test also found the injected PRN immediately i
 
 ## Optimization Ideas
 
+See also `docs/architecture_iq_path.md` for the current IQ-path contract,
+hot-path invariants, and the evaluation of whether `DataProcessor` and
+`IqBuffer` should be merged.
+
 1. Reduce GNSS Doppler search cost:
    - start with narrower Doppler windows when assisted time/location/known PRNs are available;
    - use a coarse search first, then refine only the top candidates.

@@ -230,6 +230,8 @@ private:
     bool applyAgileScanSettings(bool forceStop = false);
     bool applyStandardScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
+    double agileScanAutoStepMhz() const;
+    void applyAgileScanAutoStep(bool updateSpin = true);
     QVector<double> standardScanFrequencyList(QString *error = nullptr) const;
     QVector<double> listeningScanFrequencyList(QString *error = nullptr) const;
     double currentAgileScanCenterFrequencyHz() const;
@@ -495,6 +497,7 @@ private:
     QPushButton *gnssSelfTestButton = nullptr;
     QPushButton *gnssPositionSelfTestButton = nullptr;
     QPushButton *gnssNetworkTimeButton = nullptr;
+    QPushButton *gnssPlotButton = nullptr;
     QPushButton *gnssMonitorResetButton = nullptr;
     
     QCheckBox *spectrumCheckbox = nullptr;
@@ -582,6 +585,7 @@ private:
     QLineEdit *qthOnlineApiKeyEdit = nullptr;
     QLineEdit *qthMapSearchEdit = nullptr;
     QDoubleSpinBox *agileScanStepSpin = nullptr;
+    QCheckBox *agileScanAutoStepCheckbox = nullptr;
     QDoubleSpinBox *qthLatitudeSpin = nullptr;
     QDoubleSpinBox *qthLongitudeSpin = nullptr;
     QDoubleSpinBox *gnssChannelFilterSpin = nullptr;
@@ -716,7 +720,7 @@ private:
     int fineTuneControlMode = 0;
     bool fineTuneScaleHoldMode = false;
     bool serverDisableLocalVisualAudio = true;
-    bool digitalDecodeEnabled = true;
+    bool digitalDecodeEnabled = false;
     QByteArray pendingDmrDecoderPcm;
     int pendingDmrDecoderSampleRate = 48000;
     std::atomic<uint64_t> digitalDecoderGeneration {0};
@@ -731,6 +735,7 @@ private:
     bool listeningScanEnabled = false;
     bool listeningScanRunning = false;
     bool scanListeningLockEnabled = true;
+    bool agileScanAutoStepSampleRate = true;
     QString agileScanRangesMhz = QStringLiteral("430-432");
     double agileScanStepMhz = 0.0125;
     QString standardScanCentersMhz = QStringLiteral("430, 480");
@@ -746,8 +751,8 @@ private:
     QMap<QString, QString> listeningScanPresets;
     QStringList listeningScanPresetOrder;
     int spectrumUpdateIntervalMs = 0;
-    int waterfallRowsPerFrame = 2;
-    bool scanMeasurementEnabled = false;
+    int waterfallRowsPerFrame = 1;
+    bool scanMeasurementEnabled = true;
     bool scanMeasurementBaselineRecording = false;
     double scanMeasurementBinMhz = 0.1;
     DmrHunterSettings dmrHunterSettings;
@@ -865,8 +870,8 @@ private:
     bool frequencyControlUiStateRestorePending = false;
     QVector<GraphBandMarker> bandMarkers;
     bool bandMarkersCustomized = false;
-    bool showGeneralBandMarkers = false;
-    bool showAmateurBandMarkers = false;
+    bool showGeneralBandMarkers = true;
+    bool showAmateurBandMarkers = true;
     bool compactBandMarkers = false;
     bool diagnosticVerboseLogging = false;
     bool gnssMonitorEnabled = false;
@@ -885,6 +890,7 @@ private:
     QElapsedTimer gnssMonitorUiTimer;
     QElapsedTimer gnssSpurWatchTimer;
     QElapsedTimer gnssSpurLogTimer;
+    QDialog *gnssAcquisitionPlotDialog = nullptr;
     double qthLatitude = 0.0;
     double qthLongitude = 0.0;
     QString qthSource = QStringLiteral("manual");
@@ -936,8 +942,8 @@ private:
     quint16 audioHttpStreamPort = 21092;
     QTcpServer *audioHttpServer = nullptr;
     QList<QTcpSocket *> audioHttpClients;
-    float displayLevelMin = -120.0f;
-    float displayLevelMax = 0.0f;
+    float displayLevelMin = -140.0f;
+    float displayLevelMax = -30.0f;
     bool persistentSettingsReady = false;
     int minScale = 1;
     int maxScale = 1000;

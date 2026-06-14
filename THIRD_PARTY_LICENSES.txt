@@ -1,5 +1,5 @@
 FobosAPP third-party components
-Version: 4.2.1 release preparation
+Version: 4.2.2 release preparation
 
 FobosAPP is prepared for publication as a GPL project. The repository root
 contains the GNU General Public License version 2 text in LICENSE.

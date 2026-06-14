@@ -145,6 +145,23 @@ These come immediately after the current GNSS work, as requested.
 
 Goal: compare FobosAPP architecture against mature SDR applications and decide what to simplify, optimize, or isolate before the codebase becomes harder to move.
 
+Near-term cleanup order:
+
+1. Document the hot IQ-path contract before refactoring it.
+   - Status: first contract written in `docs/architecture_iq_path.md`.
+   - Keep Fobos native IQ reading as the optimized primary path.
+   - Treat snapshots and ordered IQ blocks as different consumer models.
+   - Do not merge `DataProcessor` and `IqBuffer` unless profiling proves the boundary itself is the bottleneck.
+2. Run a sanitary pass over critical modules.
+   - Remove stale debug hooks, obsolete traces, old comments, and unbounded logging.
+   - Keep behavior unchanged unless a clear bug is found.
+3. Extract cold modules from `main.cpp`.
+   - Prefer help/settings/translations, preset manager glue, QTH/GNSS map UI, GNSS test UI, and scan preset helpers first.
+   - Avoid broad changes to start/stop, tuning, Fobos session, and spectrum update until they are isolated by tests or diagnostics.
+4. Optimize IQ only after the contract is stable.
+   - Prefer reusable queued buffers, cheaper snapshot reads, and block-level metadata over a large architectural rewrite.
+   - Keep UI and Qt signal work outside the receiver callback.
+
 Stability notes to keep:
 
 1. Startup and close can still freeze the UI:

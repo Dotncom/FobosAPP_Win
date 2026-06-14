@@ -1,4 +1,5 @@
 #include "iqbuffer.h"
+#include "diagnosticlogging.h"
 
 #include <deque>
 #include <algorithm>
@@ -32,15 +33,21 @@ int g_traceSnapshotRemaining = 0;
 int g_tracePopRemaining = 0;
 
 bool traceMatchesCurrentEpoch() {
-    return g_traceEpoch != 0 && g_iqEpoch == g_traceEpoch;
+    return fobosVerboseLoggingEnabled() &&
+           g_traceEpoch != 0 &&
+           g_iqEpoch == g_traceEpoch;
 }
 
 bool traceMatchesPublishEpoch(std::uint64_t expectedEpoch) {
-    return g_traceEpoch != 0 &&
+    return fobosVerboseLoggingEnabled() &&
+           g_traceEpoch != 0 &&
            (g_iqEpoch == g_traceEpoch || expectedEpoch == g_traceEpoch);
 }
 
 void logTraceState(const char *event) {
+    if (!fobosVerboseLoggingEnabled()) {
+        return;
+    }
     qDebug() << "[IqBufferTrace]" << event
              << "epoch" << static_cast<qulonglong>(g_iqEpoch)
              << "traceEpoch" << static_cast<qulonglong>(g_traceEpoch)
@@ -382,11 +389,16 @@ void armRetuneTrace(std::uint64_t epoch,
                     int snapshotLogs,
                     int popLogs,
                     int rejectLogs) {
-    if (epoch == 0) {
+    std::lock_guard<std::mutex> lock(g_iqMutex);
+    if (epoch == 0 || !fobosVerboseLoggingEnabled()) {
+        g_traceEpoch = 0;
+        g_tracePublishRemaining = 0;
+        g_traceSnapshotRemaining = 0;
+        g_tracePopRemaining = 0;
+        g_traceRejectRemaining = 0;
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_iqMutex);
     g_traceEpoch = epoch;
     g_tracePublishRemaining = (std::max)(0, publishLogs);
     g_traceSnapshotRemaining = (std::max)(0, snapshotLogs);

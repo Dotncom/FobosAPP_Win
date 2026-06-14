@@ -269,7 +269,9 @@ void AudioProcessor::resetHfNoiseCancelState() {
 }
 
 void AudioProcessor::setAudioDevice(int deviceID) {
-    qDebug() << "start setAudioDevice";
+    if (fobosVerboseLoggingEnabled()) {
+        qDebug() << "[Audio] setAudioDevice" << deviceID;
+    }
     {
         std::lock_guard<std::mutex> lock(settingsMutex);
         selectedAudioDeviceID = deviceID;
@@ -288,7 +290,9 @@ void AudioProcessor::setAudioDevice(int deviceID) {
         closeAudioDevice();
     }
 #endif
-    qDebug() << "Audio device selected. It will be opened when audio starts.";
+    if (fobosVerboseLoggingEnabled()) {
+        qDebug() << "[Audio] device selected; it will be opened when audio starts.";
+    }
 }
 
 void AudioProcessor::setLocalPlaybackEnabled(bool enabled) {
@@ -308,12 +312,14 @@ void AudioProcessor::setVolume(float volume) {
 
 void AudioProcessor::enqueueExternalPcm(const QByteArray &pcmData) {
     if (!running.load() || pcmData.size() < static_cast<int>(sizeof(qint16))) {
-        static std::atomic<int> droppedLogCount{0};
-        const int logIndex = droppedLogCount.fetch_add(1);
-        if (logIndex < 20 || (logIndex % 100) == 0) {
-            qDebug() << "[Audio] external PCM dropped"
-                     << "running" << running.load()
-                     << "bytes" << pcmData.size();
+        if (fobosVerboseLoggingEnabled()) {
+            static std::atomic<int> droppedLogCount{0};
+            const int logIndex = droppedLogCount.fetch_add(1);
+            if (logIndex < 20 || (logIndex % 100) == 0) {
+                qDebug() << "[Audio] external PCM dropped"
+                         << "running" << running.load()
+                         << "bytes" << pcmData.size();
+            }
         }
         return;
     }
@@ -347,15 +353,17 @@ void AudioProcessor::enqueueExternalPcm(const QByteArray &pcmData) {
             externalAudioPrimed = afterInsertSamples >= EXTERNAL_AUDIO_START_BUFFER_SAMPLES;
         }
         notifyPlayback = externalAudioPrimed;
-        static std::atomic<int> queuedLogCount{0};
-        const int logIndex = queuedLogCount.fetch_add(1);
-        if (logIndex < 40 || (logIndex % 100) == 0) {
-            qDebug() << "[Audio] external PCM queued"
-                     << "samples" << samples.size()
-                     << "queued" << afterInsertSamples
-                     << "primed" << externalAudioPrimed
-                     << "notify" << notifyPlayback
-                     << "overflow" << overflow;
+        if (fobosVerboseLoggingEnabled()) {
+            static std::atomic<int> queuedLogCount{0};
+            const int logIndex = queuedLogCount.fetch_add(1);
+            if (logIndex < 40 || (logIndex % 100) == 0) {
+                qDebug() << "[Audio] external PCM queued"
+                         << "samples" << samples.size()
+                         << "queued" << afterInsertSamples
+                         << "primed" << externalAudioPrimed
+                         << "notify" << notifyPlayback
+                         << "overflow" << overflow;
+            }
         }
     }
     if (notifyPlayback) {
@@ -719,18 +727,20 @@ void AudioProcessor::processDmrIqDemodulatorBlock(const std::vector<float>& iqBl
         dmrLastLoggedOutputRate = requestedOutputRate;
         dmrLastLoggedDecimationFactor = decimationFactor;
         dmrLastLoggedChannelRate = channelRate;
-        qDebug() << "[DMR demod] IQ FM/4FSK path"
-                 << "rfRate" << rfInputRate
-                 << "targetChannelRate" << dmrChannelTargetRate
-                 << "channelRate" << channelRate
-                 << "decimation" << decimationFactor
-                 << "outputRate" << requestedOutputRate
-                 << "samplesPerSymbol"
-                 << (static_cast<double>(requestedOutputRate) / 4800.0)
-                 << "cicStages" << DMR_CHANNEL_CIC_STAGES
-                 << "channelCutoffHz" << DMR_FOURFSK_CHANNEL_CUTOFF_HZ
-                 << "symbolFilterHz" << DMR_FOURFSK_SYMBOL_FILTER_HZ
-                 << "outerLevel" << DMR_FOURFSK_OUTPUT_OUTER_LEVEL;
+        if (fobosVerboseLoggingEnabled()) {
+            qDebug() << "[DMR demod] IQ FM/4FSK path"
+                     << "rfRate" << rfInputRate
+                     << "targetChannelRate" << dmrChannelTargetRate
+                     << "channelRate" << channelRate
+                     << "decimation" << decimationFactor
+                     << "outputRate" << requestedOutputRate
+                     << "samplesPerSymbol"
+                     << (static_cast<double>(requestedOutputRate) / 4800.0)
+                     << "cicStages" << DMR_CHANNEL_CIC_STAGES
+                     << "channelCutoffHz" << DMR_FOURFSK_CHANNEL_CUTOFF_HZ
+                     << "symbolFilterHz" << DMR_FOURFSK_SYMBOL_FILTER_HZ
+                     << "outerLevel" << DMR_FOURFSK_OUTPUT_OUTER_LEVEL;
+        }
     }
 
     float rotI = static_cast<float>(std::cos(ncoPhase));

@@ -2,7 +2,7 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android USB/network client support work. Version 4.2.1 keeps the stable
+and Android USB/network client support work. Version 4.2.2 keeps the stable
 real-device, network, and video/image work from the 2.x/3.x line, expands the
 receiver backend layer, adds native RTL-SDR/rtl_tcp and optional SoapySDR
 backends, improves scan/measurement tooling, keeps the GNSS/QTH laboratory
@@ -24,12 +24,12 @@ for map providers, and UI settings. The desktop app also provides
 `Settings... -> Settings backup -> Export settings... / Import settings...` for
 making a separate backup file.
 
-DMR voice in 4.2.1 is experimental. Windows packages may include optional
+DMR voice in 4.2.2 is experimental. Windows packages may include optional
 `dmr_voice_backends/fobos_dmr_voice_*.dll` GPL backend modules. See
 `THIRD_PARTY_LICENSES.txt` and `licenses/dmr_voice_backend/` before
 redistributing AMBE-capable binaries.
 
-GNSS/QTH work in 4.2.1 is a laboratory workflow, not a finished
+GNSS/QTH work in 4.2.2 is a laboratory workflow, not a finished
 navigation receiver. See `docs/gnss_preflight_4.1.md` for the recommended test
 order, RF notes, and the generated acquisition report files.
 

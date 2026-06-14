@@ -141,9 +141,9 @@ struct RadioSettings {
     double actualFrequency = 100000000.0;
     double listeningFrequency = 100000000.0;
     double sampleRate = 50000000.0;
-    double bandwidth = 10000.0;
-    int modulationType = 0;
-    int fftLength = 32768;
+    double bandwidth = 200000.0;
+    int modulationType = MOD_WFM;
+    int fftLength = 65536;
     int lnaGain = 1;
     int vgaGain = 3;
     int audioDeviceId = 0;
@@ -154,7 +154,7 @@ struct RadioSettings {
     double hfNoiseCancelRefDelayNs = 0.0;
     double hfNoiseCancelRefTiltDb = 0.0;
     bool hfNoiseCancelFreeze = false;
-    bool audioEnabled = false;
+    bool audioEnabled = true;
     bool syncEnabled = false;
     std::uint8_t gpoValue = 0;
     bool dmrLabEnabled = false;

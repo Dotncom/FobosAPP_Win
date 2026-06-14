@@ -1215,6 +1215,9 @@ void DataProcessor::resetStreamDiagnostics() {
 void DataProcessor::updateStreamDiagnostics(const float *samples,
                                             uint32_t sampleCount,
                                             const char *readerMode) {
+    if (!fobosVerboseLoggingEnabled()) {
+        return;
+    }
     if (!samples || sampleCount == 0) {
         return;
     }

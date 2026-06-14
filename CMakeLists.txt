@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.2.1)
+project(FobosAPP VERSION 4.2.2)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -83,6 +83,10 @@ endif()
 set(SOURCES
     src/main.cpp
     src/main.h
+    src/appdiagnostics.cpp
+    src/appdiagnostics.h
+    src/apphelp.cpp
+    src/apphelp.h
     src/dataprocessor.cpp
     src/dataprocessor.h
     src/diagnosticlogging.h
@@ -106,6 +110,8 @@ set(SOURCES
     src/fpvhunterdetector.h
     src/gnssacquisition.cpp
     src/gnssacquisition.h
+    src/gnssqthhelpers.cpp
+    src/gnssqthhelpers.h
     src/gnsssignalmonitor.cpp
     src/gnsssignalmonitor.h
     src/iqbuffer.cpp
@@ -114,6 +120,9 @@ set(SOURCES
     src/networkcontroller.h
     src/playbackmanager.cpp
     src/playbackmanager.h
+    src/presethelpers.cpp
+    src/presethelpers.h
+    src/presetmanager.cpp
     src/qthlocator.cpp
     src/qthlocator.h
     src/qthmapwidget.cpp

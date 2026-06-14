@@ -1,4 +1,8 @@
 #include "main.h"
+#include "appdiagnostics.h"
+#include "apphelp.h"
+#include "gnssqthhelpers.h"
+#include "presethelpers.h"
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
 #include "finetunewidget.h"
@@ -24,8 +28,6 @@
 #include <QList>
 #include <QMenu>
 #include <QMetaObject>
-#include <QMessageLogContext>
-#include <QMutexLocker>
 #include <QHostAddress>
 #include <QHostInfo>
 #include <QIcon>
@@ -61,18 +63,10 @@
 #include <cstring>
 #include <limits>
 #include <array>
-#ifdef _WIN32
-#include <psapi.h>
-#endif
-#include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <new>
 #include <utility>
 
-#ifdef _MSC_VER
-#pragma comment(lib, "psapi.lib")
-#endif
 
 fobos_dev_t* device = nullptr;
 fobos_sdr_dev_t* agileDevice = nullptr;
@@ -84,21 +78,21 @@ double globalFrequency = 100000000;
 double actualFrequency = 100000000; 
 double listeningFrequency = 100000000; 
 double globalSampleRate = 50000000;
-double globalBandwidth = 10000;
+double globalBandwidth = 200000;
 double minFrequency = 60000000;
 double maxFrequency = 140000000;
-int globalModulationType = 0;
+int globalModulationType = MOD_WFM;
 int globalMode = 0;
 std::vector<float> fftMagnitudes;
 std::vector<float> fftFrequencies;
-int fftLength = 32768;
+int fftLength = 65536;
 int DEFAULT_BUF_LEN = 32768;
 double currentScale = 100.0;
 bool secondGraph = false;
 bool syncWariable = false;
 float sensitivity = 10;
 float contrast = 10;
-bool colorf = false;
+bool colorf = true;
 int deviceID = 0;
 
 namespace {
@@ -219,7 +213,7 @@ constexpr int SPECTRUM_UPDATE_AUTO_MS = 0;
 constexpr int SPECTRUM_UPDATE_MIN_MS = 5;
 constexpr int SPECTRUM_UPDATE_MAX_MS = 250;
 constexpr int WATERFALL_ROWS_PER_FRAME_MIN = 1;
-constexpr int WATERFALL_ROWS_PER_FRAME_DEFAULT = 2;
+constexpr int WATERFALL_ROWS_PER_FRAME_DEFAULT = 1;
 constexpr int WATERFALL_ROWS_PER_FRAME_MAX = 8;
 constexpr double AGILE_RF_LOW_RATE_AUTO_BANDWIDTH_RATIO = 1.00;
 constexpr double AGILE_RF_MID_RATE_AUTO_BANDWIDTH_RATIO = 1.00;
@@ -239,580 +233,6 @@ constexpr int SPUR_CALIBRATION_OUTER_BINS = 36;
 constexpr int SPUR_MAX_MASK_ENTRIES = 16;
 constexpr double SPUR_MIN_MASK_WIDTH_HZ = 50.0;
 constexpr double SPUR_MAX_MASK_WIDTH_HZ = 20000.0;
-constexpr qint64 DIAGNOSTIC_LOG_MAX_BYTES = 8 * 1024 * 1024;
-constexpr double GNSS_L1_BAND_START_HZ = 1559000000.0;
-constexpr double GNSS_L1_BAND_END_HZ = 1610000000.0;
-constexpr double GNSS_L1_BAND_CENTER_HZ = (GNSS_L1_BAND_START_HZ + GNSS_L1_BAND_END_HZ) * 0.5;
-constexpr double GNSS_L1_LISTENING_SCAN_CENTER_HZ = 1583000000.0;
-constexpr double GNSS_GPS_L1_HZ = 1575420000.0;
-constexpr double GNSS_BEIDOU_B1I_HZ = 1561098000.0;
-constexpr double GNSS_GLONASS_L1_CENTER_HZ = 1602000000.0;
-constexpr double GNSS_RAW_BANDWIDTH_HZ = 2046000.0;
-constexpr double GNSS_USEFUL_STANDARD_SPAN_HZ = 50000000.0;
-constexpr int GNSS_ACQUISITION_INTEGRATION_MS = 24;
-constexpr int GNSS_ACQUISITION_MIN_INTEGRATION_MS = 1;
-constexpr int GNSS_ACQUISITION_MAX_INTEGRATION_MS = 160;
-constexpr int GNSS_DEEP_ACQUISITION_MS = 160;
-constexpr std::size_t GNSS_QUICK_SNAPSHOT_MAX_FLOATS = 4 * 1024 * 1024;
-constexpr double GNSS_CHANNEL_FILTER_MIN_HZ = 300000.0;
-constexpr double GNSS_CHANNEL_FILTER_MAX_HZ = 1840000.0;
-
-enum class GnssAcquisitionKind {
-    None,
-    GpsL1Ca,
-};
-
-struct GnssSystemPreset {
-    QString id;
-    QString textKey;
-    QString fallbackName;
-    double centerHz = 0.0;
-    double targetHz = 0.0;
-    double bandwidthHz = 0.0;
-    QString standardScanCentersMhz;
-    QString agileScanRangesMhz;
-    int standardDwellMs = 3000;
-    int standardSettleMs = 120;
-    GnssAcquisitionKind acquisitionKind = GnssAcquisitionKind::None;
-};
-
-struct ParsedNmeaPosition {
-    double latitude = 0.0;
-    double longitude = 0.0;
-    QString talker;
-    QString sentence;
-    QString utc;
-};
-
-struct Vec3d {
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
-
-struct SyntheticPseudorange {
-    Vec3d satellite;
-    double pseudorangeMeters = 0.0;
-};
-
-struct SyntheticPositionResult {
-    bool valid = false;
-    double latitude = 0.0;
-    double longitude = 0.0;
-    double altitudeMeters = 0.0;
-    double clockBiasMeters = 0.0;
-    double errorMeters = 0.0;
-    int iterations = 0;
-    int satellites = 0;
-};
-
-constexpr double kWgs84A = 6378137.0;
-constexpr double kWgs84F = 1.0 / 298.257223563;
-constexpr double kWgs84E2 = kWgs84F * (2.0 - kWgs84F);
-constexpr double kDegToRad = 3.1415926535897932384626433832795 / 180.0;
-constexpr double kRadToDeg = 180.0 / 3.1415926535897932384626433832795;
-
-Vec3d operator+(const Vec3d &a, const Vec3d &b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-
-Vec3d operator-(const Vec3d &a, const Vec3d &b) {
-    return {a.x - b.x, a.y - b.y, a.z - b.z};
-}
-
-Vec3d operator*(const Vec3d &v, double scale) {
-    return {v.x * scale, v.y * scale, v.z * scale};
-}
-
-double dot(const Vec3d &a, const Vec3d &b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-double norm(const Vec3d &v) {
-    return std::sqrt(dot(v, v));
-}
-
-Vec3d geodeticToEcef(double latitudeDeg, double longitudeDeg, double altitudeMeters) {
-    const double lat = latitudeDeg * kDegToRad;
-    const double lon = longitudeDeg * kDegToRad;
-    const double sinLat = std::sin(lat);
-    const double cosLat = std::cos(lat);
-    const double sinLon = std::sin(lon);
-    const double cosLon = std::cos(lon);
-    const double n = kWgs84A / std::sqrt(1.0 - kWgs84E2 * sinLat * sinLat);
-    return {
-        (n + altitudeMeters) * cosLat * cosLon,
-        (n + altitudeMeters) * cosLat * sinLon,
-        (n * (1.0 - kWgs84E2) + altitudeMeters) * sinLat
-    };
-}
-
-void ecefToGeodetic(const Vec3d &ecef, double *latitudeDeg, double *longitudeDeg, double *altitudeMeters) {
-    const double b = kWgs84A * (1.0 - kWgs84F);
-    const double ep2 = (kWgs84A * kWgs84A - b * b) / (b * b);
-    const double p = std::sqrt(ecef.x * ecef.x + ecef.y * ecef.y);
-    const double theta = std::atan2(ecef.z * kWgs84A, p * b);
-    const double sinTheta = std::sin(theta);
-    const double cosTheta = std::cos(theta);
-    const double lat = std::atan2(ecef.z + ep2 * b * sinTheta * sinTheta * sinTheta,
-                                  p - kWgs84E2 * kWgs84A * cosTheta * cosTheta * cosTheta);
-    const double lon = std::atan2(ecef.y, ecef.x);
-    const double sinLat = std::sin(lat);
-    const double n = kWgs84A / std::sqrt(1.0 - kWgs84E2 * sinLat * sinLat);
-    const double alt = p / std::cos(lat) - n;
-    if (latitudeDeg) {
-        *latitudeDeg = lat * kRadToDeg;
-    }
-    if (longitudeDeg) {
-        *longitudeDeg = lon * kRadToDeg;
-    }
-    if (altitudeMeters) {
-        *altitudeMeters = alt;
-    }
-}
-
-void enuBasis(double latitudeDeg, double longitudeDeg, Vec3d *east, Vec3d *north, Vec3d *up) {
-    const double lat = latitudeDeg * kDegToRad;
-    const double lon = longitudeDeg * kDegToRad;
-    const double sinLat = std::sin(lat);
-    const double cosLat = std::cos(lat);
-    const double sinLon = std::sin(lon);
-    const double cosLon = std::cos(lon);
-    if (east) {
-        *east = {-sinLon, cosLon, 0.0};
-    }
-    if (north) {
-        *north = {-sinLat * cosLon, -sinLat * sinLon, cosLat};
-    }
-    if (up) {
-        *up = {cosLat * cosLon, cosLat * sinLon, sinLat};
-    }
-}
-
-bool solve4x4(double a[4][4], double b[4], double out[4]) {
-    double m[4][5] = {};
-    for (int row = 0; row < 4; ++row) {
-        for (int col = 0; col < 4; ++col) {
-            m[row][col] = a[row][col];
-        }
-        m[row][4] = b[row];
-    }
-
-    for (int col = 0; col < 4; ++col) {
-        int pivot = col;
-        for (int row = col + 1; row < 4; ++row) {
-            if (std::abs(m[row][col]) > std::abs(m[pivot][col])) {
-                pivot = row;
-            }
-        }
-        if (std::abs(m[pivot][col]) < 1.0e-9) {
-            return false;
-        }
-        if (pivot != col) {
-            for (int k = col; k < 5; ++k) {
-                std::swap(m[col][k], m[pivot][k]);
-            }
-        }
-        const double divisor = m[col][col];
-        for (int k = col; k < 5; ++k) {
-            m[col][k] /= divisor;
-        }
-        for (int row = 0; row < 4; ++row) {
-            if (row == col) {
-                continue;
-            }
-            const double factor = m[row][col];
-            for (int k = col; k < 5; ++k) {
-                m[row][k] -= factor * m[col][k];
-            }
-        }
-    }
-
-    for (int i = 0; i < 4; ++i) {
-        out[i] = m[i][4];
-    }
-    return true;
-}
-
-SyntheticPositionResult solveSyntheticPosition(const QVector<SyntheticPseudorange> &measurements,
-                                               const Vec3d &truthEcef,
-                                               const Vec3d &initialEcef) {
-    SyntheticPositionResult result;
-    result.satellites = measurements.size();
-    if (measurements.size() < 4) {
-        return result;
-    }
-
-    Vec3d receiver = initialEcef;
-    double clockBias = 0.0;
-    for (int iteration = 0; iteration < 12; ++iteration) {
-        double normal[4][4] = {};
-        double rhs[4] = {};
-
-        for (const SyntheticPseudorange &measurement : measurements) {
-            const Vec3d delta = receiver - measurement.satellite;
-            const double range = (std::max)(1.0, norm(delta));
-            const double predicted = range + clockBias;
-            const double residual = measurement.pseudorangeMeters - predicted;
-            const double h[4] = {
-                delta.x / range,
-                delta.y / range,
-                delta.z / range,
-                1.0
-            };
-            for (int row = 0; row < 4; ++row) {
-                rhs[row] += h[row] * residual;
-                for (int col = 0; col < 4; ++col) {
-                    normal[row][col] += h[row] * h[col];
-                }
-            }
-        }
-
-        double update[4] = {};
-        if (!solve4x4(normal, rhs, update)) {
-            return result;
-        }
-        receiver.x += update[0];
-        receiver.y += update[1];
-        receiver.z += update[2];
-        clockBias += update[3];
-        result.iterations = iteration + 1;
-        if (std::sqrt(update[0] * update[0] + update[1] * update[1] + update[2] * update[2]) < 0.001 &&
-            std::abs(update[3]) < 0.001) {
-            break;
-        }
-    }
-
-    ecefToGeodetic(receiver, &result.latitude, &result.longitude, &result.altitudeMeters);
-    result.clockBiasMeters = clockBias;
-    result.errorMeters = norm(receiver - truthEcef);
-    result.valid = qth::isValidLatitude(result.latitude) &&
-                   qth::isValidLongitude(result.longitude) &&
-                   std::isfinite(result.errorMeters);
-    return result;
-}
-
-bool nmeaChecksumMatches(const QString &body, const QString &checksumText) {
-    if (checksumText.size() < 2) {
-        return false;
-    }
-    bool ok = false;
-    const int expected = checksumText.left(2).toInt(&ok, 16);
-    if (!ok) {
-        return false;
-    }
-    quint8 actual = 0;
-    const QByteArray bytes = body.toLatin1();
-    for (char byte : bytes) {
-        actual ^= static_cast<quint8>(byte);
-    }
-    return actual == static_cast<quint8>(expected);
-}
-
-bool parseNmeaCoordinate(const QString &value,
-                         const QString &hemisphere,
-                         bool latitude,
-                         double *coordinate) {
-    if (!coordinate) {
-        return false;
-    }
-    const QString text = value.trimmed();
-    const QString hemi = hemisphere.trimmed().toUpper();
-    const int degreeDigits = latitude ? 2 : 3;
-    if (text.size() <= degreeDigits || hemi.size() != 1) {
-        return false;
-    }
-    bool degreesOk = false;
-    bool minutesOk = false;
-    const int degrees = text.left(degreeDigits).toInt(&degreesOk);
-    const double minutes = text.mid(degreeDigits).toDouble(&minutesOk);
-    if (!degreesOk || !minutesOk || !std::isfinite(minutes) || minutes < 0.0 || minutes >= 60.0) {
-        return false;
-    }
-    double result = static_cast<double>(degrees) + minutes / 60.0;
-    if (hemi == QStringLiteral("S") || hemi == QStringLiteral("W")) {
-        result = -result;
-    } else if (hemi != QStringLiteral("N") && hemi != QStringLiteral("E")) {
-        return false;
-    }
-    if (latitude) {
-        if (result < -90.0 || result > 90.0) {
-            return false;
-        }
-    } else if (result < -180.0 || result > 180.0) {
-        return false;
-    }
-    *coordinate = result;
-    return true;
-}
-
-bool parseNmeaPositionSentence(const QString &line, ParsedNmeaPosition *position) {
-    if (!position) {
-        return false;
-    }
-    QString sentence = line.trimmed();
-    if (sentence.isEmpty()) {
-        return false;
-    }
-    const int start = sentence.indexOf(QLatin1Char('$'));
-    if (start >= 0) {
-        sentence = sentence.mid(start + 1);
-    } else if (sentence.startsWith(QLatin1Char('!'))) {
-        sentence.remove(0, 1);
-    }
-    const int checksumPos = sentence.indexOf(QLatin1Char('*'));
-    const QString body = checksumPos >= 0 ? sentence.left(checksumPos) : sentence;
-    if (checksumPos >= 0) {
-        const QString checksumText = sentence.mid(checksumPos + 1).trimmed();
-        if (!nmeaChecksumMatches(body, checksumText)) {
-            return false;
-        }
-    }
-
-    const QStringList fields = body.split(QLatin1Char(','));
-    if (fields.isEmpty()) {
-        return false;
-    }
-    const QString type = fields.at(0).trimmed().toUpper();
-    if (type.size() < 5) {
-        return false;
-    }
-
-    double lat = 0.0;
-    double lon = 0.0;
-    if (type.endsWith(QStringLiteral("GGA"))) {
-        if (fields.size() < 7) {
-            return false;
-        }
-        bool fixOk = false;
-        const int fixQuality = fields.at(6).trimmed().toInt(&fixOk);
-        if (!fixOk || fixQuality <= 0) {
-            return false;
-        }
-        if (!parseNmeaCoordinate(fields.at(2), fields.at(3), true, &lat) ||
-            !parseNmeaCoordinate(fields.at(4), fields.at(5), false, &lon)) {
-            return false;
-        }
-        position->utc = fields.at(1).trimmed();
-    } else if (type.endsWith(QStringLiteral("RMC"))) {
-        if (fields.size() < 7 || fields.at(2).trimmed().toUpper() != QStringLiteral("A")) {
-            return false;
-        }
-        if (!parseNmeaCoordinate(fields.at(3), fields.at(4), true, &lat) ||
-            !parseNmeaCoordinate(fields.at(5), fields.at(6), false, &lon)) {
-            return false;
-        }
-        position->utc = fields.at(1).trimmed();
-    } else {
-        return false;
-    }
-
-    position->latitude = lat;
-    position->longitude = lon;
-    position->talker = type.left(type.size() - 3);
-    position->sentence = type.right(3);
-    return true;
-}
-
-QVector<GnssSystemPreset> gnssSystemPresets() {
-    return {
-        {
-            QStringLiteral("all_l1"),
-            QStringLiteral("gnss_system_all_l1"),
-            QStringLiteral("All L1 systems"),
-            GNSS_L1_LISTENING_SCAN_CENTER_HZ,
-            GNSS_GPS_L1_HZ,
-            GNSS_USEFUL_STANDARD_SPAN_HZ,
-            QStringLiteral("1583.000000"),
-            QStringLiteral("1559-1610"),
-            3000,
-            120,
-            GnssAcquisitionKind::None
-        },
-        {
-            QStringLiteral("gps_l1_ca"),
-            QStringLiteral("gnss_system_gps_l1_ca"),
-            QStringLiteral("GPS L1 C/A"),
-            GNSS_GPS_L1_HZ,
-            GNSS_GPS_L1_HZ,
-            GNSS_RAW_BANDWIDTH_HZ,
-            QStringLiteral("1575.420000"),
-            QStringLiteral("1574.397-1576.443"),
-            3000,
-            80,
-            GnssAcquisitionKind::GpsL1Ca
-        },
-        {
-            QStringLiteral("galileo_e1"),
-            QStringLiteral("gnss_system_galileo_e1"),
-            QStringLiteral("Galileo E1"),
-            GNSS_GPS_L1_HZ,
-            GNSS_GPS_L1_HZ,
-            4092000.0,
-            QStringLiteral("1575.420000"),
-            QStringLiteral("1571.328-1579.512"),
-            3000,
-            80,
-            GnssAcquisitionKind::None
-        },
-        {
-            QStringLiteral("beidou_b1i"),
-            QStringLiteral("gnss_system_beidou_b1i"),
-            QStringLiteral("BeiDou B1I"),
-            GNSS_BEIDOU_B1I_HZ,
-            GNSS_BEIDOU_B1I_HZ,
-            GNSS_RAW_BANDWIDTH_HZ,
-            QStringLiteral("1561.098000"),
-            QStringLiteral("1560.075-1562.121"),
-            3000,
-            80,
-            GnssAcquisitionKind::None
-        },
-        {
-            QStringLiteral("glonass_l1of"),
-            QStringLiteral("gnss_system_glonass_l1of"),
-            QStringLiteral("GLONASS L1OF"),
-            GNSS_GLONASS_L1_CENTER_HZ,
-            GNSS_GLONASS_L1_CENTER_HZ,
-            9000000.0,
-            QStringLiteral("1602.000000"),
-            QStringLiteral("1598-1606"),
-            3000,
-            80,
-            GnssAcquisitionKind::None
-        }
-    };
-}
-
-GnssSystemPreset gnssSystemPreset(const QString &id) {
-    const QVector<GnssSystemPreset> presets = gnssSystemPresets();
-    for (const GnssSystemPreset &preset : presets) {
-        if (preset.id == id) {
-            return preset;
-        }
-    }
-    for (const GnssSystemPreset &preset : presets) {
-        if (preset.id == QStringLiteral("gps_l1_ca")) {
-            return preset;
-        }
-    }
-    return presets.constFirst();
-}
-
-struct QthOnlineProviderPreset {
-    QString id;
-    QString textKey;
-    QString fallbackName;
-    QString urlTemplate;
-    QString attribution;
-    bool requiresKey = false;
-    bool noDiskCache = false;
-    int maxZoom = 19;
-};
-
-QVector<QthOnlineProviderPreset> qthOnlineProviderPresets() {
-    return {
-        {
-            QStringLiteral("osm"),
-            QStringLiteral("qth_provider_osm"),
-            QStringLiteral("OpenStreetMap"),
-            QStringLiteral("https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
-            QString::fromUtf8("\xC2\xA9 OpenStreetMap contributors"),
-            false,
-            false,
-            19
-        },
-        {
-            QStringLiteral("maptiler_satellite"),
-            QStringLiteral("qth_provider_maptiler_satellite"),
-            QStringLiteral("MapTiler Satellite"),
-            QStringLiteral("https://api.maptiler.com/maps/satellite/256/{z}/{x}/{y}.jpg?key={key}"),
-            QStringLiteral("MapTiler Satellite"),
-            true,
-            true,
-            19
-        },
-        {
-            QStringLiteral("maptiler_hybrid"),
-            QStringLiteral("qth_provider_maptiler_hybrid"),
-            QStringLiteral("MapTiler Hybrid"),
-            QStringLiteral("https://api.maptiler.com/maps/hybrid/256/{z}/{x}/{y}.jpg?key={key}"),
-            QStringLiteral("MapTiler Hybrid"),
-            true,
-            true,
-            19
-        },
-        {
-            QStringLiteral("mapbox_satellite"),
-            QStringLiteral("qth_provider_mapbox_satellite"),
-            QStringLiteral("Mapbox Satellite"),
-            QStringLiteral("https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}.jpg90?access_token={key}"),
-            QStringLiteral("Mapbox Satellite"),
-            true,
-            true,
-            19
-        },
-        {
-            QStringLiteral("nasa_gibs_truecolor"),
-            QStringLiteral("qth_provider_nasa_gibs_truecolor"),
-            QStringLiteral("NASA GIBS True Color"),
-            QStringLiteral("https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/default/GoogleMapsCompatible_Level9/{z}/{row}/{col}.jpg"),
-            QStringLiteral("NASA GIBS / ESDIS"),
-            false,
-            true,
-            9
-        },
-        {
-            QStringLiteral("custom"),
-            QStringLiteral("qth_provider_custom"),
-            QStringLiteral("Custom XYZ"),
-            QString(),
-            QString(),
-            false,
-            false,
-            19
-        }
-    };
-}
-
-QthOnlineProviderPreset qthOnlineProviderPreset(const QString &id) {
-    const QVector<QthOnlineProviderPreset> presets = qthOnlineProviderPresets();
-    for (const QthOnlineProviderPreset &preset : presets) {
-        if (preset.id == id) {
-            return preset;
-        }
-    }
-    return presets.constLast();
-}
-
-bool qthOnlineTemplateNeedsKey(const QString &urlTemplate) {
-    return urlTemplate.contains(QStringLiteral("{key}"), Qt::CaseInsensitive) ||
-           urlTemplate.contains(QStringLiteral("{token}"), Qt::CaseInsensitive);
-}
-
-QColor gnssHeatColor(double value, double minValue, double maxValue) {
-    if (!std::isfinite(value)) {
-        value = minValue;
-    }
-    const double span = (std::max)(0.001, maxValue - minValue);
-    const double t = (std::clamp)((value - minValue) / span, 0.0, 1.0);
-    if (t < 0.5) {
-        const double u = t * 2.0;
-        return QColor(static_cast<int>(30 + u * 35),
-                      static_cast<int>(55 + u * 130),
-                      static_cast<int>(110 + u * 70));
-    }
-    const double u = (t - 0.5) * 2.0;
-    return QColor(static_cast<int>(65 + u * 190),
-                  static_cast<int>(185 + u * 55),
-                  static_cast<int>(180 - u * 155));
-}
-
-QMutex gLogMutex;
-QFile gLogFile;
-qint64 gLogBytesWritten = 0;
-int gLogLinesUntilFlush = 0;
-
 qint64 agileRfLiveSettleMs(double sampleRate, bool sampleRateChange) {
     if (!std::isfinite(sampleRate) || sampleRate <= 0.0) {
         return sampleRateChange ? AGILE_RF_MID_RATE_SAMPLE_SETTLE_MS
@@ -845,204 +265,6 @@ double agileRfAutoBandwidthRatio(double sampleRate) {
 
 QString persistentSettingsFilePath() {
     return QCoreApplication::applicationDirPath() + QStringLiteral("/FobosAPP.ini");
-}
-
-QString applicationHelpText(const QString &language) {
-    if (language == QStringLiteral("uk")) {
-        return QString::fromUtf8(R"HELP(FobosAPP: короткий практичний довідник
-
-Призначення
-FobosAPP - SDR-програма для Fobos SDR, Fobos Agile, RTL-SDR, rtl_tcp і експериментального SoapySDR backend. Вона поєднує прийом IQ, спектр, водоспад, аудіодемодуляцію, сканування, записи, пресети, GNSS/QTH-мапу, мережевий режим і дослідні цифрові декодери.
-
-Основна логіка частот
-- Central Frequency - центральна частота приймача, тобто центр видимої IQ-смуги.
-- Listening Frequency - частота прослуховування/маркер демодулятора всередині поточної смуги.
-- Bandwidth - аудіо/канальна смуга для демодулятора.
-- У RF-режимі маркер має бути всередині центральна частота +/- половина sample rate.
-- У прямому HF-режимі центральна RF-частота не використовується так само, як в RF-режимі.
-
-Миша, жести і швидке налаштування
-- Колесо миші над спектром або водоспадом змінює масштаб видимого діапазону.
-- Середня кнопка миші/клік колесом по сигналу на спектрі або водоспаді автоматично ставить маркер на центр найближчого видимого сигналу.
-- Подвійний лівий клік по спектру або водоспаду робить те саме автоцентрування.
-- Правий клік по спектру або водоспаду відкриває меню: поставити центр сигналу, поставити край USB/LSB або перенести центральну частоту приймача.
-- Ліве перетягування по спектру показує вимірювання ширини сигналу.
-- Fine tune шкала або круглий регулятор рухає частоту прослуховування малими кроками.
-- F9 працює як тангента запису: утримуйте для запису, відпустіть для зупинки.
-
-Приймачі
-- Fobos Standard - основний режим для стандартної прошивки.
-- Fobos Agile - підтримує швидкий firmware scan і live-переналаштування.
-- RTL-SDR native спершу використовує rtlsdr\\rtlsdr.dll і сумісний rtlsdr\\libusb-1.0.dll; DLL у корені є тільки запасним варіантом.
-- rtl_tcp підключається до 127.0.0.1:1234.
-- SoapySDR backend доданий як теоретична сумісність, якщо на системі є SoapySDR.dll і модулі приймача.
-- Для Fobos типовий sample rate - 50 MHz. Для RTL типовий безпечний sample rate - 2.048 MHz.
-
-Спектр і водоспад
-- Spectrum/waterfall update у загальних налаштуваннях задає інтервал оновлення. Auto обирає безпечний режим.
-- Waterfall speed додає кількість рядків на один FFT-кадр: це робить водоспад візуально швидшим без додаткового FFT-навантаження.
-- FFT length впливає на деталізацію і навантаження. Великі FFT корисні для вузьких сигналів, але можуть вимагати повільнішого оновлення.
-- Band markers показують діапазони: загальні радіодіапазони, аматорські діапазони або компактний шар.
-- Spur suppression/Spur calibration допомагає позначати і приглушувати стабільні внутрішні спури.
-
-Аудіо і демодуляція
-- Audio вмикає локальне прослуховування.
-- Modulation обирає AM, FM/NFM/WFM, SSB, CW, DMR та інші режими.
-- Audio LPF/HPF у налаштуваннях фільтрує аудіо після демодуляції.
-- Для SSB можна через правий клік поставити край USB/LSB по видимому сигналу.
-- Якщо звук не відповідає сигналу після швидких переналаштувань, натисніть Stop/Start або змініть центральну частоту ще раз. Це має бути рідкісний аварійний сценарій.
-
-Сканування
-- Agile scan працює тільки з Fobos Agile firmware і сканує список діапазонів на рівні прошивки.
-- Standard scan працює через послідовне live-переналаштування центральної частоти. Він доступний для Fobos, RTL, rtl_tcp і Soapy, якщо backend підтримує retune.
-- У Standard scan користувач задає список центральних частот у MHz. Програма автоматично розсуває центри мінімум на sample rate, щоб смуги не накладалися.
-- Кнопки +/- додають або прибирають сусідні центри відносно найменшого/найбільшого значення.
-- Fill range створює список центрів з початкової і кінцевої частоти.
-- Dwell ms - скільки часу слухати одну центральну частоту.
-- Settle ms - пауза після переналаштування, щоб старі IQ-дані не змішувались з новими.
-- Listening scan не рухає центральну частоту, а перебирає частоти прослуховування всередині видимої смуги. Це корисно для GNSS L1, FT8, маяків і будь-яких наборів частот у межах одного IQ-вікна.
-- Lock listening frequency у скані фіксує частоту прослуховування, щоб маркер не стрибав між діапазонами.
-- Measure у скані збирає current/peak/baseline/delta по бінових ділянках спектра.
-
-Пресети
-- Presets відкриває менеджер частот, аудіосмуг, Agile scan, Standard scan, Listening scan, band markers і QTH markers.
-- Стрілки вгору/вниз у менеджері пресетів змінюють порядок показу.
-- Перед оновленням програми бажано експортувати FobosAPP.ini, щоб не втратити власні пресети, маркери карти і списки скану.
-- Import/Export settings у загальних налаштуваннях робить резервну копію або повертає збережені налаштування.
-
-GNSS, GPS і QTH
-- GPS/QTH блок зберігає своє місцеположення, показує Maidenhead/QTH locator і відкриває карту.
-- QTH Map підтримує offline/grid view, online tile providers і QTH-сітку.
-- Колесо миші масштабує карту навколо курсора, перетягування мишею рухає карту.
-- Правий клік по карті може ставити користувацький маркер; правий клік по маркеру видаляє його.
-- Маркери можна редагувати у Presets -> QTH markers.
-- Tune GNSS L1 і GNSS scan виставляють частоти для GPS/Galileo/BeiDou/GLONASS L1.
-- GPS C/A accumulate і GPS deep - дослідні корелятори для GPS L1 C/A. Для реального lock потрібен достатній сигнал, стабільна частота і хороша GNSS-антена.
-- Save GNSS IQ записує поточний IQ-снепшот у WAV і додає контекст у лог.
-
-Цифрові режими
-- Digital Audio містить DMR-дослідний декодер. Він може визначати частину метаданих і працювати з зовнішнім voice backend, але DMR-голос поки експериментальний.
-- Lock DMR фіксує обрані параметри DMR, корисно коли на частоті є різні color code/timeslot/contact.
-- DMR hunter, FPV hunter і Digital Video hunter шукають характерні сигнали на спектрі за шириною/порогом.
-- Video блок зараз дослідний; повноцінні відеодекодери можуть бути вимкнені у збірці.
-
-Запис і відтворення
-- Record пише Audio WAV або Channel IQ WAV залежно від вибраного режиму.
-- Hold F9/F9 утримання - швидкий momentary recording.
-- Playback дозволяє програти сумісні записи, коли приймач зупинений.
-- Реальні IQ-записи можуть бути великими; перед релізом не додавайте особисті записи, логи і тестові ефіри у репозиторій.
-
-Мережа
-- Network відкриває налаштування server/client режиму.
-- Server може передавати керування, спектр, аудіо або IQ залежно від режиму.
-- Full-IQ/Channel-IQ режими важкі для мережі і CPU, тому їх краще тестувати поступово.
-- Audio relay і Audio HTTP stream дозволяють передавати аудіо в інші програми або на інші пристрої.
-
-Корисні правила
-- Якщо щось виглядає дивно після зміни приймача або sample rate, натисніть Stop, перевірте backend/sample rate і запустіть знову.
-- Для слабких сигналів спершу добийтеся стабільного спектра і правильного центру, а вже потім ускладнюйте демодуляцію.
-- Для RTL не ставте занадто великий sample rate: 2.048 або 2.4 MHz зазвичай безпечніші.
-- Для Fobos Agile дуже малі інтервали live retune можуть перевантажувати USB/UI на слабкому комп'ютері. Збільшуйте Agile live retune interval, якщо бачите зависання.
-- Докладне логування вмикайте тільки на час тесту: воно корисне для діагностики, але може робити програму важчою.
-)HELP");
-    }
-
-    return QString::fromUtf8(R"HELP(FobosAPP: practical user guide
-
-Purpose
-FobosAPP is an SDR application for Fobos SDR, Fobos Agile, RTL-SDR, rtl_tcp and an experimental SoapySDR backend. It combines IQ reception, spectrum, waterfall, audio demodulation, scanning, recordings, presets, GNSS/QTH mapping, network mode and experimental digital decoders.
-
-Frequency model
-- Central Frequency is the SDR receiver center, the middle of the visible IQ span.
-- Listening Frequency is the demodulator marker inside the current span.
-- Bandwidth is the demodulator/audio channel width.
-- In RF mode the listening marker must stay inside center frequency +/- half of the sample rate.
-- In direct HF modes the RF center is not used the same way as in RF mode.
-
-Mouse actions and fast tuning
-- Mouse wheel over the spectrum or waterfall changes visible span/zoom.
-- Middle-click, usually clicking the mouse wheel, on a signal in the spectrum or waterfall snaps the listening marker to the nearest visible signal center.
-- Double left-click on the spectrum or waterfall does the same auto-centering.
-- Right-click on the spectrum or waterfall opens a tuning menu: tune signal center, set USB/LSB edge, or move receiver center here.
-- Left-drag on the spectrum shows a bandwidth measurement.
-- The fine-tune scale or round dial nudges the listening frequency in small steps.
-- F9 works as a push-to-record key: hold to record, release to stop.
-
-Receivers
-- Fobos Standard is the main mode for the standard firmware.
-- Fobos Agile supports firmware scan and live retuning.
-- RTL-SDR native first uses rtlsdr\\rtlsdr.dll and the matching rtlsdr\\libusb-1.0.dll; root-folder DLLs are only a fallback.
-- rtl_tcp connects to 127.0.0.1:1234.
-- SoapySDR is added as theoretical compatibility when SoapySDR.dll and device modules are installed.
-- The default Fobos sample rate is 50 MHz. The safe RTL default is 2.048 MHz.
-
-Spectrum and waterfall
-- Spectrum/waterfall update in Settings controls redraw interval. Auto keeps a safe FFT-dependent default.
-- Waterfall speed adds more rows per FFT frame. It makes the waterfall visually faster without increasing FFT load.
-- FFT length controls frequency detail and CPU load. Larger FFT sizes help with narrow signals but may need slower updates.
-- Band markers show general radio bands, amateur bands, or a compact combined layer.
-- Spur suppression and calibration can mark and reduce stable internal spurs.
-
-Audio and demodulation
-- Audio enables local playback.
-- Modulation selects AM, FM/NFM/WFM, SSB, CW, DMR and other modes.
-- Audio LPF/HPF in settings filters demodulated audio.
-- In SSB modes, right-click can align the USB or LSB edge to a visible signal.
-- If audio does not match the visible signal after aggressive retuning, use Stop/Start or retune once more. This should be a rare recovery path.
-
-Scanning
-- Agile scan works only with Fobos Agile firmware and scans ranges inside the firmware.
-- Standard scan works by live-retuning the receiver center through a list. It is available for Fobos, RTL, rtl_tcp and Soapy when the backend supports retune.
-- In Standard scan, enter center frequencies in MHz. The app keeps centers at least one sample rate apart to avoid overlapping spans.
-- +/- buttons add or remove neighboring centers from the low or high side.
-- Fill range generates a center list between the start and end frequencies.
-- Dwell ms is how long one center is observed.
-- Settle ms is the pause after retune, used to keep old IQ blocks from mixing with new ones.
-- Listening scan does not move the receiver center; it cycles listening frequencies inside the visible span. It is useful for GNSS L1, FT8, beacons and any fixed channel list inside one IQ window.
-- Lock listening frequency keeps the listening marker fixed while scan centers move.
-- Measure in scan mode collects current, peak, baseline and delta values for spectral coverage checks.
-
-Presets
-- Presets opens the manager for center frequencies, listening frequencies, audio bandwidths, Agile scan, Standard scan, Listening scan, band markers and QTH markers.
-- Up/down arrows in the preset manager change display order.
-- Before updating the app, export FobosAPP.ini if you want to keep custom presets, markers and scan lists.
-- Import/Export settings in Settings creates or restores a settings backup.
-
-GNSS, GPS and QTH
-- GPS/QTH stores your position, shows Maidenhead/QTH locator and opens the map.
-- QTH Map supports offline/grid view, online tile providers and a QTH grid overlay.
-- Mouse wheel zooms the map around the cursor; dragging pans the map.
-- Right-click on the map can place a user marker; right-click on a marker removes it.
-- Markers can be edited in Presets -> QTH markers.
-- Tune GNSS L1 and GNSS scan set receiver frequencies for GPS/Galileo/BeiDou/GLONASS L1.
-- GPS C/A accumulate and GPS deep are experimental GPS L1 C/A correlators. A real lock needs enough signal, stable tuning and a proper GNSS antenna.
-- Save GNSS IQ writes the current IQ snapshot to WAV and logs its tuning context.
-
-Digital modes
-- Digital Audio contains the experimental DMR decoder. It can detect some metadata and work with an external voice backend, but DMR voice is still experimental.
-- Lock DMR fixes selected DMR parameters, useful when several color code/timeslot/contact combinations share a frequency.
-- DMR hunter, FPV hunter and Digital Video hunter look for characteristic signals by width and threshold.
-- Video is currently experimental; full video decoders may be disabled in the build.
-
-Recording and playback
-- Record writes Audio WAV or Channel IQ WAV depending on selected recording mode.
-- Hold F9 is quick momentary recording.
-- Playback can play compatible recordings while the receiver is stopped.
-- Real IQ recordings can be huge; avoid adding personal recordings, logs and over-the-air tests to repository releases.
-
-Network
-- Network opens server/client settings.
-- Server mode can share control, spectrum, audio or IQ depending on processing mode.
-- Full-IQ and Channel-IQ modes are heavy for network and CPU, so test them gradually.
-- Audio relay and Audio HTTP stream can send demodulated audio to other programs or devices.
-
-Useful rules
-- If something looks wrong after changing receiver or sample rate, press Stop, check backend/sample rate and start again.
-- For weak signals, first get a stable spectrum and correct center, then tune the demodulator.
-- For RTL, avoid excessive sample rates. 2.048 or 2.4 MHz are usually safer.
-- On Fobos Agile, very small live-retune intervals can overload USB/UI on slower computers. Increase Agile live retune interval if you see stalls.
-- Enable detailed logging only while testing. It is valuable for diagnosis but can make the app heavier.
-)HELP");
 }
 
 void appendLe32(QByteArray &buffer, quint32 value) {
@@ -1127,22 +349,6 @@ QByteArray fixedPcm16StereoWavHeader(int sampleRate, quint32 dataBytes) {
     header.append("data", 4);
     appendLe32(header, dataBytes);
     return header;
-}
-
-const char *messageTypeName(QtMsgType type) {
-    switch (type) {
-    case QtDebugMsg:
-        return "DEBUG";
-    case QtInfoMsg:
-        return "INFO";
-    case QtWarningMsg:
-        return "WARN";
-    case QtCriticalMsg:
-        return "CRITICAL";
-    case QtFatalMsg:
-        return "FATAL";
-    }
-    return "LOG";
 }
 
 const char *runStateName(RadioRunState state) {
@@ -1333,221 +539,6 @@ bool realignDmrCenterToListening(RadioSettings &settings) {
     return true;
 }
 
-QString agileScanPresetSpec(const QString &rangesMhz, double stepMhz) {
-    return QStringLiteral("%1\t%2").arg(rangesMhz.trimmed(),
-                                      QString::number(stepMhz, 'f', 6));
-}
-
-QString standardScanPresetSpec(const QString &centersMhz, int dwellMs, int settleMs) {
-    return QStringLiteral("%1\t%2\t%3").arg(centersMhz.trimmed(),
-                                            QString::number(dwellMs),
-                                            QString::number(settleMs));
-}
-
-QString listeningScanPresetSpec(const QString &targetsMhz, int dwellMs, int settleMs) {
-    return QStringLiteral("%1\t%2\t%3").arg(targetsMhz.trimmed(),
-                                            QString::number(dwellMs),
-                                            QString::number(settleMs));
-}
-
-QString agileScanPresetRanges(const QString &spec, const QString &fallback = QString()) {
-    const QStringList parts = spec.split(QChar('\t'));
-    return parts.isEmpty() ? fallback : parts.first().trimmed();
-}
-
-QString standardScanPresetCenters(const QString &spec, const QString &fallback = QString()) {
-    const QStringList parts = spec.split(QChar('\t'));
-    return parts.isEmpty() ? fallback : parts.first().trimmed();
-}
-
-QString listeningScanPresetTargets(const QString &spec, const QString &fallback = QString()) {
-    const QStringList parts = spec.split(QChar('\t'));
-    return parts.isEmpty() ? fallback : parts.first().trimmed();
-}
-
-double agileScanPresetStepMhz(const QString &spec, double fallback) {
-    const QStringList parts = spec.split(QChar('\t'));
-    if (parts.size() < 2) {
-        return fallback;
-    }
-    bool ok = false;
-    const double value = parts.at(1).toDouble(&ok);
-    return ok ? (std::clamp)(value, AGILE_SCAN_MIN_STEP_MHZ, AGILE_SCAN_MAX_STEP_MHZ) : fallback;
-}
-
-int standardScanPresetDwellMs(const QString &spec, int fallback) {
-    const QStringList parts = spec.split(QChar('\t'));
-    if (parts.size() < 2) {
-        return fallback;
-    }
-    bool ok = false;
-    const int value = parts.at(1).toInt(&ok);
-    return ok ? (std::clamp)(value, STANDARD_SCAN_MIN_DWELL_MS, STANDARD_SCAN_MAX_DWELL_MS) : fallback;
-}
-
-int standardScanPresetSettleMs(const QString &spec, int fallback) {
-    const QStringList parts = spec.split(QChar('\t'));
-    if (parts.size() < 3) {
-        return fallback;
-    }
-    bool ok = false;
-    const int value = parts.at(2).toInt(&ok);
-    return ok ? (std::clamp)(value, STANDARD_SCAN_MIN_SETTLE_MS, STANDARD_SCAN_MAX_SETTLE_MS) : fallback;
-}
-
-int listeningScanPresetDwellMs(const QString &spec, int fallback) {
-    const QStringList parts = spec.split(QChar('\t'));
-    if (parts.size() < 2) {
-        return fallback;
-    }
-    bool ok = false;
-    const int value = parts.at(1).toInt(&ok);
-    return ok ? (std::clamp)(value, LISTENING_SCAN_MIN_DWELL_MS, LISTENING_SCAN_MAX_DWELL_MS) : fallback;
-}
-
-int listeningScanPresetSettleMs(const QString &spec, int fallback) {
-    const QStringList parts = spec.split(QChar('\t'));
-    if (parts.size() < 3) {
-        return fallback;
-    }
-    bool ok = false;
-    const int value = parts.at(2).toInt(&ok);
-    return ok ? (std::clamp)(value, LISTENING_SCAN_MIN_SETTLE_MS, LISTENING_SCAN_MAX_SETTLE_MS) : fallback;
-}
-
-template <typename T>
-QStringList normalizedPresetOrder(const QStringList &requestedOrder,
-                                  const QMap<QString, T> &presets,
-                                  const QStringList &defaultOrder = QStringList()) {
-    QStringList normalized;
-    auto appendIfValid = [&normalized, &presets](const QString &rawName) {
-        const QString name = rawName.trimmed();
-        if (!name.isEmpty() &&
-            presets.contains(name) &&
-            !normalized.contains(name)) {
-            normalized.append(name);
-        }
-    };
-
-    const QStringList seedOrder = requestedOrder.isEmpty() ? defaultOrder : requestedOrder;
-    for (const QString &name : seedOrder) {
-        appendIfValid(name);
-    }
-
-    for (auto it = presets.constBegin(); it != presets.constEnd(); ++it) {
-        appendIfValid(it.key());
-    }
-    return normalized;
-}
-
-QStringList defaultCenterFrequencyPresetOrder() {
-    QStringList order;
-    order << QStringLiteral("FM broadcast 100 MHz")
-          << QStringLiteral("Airband 125 MHz")
-          << QStringLiteral("VHF 145 MHz")
-          << QStringLiteral("UHF 433 MHz")
-          << QStringLiteral("LTE 700 downlink 780.5 MHz")
-          << QStringLiteral("LTE 800 downlink 806 MHz")
-          << QStringLiteral("GSM/LTE 900 MHz")
-          << QStringLiteral("UMTS/LTE 1800 downlink 1842.5 MHz")
-          << QStringLiteral("UMTS/LTE 2100 downlink 2140 MHz")
-          << QStringLiteral("LTE 2600 downlink 2655 MHz")
-          << QStringLiteral("GNSS L1 compact center 1583 MHz")
-          << QStringLiteral("GNSS L1 band center 1584.5 MHz")
-          << QStringLiteral("GPS/Galileo L1 1575.42 MHz")
-          << QStringLiteral("BeiDou B1I 1561.098 MHz")
-          << QStringLiteral("GLONASS L1 center 1602 MHz")
-          << QStringLiteral("FPV 1.2 GHz")
-          << QStringLiteral("FPV 2.4 GHz")
-          << QStringLiteral("Experimental 7.0 GHz")
-          << QStringLiteral("Experimental 7.5 GHz");
-    return order;
-}
-
-QStringList defaultListeningFrequencyPresetOrder() {
-    QStringList order;
-    order << QStringLiteral("HF center 0 Hz")
-          << QStringLiteral("HF 500 kHz")
-          << QStringLiteral("HF 1.25 MHz")
-          << QStringLiteral("80 m 3.65 MHz")
-          << QStringLiteral("40 m 7.05 MHz")
-          << QStringLiteral("20 m FT8 14.074 MHz")
-          << QStringLiteral("VHF 145 MHz")
-          << QStringLiteral("UHF 433 MHz")
-          << QStringLiteral("LTE 700 downlink 780.5 MHz")
-          << QStringLiteral("LTE 800 downlink 806 MHz")
-          << QStringLiteral("GSM/LTE 900 MHz")
-          << QStringLiteral("UMTS/LTE 1800 downlink 1842.5 MHz")
-          << QStringLiteral("UMTS/LTE 2100 downlink 2140 MHz")
-          << QStringLiteral("LTE 2600 downlink 2655 MHz")
-          << QStringLiteral("GNSS L1 compact center 1583 MHz")
-          << QStringLiteral("GNSS L1 band center 1584.5 MHz")
-          << QStringLiteral("GPS/Galileo L1 1575.42 MHz")
-          << QStringLiteral("BeiDou B1I 1561.098 MHz")
-          << QStringLiteral("GLONASS L1 center 1602 MHz");
-    return order;
-}
-
-QStringList defaultBandwidthPresetOrder() {
-    QStringList order;
-    order << QStringLiteral("CW 500 Hz")
-          << QStringLiteral("SSB 2.7 kHz")
-          << QStringLiteral("FT8 3 kHz")
-          << QStringLiteral("AM 6 kHz")
-          << QStringLiteral("AM 10 kHz")
-          << QStringLiteral("NFM 12.5 kHz")
-          << QStringLiteral("DMR 12.5 kHz")
-          << QStringLiteral("WFM 200 kHz")
-          << QStringLiteral("SSTV 3 kHz")
-          << QStringLiteral("NOAA APT 40 kHz")
-          << QStringLiteral("WEFAX 3 kHz")
-          << QStringLiteral("LRPT 140 kHz")
-          << QStringLiteral("ATV 3 MHz")
-          << QStringLiteral("ATV 5 MHz")
-          << QStringLiteral("FPV 8 MHz")
-          << QStringLiteral("FPV 10 MHz")
-          << QStringLiteral("GNSS C/A 2.046 MHz")
-          << QStringLiteral("GNSS raw 4.092 MHz")
-          << QStringLiteral("GLONASS L1OF 9 MHz")
-          << QStringLiteral("GNSS L1 survey 50 MHz");
-    return order;
-}
-
-QStringList defaultAgileScanPresetOrder() {
-    QStringList order;
-    order << QStringLiteral("Narrow DMR example")
-          << QStringLiteral("VHF DMR 160-174 coarse")
-          << QStringLiteral("UHF DMR 400-470 coarse")
-          << QStringLiteral("REB broad check 300/600/5800")
-          << QStringLiteral("REB 300-400 1MHz")
-          << QStringLiteral("REB 600-1200 5MHz")
-          << QStringLiteral("Cellular LTE/3G downlinks sparse")
-          << QStringLiteral("Digital video sparse")
-          << QStringLiteral("REB 5.8GHz 5MHz")
-          << QStringLiteral("FPV 1.2/2.4 sparse")
-          << QStringLiteral("GNSS L1 1559-1610 50MHz");
-    return order;
-}
-
-QStringList defaultStandardScanPresetOrder() {
-    QStringList order;
-    order << QStringLiteral("RF 100-300 by 50MHz")
-          << QStringLiteral("UHF broad 400-700 by 50MHz")
-          << QStringLiteral("Cellular LTE/3G downlinks")
-          << QStringLiteral("GNSS L1 two-center 50MHz useful");
-    return order;
-}
-
-QStringList defaultListeningScanPresetOrder() {
-    QStringList order;
-    order << QStringLiteral("FT8 HF common")
-          << QStringLiteral("Cellular LTE/3G anchors")
-          << QStringLiteral("GNSS L1 main signals")
-          << QStringLiteral("GLONASS L1OF channels")
-          << QStringLiteral("GNSS L1 dense");
-    return order;
-}
-
 QVector<ScanVisualSegment> scanSegmentsFromFrame(const QJsonObject &frame) {
     QVector<ScanVisualSegment> segments;
     const QJsonArray segmentArray = frame.value("scanSegments").toArray();
@@ -1613,6 +604,154 @@ std::vector<float> actualFrequenciesFromScanSegments(const std::vector<float> &d
     return actualFrequencies;
 }
 
+double displayFrequencyForScanActual(double actualFrequencyHz,
+                                     const QVector<ScanVisualSegment> &segments,
+                                     double fallbackDisplayHz) {
+    if (!std::isfinite(actualFrequencyHz) || segments.isEmpty()) {
+        return fallbackDisplayHz;
+    }
+    for (const ScanVisualSegment &segment : segments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            !std::isfinite(segment.actualStartHz) ||
+            !std::isfinite(segment.actualEndHz) ||
+            segment.endHz <= segment.startHz ||
+            segment.actualEndHz <= segment.actualStartHz ||
+            actualFrequencyHz < segment.actualStartHz ||
+            actualFrequencyHz > segment.actualEndHz) {
+            continue;
+        }
+        const double ratio =
+            (actualFrequencyHz - segment.actualStartHz) /
+            (segment.actualEndHz - segment.actualStartHz);
+        return segment.startHz +
+               (std::clamp)(ratio, 0.0, 1.0) *
+                   (segment.endHz - segment.startHz);
+    }
+    return fallbackDisplayHz;
+}
+
+double actualFrequencyForScanDisplay(const ScanVisualSegment &segment, double displayFrequencyHz) {
+    if (!std::isfinite(displayFrequencyHz) ||
+        !std::isfinite(segment.startHz) ||
+        !std::isfinite(segment.endHz) ||
+        !std::isfinite(segment.actualStartHz) ||
+        !std::isfinite(segment.actualEndHz) ||
+        segment.endHz <= segment.startHz) {
+        return displayFrequencyHz;
+    }
+    const double ratio =
+        (displayFrequencyHz - segment.startHz) /
+        (segment.endHz - segment.startHz);
+    return segment.actualStartHz +
+           (std::clamp)(ratio, 0.0, 1.0) *
+               (segment.actualEndHz - segment.actualStartHz);
+}
+
+ScanVisualFrame windowedScanVisualFrame(const ScanVisualFrame &frame,
+                                        double centerDisplayHz,
+                                        double spanHz) {
+    if (!frame.valid ||
+        frame.frequencies.size() < 2 ||
+        frame.magnitudes.size() != frame.frequencies.size() ||
+        !std::isfinite(frame.minFrequency) ||
+        !std::isfinite(frame.maxFrequency) ||
+        frame.maxFrequency <= frame.minFrequency ||
+        !std::isfinite(centerDisplayHz) ||
+        !std::isfinite(spanHz) ||
+        spanHz <= 0.0) {
+        return frame;
+    }
+
+    const double fullSpanHz = frame.maxFrequency - frame.minFrequency;
+    if (spanHz >= fullSpanHz * 0.999) {
+        return frame;
+    }
+
+    const double visibleSpanHz = (std::clamp)(spanHz, 1.0, fullSpanHz);
+    double windowMinHz = centerDisplayHz - visibleSpanHz * 0.5;
+    windowMinHz = (std::clamp)(windowMinHz,
+                               frame.minFrequency,
+                               frame.maxFrequency - visibleSpanHz);
+    const double windowMaxHz = windowMinHz + visibleSpanHz;
+
+    const int sourceCount = static_cast<int>(frame.frequencies.size());
+    int first = 0;
+    while (first < sourceCount - 1 &&
+           frame.frequencies[static_cast<std::size_t>(first)] < windowMinHz) {
+        ++first;
+    }
+    int last = sourceCount - 1;
+    while (last > first &&
+           frame.frequencies[static_cast<std::size_t>(last)] > windowMaxHz) {
+        --last;
+    }
+    if (last - first + 1 < 2) {
+        return frame;
+    }
+
+    const int targetCount = last - first + 1;
+    constexpr float windowFloorDb = -160.0f;
+    ScanVisualFrame window;
+    window.valid = true;
+    window.mosaic = frame.mosaic;
+    window.minFrequency = windowMinHz;
+    window.maxFrequency = windowMaxHz;
+    window.centerFrequency = (windowMinHz + windowMaxHz) * 0.5;
+    window.fftLength = targetCount;
+    window.sectorCount = frame.sectorCount;
+    window.frequencies.reserve(static_cast<std::size_t>(targetCount));
+    window.actualFrequencies.reserve(static_cast<std::size_t>(targetCount));
+    window.magnitudes.assign(static_cast<std::size_t>(targetCount), windowFloorDb);
+    const bool haveReference = frame.referenceMagnitudes.size() == frame.magnitudes.size();
+    if (haveReference) {
+        window.referenceMagnitudes.assign(static_cast<std::size_t>(targetCount), windowFloorDb);
+    }
+
+    for (int j = 0; j < targetCount; ++j) {
+        const int sourceIndex = first + j;
+        window.frequencies.push_back(frame.frequencies[static_cast<std::size_t>(sourceIndex)]);
+        if (frame.actualFrequencies.size() == frame.frequencies.size()) {
+            window.actualFrequencies.push_back(frame.actualFrequencies[static_cast<std::size_t>(sourceIndex)]);
+        }
+
+        const int sourceLevelIndex = (sourceIndex + sourceCount / 2) % sourceCount;
+        const int targetLevelIndex = (j + targetCount / 2) % targetCount;
+        window.magnitudes[static_cast<std::size_t>(targetLevelIndex)] =
+            frame.magnitudes[static_cast<std::size_t>(sourceLevelIndex)];
+        if (haveReference) {
+            window.referenceMagnitudes[static_cast<std::size_t>(targetLevelIndex)] =
+                frame.referenceMagnitudes[static_cast<std::size_t>(sourceLevelIndex)];
+        }
+    }
+    if (window.actualFrequencies.size() != window.frequencies.size()) {
+        window.actualFrequencies.clear();
+    }
+
+    for (const ScanVisualSegment &segment : frame.segments) {
+        if (!std::isfinite(segment.startHz) ||
+            !std::isfinite(segment.endHz) ||
+            segment.endHz <= segment.startHz ||
+            segment.endHz < windowMinHz ||
+            segment.startHz > windowMaxHz) {
+            continue;
+        }
+        ScanVisualSegment clipped = segment;
+        clipped.startHz = (std::max)(segment.startHz, windowMinHz);
+        clipped.endHz = (std::min)(segment.endHz, windowMaxHz);
+        if (clipped.endHz <= clipped.startHz) {
+            continue;
+        }
+        clipped.centerHz = (clipped.startHz + clipped.endHz) * 0.5;
+        clipped.actualStartHz = actualFrequencyForScanDisplay(segment, clipped.startHz);
+        clipped.actualEndHz = actualFrequencyForScanDisplay(segment, clipped.endHz);
+        clipped.actualCenterHz = (clipped.actualStartHz + clipped.actualEndHz) * 0.5;
+        window.segments.push_back(clipped);
+    }
+
+    return window;
+}
+
 bool actualFrequencyInsideScanSegments(double frequencyHz, const QVector<ScanVisualSegment> &segments) {
     if (!std::isfinite(frequencyHz) || segments.isEmpty()) {
         return false;
@@ -1644,264 +783,6 @@ double fallbackActualFrequencyForScanSegments(const QVector<ScanVisualSegment> &
         return (segment.actualStartHz + segment.actualEndHz) * 0.5;
     }
     return fallbackHz;
-}
-
-QVector<double> parseAgileScanFrequenciesMhz(const QString &rangesMhz,
-                                             double stepMhz,
-                                             QString *error) {
-    QVector<double> frequencies;
-    QString text = rangesMhz.trimmed();
-    text.replace(QChar(0x2013), QLatin1Char('-'));
-    text.replace(QChar(0x2014), QLatin1Char('-'));
-    text.replace(QLatin1Char('\\'), QLatin1Char(','));
-    text.replace(QLatin1Char('/'), QLatin1Char(','));
-    text.replace(QLatin1Char(';'), QLatin1Char(','));
-    text.replace(QRegularExpression(QStringLiteral("\\s+")), QString());
-    text.replace(QRegularExpression(QStringLiteral("mhz|мгц"), QRegularExpression::CaseInsensitiveOption),
-                 QString());
-
-    if (text.isEmpty()) {
-        if (error) {
-            *error = QStringLiteral("Scan ranges are empty");
-        }
-        return frequencies;
-    }
-
-    stepMhz = (std::clamp)(stepMhz, AGILE_SCAN_MIN_STEP_MHZ, AGILE_SCAN_MAX_STEP_MHZ);
-    const QStringList tokens = text.split(QLatin1Char(','), Qt::SkipEmptyParts);
-    for (const QString &token : tokens) {
-        const int dashIndex = token.indexOf(QLatin1Char('-'));
-        bool startOk = false;
-        bool endOk = false;
-        double startMhz = 0.0;
-        double endMhz = 0.0;
-
-        if (dashIndex > 0) {
-            startMhz = token.left(dashIndex).toDouble(&startOk);
-            endMhz = token.mid(dashIndex + 1).toDouble(&endOk);
-        } else {
-            startMhz = token.toDouble(&startOk);
-            endMhz = startMhz;
-            endOk = startOk;
-        }
-
-        if (!startOk || !endOk || startMhz <= 0.0 || endMhz <= 0.0) {
-            if (error) {
-                *error = QStringLiteral("Bad scan range: %1").arg(token);
-            }
-            frequencies.clear();
-            return frequencies;
-        }
-        if (endMhz < startMhz) {
-            std::swap(startMhz, endMhz);
-        }
-        const double startHz = startMhz * 1000000.0;
-        const double endHz = endMhz * 1000000.0;
-        if (startHz < RF_MIN_CENTER_FREQUENCY ||
-            endHz > RF_EXPERIMENTAL_MAX_FREQUENCY) {
-            if (error) {
-                *error = QStringLiteral("Scan uses RF input only: %1 MHz to %2 MHz")
-                             .arg(RF_MIN_CENTER_FREQUENCY / 1000000.0, 0, 'f', 0)
-                             .arg(RF_EXPERIMENTAL_MAX_FREQUENCY / 1000000.0, 0, 'f', 0);
-            }
-            frequencies.clear();
-            return frequencies;
-        }
-
-        const int countBefore = frequencies.size();
-        for (double mhz = startMhz; mhz <= endMhz + stepMhz * 0.25; mhz += stepMhz) {
-            frequencies.push_back(mhz * 1000000.0);
-            if (frequencies.size() > AGILE_SCAN_MAX_POINTS) {
-                if (error) {
-                    *error = QStringLiteral("Too many scan points (%1 max). Increase step or split presets.")
-                                 .arg(AGILE_SCAN_MAX_POINTS);
-                }
-                frequencies.clear();
-                return frequencies;
-            }
-        }
-        if (frequencies.size() == countBefore) {
-            frequencies.push_back(startMhz * 1000000.0);
-        }
-    }
-
-    std::sort(frequencies.begin(), frequencies.end());
-    auto last = std::unique(frequencies.begin(), frequencies.end(), [](double a, double b) {
-        return std::abs(a - b) < 0.5;
-    });
-    frequencies.erase(last, frequencies.end());
-
-    if (frequencies.size() < AGILE_SCAN_MIN_POINTS) {
-        if (error) {
-            *error = QStringLiteral("Agile scan needs at least two frequencies");
-        }
-        frequencies.clear();
-    }
-    return frequencies;
-}
-
-QString formatMhzList(const QVector<double> &frequenciesHz) {
-    QStringList parts;
-    parts.reserve(frequenciesHz.size());
-    for (const double frequencyHz : frequenciesHz) {
-        QString text = QString::number(frequencyHz / 1000000.0, 'f', 6);
-        while (text.contains(QLatin1Char('.')) && text.endsWith(QLatin1Char('0'))) {
-            text.chop(1);
-        }
-        if (text.endsWith(QLatin1Char('.'))) {
-            text.chop(1);
-        }
-        parts << text;
-    }
-    return parts.join(QStringLiteral(", "));
-}
-
-QVector<double> parseStandardScanCentersMhz(const QString &centersMhz,
-                                            double sampleRateHz,
-                                            int minimumPoints,
-                                            QString *error,
-                                            bool *adjusted) {
-    if (adjusted) {
-        *adjusted = false;
-    }
-    QVector<double> frequencies;
-    QString text = centersMhz.trimmed();
-    text.replace(QChar(0x2013), QLatin1Char('-'));
-    text.replace(QChar(0x2014), QLatin1Char('-'));
-    text.replace(QLatin1Char('\\'), QLatin1Char(','));
-    text.replace(QLatin1Char('/'), QLatin1Char(','));
-    text.replace(QLatin1Char(';'), QLatin1Char(','));
-    text.replace(QRegularExpression(QStringLiteral("mhz|мгц|РјРіС†"),
-                                    QRegularExpression::CaseInsensitiveOption),
-                 QString());
-    text.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(","));
-
-    if (text.isEmpty()) {
-        if (minimumPoints > 0 && error) {
-            *error = QStringLiteral("Standard scan centers are empty");
-        }
-        return frequencies;
-    }
-
-    const QStringList tokens = text.split(QLatin1Char(','), Qt::SkipEmptyParts);
-    for (const QString &token : tokens) {
-        bool ok = false;
-        const double mhz = token.toDouble(&ok);
-        const double frequencyHz = mhz * 1000000.0;
-        if (!ok ||
-            !std::isfinite(frequencyHz) ||
-            frequencyHz < RF_MIN_CENTER_FREQUENCY ||
-            frequencyHz > RF_EXPERIMENTAL_MAX_FREQUENCY) {
-            if (error) {
-                *error = QStringLiteral("Standard scan uses RF centers only: %1 MHz to %2 MHz")
-                             .arg(RF_MIN_CENTER_FREQUENCY / 1000000.0, 0, 'f', 0)
-                             .arg(RF_EXPERIMENTAL_MAX_FREQUENCY / 1000000.0, 0, 'f', 0);
-            }
-            frequencies.clear();
-            return frequencies;
-        }
-        frequencies.push_back(frequencyHz);
-    }
-
-    std::sort(frequencies.begin(), frequencies.end());
-    if (std::isfinite(sampleRateHz) && sampleRateHz > 0.0 && frequencies.size() > 1) {
-        const double minimumStepHz = (std::max)(1.0, sampleRateHz);
-        for (int i = 1; i < frequencies.size(); ++i) {
-            const double minimumFrequency = frequencies.at(i - 1) + minimumStepHz;
-            if (frequencies.at(i) < minimumFrequency - 0.5) {
-                frequencies[i] = minimumFrequency;
-                if (adjusted) {
-                    *adjusted = true;
-                }
-            }
-            if (frequencies.at(i) > RF_EXPERIMENTAL_MAX_FREQUENCY) {
-                if (error) {
-                    *error = QStringLiteral("Standard scan list exceeds receiver range after sample-rate spacing");
-                }
-                frequencies.clear();
-                return frequencies;
-            }
-        }
-    }
-
-    if (frequencies.size() < minimumPoints) {
-        if (error) {
-            *error = QStringLiteral("Standard scan needs at least two centers");
-        }
-        frequencies.clear();
-    }
-    return frequencies;
-}
-
-QVector<double> parseListeningScanTargetsMhz(const QString &targetsMhz,
-                                             double minimumHz,
-                                             double maximumHz,
-                                             int minimumPoints,
-                                             QString *error) {
-    QVector<double> frequencies;
-    QString text = targetsMhz.trimmed();
-    text.replace(QChar(0x2013), QLatin1Char('-'));
-    text.replace(QChar(0x2014), QLatin1Char('-'));
-    text.replace(QLatin1Char('\\'), QLatin1Char(','));
-    text.replace(QLatin1Char('/'), QLatin1Char(','));
-    text.replace(QLatin1Char(';'), QLatin1Char(','));
-    text.replace(QRegularExpression(QStringLiteral("mhz|РјРіС†|Р СР С–РЎвЂ "),
-                                    QRegularExpression::CaseInsensitiveOption),
-                 QString());
-    text.replace(QRegularExpression(QStringLiteral("\\s+")), QStringLiteral(","));
-
-    if (text.isEmpty()) {
-        if (minimumPoints > 0 && error) {
-            *error = QStringLiteral("Listening scan targets are empty");
-        }
-        return frequencies;
-    }
-
-    if (!std::isfinite(minimumHz) || minimumHz < 0.0) {
-        minimumHz = 0.0;
-    }
-    if (!std::isfinite(maximumHz) || maximumHz <= minimumHz) {
-        maximumHz = RF_EXPERIMENTAL_MAX_FREQUENCY;
-    }
-
-    const QStringList tokens = text.split(QLatin1Char(','), Qt::SkipEmptyParts);
-    for (const QString &token : tokens) {
-        bool ok = false;
-        const double mhz = token.toDouble(&ok);
-        const double frequencyHz = mhz * 1000000.0;
-        if (!ok ||
-            !std::isfinite(frequencyHz) ||
-            frequencyHz < minimumHz ||
-            frequencyHz > maximumHz) {
-            if (error) {
-                *error = QStringLiteral("Listening scan target out of range: %1 MHz to %2 MHz")
-                             .arg(minimumHz / 1000000.0, 0, 'f', 3)
-                             .arg(maximumHz / 1000000.0, 0, 'f', 3);
-            }
-            frequencies.clear();
-            return frequencies;
-        }
-        bool duplicate = false;
-        for (const double existingHz : std::as_const(frequencies)) {
-            if (std::abs(existingHz - frequencyHz) < 0.5) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            frequencies.push_back(frequencyHz);
-        }
-    }
-
-    if (frequencies.size() < minimumPoints) {
-        if (error) {
-            *error = QStringLiteral("Listening scan needs at least %1 target%2")
-                         .arg(minimumPoints)
-                         .arg(minimumPoints == 1 ? QString() : QStringLiteral("s"));
-        }
-        frequencies.clear();
-    }
-    return frequencies;
 }
 
 int scalePercentToSliderValue(double scalePercent) {
@@ -2207,178 +1088,6 @@ QImage createSstvTestPattern() {
     return image;
 }
 
-bool shouldWriteDiagnosticLogLine(QtMsgType type, const QString &message) {
-    if (type != QtDebugMsg || fobosVerboseLoggingEnabled()) {
-        return true;
-    }
-
-    return message.contains(QStringLiteral("[Log]")) ||
-           message.contains(QStringLiteral("[Crash]"));
-}
-
-void diagnosticMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &message) {
-    const QString line = QString("%1 [%2] [tid 0x%3] %4%5")
-                             .arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz"))
-                             .arg(messageTypeName(type))
-                             .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16)
-                             .arg(message)
-                             .arg(context.file ? QString(" (%1:%2)").arg(context.file).arg(context.line) : QString());
-
-    const bool writeDiagnosticOutput = shouldWriteDiagnosticLogLine(type, message);
-    if (writeDiagnosticOutput) {
-        QMutexLocker lock(&gLogMutex);
-        if (gLogFile.isOpen()) {
-            if (gLogBytesWritten >= DIAGNOSTIC_LOG_MAX_BYTES) {
-                const QString currentPath = gLogFile.fileName();
-                gLogFile.close();
-                QFile::remove(currentPath + QStringLiteral(".1"));
-                QFile::rename(currentPath, currentPath + QStringLiteral(".1"));
-                gLogFile.setFileName(currentPath);
-                gLogFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
-                gLogBytesWritten = 0;
-                gLogLinesUntilFlush = 0;
-            }
-
-            const QByteArray encodedLine = line.toUtf8();
-            gLogFile.write(encodedLine);
-            gLogFile.write("\n");
-            gLogBytesWritten += encodedLine.size() + 1;
-            ++gLogLinesUntilFlush;
-            if (type != QtDebugMsg || gLogLinesUntilFlush >= 64) {
-                gLogFile.flush();
-                gLogLinesUntilFlush = 0;
-            }
-        }
-    }
-
-    const bool echoDebugOutput =
-        type != QtDebugMsg || fobosVerboseLoggingEnabled();
-    if (echoDebugOutput) {
-        const QByteArray localLine = line.toLocal8Bit();
-        std::fprintf(stderr, "%s\n", localLine.constData());
-        std::fflush(stderr);
-    }
-
-#ifdef _WIN32
-    if (echoDebugOutput) {
-        const std::wstring debugLine = (line + "\n").toStdWString();
-        OutputDebugStringW(debugLine.c_str());
-    }
-#endif
-
-    if (type == QtFatalMsg) {
-        std::abort();
-    }
-}
-
-void installDiagnosticLogger() {
-    const QString logPath = QDir(QCoreApplication::applicationDirPath()).filePath("FobosAPP_diagnostic.log");
-    if (QFileInfo(logPath).size() >= DIAGNOSTIC_LOG_MAX_BYTES) {
-        QFile::remove(logPath + QStringLiteral(".1"));
-        QFile::rename(logPath, logPath + QStringLiteral(".1"));
-    }
-    gLogFile.setFileName(logPath);
-    gLogFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
-    gLogBytesWritten = gLogFile.isOpen() ? gLogFile.size() : 0;
-    gLogLinesUntilFlush = 0;
-    qInstallMessageHandler(diagnosticMessageHandler);
-    qDebug() << "[Log] ===== Diagnostic session started =====";
-    qDebug() << "[Log] Diagnostic log path:" << QDir::toNativeSeparators(logPath)
-             << "fileOpen" << gLogFile.isOpen();
-    qDebug() << "[Log] Verbose diagnostic logging"
-             << (fobosVerboseLoggingEnabled() ? "enabled" : "disabled");
-}
-
-#ifdef _WIN32
-QString modulePathForAddress(void *address) {
-    if (!address) {
-        return QString();
-    }
-
-    MEMORY_BASIC_INFORMATION memoryInfo;
-    ZeroMemory(&memoryInfo, sizeof(memoryInfo));
-    if (!VirtualQuery(address, &memoryInfo, sizeof(memoryInfo)) || !memoryInfo.AllocationBase) {
-        return QString();
-    }
-
-    wchar_t modulePath[MAX_PATH] = {};
-    const DWORD length = GetModuleFileNameW(static_cast<HMODULE>(memoryInfo.AllocationBase),
-                                            modulePath,
-                                            MAX_PATH);
-    if (length == 0) {
-        return QString();
-    }
-    return QString::fromWCharArray(modulePath, static_cast<int>(length));
-}
-
-LONG WINAPI diagnosticUnhandledExceptionFilter(EXCEPTION_POINTERS *exceptionInfo) {
-    if (!exceptionInfo || !exceptionInfo->ExceptionRecord) {
-        qCritical() << "[Crash] unhandled Windows exception without exception record";
-        return EXCEPTION_EXECUTE_HANDLER;
-    }
-
-    EXCEPTION_RECORD *record = exceptionInfo->ExceptionRecord;
-    void *address = record->ExceptionAddress;
-    const QString modulePath = modulePathForAddress(address);
-    qCritical() << "[Crash] unhandled Windows exception"
-                << "code" << QString("0x%1").arg(static_cast<quint32>(record->ExceptionCode), 8, 16, QChar('0'))
-                << "address" << address
-                << "module" << (modulePath.isEmpty() ? QString("unknown") : QDir::toNativeSeparators(modulePath))
-                << "parameters" << static_cast<quint32>(record->NumberParameters);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-#endif
-
-void diagnosticTerminateHandler() {
-    qCritical() << "[Crash] std::terminate called";
-    std::abort();
-}
-
-void installCrashLogger() {
-#ifdef _WIN32
-    SetUnhandledExceptionFilter(diagnosticUnhandledExceptionFilter);
-#endif
-    std::set_terminate(diagnosticTerminateHandler);
-    qDebug() << "[Log] Crash logger installed";
-}
-
-void logMemorySnapshot(const char *tag) {
-    if (!fobosVerboseLoggingEnabled()) {
-        return;
-    }
-
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX counters;
-    ZeroMemory(&counters, sizeof(counters));
-    counters.cb = sizeof(counters);
-
-    MEMORYSTATUSEX memoryStatus;
-    ZeroMemory(&memoryStatus, sizeof(memoryStatus));
-    memoryStatus.dwLength = sizeof(memoryStatus);
-
-    const bool processOk = GetProcessMemoryInfo(GetCurrentProcess(),
-                                                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                                                sizeof(counters)) != 0;
-    const bool systemOk = GlobalMemoryStatusEx(&memoryStatus) != 0;
-    if (!processOk && !systemOk) {
-        qDebug() << "[Memory]" << tag << "unavailable";
-        return;
-    }
-
-    const auto toMb = [](quint64 bytes) {
-        return static_cast<double>(bytes) / (1024.0 * 1024.0);
-    };
-
-    qDebug() << "[Memory]" << tag
-             << "workingSetMB" << (processOk ? toMb(counters.WorkingSetSize) : -1.0)
-             << "privateMB" << (processOk ? toMb(counters.PrivateUsage) : -1.0)
-             << "availPhysMB" << (systemOk ? toMb(memoryStatus.ullAvailPhys) : -1.0)
-             << "memoryLoadPct" << (systemOk ? static_cast<int>(memoryStatus.dwMemoryLoad) : -1);
-#else
-    qDebug() << "[Memory]" << tag << "snapshot unavailable on this platform";
-#endif
-}
-
 } // namespace
 
 QString formatSampleRate(double sampleRate);
@@ -2669,7 +1378,7 @@ YourClassName::YourClassName(QWidget *parent)
     fftComboBox->addItem("524288");
     fftComboBox->addItem("1048576");
     fftComboBox->addItem("2097152");
-    fftComboBox->setCurrentIndex(4);
+    fftComboBox->setCurrentText(QString::number(pendingSettings.fftLength));
     
     lnaGainSlider = new QSlider(Qt::Horizontal, this);
     lnaGainSlider->setRange(1, 3);
@@ -2753,6 +1462,7 @@ YourClassName::YourClassName(QWidget *parent)
     
     audioCheckbox = new QCheckBox("Audio", this);
     markTranslatable(audioCheckbox, QStringLiteral("audio"), QStringLiteral("Audio"));
+    audioCheckbox->setChecked(pendingSettings.audioEnabled);
     syncCheckbox = new QCheckBox("Sync", this);
     markTranslatable(syncCheckbox, QStringLiteral("sync"), QStringLiteral("Sync"));
     syncCheckbox->setChecked(false);
@@ -2760,8 +1470,8 @@ YourClassName::YourClassName(QWidget *parent)
     syncCheckbox->setToolTip("Async reader is forced for continuous streaming tests.");
     graphCheckbox = new QCheckBox("Spectr 2", this);
     markTranslatable(graphCheckbox, QStringLiteral("spectrum2"), QStringLiteral("Spectr 2"));
-    colorCheckbox = new QCheckBox("Colorful", this);
-    markTranslatable(colorCheckbox, QStringLiteral("colorful"), QStringLiteral("Colorful"));
+    colorCheckbox = new QCheckBox("Color spectrum", this);
+    markTranslatable(colorCheckbox, QStringLiteral("colorful"), QStringLiteral("Color spectrum"));
     audioCheckbox->hide();
     syncCheckbox->hide();
     graphCheckbox->hide();
@@ -3001,6 +1711,8 @@ YourClassName::YourClassName(QWidget *parent)
 
     QGroupBox *agileScanBox = new QGroupBox("Agile scan", this);
     markTranslatable(agileScanBox, QStringLiteral("agile_scan"), QStringLiteral("Agile scan"));
+    QGroupBox *spectrumMeasurementBox = new QGroupBox("Spectrum measurement", this);
+    markTranslatable(spectrumMeasurementBox, QStringLiteral("spectrum_measurement"), QStringLiteral("Spectrum measurement"));
     agileScanCheckbox = new QCheckBox("Enable scan", agileScanBox);
     markTranslatable(agileScanCheckbox, QStringLiteral("enable_scan"), QStringLiteral("Enable scan"));
     agileScanPresetCombo = new QComboBox(agileScanBox);
@@ -3019,49 +1731,57 @@ YourClassName::YourClassName(QWidget *parent)
     agileScanStepSpin->setSuffix(QStringLiteral(" MHz"));
     agileScanStepSpin->setValue(agileScanStepMhz);
     agileScanStepSpin->setMaximumWidth(104);
-    scanMeasurementCheckbox = new QCheckBox("Measure", agileScanBox);
-    markTranslatable(scanMeasurementCheckbox, QStringLiteral("measure"), QStringLiteral("Measure"));
+    agileScanAutoStepCheckbox = new QCheckBox("Step = SR", agileScanBox);
+    markTranslatable(agileScanAutoStepCheckbox,
+                     QStringLiteral("agile_auto_step"),
+                     QStringLiteral("Step = SR"));
+    agileScanAutoStepCheckbox->setToolTip(uiText(
+        QStringLiteral("agile_auto_step_tooltip"),
+        QStringLiteral("Use the current sample rate in MHz as the Agile scan step.")));
+    scanMeasurementCheckbox = new QCheckBox("Measure spectrum", spectrumMeasurementBox);
+    markTranslatable(scanMeasurementCheckbox, QStringLiteral("measure"), QStringLiteral("Measure spectrum"));
     scanMeasurementCheckbox->setToolTip(uiText(
         QStringLiteral("measure_tooltip"),
-        QStringLiteral("Collect current, peak-hold, baseline and delta values for scan coverage checks")));
+        QStringLiteral("Collect current, peak-hold, baseline and delta values for spectrum coverage checks")));
     scanMeasurementCheckbox->setChecked(scanMeasurementEnabled);
-    scanMeasurementBinSpin = new QDoubleSpinBox(agileScanBox);
+    scanMeasurementBinSpin = new QDoubleSpinBox(spectrumMeasurementBox);
     scanMeasurementBinSpin->setRange(SCAN_MEASUREMENT_MIN_BIN_MHZ, SCAN_MEASUREMENT_MAX_BIN_MHZ);
     scanMeasurementBinSpin->setDecimals(3);
     scanMeasurementBinSpin->setSingleStep(0.1);
     scanMeasurementBinSpin->setSuffix(QStringLiteral(" MHz"));
     scanMeasurementBinSpin->setValue(scanMeasurementBinMhz);
-    scanMeasurementBaselineButton = new QPushButton("BG Rec", agileScanBox);
+    scanMeasurementBaselineButton = new QPushButton("BG Rec", spectrumMeasurementBox);
     markTranslatable(scanMeasurementBaselineButton, QStringLiteral("bg_rec"), QStringLiteral("BG Rec"));
     scanMeasurementBaselineButton->setCheckable(true);
     scanMeasurementBaselineButton->setToolTip(uiText(
         QStringLiteral("bg_rec_tooltip"),
         QStringLiteral("Record baseline while the source under test is off")));
-    scanMeasurementResetPeakButton = new QPushButton("Reset Peak", agileScanBox);
+    scanMeasurementResetPeakButton = new QPushButton("Reset Peak", spectrumMeasurementBox);
     markTranslatable(scanMeasurementResetPeakButton, QStringLiteral("reset_peak"), QStringLiteral("Reset Peak"));
     scanMeasurementResetPeakButton->setToolTip(uiText(
         QStringLiteral("reset_peak_tooltip"),
         QStringLiteral("Clear peak-hold values without clearing baseline")));
-    scanMeasurementExportButton = new QPushButton("CSV", agileScanBox);
+    scanMeasurementExportButton = new QPushButton("CSV", spectrumMeasurementBox);
     scanMeasurementExportButton->setToolTip(uiText(QStringLiteral("csv_tooltip"),
-                                                   QStringLiteral("Export scan measurement bins to CSV")));
-    spurSuppressionCheckbox = new QCheckBox("Spur", agileScanBox);
+                                                   QStringLiteral("Export spectrum measurement bins to CSV")));
+    spurSuppressionCheckbox = new QCheckBox("Spur", spectrumMeasurementBox);
     markTranslatable(spurSuppressionCheckbox, QStringLiteral("spur"), QStringLiteral("Spur"));
     spurSuppressionCheckbox->setToolTip(uiText(
         QStringLiteral("spur_tooltip"),
-        QStringLiteral("Suppress calibrated internal receiver spurs in spectrum, waterfall and scan measurements")));
+        QStringLiteral("Suppress calibrated internal receiver spurs in spectrum, waterfall and spectrum measurements")));
     spurSuppressionCheckbox->setChecked(spurSuppressionEnabled);
-    spurCalibrateButton = new QPushButton("Cal", agileScanBox);
+    spurCalibrateButton = new QPushButton("Cal", spectrumMeasurementBox);
     markTranslatable(spurCalibrateButton, QStringLiteral("cal"), QStringLiteral("Cal"));
     spurCalibrateButton->setToolTip(uiText(
         QStringLiteral("cal_tooltip"),
         QStringLiteral("Calibrate stable narrow spurs with a 50 ohm load connected")));
-    spurClearButton = new QPushButton("Clear", agileScanBox);
+    spurClearButton = new QPushButton("Clear", spectrumMeasurementBox);
     markTranslatable(spurClearButton, QStringLiteral("clear"), QStringLiteral("Clear"));
     spurClearButton->setToolTip(uiText(QStringLiteral("clear_spur_tooltip"),
                                        QStringLiteral("Clear calibrated spur mask")));
     agileScanSavePresetButton = new QPushButton("Save", agileScanBox);
-    markTranslatable(agileScanSavePresetButton, QStringLiteral("save"), QStringLiteral("Save"));
+    markTranslatable(agileScanSavePresetButton, QStringLiteral("save_short"), QStringLiteral("Save"));
+    agileScanSavePresetButton->setToolTip(uiText(QStringLiteral("save"), QStringLiteral("Save")));
     agileScanDeletePresetButton = new QPushButton("Del", agileScanBox);
     markTranslatable(agileScanDeletePresetButton, QStringLiteral("delete_short"), QStringLiteral("Del"));
     agileScanStatusLabel = new QLabel(uiText(QStringLiteral("agile_scan_off"),
@@ -3071,13 +1791,13 @@ YourClassName::YourClassName(QWidget *parent)
     agileScanStatusLabel->setWordWrap(false);
     agileScanStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     scanMeasurementStatusLabel = new QLabel(uiText(QStringLiteral("scan_measurement_idle"),
-                                                   QStringLiteral("Scan measurement: idle")), agileScanBox);
+                                                   QStringLiteral("Spectrum measurement: idle")), spectrumMeasurementBox);
     scanMeasurementStatusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     scanMeasurementStatusLabel->setMinimumWidth(0);
     scanMeasurementStatusLabel->setWordWrap(false);
     scanMeasurementStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     spurSuppressionStatusLabel = new QLabel(uiText(QStringLiteral("spur_mask_off"),
-                                                   QStringLiteral("Spur mask: off")), agileScanBox);
+                                                   QStringLiteral("Spur mask: off")), spectrumMeasurementBox);
     spurSuppressionStatusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     spurSuppressionStatusLabel->setMinimumWidth(0);
     spurSuppressionStatusLabel->setWordWrap(false);
@@ -3086,7 +1806,7 @@ YourClassName::YourClassName(QWidget *parent)
     QHBoxLayout *agileScanPresetLayout = new QHBoxLayout();
     QHBoxLayout *agileScanPresetButtonLayout = new QHBoxLayout();
     QHBoxLayout *agileScanRangeLayout = new QHBoxLayout();
-    QHBoxLayout *scanToolsLayout = new QHBoxLayout();
+    QVBoxLayout *spectrumMeasurementLayout = new QVBoxLayout(spectrumMeasurementBox);
     QVBoxLayout *scanMeasurementPanelLayout = new QVBoxLayout();
     QHBoxLayout *scanMeasurementTopLayout = new QHBoxLayout();
     QHBoxLayout *scanMeasurementButtonLayout = new QHBoxLayout();
@@ -3102,17 +1822,22 @@ YourClassName::YourClassName(QWidget *parent)
     agileScanPresetButtonLayout->setSpacing(4);
     agileScanPresetButtonLayout->addWidget(agileScanSavePresetButton);
     agileScanPresetButtonLayout->addWidget(agileScanDeletePresetButton);
+    agileScanPresetButtonLayout->addWidget(agileScanAutoStepCheckbox);
     agileScanPresetButtonLayout->addStretch(1);
     agileScanPresetButtonLayout->addWidget(agileScanStepLabel);
     agileScanPresetButtonLayout->addWidget(agileScanStepSpin);
     agileScanRangeLayout->addWidget(agileScanRangeLabel);
     agileScanRangeLayout->addWidget(agileScanRangesEdit, 1);
-    QLabel *scanMeasurementBinLabel = new QLabel("Bin:", agileScanBox);
+    QLabel *scanMeasurementBinLabel = new QLabel("Bin:", spectrumMeasurementBox);
     markTranslatable(scanMeasurementBinLabel, QStringLiteral("bin"), QStringLiteral("Bin:"));
     scanMeasurementBinSpin->setMaximumWidth(92);
     scanMeasurementBaselineButton->setMaximumWidth(68);
     scanMeasurementResetPeakButton->setMaximumWidth(86);
     scanMeasurementExportButton->setMaximumWidth(44);
+    agileScanSavePresetButton->setMaximumWidth(52);
+    agileScanDeletePresetButton->setMaximumWidth(42);
+    agileScanSavePresetButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    agileScanDeletePresetButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     spurCalibrateButton->setMaximumWidth(44);
     spurClearButton->setMaximumWidth(54);
 
@@ -3132,8 +1857,8 @@ YourClassName::YourClassName(QWidget *parent)
     scanMeasurementPanelLayout->setSpacing(2);
     scanMeasurementPanelLayout->addLayout(scanMeasurementTopLayout);
     scanMeasurementPanelLayout->addLayout(scanMeasurementButtonLayout);
-    scanMeasurementPanelLayout->addWidget(agileScanStatusLabel);
     scanMeasurementPanelLayout->addWidget(scanMeasurementStatusLabel);
+    spectrumMeasurementLayout->addLayout(scanMeasurementPanelLayout);
 
     spurSuppressionLayout->setContentsMargins(0, 0, 0, 0);
     spurSuppressionLayout->setSpacing(4);
@@ -3145,15 +1870,12 @@ YourClassName::YourClassName(QWidget *parent)
     spurSuppressionPanelLayout->setSpacing(2);
     spurSuppressionPanelLayout->addLayout(spurSuppressionLayout);
     spurSuppressionPanelLayout->addWidget(spurSuppressionStatusLabel);
+    spectrumMeasurementLayout->addLayout(spurSuppressionPanelLayout);
 
-    scanToolsLayout->setContentsMargins(0, 0, 0, 0);
-    scanToolsLayout->setSpacing(8);
-    scanToolsLayout->addLayout(scanMeasurementPanelLayout, 3);
-    scanToolsLayout->addLayout(spurSuppressionPanelLayout, 2);
     agileScanLayout->addLayout(agileScanPresetLayout);
     agileScanLayout->addLayout(agileScanPresetButtonLayout);
     agileScanLayout->addLayout(agileScanRangeLayout);
-    agileScanLayout->addLayout(scanToolsLayout);
+    agileScanLayout->addWidget(agileScanStatusLabel);
 
     QGroupBox *standardScanBox = new QGroupBox("Standard scan", this);
     markTranslatable(standardScanBox, QStringLiteral("standard_scan"), QStringLiteral("Standard scan"));
@@ -3510,77 +2232,123 @@ YourClassName::YourClassName(QWidget *parent)
     qthLongitudeSpin->setSuffix(QStringLiteral(" deg"));
     qthLocatorLabel = new QLabel(qthBox);
     qthLocatorLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    auto prepareGnssStatusLabel = [](QLabel *label) {
+        if (!label) {
+            return;
+        }
+        label->setWordWrap(true);
+        label->setMinimumWidth(0);
+        label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    };
     qthStatusLabel = new QLabel(qthBox);
-    qthStatusLabel->setWordWrap(true);
-    qthStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    qthMapButton = new QPushButton("QTH Map", qthBox);
-    markTranslatable(qthMapButton, QStringLiteral("qth_map"), QStringLiteral("QTH Map"));
-    qthCopyButton = new QPushButton("Copy QTH", qthBox);
-    markTranslatable(qthCopyButton, QStringLiteral("copy_qth"), QStringLiteral("Copy QTH"));
+    prepareGnssStatusLabel(qthStatusLabel);
+    qthMapButton = new QPushButton("Map", qthBox);
+    markTranslatable(qthMapButton, QStringLiteral("qth_map"), QStringLiteral("Map"));
+    qthCopyButton = new QPushButton("Copy", qthBox);
+    markTranslatable(qthCopyButton, QStringLiteral("copy_qth"), QStringLiteral("Copy"));
     qthPasteNmeaButton = new QPushButton("Paste NMEA", qthBox);
-    markTranslatable(qthPasteNmeaButton, QStringLiteral("paste_nmea"), QStringLiteral("Paste NMEA"));
+    markTranslatable(qthPasteNmeaButton, QStringLiteral("paste_nmea"), QStringLiteral("NMEA"));
     qthPasteNmeaButton->setToolTip(uiText(
         QStringLiteral("nmea_paste_tooltip"),
         QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
-    gnssTuneButton = new QPushButton("Tune GNSS L1", qthBox);
-    markTranslatable(gnssTuneButton, QStringLiteral("tune_gnss_l1"), QStringLiteral("Tune GNSS L1"));
-    gnssScanButton = new QPushButton("Use GNSS scan", qthBox);
-    markTranslatable(gnssScanButton, QStringLiteral("use_gnss_scan"), QStringLiteral("Use GNSS scan"));
-    gnssRawLogButton = new QPushButton("Save GNSS IQ", qthBox);
-    markTranslatable(gnssRawLogButton, QStringLiteral("log_raw_context"), QStringLiteral("Save GNSS IQ"));
+    gnssTuneButton = new QPushButton("Tune", qthBox);
+    markTranslatable(gnssTuneButton, QStringLiteral("tune_gnss_l1"), QStringLiteral("Tune"));
+    gnssScanButton = new QPushButton("Scan", qthBox);
+    markTranslatable(gnssScanButton, QStringLiteral("use_gnss_scan"), QStringLiteral("Scan"));
+    gnssRawLogButton = new QPushButton("Save IQ", qthBox);
+    markTranslatable(gnssRawLogButton, QStringLiteral("log_raw_context"), QStringLiteral("Save IQ"));
     gnssRawLogButton->setToolTip(uiText(
         QStringLiteral("gnss_raw_context_tooltip"),
         QStringLiteral("Save the current live GNSS IQ snapshot as stereo PCM16 WAV and write its tuning context to the diagnostic log.")));
-    gnssAcquireButton = new QPushButton("GPS C/A accumulate", qthBox);
-    markTranslatable(gnssAcquireButton, QStringLiteral("gps_ca_scan"), QStringLiteral("GPS C/A accumulate"));
+    gnssAcquireButton = new QPushButton("Accum", qthBox);
+    markTranslatable(gnssAcquireButton, QStringLiteral("gps_ca_scan"), QStringLiteral("Accum"));
     gnssAcquireButton->setToolTip(uiText(
         QStringLiteral("gps_ca_scan_tooltip"),
         QStringLiteral("Run accumulated GPS L1 C/A PRN correlation on the current IQ snapshot.")));
-    gnssDeepAcquireButton = new QPushButton("GPS deep", qthBox);
-    markTranslatable(gnssDeepAcquireButton, QStringLiteral("gps_ca_deep_scan"), QStringLiteral("GPS deep"));
+    gnssDeepAcquireButton = new QPushButton("Deep", qthBox);
+    markTranslatable(gnssDeepAcquireButton, QStringLiteral("gps_ca_deep_scan"), QStringLiteral("Deep"));
     gnssDeepAcquireButton->setToolTip(uiText(
         QStringLiteral("gps_ca_deep_scan_tooltip"),
         QStringLiteral("Run a 160 ms GPS L1 C/A acquisition using the extended live IQ buffer.")));
-    gnssOfflineAcquireButton = new QPushButton("GPS replay", qthBox);
-    markTranslatable(gnssOfflineAcquireButton, QStringLiteral("gps_ca_replay_scan"), QStringLiteral("GPS replay"));
+    gnssOfflineAcquireButton = new QPushButton("Replay", qthBox);
+    markTranslatable(gnssOfflineAcquireButton, QStringLiteral("gps_ca_replay_scan"), QStringLiteral("Replay"));
     gnssOfflineAcquireButton->setToolTip(uiText(
         QStringLiteral("gps_ca_replay_scan_tooltip"),
         QStringLiteral("Run GPS L1 C/A acquisition directly on the selected Channel IQ WAV recording.")));
-    gnssSelfTestButton = new QPushButton("GPS self-test", qthBox);
-    markTranslatable(gnssSelfTestButton, QStringLiteral("gps_ca_self_test"), QStringLiteral("GPS self-test"));
+    gnssSelfTestButton = new QPushButton("Self-test", qthBox);
+    markTranslatable(gnssSelfTestButton, QStringLiteral("gps_ca_self_test"), QStringLiteral("Self-test"));
     gnssSelfTestButton->setToolTip(uiText(
         QStringLiteral("gps_ca_self_test_tooltip"),
         QStringLiteral("Generate an ideal GPS L1 C/A IQ signal and run it through the same acquisition path.")));
-    gnssPositionSelfTestButton = new QPushButton("Position test", qthBox);
-    markTranslatable(gnssPositionSelfTestButton, QStringLiteral("gnss_position_self_test"), QStringLiteral("Position test"));
+    gnssPositionSelfTestButton = new QPushButton("Position", qthBox);
+    markTranslatable(gnssPositionSelfTestButton, QStringLiteral("gnss_position_self_test"), QStringLiteral("Position"));
     gnssPositionSelfTestButton->setToolTip(uiText(
         QStringLiteral("gnss_position_self_test_tooltip"),
         QStringLiteral("Solve a synthetic multi-satellite pseudorange fix and show the result on the QTH map.")));
-    gnssMonitorCheckbox = new QCheckBox("GNSS IQ monitor", qthBox);
-    markTranslatable(gnssMonitorCheckbox, QStringLiteral("gnss_iq_monitor"), QStringLiteral("GNSS IQ monitor"));
+    gnssMonitorCheckbox = new QCheckBox("IQ monitor", qthBox);
+    markTranslatable(gnssMonitorCheckbox, QStringLiteral("gnss_iq_monitor"), QStringLiteral("IQ monitor"));
     gnssMonitorCheckbox->setToolTip(uiText(
         QStringLiteral("gnss_iq_monitor_tooltip"),
         QStringLiteral("Measure live/playback IQ level, DC offset, clipping and I/Q balance before attempting GNSS acquisition.")));
     gnssMonitorResetButton = new QPushButton("Reset", qthBox);
     markTranslatable(gnssMonitorResetButton, QStringLiteral("reset"), QStringLiteral("Reset"));
-    gnssNetworkTimeButton = new QPushButton("NTP time", qthBox);
-    markTranslatable(gnssNetworkTimeButton, QStringLiteral("gnss_ntp_time"), QStringLiteral("NTP time"));
+    gnssNetworkTimeButton = new QPushButton("NTP", qthBox);
+    markTranslatable(gnssNetworkTimeButton, QStringLiteral("gnss_ntp_time"), QStringLiteral("NTP"));
     gnssNetworkTimeButton->setToolTip(uiText(
         QStringLiteral("gnss_ntp_time_tooltip"),
         QStringLiteral("Query an internet NTP server for UTC time. This is only an assisted-GNSS hint, not code-phase lock.")));
+    gnssPlotButton = new QPushButton("Plot", qthBox);
+    markTranslatable(gnssPlotButton, QStringLiteral("gnss_acq_plot"), QStringLiteral("Plot"));
+    gnssPlotButton->setToolTip(uiText(
+        QStringLiteral("gnss_acq_plot_tooltip"),
+        QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
     gnssMonitorStatusLabel = new QLabel(qthBox);
-    gnssMonitorStatusLabel->setWordWrap(true);
-    gnssMonitorStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    prepareGnssStatusLabel(gnssMonitorStatusLabel);
     gnssAcquireStatusLabel = new QLabel(qthBox);
-    gnssAcquireStatusLabel->setWordWrap(true);
-    gnssAcquireStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    gnssAcquisitionPlotLabel = new QLabel(qthBox);
-    gnssAcquisitionPlotLabel->setMinimumHeight(170);
-    gnssAcquisitionPlotLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    prepareGnssStatusLabel(gnssAcquireStatusLabel);
+    gnssAcquisitionPlotDialog = new QDialog(this);
+    gnssAcquisitionPlotDialog->setWindowTitle(uiText(QStringLiteral("gnss_acq_plot_title"),
+                                                     QStringLiteral("GNSS acquisition diagnostics")));
+    gnssAcquisitionPlotDialog->resize(720, 300);
+    QVBoxLayout *gnssPlotDialogLayout = new QVBoxLayout(gnssAcquisitionPlotDialog);
+    gnssAcquisitionPlotLabel = new QLabel(gnssAcquisitionPlotDialog);
+    gnssAcquisitionPlotLabel->setMinimumSize(520, 220);
+    gnssAcquisitionPlotLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     gnssAcquisitionPlotLabel->setScaledContents(false);
+    gnssAcquisitionPlotLabel->setAlignment(Qt::AlignCenter);
+    gnssAcquisitionPlotLabel->setText(uiText(QStringLiteral("gnss_acq_plot_waiting"),
+                                             QStringLiteral("Run GPS C/A accumulation to draw correlation diagnostics.")));
     gnssAcquisitionPlotLabel->setToolTip(uiText(
         QStringLiteral("gnss_acq_plot_tooltip"),
         QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
+    gnssPlotDialogLayout->addWidget(gnssAcquisitionPlotLabel, 1);
+
+    auto prepareGnssButton = [](QPushButton *button) {
+        if (!button) {
+            return;
+        }
+        button->setMinimumWidth(0);
+        button->setMaximumWidth(82);
+        button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    };
+    for (QPushButton *button : {
+             qthMapButton,
+             qthCopyButton,
+             qthPasteNmeaButton,
+             gnssTuneButton,
+             gnssScanButton,
+             gnssRawLogButton,
+             gnssAcquireButton,
+             gnssDeepAcquireButton,
+             gnssOfflineAcquireButton,
+             gnssSelfTestButton,
+             gnssPositionSelfTestButton,
+             gnssNetworkTimeButton,
+             gnssPlotButton,
+             gnssMonitorResetButton}) {
+        prepareGnssButton(button);
+    }
 
     QLabel *qthSourceLabel = new QLabel("Source:", qthBox);
     markTranslatable(qthSourceLabel, QStringLiteral("source"), QStringLiteral("Source:"));
@@ -3632,12 +2400,12 @@ YourClassName::YourClassName(QWidget *parent)
     qthLayout->addWidget(gnssNetworkTimeButton, 11, 0);
     qthLayout->addWidget(gnssOfflineAcquireButton, 11, 1);
     qthLayout->addWidget(gnssPositionSelfTestButton, 11, 2);
-    qthLayout->addWidget(gnssMonitorCheckbox, 12, 0, 1, 2);
+    qthLayout->addWidget(gnssMonitorCheckbox, 12, 0);
+    qthLayout->addWidget(gnssPlotButton, 12, 1);
     qthLayout->addWidget(gnssMonitorResetButton, 12, 2);
     qthLayout->addWidget(gnssMonitorStatusLabel, 13, 0, 1, 3);
     qthLayout->addWidget(gnssAcquireStatusLabel, 14, 0, 1, 3);
-    qthLayout->addWidget(gnssAcquisitionPlotLabel, 15, 0, 1, 3);
-    qthLayout->addWidget(qthStatusLabel, 16, 0, 1, 3);
+    qthLayout->addWidget(qthStatusLabel, 15, 0, 1, 3);
 
     dmrHunterControls = new SpectrumHunterControls(
         QStringLiteral("DMR Hunter"),
@@ -3711,7 +2479,7 @@ YourClassName::YourClassName(QWidget *parent)
     digitalVideoHunterControls->addPreset(QStringLiteral("DATV/DVB 2.4"), QStringLiteral("2300-2500\t2.000000"));
     digitalVideoHunterControls->addPreset(QStringLiteral("DATV/DVB 3.3"), QStringLiteral("3200-3500\t5.000000"));
     digitalVideoHunterControls->addPreset(QStringLiteral("DATV/DVB 5.8"), QStringLiteral("4900-5925\t5.000000"));
-    digitalVideoHunterControls->addPreset(QStringLiteral("Digital video sparse"), QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925\t5.000000"));
+    digitalVideoHunterControls->addPreset(QStringLiteral("Digital video sparse"), QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925\t10.000000"));
     digitalVideoHunterControls->setCandidateNavigationVisible(true);
 
     QLabel *bandwidthLabel = new QLabel("Audio Bandwidth:", this);
@@ -3734,7 +2502,7 @@ YourClassName::YourClassName(QWidget *parent)
     });
     ensureDefaultFrequencyPresets();
     updateFrequencyPresetControls();
-    bandwidthControl->setValueHz(defaultBandwidthForModulation(MOD_AM));
+    bandwidthControl->setValueHz(pendingSettings.bandwidth);
    
     QStringList modulationNames = {"AM", "NFM", "SAM", "USB", "LSB", "DSB", "CW", "WFM"};
     QVector<int> modulationIds = {MOD_AM, MOD_NFM, MOD_SAM, MOD_USB, MOD_LSB, MOD_DSB,
@@ -3769,7 +2537,7 @@ YourClassName::YourClassName(QWidget *parent)
                                                              modulationNames[i],
                                                              modulationIds[i],
                                                              QString());
-        if (i == 0) {
+        if (modulationIds[i] == pendingSettings.modulationType) {
             radioButton->setChecked(true); 
         }
     }
@@ -3953,9 +2721,12 @@ YourClassName::YourClassName(QWidget *parent)
     CollapsibleSection hfCancelSection = createCollapsibleSection(QStringLiteral("hf_cancel_lab_section"), QStringLiteral("HF cancel lab"), false);
     hfCancelSection.contentLayout->addLayout(hfNoiseCancelLayout);
 
-    CollapsibleSection scanSection = createCollapsibleSection(QStringLiteral("scan_measurement"), QStringLiteral("Scan / measurement"), false);
+    CollapsibleSection scanSection = createCollapsibleSection(QStringLiteral("scan"), QStringLiteral("Scan"), false);
     scanSection.contentLayout->addWidget(agileScanBox);
     scanSection.contentLayout->addWidget(standardScanBox);
+
+    CollapsibleSection spectrumMeasurementSection = createCollapsibleSection(QStringLiteral("spectrum_measurement"), QStringLiteral("Spectrum measurement"), false);
+    spectrumMeasurementSection.contentLayout->addWidget(spectrumMeasurementBox);
 
     CollapsibleSection listeningScanSection = createCollapsibleSection(QStringLiteral("listening_scan"), QStringLiteral("Listening scan"), false);
     listeningScanSection.contentLayout->addWidget(listeningScanBox);
@@ -4012,6 +2783,7 @@ YourClassName::YourClassName(QWidget *parent)
     layout->addWidget(receiverSection.widget);
     layout->addWidget(hfCancelSection.widget);
     layout->addWidget(scanSection.widget);
+    layout->addWidget(spectrumMeasurementSection.widget);
     layout->addWidget(listeningScanSection.widget);
     layout->addWidget(qthSection.widget);
     layout->addWidget(dmrHunterSection.widget);
@@ -4225,6 +2997,14 @@ YourClassName::YourClassName(QWidget *parent)
     connect(gnssSelfTestButton, &QPushButton::clicked, this, &YourClassName::runGnssSyntheticSelfTest);
     connect(gnssPositionSelfTestButton, &QPushButton::clicked, this, &YourClassName::runGnssPositionSelfTest);
     connect(gnssNetworkTimeButton, &QPushButton::clicked, this, &YourClassName::requestGnssNetworkTime);
+    connect(gnssPlotButton, &QPushButton::clicked, this, [this]() {
+        if (!gnssAcquisitionPlotDialog) {
+            return;
+        }
+        gnssAcquisitionPlotDialog->show();
+        gnssAcquisitionPlotDialog->raise();
+        gnssAcquisitionPlotDialog->activateWindow();
+    });
     connect(gnssNtpSocket, &QUdpSocket::readyRead, this, &YourClassName::handleGnssNetworkTimeResponse);
     connect(gnssMonitorCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
         gnssMonitorEnabled = checked;
@@ -4867,6 +3647,12 @@ YourClassName::YourClassName(QWidget *parent)
         applyScanUiChange(false);
     });
     connect(agileScanStepSpin, &QDoubleSpinBox::editingFinished, this, [applyScanUiChange]() {
+        applyScanUiChange(true);
+    });
+    connect(agileScanAutoStepCheckbox, &QCheckBox::toggled, this, [this, applyScanUiChange](bool checked) {
+        agileScanAutoStepSampleRate = checked;
+        applyAgileScanAutoStep(true);
+        updateAgileScanControls();
         applyScanUiChange(true);
     });
     connect(agileScanPresetCombo, QOverload<int>::of(&QComboBox::activated), this, [this, applyScanUiChange](int index) {
@@ -5686,7 +4472,7 @@ bool YourClassName::restartStreamForHardwareChange() {
 
     updateSpectrumTimerInterval();
     settingRange();
-    spectrumTuningDebugFramesRemaining = 32;
+    spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 32 : 0;
 
     const bool serverIqStreaming = networkMode == NetworkMode::Server && isClientIqProcessingMode();
     const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
@@ -5913,10 +4699,40 @@ QVector<double> YourClassName::agileScanFrequencyList(QString *error) const {
     const QString ranges = agileScanRangesEdit
                                ? agileScanRangesEdit->text().trimmed()
                                : agileScanRangesMhz.trimmed();
-    const double step = agileScanStepSpin
-                            ? agileScanStepSpin->value()
-                            : agileScanStepMhz;
+    const double step = agileScanAutoStepSampleRate
+                            ? agileScanAutoStepMhz()
+                            : (agileScanStepSpin
+                                   ? agileScanStepSpin->value()
+                                   : agileScanStepMhz);
     return parseAgileScanFrequenciesMhz(ranges, step, error);
+}
+
+double YourClassName::agileScanAutoStepMhz() const {
+    double sampleRate = pendingSettings.sampleRate;
+    if ((!std::isfinite(sampleRate) || sampleRate <= 0.0) && sampleBox) {
+        bool ok = false;
+        const double currentRate = sampleBox->currentData().toDouble(&ok);
+        if (ok) {
+            sampleRate = currentRate;
+        }
+    }
+    if (!std::isfinite(sampleRate) || sampleRate <= 0.0) {
+        sampleRate = globalSampleRate;
+    }
+    return (std::clamp)(sampleRate / 1000000.0,
+                        AGILE_SCAN_MIN_STEP_MHZ,
+                        AGILE_SCAN_MAX_STEP_MHZ);
+}
+
+void YourClassName::applyAgileScanAutoStep(bool updateSpin) {
+    if (!agileScanAutoStepSampleRate) {
+        return;
+    }
+    agileScanStepMhz = agileScanAutoStepMhz();
+    if (updateSpin && agileScanStepSpin) {
+        QSignalBlocker blocker(agileScanStepSpin);
+        agileScanStepSpin->setValue(agileScanStepMhz);
+    }
 }
 
 QVector<double> YourClassName::standardScanFrequencyList(QString *error) const {
@@ -6165,8 +4981,15 @@ void YourClassName::updateAgileScanControls() {
     if (agileScanRangesEdit) {
         agileScanRangesEdit->setEnabled(scanChecked);
     }
+    if (agileScanAutoStepCheckbox) {
+        agileScanAutoStepCheckbox->setEnabled(agileScanSupported);
+        agileScanAutoStepCheckbox->setToolTip(uiText(
+            QStringLiteral("agile_auto_step_tooltip"),
+            QStringLiteral("Use the current sample rate in MHz as the Agile scan step.")));
+    }
+    applyAgileScanAutoStep(true);
     if (agileScanStepSpin) {
-        agileScanStepSpin->setEnabled(scanChecked);
+        agileScanStepSpin->setEnabled(scanChecked && !agileScanAutoStepSampleRate);
     }
     if (agileScanPresetCombo) {
         agileScanPresetCombo->setEnabled(agileScanSupported);
@@ -6442,16 +5265,16 @@ void YourClassName::updateScanMeasurementStatus() {
 
     if (!scanMeasurementEnabled) {
         setScanStatus(uiText(QStringLiteral("scan_measurement_off"),
-                             QStringLiteral("Scan measurement: off")));
+                             QStringLiteral("Spectrum measurement: off")));
         return;
     }
 
     if (scanMeasurementBins.isEmpty()) {
         setScanStatus(scanMeasurementBaselineRecording
                           ? uiText(QStringLiteral("scan_measurement_recording_baseline"),
-                                   QStringLiteral("Scan measurement: recording baseline..."))
+                                   QStringLiteral("Spectrum measurement: recording baseline..."))
                           : uiText(QStringLiteral("scan_measurement_waiting"),
-                                   QStringLiteral("Scan measurement: waiting for spectrum")));
+                                   QStringLiteral("Spectrum measurement: waiting for spectrum")));
         return;
     }
 
@@ -6486,7 +5309,7 @@ void YourClassName::updateScanMeasurementStatus() {
     setScanStatus(
         baselineBins > 0
             ? uiText(QStringLiteral("scan_measurement_with_baseline"),
-                     QStringLiteral("Scan measurement: %1 bins, peak %2 dB, avg %3 dB, delta %4 dB, coverage %5% >+%6 dB%7"))
+                     QStringLiteral("Spectrum measurement: %1 bins, peak %2 dB, avg %3 dB, delta %4 dB, coverage %5% >+%6 dB%7"))
                   .arg(currentBins)
                   .arg(maxPeak, 0, 'f', 1)
                   .arg(avgPeak, 0, 'f', 1)
@@ -6497,7 +5320,7 @@ void YourClassName::updateScanMeasurementStatus() {
                            ? uiText(QStringLiteral("bg_rec_suffix"), QStringLiteral(" (BG rec)"))
                            : QString())
             : uiText(QStringLiteral("scan_measurement_without_baseline"),
-                     QStringLiteral("Scan measurement: %1 bins, peak %2 dB, avg %3 dB%4"))
+                     QStringLiteral("Spectrum measurement: %1 bins, peak %2 dB, avg %3 dB%4"))
                   .arg(currentBins)
                   .arg(maxPeak, 0, 'f', 1)
                   .arg(avgPeak, 0, 'f', 1)
@@ -7398,9 +6221,9 @@ void YourClassName::exportScanMeasurementCsv() {
     if (scanMeasurementBins.isEmpty()) {
         QMessageBox::information(this,
                                  uiText(QStringLiteral("scan_measurement_title"),
-                                        QStringLiteral("Scan measurement")),
+                                        QStringLiteral("Spectrum measurement")),
                                  uiText(QStringLiteral("scan_measurement_no_data_export"),
-                                        QStringLiteral("No scan measurement data to export.")));
+                                        QStringLiteral("No spectrum measurement data to export.")));
         return;
     }
 
@@ -7408,8 +6231,8 @@ void YourClassName::exportScanMeasurementCsv() {
         QDir(QCoreApplication::applicationDirPath()).filePath(
             QStringLiteral("scan_measurement_%1.csv").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"))));
     const QString path = QFileDialog::getSaveFileName(this,
-                                                      uiText(QStringLiteral("export_scan_measurement_csv"),
-                                                             QStringLiteral("Export scan measurement CSV")),
+                                                     uiText(QStringLiteral("export_scan_measurement_csv"),
+                                                             QStringLiteral("Export spectrum measurement CSV")),
                                                       defaultPath,
                                                       uiText(QStringLiteral("csv_files_filter"),
                                                              QStringLiteral("CSV files (*.csv)")));
@@ -7421,7 +6244,7 @@ void YourClassName::exportScanMeasurementCsv() {
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
         QMessageBox::warning(this,
                              uiText(QStringLiteral("scan_measurement_title"),
-                                    QStringLiteral("Scan measurement")),
+                                    QStringLiteral("Spectrum measurement")),
                              uiText(QStringLiteral("scan_measurement_csv_write_failed"),
                                     QStringLiteral("Cannot write CSV file.")));
         return;
@@ -7940,8 +6763,11 @@ void YourClassName::ensureDefaultFrequencyPresets() {
         centerFrequencyPresets[QStringLiteral("VHF 145 MHz")] = 145000000.0;
         centerFrequencyPresets[QStringLiteral("UHF 433 MHz")] = 433000000.0;
         centerFrequencyPresets[QStringLiteral("GSM/LTE 900 MHz")] = 900000000.0;
+        centerFrequencyPresets[QStringLiteral("FPV 1.1 GHz")] = 1120000000.0;
         centerFrequencyPresets[QStringLiteral("FPV 1.2 GHz")] = 1200000000.0;
+        centerFrequencyPresets[QStringLiteral("FPV 1.3 GHz")] = 1280000000.0;
         centerFrequencyPresets[QStringLiteral("FPV 2.4 GHz")] = 2400000000.0;
+        centerFrequencyPresets[QStringLiteral("FPV 3.3 GHz")] = 3350000000.0;
         centerFrequencyPresets[QStringLiteral("Experimental 7.0 GHz")] = 7000000000.0;
         centerFrequencyPresets[QStringLiteral("Experimental 7.5 GHz")] = 7500000000.0;
     }
@@ -7968,8 +6794,16 @@ void YourClassName::ensureDefaultFrequencyPresets() {
     addMissingFrequencyPreset(QStringLiteral("UMTS/LTE 1800 downlink 1842.5 MHz"), 1842500000.0);
     addMissingFrequencyPreset(QStringLiteral("UMTS/LTE 2100 downlink 2140 MHz"), 2140000000.0);
     addMissingFrequencyPreset(QStringLiteral("LTE 2600 downlink 2655 MHz"), 2655000000.0);
+    addMissingFrequencyPreset(QStringLiteral("UHF Satcom 255 MHz"), 255000000.0);
+    addMissingFrequencyPreset(QStringLiteral("FPV 1.1 GHz"), 1120000000.0);
+    addMissingFrequencyPreset(QStringLiteral("FPV 1.3 GHz"), 1280000000.0);
+    addMissingFrequencyPreset(QStringLiteral("FPV 3.3 GHz"), 3350000000.0);
     const QVector<double> fpvVideoPresetMhz = {
-        1440.0, 1450.0, 1600.0, 1620.0,
+        1080.0, 1120.0, 1160.0, 1200.0,
+        1240.0, 1258.0, 1280.0, 1320.0,
+        1360.0, 1440.0, 1450.0, 1600.0, 1620.0,
+        3200.0, 3250.0, 3300.0, 3350.0,
+        3400.0, 3450.0, 3500.0,
         4990.0, 5010.0, 5360.0, 5460.0,
         5640.0, 5660.0, 5680.0, 5880.0,
         5890.0, 5910.0
@@ -8010,6 +6844,7 @@ void YourClassName::ensureDefaultFrequencyPresets() {
     addMissingBandwidthPreset(QStringLiteral("ATV 5 MHz"), 5000000.0);
     addMissingBandwidthPreset(QStringLiteral("FPV 8 MHz"), 8000000.0);
     addMissingBandwidthPreset(QStringLiteral("FPV 10 MHz"), 10000000.0);
+    addMissingBandwidthPreset(QStringLiteral("UHF Satcom NFM 25 kHz"), 25000.0);
     addMissingBandwidthPreset(QStringLiteral("GNSS C/A 2.046 MHz"), GNSS_RAW_BANDWIDTH_HZ);
     addMissingBandwidthPreset(QStringLiteral("GNSS raw 4.092 MHz"), 4092000.0);
     addMissingBandwidthPreset(QStringLiteral("GLONASS L1OF 9 MHz"), 9000000.0);
@@ -10306,8 +9141,8 @@ void YourClassName::runGnssPositionSelfTest() {
     QVector<SyntheticPseudorange> measurements;
     measurements.reserve(static_cast<int>(directions.size()));
     for (const SyntheticSatelliteDirection &direction : directions) {
-        const double az = direction.azimuthDeg * kDegToRad;
-        const double el = direction.elevationDeg * kDegToRad;
+        const double az = direction.azimuthDeg * GNSS_DEG_TO_RAD;
+        const double el = direction.elevationDeg * GNSS_DEG_TO_RAD;
         const Vec3d los =
             east * (std::sin(az) * std::cos(el)) +
             north * (std::cos(az) * std::cos(el)) +
@@ -10315,7 +9150,7 @@ void YourClassName::runGnssPositionSelfTest() {
         SyntheticPseudorange measurement;
         measurement.satellite = truthEcef + los * direction.slantMeters;
         measurement.pseudorangeMeters =
-            norm(measurement.satellite - truthEcef) +
+            vectorNorm(measurement.satellite - truthEcef) +
             receiverClockBiasMeters +
             direction.noiseMeters;
         measurements.append(measurement);
@@ -10665,801 +9500,6 @@ void YourClassName::updateGnssAcquisitionStatus(const GnssAcquisitionResult &res
     }
 }
 
-void YourClassName::openPresetManager() {
-    ensureDefaultFrequencyPresets();
-    ensureDefaultBandMarkers();
-
-    QDialog dialog(this);
-    dialog.setWindowTitle(uiText(QStringLiteral("preset_manager"), QStringLiteral("Preset Manager")));
-    dialog.resize(720, 520);
-
-    QVBoxLayout *rootLayout = new QVBoxLayout(&dialog);
-    QTabWidget *tabs = new QTabWidget(&dialog);
-
-    auto moveSelectedTableRow = [](QTableWidget *table, int direction) {
-        if (!table || direction == 0) {
-            return;
-        }
-        const int row = table->currentRow();
-        const int targetRow = row + direction;
-        if (row < 0 || targetRow < 0 || targetRow >= table->rowCount()) {
-            return;
-        }
-
-        const int columnCount = table->columnCount();
-        for (int column = 0; column < columnCount; ++column) {
-            QTableWidgetItem *current = table->takeItem(row, column);
-            QTableWidgetItem *target = table->takeItem(targetRow, column);
-            table->setItem(row, column, target);
-            table->setItem(targetRow, column, current);
-        }
-        table->setCurrentCell(targetRow, 0);
-        table->selectRow(targetRow);
-    };
-
-    auto addOrderButtons = [this, moveSelectedTableRow](QHBoxLayout *layout,
-                                                        QTableWidget *table,
-                                                        QWidget *page) {
-        QToolButton *moveUpButton = new QToolButton(page);
-        moveUpButton->setArrowType(Qt::UpArrow);
-        moveUpButton->setToolTip(uiText(QStringLiteral("move_up"), QStringLiteral("Move up")));
-        QToolButton *moveDownButton = new QToolButton(page);
-        moveDownButton->setArrowType(Qt::DownArrow);
-        moveDownButton->setToolTip(uiText(QStringLiteral("move_down"), QStringLiteral("Move down")));
-        layout->addWidget(moveUpButton);
-        layout->addWidget(moveDownButton);
-        QObject::connect(moveUpButton, &QToolButton::clicked, table, [table, moveSelectedTableRow]() {
-            moveSelectedTableRow(table, -1);
-        });
-        QObject::connect(moveDownButton, &QToolButton::clicked, table, [table, moveSelectedTableRow]() {
-            moveSelectedTableRow(table, 1);
-        });
-    };
-
-    auto makeNumericTab = [this, &dialog, addOrderButtons](const QMap<QString, double> &presets,
-                                                           const QStringList &order,
-                                                           const QString &valueHeader,
-                                                           double minimum,
-                                                           double maximum) -> QTableWidget * {
-        QWidget *page = new QWidget(&dialog);
-        QVBoxLayout *pageLayout = new QVBoxLayout(page);
-        QTableWidget *table = new QTableWidget(page);
-        table->setColumnCount(2);
-        table->setHorizontalHeaderLabels({uiText(QStringLiteral("name"), QStringLiteral("Name")), valueHeader});
-        table->horizontalHeader()->setStretchLastSection(true);
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
-        table->setRowCount(presets.size());
-        int row = 0;
-        for (const QString &name : normalizedPresetOrder(order, presets)) {
-            auto it = presets.constFind(name);
-            if (it == presets.constEnd()) {
-                continue;
-            }
-            table->setItem(row, 0, new QTableWidgetItem(name));
-            table->setItem(row, 1, new QTableWidgetItem(QString::number(it.value(), 'f', 3)));
-            ++row;
-        }
-        table->setRowCount(row);
-
-        QHBoxLayout *buttonLayout = new QHBoxLayout();
-        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
-        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
-        buttonLayout->addWidget(addButton);
-        buttonLayout->addWidget(removeButton);
-        addOrderButtons(buttonLayout, table, page);
-        buttonLayout->addStretch();
-        pageLayout->addWidget(table);
-        pageLayout->addLayout(buttonLayout);
-
-        QObject::connect(addButton, &QPushButton::clicked, table, [this, table, minimum]() {
-            const int row = table->rowCount();
-            table->insertRow(row);
-            table->setItem(row, 0, new QTableWidgetItem(uiText(QStringLiteral("new_preset"), QStringLiteral("New preset"))));
-            table->setItem(row, 1, new QTableWidgetItem(QString::number((std::max)(0.0, minimum), 'f', 3)));
-            table->setCurrentCell(row, 0);
-            table->editItem(table->item(row, 0));
-        });
-        QObject::connect(removeButton, &QPushButton::clicked, table, [this, table]() {
-            const int row = table->currentRow();
-            if (row >= 0) {
-                table->removeRow(row);
-            }
-        });
-
-        table->setProperty("minimumValue", minimum);
-        table->setProperty("maximumValue", maximum);
-        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
-        return table;
-    };
-
-    auto makeAgileTab = [this, &dialog, addOrderButtons](const QMap<QString, QString> &presets,
-                                                         const QStringList &order) -> QTableWidget * {
-        QWidget *page = new QWidget(&dialog);
-        QVBoxLayout *pageLayout = new QVBoxLayout(page);
-        QTableWidget *table = new QTableWidget(page);
-        table->setColumnCount(3);
-        table->setHorizontalHeaderLabels({uiText(QStringLiteral("name"), QStringLiteral("Name")),
-                                          uiText(QStringLiteral("ranges_mhz_plain"), QStringLiteral("Ranges MHz")),
-                                          uiText(QStringLiteral("step_mhz"), QStringLiteral("Step MHz"))});
-        table->horizontalHeader()->setStretchLastSection(true);
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
-        table->setRowCount(presets.size());
-        int row = 0;
-        for (const QString &name : normalizedPresetOrder(order, presets)) {
-            auto it = presets.constFind(name);
-            if (it == presets.constEnd()) {
-                continue;
-            }
-            table->setItem(row, 0, new QTableWidgetItem(name));
-            table->setItem(row, 1, new QTableWidgetItem(agileScanPresetRanges(it.value())));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(agileScanPresetStepMhz(it.value(), 0.0125), 'f', 6)));
-            ++row;
-        }
-        table->setRowCount(row);
-
-        QHBoxLayout *buttonLayout = new QHBoxLayout();
-        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
-        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
-        buttonLayout->addWidget(addButton);
-        buttonLayout->addWidget(removeButton);
-        addOrderButtons(buttonLayout, table, page);
-        buttonLayout->addStretch();
-        pageLayout->addWidget(table);
-        pageLayout->addLayout(buttonLayout);
-
-        QObject::connect(addButton, &QPushButton::clicked, table, [this, table]() {
-            const int row = table->rowCount();
-            table->insertRow(row);
-            table->setItem(row, 0, new QTableWidgetItem(uiText(QStringLiteral("new_scan_preset"), QStringLiteral("New scan preset"))));
-            table->setItem(row, 1, new QTableWidgetItem(QStringLiteral("430-432")));
-            table->setItem(row, 2, new QTableWidgetItem(QStringLiteral("0.0125")));
-            table->setCurrentCell(row, 0);
-            table->editItem(table->item(row, 0));
-        });
-        QObject::connect(removeButton, &QPushButton::clicked, table, [this, table]() {
-            const int row = table->currentRow();
-            if (row >= 0) {
-                table->removeRow(row);
-            }
-        });
-
-        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
-        return table;
-    };
-
-    auto makeStandardScanTab = [this, &dialog, addOrderButtons](const QMap<QString, QString> &presets,
-                                                                const QStringList &order) -> QTableWidget * {
-        QWidget *page = new QWidget(&dialog);
-        QVBoxLayout *pageLayout = new QVBoxLayout(page);
-        QTableWidget *table = new QTableWidget(page);
-        table->setColumnCount(4);
-        table->setHorizontalHeaderLabels({uiText(QStringLiteral("name"), QStringLiteral("Name")),
-                                          uiText(QStringLiteral("centers_mhz_plain"), QStringLiteral("Centers MHz")),
-                                          uiText(QStringLiteral("dwell_ms"), QStringLiteral("Dwell ms")),
-                                          uiText(QStringLiteral("settle_ms"), QStringLiteral("Settle ms"))});
-        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
-        table->setRowCount(presets.size());
-        int row = 0;
-        for (const QString &name : normalizedPresetOrder(order, presets)) {
-            auto it = presets.constFind(name);
-            if (it == presets.constEnd()) {
-                continue;
-            }
-            table->setItem(row, 0, new QTableWidgetItem(name));
-            table->setItem(row, 1, new QTableWidgetItem(standardScanPresetCenters(it.value())));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(standardScanPresetDwellMs(it.value(), standardScanDwellMs))));
-            table->setItem(row, 3, new QTableWidgetItem(QString::number(standardScanPresetSettleMs(it.value(), standardScanSettleMs))));
-            ++row;
-        }
-        table->setRowCount(row);
-
-        QHBoxLayout *buttonLayout = new QHBoxLayout();
-        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
-        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
-        buttonLayout->addWidget(addButton);
-        buttonLayout->addWidget(removeButton);
-        addOrderButtons(buttonLayout, table, page);
-        buttonLayout->addStretch();
-        pageLayout->addWidget(table);
-        pageLayout->addLayout(buttonLayout);
-
-        QObject::connect(addButton, &QPushButton::clicked, table, [this, table]() {
-            const int row = table->rowCount();
-            table->insertRow(row);
-            table->setItem(row, 0, new QTableWidgetItem(uiText(QStringLiteral("new_standard_scan_preset"),
-                                                               QStringLiteral("New standard scan preset"))));
-            table->setItem(row, 1, new QTableWidgetItem(standardScanCentersMhz));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(standardScanDwellMs)));
-            table->setItem(row, 3, new QTableWidgetItem(QString::number(standardScanSettleMs)));
-            table->setCurrentCell(row, 0);
-            table->editItem(table->item(row, 0));
-        });
-        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
-            const int row = table->currentRow();
-            if (row >= 0) {
-                table->removeRow(row);
-            }
-        });
-
-        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
-        return table;
-    };
-
-    auto makeListeningScanTab = [this, &dialog, addOrderButtons](const QMap<QString, QString> &presets,
-                                                                 const QStringList &order) -> QTableWidget * {
-        QWidget *page = new QWidget(&dialog);
-        QVBoxLayout *pageLayout = new QVBoxLayout(page);
-        QTableWidget *table = new QTableWidget(page);
-        table->setColumnCount(4);
-        table->setHorizontalHeaderLabels({uiText(QStringLiteral("name"), QStringLiteral("Name")),
-                                          uiText(QStringLiteral("targets_mhz_plain"), QStringLiteral("Targets MHz")),
-                                          uiText(QStringLiteral("dwell_ms"), QStringLiteral("Dwell ms")),
-                                          uiText(QStringLiteral("settle_ms"), QStringLiteral("Settle ms"))});
-        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
-        table->setRowCount(presets.size());
-        int row = 0;
-        for (const QString &name : normalizedPresetOrder(order, presets)) {
-            auto it = presets.constFind(name);
-            if (it == presets.constEnd()) {
-                continue;
-            }
-            table->setItem(row, 0, new QTableWidgetItem(name));
-            table->setItem(row, 1, new QTableWidgetItem(listeningScanPresetTargets(it.value())));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(listeningScanPresetDwellMs(it.value(), listeningScanDwellMs))));
-            table->setItem(row, 3, new QTableWidgetItem(QString::number(listeningScanPresetSettleMs(it.value(), listeningScanSettleMs))));
-            ++row;
-        }
-        table->setRowCount(row);
-
-        QHBoxLayout *buttonLayout = new QHBoxLayout();
-        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add"), QStringLiteral("Add")), page);
-        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
-        buttonLayout->addWidget(addButton);
-        buttonLayout->addWidget(removeButton);
-        addOrderButtons(buttonLayout, table, page);
-        buttonLayout->addStretch();
-        pageLayout->addWidget(table);
-        pageLayout->addLayout(buttonLayout);
-
-        QObject::connect(addButton, &QPushButton::clicked, table, [this, table]() {
-            const int row = table->rowCount();
-            table->insertRow(row);
-            table->setItem(row, 0, new QTableWidgetItem(uiText(QStringLiteral("new_listening_scan_preset"),
-                                                               QStringLiteral("New listening scan preset"))));
-            table->setItem(row, 1, new QTableWidgetItem(listeningScanTargetsMhz));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(listeningScanDwellMs)));
-            table->setItem(row, 3, new QTableWidgetItem(QString::number(listeningScanSettleMs)));
-            table->setCurrentCell(row, 0);
-            table->editItem(table->item(row, 0));
-        });
-        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
-            const int row = table->currentRow();
-            if (row >= 0) {
-                table->removeRow(row);
-            }
-        });
-
-        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
-        return table;
-    };
-
-    auto makeBandMarkerTab = [this, &dialog](const QVector<GraphBandMarker> &markers) -> QTableWidget * {
-        QWidget *page = new QWidget(&dialog);
-        QVBoxLayout *pageLayout = new QVBoxLayout(page);
-        QTableWidget *table = new QTableWidget(page);
-        table->setColumnCount(4);
-        table->setHorizontalHeaderLabels({uiText(QStringLiteral("layer"), QStringLiteral("Layer")),
-                                          uiText(QStringLiteral("label"), QStringLiteral("Label")),
-                                          uiText(QStringLiteral("start_mhz"), QStringLiteral("Start MHz")),
-                                          uiText(QStringLiteral("end_mhz"), QStringLiteral("End MHz"))});
-        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
-
-        auto setLayerCell = [this, table](int row, bool amateur) {
-            QComboBox *layerCombo = new QComboBox(table);
-            layerCombo->addItem(uiText(QStringLiteral("common"), QStringLiteral("Common")), QStringLiteral("general"));
-            layerCombo->addItem(QStringLiteral("HAM"), QStringLiteral("amateur"));
-            layerCombo->setCurrentIndex(amateur ? 1 : 0);
-            table->setCellWidget(row, 0, layerCombo);
-        };
-        auto setBandRow = [table, setLayerCell](int row, const GraphBandMarker &marker) {
-            setLayerCell(row, marker.amateur);
-            table->setItem(row, 1, new QTableWidgetItem(marker.label));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(marker.startHz / 1000000.0, 'f', 6)));
-            table->setItem(row, 3, new QTableWidgetItem(QString::number(marker.endHz / 1000000.0, 'f', 6)));
-        };
-
-        table->setRowCount(markers.size());
-        for (int row = 0; row < markers.size(); ++row) {
-            setBandRow(row, markers.at(row));
-        }
-
-        QHBoxLayout *buttonLayout = new QHBoxLayout();
-        QPushButton *addCommonButton = new QPushButton(uiText(QStringLiteral("add_common"), QStringLiteral("Add common")), page);
-        QPushButton *addHamButton = new QPushButton(uiText(QStringLiteral("add_ham"), QStringLiteral("Add HAM")), page);
-        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
-        buttonLayout->addWidget(addCommonButton);
-        buttonLayout->addWidget(addHamButton);
-        buttonLayout->addWidget(removeButton);
-        buttonLayout->addStretch();
-        pageLayout->addWidget(table);
-        pageLayout->addLayout(buttonLayout);
-
-        auto addBandRow = [this, table, setBandRow](bool amateur) {
-            const int row = table->rowCount();
-            table->insertRow(row);
-            GraphBandMarker marker;
-            marker.label = amateur ? uiText(QStringLiteral("new_ham_band"), QStringLiteral("New HAM band"))
-                                   : uiText(QStringLiteral("new_band"), QStringLiteral("New band"));
-            marker.startHz = amateur ? 144000000.0 : 118000000.0;
-            marker.endHz = amateur ? 146000000.0 : 137000000.0;
-            marker.amateur = amateur;
-            setBandRow(row, marker);
-            table->setCurrentCell(row, 1);
-            table->editItem(table->item(row, 1));
-        };
-        QObject::connect(addCommonButton, &QPushButton::clicked, table, [addBandRow]() {
-            addBandRow(false);
-        });
-        QObject::connect(addHamButton, &QPushButton::clicked, table, [addBandRow]() {
-            addBandRow(true);
-        });
-        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
-            const int row = table->currentRow();
-            if (row >= 0) {
-                table->removeRow(row);
-            }
-        });
-
-        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
-        return table;
-    };
-
-    auto makeQthMarkerTab = [this, &dialog](const QVector<qth::UserMarker> &markers) -> QTableWidget * {
-        QWidget *page = new QWidget(&dialog);
-        QVBoxLayout *pageLayout = new QVBoxLayout(page);
-        QTableWidget *table = new QTableWidget(page);
-        table->setColumnCount(5);
-        table->setHorizontalHeaderLabels({uiText(QStringLiteral("number"), QStringLiteral("Number")),
-                                          uiText(QStringLiteral("name"), QStringLiteral("Name")),
-                                          uiText(QStringLiteral("latitude"), QStringLiteral("Latitude")),
-                                          uiText(QStringLiteral("longitude"), QStringLiteral("Longitude")),
-                                          uiText(QStringLiteral("description"), QStringLiteral("Description"))});
-        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
-
-        auto setMarkerRow = [table](int row, const qth::UserMarker &marker) {
-            table->setItem(row, 0, new QTableWidgetItem(QString::number(marker.number)));
-            table->setItem(row, 1, new QTableWidgetItem(marker.name));
-            table->setItem(row, 2, new QTableWidgetItem(QString::number(marker.latitude, 'f', 6)));
-            table->setItem(row, 3, new QTableWidgetItem(QString::number(marker.longitude, 'f', 6)));
-            table->setItem(row, 4, new QTableWidgetItem(marker.description));
-        };
-
-        table->setRowCount(markers.size());
-        for (int row = 0; row < markers.size(); ++row) {
-            setMarkerRow(row, markers.at(row));
-        }
-
-        QHBoxLayout *buttonLayout = new QHBoxLayout();
-        QPushButton *addButton = new QPushButton(uiText(QStringLiteral("add_marker"), QStringLiteral("Add marker")), page);
-        QPushButton *removeButton = new QPushButton(uiText(QStringLiteral("remove"), QStringLiteral("Remove")), page);
-        buttonLayout->addWidget(addButton);
-        buttonLayout->addWidget(removeButton);
-        buttonLayout->addStretch();
-        pageLayout->addWidget(table);
-        pageLayout->addLayout(buttonLayout);
-
-        QObject::connect(addButton, &QPushButton::clicked, table, [this, table, setMarkerRow]() {
-            int nextNumber = 1;
-            for (int row = 0; row < table->rowCount(); ++row) {
-                bool ok = false;
-                const int number = table->item(row, 0) ? table->item(row, 0)->text().toInt(&ok) : 0;
-                if (ok) {
-                    nextNumber = (std::max)(nextNumber, number + 1);
-                }
-            }
-            qth::UserMarker marker;
-            marker.number = nextNumber;
-            marker.latitude = qthLatitude;
-            marker.longitude = qthLongitude;
-            marker.name = qth::maidenheadLocator(marker.latitude, marker.longitude, 6);
-            const int row = table->rowCount();
-            table->insertRow(row);
-            setMarkerRow(row, marker);
-            table->setCurrentCell(row, 1);
-            table->editItem(table->item(row, 1));
-        });
-        QObject::connect(removeButton, &QPushButton::clicked, table, [table]() {
-            const int row = table->currentRow();
-            if (row >= 0) {
-                table->removeRow(row);
-            }
-        });
-
-        table->setProperty("pageWidget", QVariant::fromValue(static_cast<void*>(page)));
-        return table;
-    };
-
-    QTableWidget *centerTable = makeNumericTab(centerFrequencyPresets,
-                                              centerFrequencyPresetOrder,
-                                              uiText(QStringLiteral("frequency_hz"), QStringLiteral("Frequency Hz")),
-                                              0.0,
-                                              RF_EXPERIMENTAL_MAX_FREQUENCY);
-    QTableWidget *listeningTable = makeNumericTab(listeningFrequencyPresets,
-                                                 listeningFrequencyPresetOrder,
-                                                 uiText(QStringLiteral("frequency_hz"), QStringLiteral("Frequency Hz")),
-                                                 -RF_EXPERIMENTAL_MAX_FREQUENCY,
-                                                 RF_EXPERIMENTAL_MAX_FREQUENCY);
-    QTableWidget *bandwidthTable = makeNumericTab(bandwidthValuePresets,
-                                                 bandwidthPresetOrder,
-                                                 uiText(QStringLiteral("bandwidth_hz"), QStringLiteral("Bandwidth Hz")),
-                                                 1.0,
-                                                 20000000.0);
-    QTableWidget *agileTable = makeAgileTab(agileScanPresets, agileScanPresetOrder);
-    QTableWidget *standardScanTable = makeStandardScanTab(standardScanPresets, standardScanPresetOrder);
-    QTableWidget *listeningScanTable = makeListeningScanTab(listeningScanPresets, listeningScanPresetOrder);
-    QTableWidget *bandMarkerTable = makeBandMarkerTab(bandMarkers);
-    QTableWidget *qthMarkerTable = makeQthMarkerTab(qthUserMarkers);
-
-    tabs->addTab(static_cast<QWidget*>(centerTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("preset_tab_center"), QStringLiteral("Center")));
-    tabs->addTab(static_cast<QWidget*>(listeningTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("preset_tab_listen"), QStringLiteral("Listen")));
-    tabs->addTab(static_cast<QWidget*>(bandwidthTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("preset_tab_audio_bw"), QStringLiteral("Audio BW")));
-    tabs->addTab(static_cast<QWidget*>(agileTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("agile_scan"), QStringLiteral("Agile scan")));
-    tabs->addTab(static_cast<QWidget*>(standardScanTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("preset_tab_standard_scan"), QStringLiteral("Standard scan")));
-    tabs->addTab(static_cast<QWidget*>(listeningScanTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("preset_tab_listening_scan"), QStringLiteral("Listening scan")));
-    tabs->addTab(static_cast<QWidget*>(bandMarkerTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("general_band_markers"), QStringLiteral("Band markers")));
-    tabs->addTab(static_cast<QWidget*>(qthMarkerTable->property("pageWidget").value<void*>()),
-                 uiText(QStringLiteral("preset_tab_qth_markers"), QStringLiteral("QTH markers")));
-
-    QLabel *hintLabel = new QLabel(uiText(QStringLiteral("presets_hint"),
-                                          QStringLiteral("Values are stored in Hz for frequency/audio presets. Scan presets and band-marker ranges are edited in MHz. HAM defaults are Region-1-style hints; edit them for local rules.")),
-                                   &dialog);
-    hintLabel->setWordWrap(true);
-    QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    if (QPushButton *okButton = buttonBox->button(QDialogButtonBox::Ok)) {
-        okButton->setText(uiText(QStringLiteral("ok"), QStringLiteral("OK")));
-    }
-    if (QPushButton *cancelButton = buttonBox->button(QDialogButtonBox::Cancel)) {
-        cancelButton->setText(uiText(QStringLiteral("cancel"), QStringLiteral("Cancel")));
-    }
-    rootLayout->addWidget(tabs);
-    rootLayout->addWidget(hintLabel);
-    rootLayout->addWidget(buttonBox);
-
-    auto tableNameOrder = [](QTableWidget *table) {
-        QStringList order;
-        if (!table) {
-            return order;
-        }
-        for (int row = 0; row < table->rowCount(); ++row) {
-            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
-            if (!name.isEmpty() && !order.contains(name)) {
-                order.append(name);
-            }
-        }
-        return order;
-    };
-
-    auto readNumericTable = [](QTableWidget *table, QMap<QString, double> &target, QString *error) {
-        QMap<QString, double> next;
-        const double minimum = table->property("minimumValue").toDouble();
-        const double maximum = table->property("maximumValue").toDouble();
-        for (int row = 0; row < table->rowCount(); ++row) {
-            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
-            const QString valueText = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
-            if (name.isEmpty() && valueText.isEmpty()) {
-                continue;
-            }
-            bool ok = false;
-            const double value = valueText.toDouble(&ok);
-            if (name.isEmpty() || !ok || !std::isfinite(value) || value < minimum || value > maximum) {
-                if (error) {
-                    *error = QStringLiteral("Bad numeric preset at row %1").arg(row + 1);
-                }
-                return false;
-            }
-            next[name] = value;
-        }
-        target = next;
-        return true;
-    };
-
-    auto readAgileTable = [](QTableWidget *table, QMap<QString, QString> &target, QString *error) {
-        QMap<QString, QString> next;
-        for (int row = 0; row < table->rowCount(); ++row) {
-            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
-            const QString ranges = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
-            const QString stepText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
-            if (name.isEmpty() && ranges.isEmpty() && stepText.isEmpty()) {
-                continue;
-            }
-            bool ok = false;
-            const double step = stepText.toDouble(&ok);
-            if (name.isEmpty() || ranges.isEmpty() || !ok ||
-                !std::isfinite(step) ||
-                step < AGILE_SCAN_MIN_STEP_MHZ ||
-                step > AGILE_SCAN_MAX_STEP_MHZ) {
-                if (error) {
-                    *error = QStringLiteral("Bad Agile scan preset at row %1").arg(row + 1);
-                }
-                return false;
-            }
-            QString parseError;
-            parseAgileScanFrequenciesMhz(ranges, step, &parseError);
-            if (!parseError.isEmpty()) {
-                if (error) {
-                    *error = QStringLiteral("%1: %2").arg(name, parseError);
-                }
-                return false;
-            }
-            next[name] = agileScanPresetSpec(ranges, step);
-        }
-        target = next;
-        return true;
-    };
-
-    auto readStandardScanTable = [this](QTableWidget *table, QMap<QString, QString> &target, QString *error) {
-        QMap<QString, QString> next;
-        for (int row = 0; row < table->rowCount(); ++row) {
-            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
-            const QString centers = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
-            const QString dwellText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
-            const QString settleText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
-            if (name.isEmpty() && centers.isEmpty() && dwellText.isEmpty() && settleText.isEmpty()) {
-                continue;
-            }
-            bool dwellOk = false;
-            bool settleOk = false;
-            const int dwellMs = dwellText.toInt(&dwellOk);
-            const int settleMs = settleText.toInt(&settleOk);
-            if (name.isEmpty() ||
-                centers.isEmpty() ||
-                !dwellOk ||
-                !settleOk ||
-                dwellMs < STANDARD_SCAN_MIN_DWELL_MS ||
-                dwellMs > STANDARD_SCAN_MAX_DWELL_MS ||
-                settleMs < STANDARD_SCAN_MIN_SETTLE_MS ||
-                settleMs > STANDARD_SCAN_MAX_SETTLE_MS) {
-                if (error) {
-                    *error = QStringLiteral("Bad standard scan preset at row %1").arg(row + 1);
-                }
-                return false;
-            }
-            QString parseError;
-            parseStandardScanCentersMhz(centers,
-                                        pendingSettings.sampleRate,
-                                        AGILE_SCAN_MIN_POINTS,
-                                        &parseError,
-                                        nullptr);
-            if (!parseError.isEmpty()) {
-                if (error) {
-                    *error = QStringLiteral("%1: %2").arg(name, parseError);
-                }
-                return false;
-            }
-            next[name] = standardScanPresetSpec(centers, dwellMs, settleMs);
-        }
-        target = next;
-        return true;
-    };
-
-    auto readListeningScanTable = [](QTableWidget *table, QMap<QString, QString> &target, QString *error) {
-        QMap<QString, QString> next;
-        for (int row = 0; row < table->rowCount(); ++row) {
-            const QString name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
-            const QString targets = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
-            const QString dwellText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
-            const QString settleText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
-            if (name.isEmpty() && targets.isEmpty() && dwellText.isEmpty() && settleText.isEmpty()) {
-                continue;
-            }
-            bool dwellOk = false;
-            bool settleOk = false;
-            const int dwellMs = dwellText.toInt(&dwellOk);
-            const int settleMs = settleText.toInt(&settleOk);
-            if (name.isEmpty() ||
-                targets.isEmpty() ||
-                !dwellOk ||
-                !settleOk ||
-                dwellMs < LISTENING_SCAN_MIN_DWELL_MS ||
-                dwellMs > LISTENING_SCAN_MAX_DWELL_MS ||
-                settleMs < LISTENING_SCAN_MIN_SETTLE_MS ||
-                settleMs > LISTENING_SCAN_MAX_SETTLE_MS) {
-                if (error) {
-                    *error = QStringLiteral("Bad listening scan preset at row %1").arg(row + 1);
-                }
-                return false;
-            }
-            QString parseError;
-            parseListeningScanTargetsMhz(targets, 0.0, RF_EXPERIMENTAL_MAX_FREQUENCY, 1, &parseError);
-            if (!parseError.isEmpty()) {
-                if (error) {
-                    *error = QStringLiteral("%1: %2").arg(name, parseError);
-                }
-                return false;
-            }
-            next[name] = listeningScanPresetSpec(targets, dwellMs, settleMs);
-        }
-        target = next;
-        return true;
-    };
-
-    auto readBandMarkerTable = [](QTableWidget *table, QVector<GraphBandMarker> &target, QString *error) {
-        QVector<GraphBandMarker> next;
-        for (int row = 0; row < table->rowCount(); ++row) {
-            QComboBox *layerCombo = qobject_cast<QComboBox*>(table->cellWidget(row, 0));
-            const QString layer = layerCombo ? layerCombo->currentData().toString() : QStringLiteral("general");
-            const QString label = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
-            const QString startText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
-            const QString endText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
-            if (label.isEmpty() && startText.isEmpty() && endText.isEmpty()) {
-                continue;
-            }
-
-            bool startOk = false;
-            bool endOk = false;
-            const double startMhz = startText.toDouble(&startOk);
-            const double endMhz = endText.toDouble(&endOk);
-            if (label.isEmpty() ||
-                !startOk ||
-                !endOk ||
-                !std::isfinite(startMhz) ||
-                !std::isfinite(endMhz) ||
-                startMhz < 0.0 ||
-                endMhz <= startMhz ||
-                endMhz > 100000.0) {
-                if (error) {
-                    *error = QStringLiteral("Bad band marker at row %1").arg(row + 1);
-                }
-                return false;
-            }
-
-            GraphBandMarker marker;
-            marker.startHz = startMhz * 1000000.0;
-            marker.endHz = endMhz * 1000000.0;
-            marker.label = label;
-            marker.amateur = layer == QStringLiteral("amateur");
-            next.append(marker);
-        }
-        target = next;
-        return true;
-    };
-
-    auto readQthMarkerTable = [this](QTableWidget *table, QVector<qth::UserMarker> &target, QString *error) {
-        QVector<qth::UserMarker> next;
-        QVector<int> usedNumbers;
-        for (int row = 0; row < table->rowCount(); ++row) {
-            const QString numberText = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
-            QString name = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
-            const QString latText = table->item(row, 2) ? table->item(row, 2)->text().trimmed() : QString();
-            const QString lonText = table->item(row, 3) ? table->item(row, 3)->text().trimmed() : QString();
-            const QString description = table->item(row, 4) ? table->item(row, 4)->text().trimmed() : QString();
-            if (numberText.isEmpty() && name.isEmpty() && latText.isEmpty() && lonText.isEmpty() && description.isEmpty()) {
-                continue;
-            }
-
-            bool numberOk = false;
-            bool latOk = false;
-            bool lonOk = false;
-            const int number = numberText.toInt(&numberOk);
-            const double latitude = latText.toDouble(&latOk);
-            const double longitude = lonText.toDouble(&lonOk);
-            if (!numberOk ||
-                number <= 0 ||
-                usedNumbers.contains(number) ||
-                !latOk ||
-                !lonOk ||
-                !qth::isValidLatitude(latitude) ||
-                !qth::isValidLongitude(longitude)) {
-                if (error) {
-                    *error = uiText(QStringLiteral("bad_qth_marker_row"),
-                                    QStringLiteral("Bad QTH marker at row %1"))
-                                 .arg(row + 1);
-                }
-                return false;
-            }
-
-            usedNumbers.append(number);
-            if (name.isEmpty()) {
-                name = qth::maidenheadLocator(latitude, longitude, 6);
-            }
-
-            qth::UserMarker marker;
-            marker.number = number;
-            marker.name = name.left(80);
-            marker.description = description.left(512);
-            marker.latitude = latitude;
-            marker.longitude = longitude;
-            next.append(marker);
-        }
-        target = next;
-        return true;
-    };
-
-    connect(buttonBox, &QDialogButtonBox::accepted, &dialog, [&]() {
-        QString error;
-        QMap<QString, double> nextCenter = centerFrequencyPresets;
-        QMap<QString, double> nextListening = listeningFrequencyPresets;
-        QMap<QString, double> nextBandwidth = bandwidthValuePresets;
-        QMap<QString, QString> nextAgile = agileScanPresets;
-        QMap<QString, QString> nextStandardScan = standardScanPresets;
-        QMap<QString, QString> nextListeningScan = listeningScanPresets;
-        QVector<GraphBandMarker> nextBandMarkers = bandMarkers;
-        QVector<qth::UserMarker> nextQthMarkers = qthUserMarkers;
-        if (!readNumericTable(centerTable, nextCenter, &error) ||
-            !readNumericTable(listeningTable, nextListening, &error) ||
-            !readNumericTable(bandwidthTable, nextBandwidth, &error) ||
-            !readAgileTable(agileTable, nextAgile, &error) ||
-            !readStandardScanTable(standardScanTable, nextStandardScan, &error) ||
-            !readListeningScanTable(listeningScanTable, nextListeningScan, &error) ||
-            !readBandMarkerTable(bandMarkerTable, nextBandMarkers, &error) ||
-            !readQthMarkerTable(qthMarkerTable, nextQthMarkers, &error)) {
-            QMessageBox::warning(&dialog,
-                                  uiText(QStringLiteral("preset_manager"), QStringLiteral("Preset Manager")),
-                                  error);
-            return;
-        }
-        centerFrequencyPresets = nextCenter;
-        listeningFrequencyPresets = nextListening;
-        bandwidthValuePresets = nextBandwidth;
-        agileScanPresets = nextAgile;
-        standardScanPresets = nextStandardScan;
-        listeningScanPresets = nextListeningScan;
-        centerFrequencyPresetOrder =
-            normalizedPresetOrder(tableNameOrder(centerTable), centerFrequencyPresets);
-        listeningFrequencyPresetOrder =
-            normalizedPresetOrder(tableNameOrder(listeningTable), listeningFrequencyPresets);
-        bandwidthPresetOrder =
-            normalizedPresetOrder(tableNameOrder(bandwidthTable), bandwidthValuePresets);
-        agileScanPresetOrder =
-            normalizedPresetOrder(tableNameOrder(agileTable), agileScanPresets);
-        standardScanPresetOrder =
-            normalizedPresetOrder(tableNameOrder(standardScanTable), standardScanPresets);
-        listeningScanPresetOrder =
-            normalizedPresetOrder(tableNameOrder(listeningScanTable), listeningScanPresets);
-        bandMarkers = nextBandMarkers;
-        qthUserMarkers = nextQthMarkers;
-        bandMarkersCustomized = true;
-        updateFrequencyPresetControls();
-        updateGraphBandMarkers();
-        updateQthControls();
-        savePersistentSettings();
-        dialog.accept();
-    });
-    connect(buttonBox, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-
-    dialog.exec();
-}
-
 void YourClassName::openApplicationHelp() {
     QWidget *parentWidget = QApplication::activeWindow();
     QDialog dialog(parentWidget ? parentWidget : static_cast<QWidget*>(this));
@@ -11584,10 +9624,10 @@ void YourClassName::openApplicationSettings() {
     QCheckBox *audioOption = new QCheckBox(uiText(QStringLiteral("audio"), QStringLiteral("Audio")), quickOptionsBox);
     QCheckBox *syncOption = new QCheckBox(uiText(QStringLiteral("sync"), QStringLiteral("Sync")), quickOptionsBox);
     QCheckBox *spectrum2Option = new QCheckBox(uiText(QStringLiteral("spectrum2"), QStringLiteral("Spectr 2")), quickOptionsBox);
-    QCheckBox *colorOption = new QCheckBox(uiText(QStringLiteral("colorful"), QStringLiteral("Colorful")), quickOptionsBox);
+    QCheckBox *colorOption = new QCheckBox(uiText(QStringLiteral("colorful"), QStringLiteral("Color spectrum")), quickOptionsBox);
     QCheckBox *generalBandMarkersOption = new QCheckBox(uiText(QStringLiteral("general_band_markers"), QStringLiteral("Band markers")), quickOptionsBox);
     QCheckBox *amateurBandMarkersOption = new QCheckBox(uiText(QStringLiteral("amateur_band_markers"), QStringLiteral("HAM bands")), quickOptionsBox);
-    QCheckBox *compactBandMarkersOption = new QCheckBox(uiText(QStringLiteral("compact_band_markers"), QStringLiteral("Collapsed")), quickOptionsBox);
+    QCheckBox *compactBandMarkersOption = new QCheckBox(uiText(QStringLiteral("compact_band_markers"), QStringLiteral("Collapsed bands")), quickOptionsBox);
     QCheckBox *loggingOption = new QCheckBox(uiText(QStringLiteral("logging"), QString::fromUtf8("Логування")), quickOptionsBox);
     loggingOption->setToolTip(uiText(QStringLiteral("logging_tooltip"),
                                      QStringLiteral("Write detailed diagnostic logs and DMR dumps")));
@@ -12092,8 +10132,7 @@ bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char
             liveRetuneSettleTimer.invalidate();
         }
         standardScanDwellTimer.restart();
-        spectrumTuningDebugFramesRemaining =
-            fobosVerboseLoggingEnabled() ? 4 : spectrumTuningDebugFramesRemaining;
+        spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 4 : 0;
 
         qDebug() << "[StandardScan] external retune"
                  << "reason" << (reason ? reason : "")
@@ -12160,7 +10199,7 @@ bool YourClassName::applyStandardScanRetune(double targetFrequencyHz, const char
                                               STANDARD_SCAN_MAX_SETTLE_MS);
     liveRetuneSettleTimer.start();
     standardScanDwellTimer.restart();
-    spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 4 : spectrumTuningDebugFramesRemaining;
+    spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 4 : 0;
 
     qDebug() << "[StandardScan] retune"
              << "reason" << (reason ? reason : "")
@@ -12638,6 +10677,9 @@ void YourClassName::refreshSettingsFromUi() {
     if (agileScanCheckbox) {
         agileScanEnabled = agileScanCheckbox->isChecked();
     }
+    if (agileScanAutoStepCheckbox) {
+        agileScanAutoStepSampleRate = agileScanAutoStepCheckbox->isChecked();
+    }
     if (agileScanRangesEdit) {
         agileScanRangesMhz = agileScanRangesEdit->text().trimmed();
     }
@@ -12646,6 +10688,7 @@ void YourClassName::refreshSettingsFromUi() {
                                         AGILE_SCAN_MIN_STEP_MHZ,
                                         AGILE_SCAN_MAX_STEP_MHZ);
     }
+    applyAgileScanAutoStep(false);
     if (standardScanCheckbox) {
         standardScanEnabled = standardScanCheckbox->isChecked();
     }
@@ -13180,7 +11223,7 @@ bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &
                                    pendingSettings.actualFrequency);
             liveRetuneSettleDurationMs = LIVE_RETUNE_SETTLE_MS;
             liveRetuneSettleTimer.start();
-            spectrumTuningDebugFramesRemaining = 32;
+            spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 32 : 0;
         }
         return retuned;
     }
@@ -13237,7 +11280,7 @@ bool YourClassName::applyCenterFrequencyToHardwareIfNeeded(const RadioSettings &
         networkSpectrumFrameFftLength = 0;
         liveRetuneSettleDurationMs = LIVE_RETUNE_SETTLE_MS;
         liveRetuneSettleTimer.start();
-        spectrumTuningDebugFramesRemaining = 32;
+        spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 32 : 0;
         qDebug() << "[LiveTune]" << reason
                  << "cleared live IQ after center retune; preserving visual history"
                  << "settleMs" << liveRetuneSettleDurationMs;
@@ -13519,6 +11562,7 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["dmrAdaptiveSlicer"] = pendingSettings.dmrAdaptiveSlicer;
     settings["scalePercent"] = currentScale;
     settings["agileScanEnabled"] = agileScanEnabled;
+    settings["agileScanAutoStepSampleRate"] = agileScanAutoStepSampleRate;
     settings["agileScanRangesMhz"] = agileScanRangesMhz;
     settings["agileScanStepMhz"] = agileScanStepMhz;
     settings["scanListeningLockEnabled"] = scanListeningLockEnabled;
@@ -13715,10 +11759,13 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
         readBool("dmrAdaptiveSlicer", pendingSettings.dmrAdaptiveSlicer);
     currentScale = readDouble("scalePercent", currentScale);
     agileScanEnabled = readBool("agileScanEnabled", agileScanEnabled);
+    agileScanAutoStepSampleRate =
+        readBool("agileScanAutoStepSampleRate", agileScanAutoStepSampleRate);
     agileScanRangesMhz = settingsJson.value("agileScanRangesMhz").toString(agileScanRangesMhz).trimmed();
     agileScanStepMhz = (std::clamp)(readDouble("agileScanStepMhz", agileScanStepMhz),
                                     AGILE_SCAN_MIN_STEP_MHZ,
                                     AGILE_SCAN_MAX_STEP_MHZ);
+    applyAgileScanAutoStep(false);
     scanListeningLockEnabled = readBool("scanListeningLockEnabled", scanListeningLockEnabled);
     standardScanEnabled = readBool("standardScanEnabled", standardScanEnabled);
     standardScanCentersMhz =
@@ -13948,10 +11995,10 @@ void YourClassName::loadUiTranslations() {
         {"audio", "Audio"},
         {"sync", "Sync"},
         {"spectrum2", "Spectr 2"},
-        {"colorful", "Colorful"},
+        {"colorful", "Color spectrum"},
         {"general_band_markers", "Band markers"},
         {"amateur_band_markers", "HAM bands"},
-        {"compact_band_markers", "Collapsed"},
+        {"compact_band_markers", "Collapsed bands"},
         {"logging", "Logging"},
         {"logging_tooltip", "Write detailed diagnostic logs and DMR dumps"},
         {"internal", "Internal"},
@@ -13978,18 +12025,23 @@ void YourClassName::loadUiTranslations() {
         {"ref_delay", "Ref delay"},
         {"ref_tilt", "Ref tilt"},
         {"freeze", "Freeze"},
+        {"scan", "Scan"},
         {"agile_scan", "Agile scan"},
+        {"spectrum_measurement", "Spectrum measurement"},
         {"enable_scan", "Enable scan"},
         {"save", "Save"},
+        {"save_short", "Save"},
         {"delete_short", "Del"},
         {"ranges_mhz", "Ranges MHz:"},
         {"step", "Step:"},
+        {"agile_auto_step", "Step = SR"},
+        {"agile_auto_step_tooltip", "Use the current sample rate in MHz as the Agile scan step."},
         {"gps_qth", "GPS / QTH"},
         {"manual", "Manual"},
         {"nmea_gps", "NMEA GPS"},
         {"os_location", "OS location"},
         {"gps_source_future_tooltip", "OS location input is planned; manual coordinates are used for now."},
-        {"paste_nmea", "Paste NMEA"},
+        {"paste_nmea", "NMEA"},
         {"nmea_paste_tooltip", "Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH."},
         {"nmea_parse_failed", "NMEA: no valid GGA/RMC position found in clipboard."},
         {"nmea_position_applied", "NMEA QTH: %1 %2, %3 (%4)"},
@@ -14016,36 +12068,38 @@ void YourClassName::loadUiTranslations() {
         {"latitude_short", "Lat:"},
         {"longitude_short", "Lon:"},
         {"qth_locator_short", "QTH:"},
-        {"qth_map", "QTH Map"},
-        {"copy_qth", "Copy QTH"},
-        {"tune_gnss_l1", "Tune GNSS L1"},
-        {"use_gnss_scan", "Use GNSS scan"},
-        {"gps_ca_scan", "GPS C/A accumulate"},
+        {"qth_map", "Map"},
+        {"copy_qth", "Copy"},
+        {"tune_gnss_l1", "Tune"},
+        {"use_gnss_scan", "Scan"},
+        {"gps_ca_scan", "Accum"},
         {"gps_ca_scan_tooltip", "Run accumulated GPS L1 C/A PRN correlation on the current IQ snapshot."},
-        {"gps_ca_deep_scan", "GPS deep"},
+        {"gps_ca_deep_scan", "Deep"},
         {"gps_ca_deep_scan_tooltip", "Run a 160 ms GPS L1 C/A acquisition using the extended live IQ buffer."},
-        {"gps_ca_replay_scan", "GPS replay"},
+        {"gps_ca_replay_scan", "Replay"},
         {"gps_ca_replay_scan_tooltip", "Run GPS L1 C/A acquisition directly on the selected Channel IQ WAV recording."},
         {"gnss_replay_no_file", "GNSS replay: select a Channel IQ WAV recording."},
         {"gnss_replay_bad_file", "GNSS replay: selected file is not a supported stereo IQ WAV."},
         {"gnss_replay_too_short", "GNSS replay: recording is too short for one GPS C/A millisecond."},
         {"gnss_replay_read_failed", "GNSS replay: cannot read selected WAV."},
         {"gnss_replay_running", "GNSS replay: running acquisition on selected WAV"},
-        {"gps_ca_self_test", "GPS self-test"},
+        {"gps_ca_self_test", "Self-test"},
         {"gps_ca_self_test_tooltip", "Generate an ideal GPS L1 C/A IQ signal and run it through the same acquisition path."},
         {"gps_ca_self_test_running", "GPS self-test: running"},
-        {"gnss_position_self_test", "Position test"},
+        {"gnss_position_self_test", "Position"},
         {"gnss_position_self_test_tooltip", "Solve a synthetic multi-satellite pseudorange fix and show the result on the QTH map."},
         {"gnss_position_self_test_failed", "GNSS position self-test failed: solver did not converge."},
         {"gnss_position_self_test_marker", "GNSS synthetic"},
         {"gnss_position_self_test_result", "GNSS position self-test: %1, %2 (%3), error %4 m, clock %5 m, %6 satellites"},
-        {"gnss_ntp_time", "NTP time"},
+        {"gnss_ntp_time", "NTP"},
         {"gnss_ntp_time_tooltip", "Query an internet NTP server for UTC time. This is only an assisted-GNSS hint, not code-phase lock."},
         {"gnss_ntp_querying", "NTP UTC: querying pool.ntp.org"},
         {"gnss_ntp_result", "NTP UTC: %1, local offset %2 ms"},
         {"gnss_ntp_lookup_failed", "NTP UTC: DNS lookup failed for %1"},
         {"gnss_ntp_send_failed", "NTP UTC: request send failed: %1"},
         {"gnss_ntp_timeout", "NTP UTC: no response; network or UDP/123 may be blocked"},
+        {"gnss_acq_plot", "Plot"},
+        {"gnss_acq_plot_title", "GNSS acquisition diagnostics"},
         {"gnss_acq_plot_tooltip", "GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history."},
         {"gnss_acq_plot_waiting", "Run GPS C/A accumulation to draw correlation diagnostics."},
         {"gps_ca_scan_running", "GPS C/A accumulation: running"},
@@ -14055,12 +12109,12 @@ void YourClassName::loadUiTranslations() {
         {"gps_ca_scan_cancelled", "GPS C/A accumulation: cancelled"},
         {"gps_ca_scan_result", "GPS C/A: PRN %1, metric %2 dB, doppler %3 Hz, code %4, %5 ms accumulated"},
         {"gps_ca_scan_weak", "GPS C/A: weak/no lock, best PRN %1, metric %2 dB, doppler %3 Hz, code %4, %5 ms accumulated"},
-        {"log_raw_context", "Save GNSS IQ"},
+        {"log_raw_context", "Save IQ"},
         {"gnss_raw_context_tooltip", "Save the current live GNSS IQ snapshot as stereo PCM16 WAV and write its tuning context to the diagnostic log."},
         {"gnss_raw_no_iq", "GNSS IQ snapshot: no IQ data yet."},
         {"gnss_raw_save_failed", "GNSS IQ snapshot save failed: %1"},
         {"gnss_raw_saved", "GNSS IQ snapshot saved: %1"},
-        {"gnss_iq_monitor", "GNSS IQ monitor"},
+        {"gnss_iq_monitor", "IQ monitor"},
         {"gnss_iq_monitor_tooltip", "Measure live/playback IQ level, DC offset, clipping and I/Q balance before attempting GNSS acquisition."},
         {"gnss_iq_monitor_idle", "GNSS IQ monitor: off"},
         {"gnss_iq_monitor_waiting", "GNSS IQ monitor: waiting for IQ samples"},
@@ -14380,6 +12434,16 @@ void YourClassName::applyUiLanguage() {
         qthPasteNmeaButton->setToolTip(uiText(
             QStringLiteral("nmea_paste_tooltip"),
             QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
+    }
+    if (gnssAcquisitionPlotDialog) {
+        gnssAcquisitionPlotDialog->setWindowTitle(uiText(
+            QStringLiteral("gnss_acq_plot_title"),
+            QStringLiteral("GNSS acquisition diagnostics")));
+    }
+    if (gnssPlotButton) {
+        gnssPlotButton->setToolTip(uiText(
+            QStringLiteral("gnss_acq_plot_tooltip"),
+            QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
     }
     if (gnssDopplerSpanSpin) {
         gnssDopplerSpanSpin->setToolTip(uiText(
@@ -14760,6 +12824,11 @@ void YourClassName::updateUiFromPendingSettings() {
         QSignalBlocker blocker(agileScanCheckbox);
         agileScanCheckbox->setChecked(agileScanEnabled);
     }
+    if (agileScanAutoStepCheckbox) {
+        QSignalBlocker blocker(agileScanAutoStepCheckbox);
+        agileScanAutoStepCheckbox->setChecked(agileScanAutoStepSampleRate);
+    }
+    applyAgileScanAutoStep(false);
     if (agileScanRangesEdit) {
         QSignalBlocker blocker(agileScanRangesEdit);
         agileScanRangesEdit->setText(agileScanRangesMhz);
@@ -14987,10 +13056,13 @@ void YourClassName::loadPersistentSettings() {
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>((std::clamp)(settings.value("receiver/gpoValue", static_cast<int>(pendingSettings.gpoValue)).toInt(), 0, 255));
     agileScanEnabled = settings.value("agileScan/enabled", agileScanEnabled).toBool();
+    agileScanAutoStepSampleRate =
+        settings.value("agileScan/autoStepSampleRate", agileScanAutoStepSampleRate).toBool();
     agileScanRangesMhz = settings.value("agileScan/rangesMhz", agileScanRangesMhz).toString().trimmed();
     agileScanStepMhz = (std::clamp)(settings.value("agileScan/stepMhz", agileScanStepMhz).toDouble(),
                                     AGILE_SCAN_MIN_STEP_MHZ,
                                     AGILE_SCAN_MAX_STEP_MHZ);
+    applyAgileScanAutoStep(false);
     standardScanEnabled = settings.value("standardScan/enabled", standardScanEnabled).toBool();
     scanListeningLockEnabled = settings.value("standardScan/listenLock", scanListeningLockEnabled).toBool();
     standardScanCentersMhz = settings.value("standardScan/centersMhz", standardScanCentersMhz).toString().trimmed();
@@ -15099,8 +13171,11 @@ void YourClassName::loadPersistentSettings() {
             standardScanCentersMhz = formatMhzList(normalized);
         }
     }
-    scanMeasurementEnabled = settings.value("agileScan/measurementEnabled", scanMeasurementEnabled).toBool();
-    scanMeasurementBinMhz = (std::clamp)(settings.value("agileScan/measurementBinMhz", scanMeasurementBinMhz).toDouble(),
+    scanMeasurementEnabled =
+        settings.value("spectrumMeasurement/enabled",
+                       settings.value("agileScan/measurementEnabled", scanMeasurementEnabled)).toBool();
+    scanMeasurementBinMhz = (std::clamp)(settings.value("spectrumMeasurement/binMhz",
+                                                        settings.value("agileScan/measurementBinMhz", scanMeasurementBinMhz)).toDouble(),
                                          SCAN_MEASUREMENT_MIN_BIN_MHZ,
                                          SCAN_MEASUREMENT_MAX_BIN_MHZ);
     dmrHunterSettings.enabled = settings.value("dmrHunter/enabled", dmrHunterSettings.enabled).toBool();
@@ -15172,11 +13247,37 @@ void YourClassName::loadPersistentSettings() {
     }
     if (!agileScanPresets.contains(QStringLiteral("Digital video sparse"))) {
         agileScanPresets[QStringLiteral("Digital video sparse")] =
-            agileScanPresetSpec(QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925"), 5.0);
+            agileScanPresetSpec(QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925"), 10.0);
+    } else {
+        const QString legacyDigitalVideoRanges = QStringLiteral("1080-1360\\2300-2500\\3200-3500\\4900-5925");
+        const QString legacySpec = agileScanPresets.value(QStringLiteral("Digital video sparse"));
+        if (agileScanPresetRanges(legacySpec) == legacyDigitalVideoRanges &&
+            agileScanPresetStepMhz(legacySpec, 10.0) < 10.0) {
+            QString parseError;
+            parseAgileScanFrequenciesMhz(legacyDigitalVideoRanges,
+                                         agileScanPresetStepMhz(legacySpec, 5.0),
+                                         &parseError);
+            if (parseError.contains(QStringLiteral("Too many scan points"), Qt::CaseInsensitive)) {
+                agileScanPresets[QStringLiteral("Digital video sparse")] =
+                    agileScanPresetSpec(legacyDigitalVideoRanges, 10.0);
+            }
+        }
     }
     if (!agileScanPresets.contains(QStringLiteral("Cellular LTE/3G downlinks sparse"))) {
         agileScanPresets[QStringLiteral("Cellular LTE/3G downlinks sparse")] =
             agileScanPresetSpec(QStringLiteral("758-821\\925-960\\1805-1880\\2110-2170\\2620-2690"), 10.0);
+    }
+    if (!agileScanPresets.contains(QStringLiteral("UHF Satcom 240-270 250kHz"))) {
+        agileScanPresets[QStringLiteral("UHF Satcom 240-270 250kHz")] =
+            agileScanPresetSpec(QStringLiteral("240-270"), 0.25);
+    }
+    if (!agileScanPresets.contains(QStringLiteral("FPV 1.1-1.3 common"))) {
+        agileScanPresets[QStringLiteral("FPV 1.1-1.3 common")] =
+            agileScanPresetSpec(QStringLiteral("1080,1120,1160,1200,1240,1258,1280,1320,1360"), 1.0);
+    }
+    if (!agileScanPresets.contains(QStringLiteral("FPV 3.3GHz sparse"))) {
+        agileScanPresets[QStringLiteral("FPV 3.3GHz sparse")] =
+            agileScanPresetSpec(QStringLiteral("3200-3500"), 50.0);
     }
     if (!agileScanPresets.contains(QStringLiteral("GNSS L1 1559-1610 50MHz"))) {
         agileScanPresets[QStringLiteral("GNSS L1 1559-1610 50MHz")] =
@@ -15255,6 +13356,10 @@ void YourClassName::loadPersistentSettings() {
     if (!listeningScanPresets.contains(QStringLiteral("Cellular LTE/3G anchors"))) {
         listeningScanPresets[QStringLiteral("Cellular LTE/3G anchors")] =
             listeningScanPresetSpec(QStringLiteral("780.5, 806, 942.5, 1842.5, 2140, 2655"), 3000, 100);
+    }
+    if (!listeningScanPresets.contains(QStringLiteral("UHF Satcom survey"))) {
+        listeningScanPresets[QStringLiteral("UHF Satcom survey")] =
+            listeningScanPresetSpec(QStringLiteral("243, 250, 255, 260, 265, 270"), 3000, 100);
     }
     if (!listeningScanPresets.contains(QStringLiteral("GLONASS L1OF channels"))) {
         listeningScanPresets[QStringLiteral("GLONASS L1OF channels")] =
@@ -15587,6 +13692,7 @@ void YourClassName::savePersistentSettings() {
                  << "listening" << settingsToSave.listeningFrequency;
     }
     settings.setValue("agileScan/enabled", agileScanEnabled);
+    settings.setValue("agileScan/autoStepSampleRate", agileScanAutoStepSampleRate);
     settings.setValue("agileScan/rangesMhz", agileScanRangesMhz);
     settings.setValue("agileScan/stepMhz", agileScanStepMhz);
     settings.setValue("standardScan/enabled", standardScanEnabled);
@@ -15634,8 +13740,8 @@ void YourClassName::savePersistentSettings() {
         settings.setValue(QStringLiteral("longitude"), marker.longitude);
     }
     settings.endArray();
-    settings.setValue("agileScan/measurementEnabled", scanMeasurementEnabled);
-    settings.setValue("agileScan/measurementBinMhz", scanMeasurementBinMhz);
+    settings.setValue("spectrumMeasurement/enabled", scanMeasurementEnabled);
+    settings.setValue("spectrumMeasurement/binMhz", scanMeasurementBinMhz);
     settings.setValue("dmrHunter/enabled", dmrHunterSettings.enabled);
     settings.setValue("dmrHunter/minWidthKhz", dmrHunterSettings.minWidthKhz);
     settings.setValue("dmrHunter/maxWidthKhz", dmrHunterSettings.maxWidthKhz);
@@ -19950,7 +18056,12 @@ void YourClassName::updateSpectrum() {
         return;
     }
 
-    const bool traceFrame = spectrumDebugFramesRemaining > 0;
+    const bool verboseLogging = fobosVerboseLoggingEnabled();
+    if (!verboseLogging) {
+        spectrumDebugFramesRemaining = 0;
+        spectrumTuningDebugFramesRemaining = 0;
+    }
+    const bool traceFrame = verboseLogging && spectrumDebugFramesRemaining > 0;
     QElapsedTimer traceTimer;
     if (traceFrame) {
         traceTimer.start();
@@ -20002,11 +18113,6 @@ void YourClassName::updateSpectrum() {
         return;
     }
 
-    //dataq = new float[dataSize];
-        //for (int i = 0; i < 8; ++i){
-        //int setrf = fobos_rx_set_frequency(device, globalFrequency + globalSampleRate * i, &actualFrequency);
-        //memcpy(iqData + i * DEFAULT_BUF_LEN/8, dataq, DEFAULT_BUF_LEN/8 * sizeof(float));
-        //}
     std::vector<float> spectrumFrequencies;
     std::vector<float> spectrumMagnitudes;
     std::vector<float> referenceMagnitudes;
@@ -20110,6 +18216,7 @@ void YourClassName::updateSpectrum() {
     int displayFftLength = static_cast<int>(spectrumFrequencies.size());
     QVector<ScanVisualSegment> displayScanSegments;
     ScanVisualFrame scanFrame;
+    ScanVisualFrame visibleScanFrame;
     const bool agileScanVisualActive =
         agileScanRunning &&
         activeFobosApiKind == FobosApiKind::Agile &&
@@ -20138,22 +18245,40 @@ void YourClassName::updateSpectrum() {
                                                    spectrumMagnitudes,
                                                    referenceMagnitudes);
             if (scanFrame.valid) {
-                displayFrequenciesPtr = &scanFrame.frequencies;
-                displayMagnitudesPtr = &scanFrame.magnitudes;
-                displayReferenceMagnitudesPtr = &scanFrame.referenceMagnitudes;
-                displayMeasurementFrequenciesPtr = &scanFrame.actualFrequencies;
-                displayCenterFrequency = scanFrame.centerFrequency;
-                displayMinFrequency = scanFrame.minFrequency;
-                displayMaxFrequency = scanFrame.maxFrequency;
-                displayFftLength = scanFrame.fftLength;
-                displayScanSegments = scanFrame.segments;
-                if (scanFrame.actualFrequencies.size() == scanFrame.magnitudes.size()) {
-                    dmrHunterFrequenciesPtr = &scanFrame.actualFrequencies;
-                    dmrHunterMagnitudesPtr = &scanFrame.magnitudes;
-                    fpvHunterFrequenciesPtr = &scanFrame.actualFrequencies;
-                    fpvHunterMagnitudesPtr = &scanFrame.magnitudes;
-                    digitalVideoHunterFrequenciesPtr = &scanFrame.actualFrequencies;
-                    digitalVideoHunterMagnitudesPtr = &scanFrame.magnitudes;
+                const double scanFullSpanHz = scanFrame.maxFrequency - scanFrame.minFrequency;
+                const double scanVisibleSpanHz =
+                    std::isfinite(scanFullSpanHz) && scanFullSpanHz > 0.0
+                        ? scanFullSpanHz * (currentScale / 100.0)
+                        : scanFullSpanHz;
+                const double scanVisibleCenterHz =
+                    displayFrequencyForScanActual(pendingSettings.listeningFrequency,
+                                                  scanFrame.segments,
+                                                  scanFrame.centerFrequency);
+                const ScanVisualFrame *displayScanFrame = &scanFrame;
+                if (std::isfinite(scanFullSpanHz) &&
+                    scanFullSpanHz > 0.0 &&
+                    scanVisibleSpanHz < scanFullSpanHz * 0.999) {
+                    visibleScanFrame =
+                        windowedScanVisualFrame(scanFrame, scanVisibleCenterHz, scanVisibleSpanHz);
+                    displayScanFrame = &visibleScanFrame;
+                }
+
+                displayFrequenciesPtr = &displayScanFrame->frequencies;
+                displayMagnitudesPtr = &displayScanFrame->magnitudes;
+                displayReferenceMagnitudesPtr = &displayScanFrame->referenceMagnitudes;
+                displayMeasurementFrequenciesPtr = &displayScanFrame->actualFrequencies;
+                displayCenterFrequency = displayScanFrame->centerFrequency;
+                displayMinFrequency = displayScanFrame->minFrequency;
+                displayMaxFrequency = displayScanFrame->maxFrequency;
+                displayFftLength = displayScanFrame->fftLength;
+                displayScanSegments = displayScanFrame->segments;
+                if (displayScanFrame->actualFrequencies.size() == displayScanFrame->magnitudes.size()) {
+                    dmrHunterFrequenciesPtr = &displayScanFrame->actualFrequencies;
+                    dmrHunterMagnitudesPtr = &displayScanFrame->magnitudes;
+                    fpvHunterFrequenciesPtr = &displayScanFrame->actualFrequencies;
+                    fpvHunterMagnitudesPtr = &displayScanFrame->magnitudes;
+                    digitalVideoHunterFrequenciesPtr = &displayScanFrame->actualFrequencies;
+                    digitalVideoHunterMagnitudesPtr = &displayScanFrame->magnitudes;
                 }
             }
         }
@@ -20358,6 +18483,7 @@ void YourClassName::onSampleRateChanged(int index) {
     }
 
     pendingSettings.sampleRate = selectedSampleRate;
+    applyAgileScanAutoStep(true);
     normalizeStandardScanCentersUi(false);
     normalizeTuning(pendingSettings);
     publishSettingsToGlobals();
@@ -20401,6 +18527,7 @@ void YourClassName::onSampleRateChanged(int index) {
 
             globalSampleRate = actualRate;
             pendingSettings.sampleRate = actualRate;
+            applyAgileScanAutoStep(true);
             appliedSampleRate = actualRate;
             if (hardwareSettingsApplied) {
                 appliedHardwareSettings.sampleRate = actualRate;
@@ -20421,7 +18548,7 @@ void YourClassName::onSampleRateChanged(int index) {
             clearLiveSpectrumSnapshot(false);
             liveRetuneSettleDurationMs = agileRfLiveSettleMs(actualRate, true);
             liveRetuneSettleTimer.start();
-            spectrumTuningDebugFramesRemaining = 32;
+            spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 32 : 0;
             qDebug() << "[FobosLifecycle] Agile RF sample-rate live settle armed"
                      << "settleMs" << liveRetuneSettleDurationMs;
             savePersistentSettings();
@@ -21447,7 +19574,7 @@ void YourClassName::startFobosProcessing() {
                                   Qt::QueuedConnection);
     }
     spectrumDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 12 : 0;
-    spectrumTuningDebugFramesRemaining = 32;
+    spectrumTuningDebugFramesRemaining = fobosVerboseLoggingEnabled() ? 32 : 0;
     updateSpectrumTimerInterval();
     if (fobosVerboseLoggingEnabled()) {
         qDebug() << "[FobosLifecycle] clearing IQ buffer before reader start; preserving visual history";
@@ -21880,8 +20007,8 @@ int main(int argc, char *argv[]) {
 
     qDebug() << "App started";
 #ifdef _WIN32
-        SetConsoleOutputCP(CP_UTF8);  // Устанавливаем UTF-8 для вывода
-        SetConsoleCP(CP_UTF8);        // Устанавливаем UTF-8 для ввода
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
 #endif
     return app.exec();
 }

@@ -1,5 +1,35 @@
 # Changelog
 
+## 4.2.2 - 2026-06-14
+
+### Added
+
+- Added the separated diagnostics, help, GNSS/QTH helper, preset helper, and
+  preset manager modules to reduce the load carried by `main.cpp`.
+- Added SATCOM and expanded FPV/LTE/3G default presets, plus ordered preset
+  controls for moving entries up and down.
+- Added the built-in bilingual feature guide and refreshed the default desktop
+  startup profile for wide FM, 200 kHz bandwidth, larger FFT, color spectrum,
+  visible band overlays, and safer scan defaults.
+
+### Changed
+
+- Optimized spectrum/waterfall hot-path handling and exposed faster waterfall
+  frame timing/row duplication defaults.
+- Moved scan/spectrum measurement and spur controls into a clearer Spectrum
+  measurement section.
+- Shortened the GNSS/QTH controls and moved acquisition diagnostics into a
+  separate plot window so the left control panel no longer grows too wide.
+- Kept the RTL-SDR backend wired into Standard scan and kept optional SoapySDR
+  support documented as experimental.
+
+### Fixed
+
+- Reduced unnecessary diagnostic noise when verbose logging is disabled and
+  tightened start/stop/retune handling after the Fobos IQ offset investigation.
+- Kept release packaging focused on runtime files by excluding local settings,
+  logs, and real IQ/recording artifacts.
+
 ## 4.2.1 - 2026-06-14
 
 ### Fixed

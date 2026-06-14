@@ -1071,9 +1071,11 @@ void DigitalDecoder::queueDmrVoicePcm(const QByteArray &pcmData) {
         const int dropBytes =
             (std::min)(pendingDmrVoicePcm.size(), chunksToDrop * DMR_VOICE_PCM_CHUNK_BYTES);
         pendingDmrVoicePcm.remove(0, dropBytes);
-        qDebug() << "[DMR audio]"
-                 << "pcmJitterBufferDropBytes" << dropBytes
-                 << "remainingBytes" << pendingDmrVoicePcm.size();
+        if (fobosVerboseLoggingEnabled()) {
+            qDebug() << "[DMR audio]"
+                     << "pcmJitterBufferDropBytes" << dropBytes
+                     << "remainingBytes" << pendingDmrVoicePcm.size();
+        }
     }
 
     while (pendingDmrVoicePcm.size() >= DMR_VOICE_PCM_CHUNK_BYTES) {
@@ -1699,10 +1701,12 @@ void DigitalDecoder::configureForMode(int modulationType, int sampleRate) {
         updateStatus(QStringLiteral("FT8 detector: waiting for a 15 s frame"));
     } else if (modulationType == MOD_DMR) {
         const double samplesPerSymbol = static_cast<double>(activeSampleRate) / 4800.0;
-        qDebug() << "[DMR decoder] configured"
-                 << "sampleRate" << activeSampleRate
-                 << "samplesPerSymbol" << samplesPerSymbol
-                 << "vocoderAvailable" << dmrVocoder.isAvailable();
+        if (fobosVerboseLoggingEnabled()) {
+            qDebug() << "[DMR decoder] configured"
+                     << "sampleRate" << activeSampleRate
+                     << "samplesPerSymbol" << samplesPerSymbol
+                     << "vocoderAvailable" << dmrVocoder.isAvailable();
+        }
         updateStatus(dmrVocoder.isAvailable()
                          ? QStringLiteral("DMR monitor: %1 kHz 4FSK, %2 sps, AMBE vocoder ready")
                                .arg(activeSampleRate / 1000)
