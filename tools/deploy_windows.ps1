@@ -99,6 +99,7 @@ foreach ($DocFile in $DocFiles) {
 }
 
 $ReleaseDocFiles = @(
+    "docs\bladerf_native_beta.md",
     "docs\gnss_preflight_4.1.md",
     "docs\iq_pipeline_audit.md",
     "docs\roadmap_4.0_cleanup.md"

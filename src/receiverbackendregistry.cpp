@@ -63,7 +63,15 @@ QList<ReceiverBackendRegistration> receiverBackendRegistrySnapshot() {
                              ReceiverBackendFeature::PpmCorrection,
                          false,
                          true,
-                         QStringLiteral("Ready when SoapySDR runtime and device modules are available"))
+                         QStringLiteral("Ready when SoapySDR runtime and device modules are available")),
+        makeRegistration(QStringLiteral("bladerf-native"),
+                         QStringLiteral("bladeRF native"),
+                         ReceiverBackendStreamKind::BladeRfNative,
+                         ReceiverBackendFeature::HardwareBandwidth |
+                             ReceiverBackendFeature::PpmCorrection,
+                         false,
+                         true,
+                         QStringLiteral("Experimental RX path; ready when libbladeRF is available"))
     };
 }
 

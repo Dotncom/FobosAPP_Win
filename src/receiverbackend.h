@@ -32,7 +32,8 @@ enum class ReceiverBackendStreamKind {
     FobosAgile,
     RtlSdrNative,
     RtlTcp,
-    SoapySdr
+    SoapySdr,
+    BladeRfNative
 };
 
 struct ReceiverBackendDeviceInfo {
@@ -79,6 +80,7 @@ struct ReceiverStreamDescriptor {
     quint16 rtlTcpPort = 1234;
     int rtlSdrNativeDeviceIndex = 0;
     int soapySdrDeviceIndex = 0;
+    int bladeRfNativeDeviceIndex = 0;
     int rtlTcpTunerGainTenthsDb = -1;
     bool rtlTcpAgc = true;
     bool syncReader = false;

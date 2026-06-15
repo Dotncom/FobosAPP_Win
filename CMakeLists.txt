@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.3.1)
+project(FobosAPP VERSION 4.3.2)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -100,6 +100,8 @@ set(SOURCES
     src/digitalvideohunterdetector.h
     src/digitaldecoder.cpp
     src/digitaldecoder.h
+    src/bladerfbackend.cpp
+    src/bladerfbackend.h
     src/frequencycontrol.cpp
     src/frequencycontrol.h
     src/finetunewidget.cpp

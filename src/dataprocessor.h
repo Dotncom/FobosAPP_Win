@@ -78,6 +78,7 @@ private:
     void runRtlTcpReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
     void runRtlSdrNativeReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
     void runSoapySdrReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
+    void runBladeRfNativeReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples);
     void handleUnsigned8IqData(const unsigned char *buf, uint32_t byteCount, const char *readerMode);
 
 //signals:

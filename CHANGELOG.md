@@ -1,5 +1,23 @@
 # Changelog
 
+## 4.3.2-beta - 2026-06-15
+
+### Added
+
+- Added an experimental native bladeRF RX backend that loads `bladeRF.dll` /
+  `libbladeRF` at runtime and feeds SC16_Q11 IQ into the existing FobosAPP
+  float-IQ pipeline.
+- Added bladeRF device enumeration, open/configure/start, live center retune,
+  standard scan compatibility, and optional detailed RX statistics logging.
+- Bundled the Nuand 2025.10 Windows `bladeRF.dll` runtime and matching
+  `libusb-1.0.dll` in the beta Windows package under `bladerf/`.
+
+### Notes
+
+- bladeRF support is RX-only and untested without community hardware.
+- TX/PTT support is intentionally not enabled yet; it remains planned for the
+  separate future `TransmitterBackend` safety architecture.
+
 ## 4.3.1 - 2026-06-15
 
 ### Changed

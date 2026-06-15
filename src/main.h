@@ -208,6 +208,8 @@ private:
     bool isRtlSdrNativeSelected() const;
     int selectedRtlSdrNativeIndex() const;
     bool isSoapySdrSelected() const;
+    bool isBladeRfNativeSelected() const;
+    int selectedBladeRfNativeIndex() const;
     bool isRtlBackendSelected() const;
     bool isExternalReceiverBackendSelected() const;
     bool normalizeRtlSdrSettings();
@@ -220,6 +222,9 @@ private:
     ReceiverStreamDescriptor makeSoapySdrStreamDescriptor(bool queueAudioBlocks,
                                                           bool publishIqSnapshot,
                                                           bool emitIqFrames) const;
+    ReceiverStreamDescriptor makeBladeRfNativeStreamDescriptor(bool queueAudioBlocks,
+                                                               bool publishIqSnapshot,
+                                                               bool emitIqFrames) const;
     bool restartStreamForHardwareChange();
     bool restartAgileReaderForCenterRetune(double previousFrequency,
                                            double requestedFrequency,

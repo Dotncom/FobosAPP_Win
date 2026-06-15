@@ -1,6 +1,7 @@
 #include "dataprocessor.h"
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
+#include "bladerfbackend.h"
 #include "fobosbackend.h"
 #include "rtlsdrbackend.h"
 #include "soapysdrbackend.h"
@@ -56,6 +57,10 @@ constexpr int SOAPY_SDR_ERR_OPEN = -14101;
 constexpr int SOAPY_SDR_ERR_CONFIGURE = -14102;
 constexpr int SOAPY_SDR_ERR_STREAM = -14103;
 constexpr int SOAPY_SDR_TIMEOUT = -1;
+constexpr int BLADERF_NATIVE_ERR_OPEN = -15101;
+constexpr int BLADERF_NATIVE_ERR_CONFIGURE = -15102;
+constexpr int BLADERF_NATIVE_ERR_STREAM = -15103;
+constexpr uint32_t BLADERF_SYNC_TIMEOUT_MS = 250;
 
 bool writeRtlTcpCommand(QTcpSocket &socket, quint8 command, quint32 parameter) {
     char packet[5] = {};
@@ -463,6 +468,12 @@ void DataProcessor::run() {
         readBlockSamples = asyncBlockSamplesForRate(sampleRate);
         activeSyncMode = false;
         runSoapySdrReader(readerStream, readBlockSamples);
+        return;
+    }
+    if (readerStreamKind == ReceiverBackendStreamKind::BladeRfNative) {
+        readBlockSamples = asyncBlockSamplesForRate(sampleRate);
+        activeSyncMode = false;
+        runBladeRfNativeReader(readerStream, readBlockSamples);
         return;
     }
     if (readerApiKind == FobosApiKind::Agile && requestedAgileScanEnabled.load()) {
@@ -1078,6 +1089,235 @@ void DataProcessor::runSoapySdrReader(const ReceiverStreamDescriptor &stream, ui
     deactivateSoapySdrStreamSafely(soapyDevice, rxStream);
     closeSoapySdrStreamSafely(soapyDevice, rxStream);
     closeSoapySdrDeviceSafely(soapyDevice);
+    activeDevice = nullptr;
+    running = false;
+}
+
+void DataProcessor::runBladeRfNativeReader(const ReceiverStreamDescriptor &stream, uint32_t blockSamples) {
+    QString loadedPath;
+    QString errorMessage;
+    if (!bladeRfLibraryAvailable(&loadedPath, &errorMessage)) {
+        qDebug() << "[bladeRF] native library unavailable" << errorMessage;
+        emit readerFailed(BLADERF_NATIVE_ERR_OPEN, !running.load());
+        running = false;
+        return;
+    }
+
+    const QVector<BladeRfDeviceInfo> devices = enumerateBladeRfDevices();
+    QStringList deviceLabels;
+    deviceLabels.reserve(devices.size());
+    for (const BladeRfDeviceInfo &deviceInfo : devices) {
+        deviceLabels.append(QStringLiteral("#%1 %2").arg(deviceInfo.nativeIndex).arg(deviceInfo.label));
+    }
+    qDebug() << "[bladeRF] enumerate before open"
+             << "count" << devices.size()
+             << "devices" << deviceLabels;
+
+    void *bladeDevice = nullptr;
+    int ret = openBladeRfDeviceSafely(&bladeDevice, stream.bladeRfNativeDeviceIndex);
+    qDebug() << "[bladeRF] open"
+             << "index" << stream.bladeRfNativeDeviceIndex
+             << "result" << ret
+             << "device" << bladeDevice
+             << "library" << loadedPath;
+    if (ret != 0 || !bladeDevice) {
+        qDebug() << "[bladeRF] open failed" << bladeRfLastErrorMessage();
+        emit readerFailed(BLADERF_NATIVE_ERR_OPEN, !running.load());
+        running = false;
+        return;
+    }
+
+    activeDevice = bladeDevice;
+    const double sampleRate = stream.sampleRateHz > 0.0 ? stream.sampleRateHz : requestedSampleRate.load();
+    const double centerFrequency = requestedCenterFrequency.load() > 0.0
+                                       ? requestedCenterFrequency.load()
+                                       : stream.centerFrequencyHz;
+    const uint32_t sampleRateHz = static_cast<uint32_t>((std::clamp)(sampleRate, 1.0, 61440000.0));
+    const uint64_t centerFrequencyHz = static_cast<uint64_t>((std::max)(0.0, centerFrequency));
+    uint32_t actualSampleRateHz = 0;
+    uint32_t actualBandwidthHz = 0;
+    bool configured = true;
+
+    ret = setBladeRfSampleRateSafely(bladeDevice, sampleRateHz, &actualSampleRateHz);
+    qDebug() << "[bladeRF] set sample rate"
+             << sampleRateHz
+             << "actual" << actualSampleRateHz
+             << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setBladeRfBandwidthSafely(bladeDevice,
+                                    sampleRateHz,
+                                    &actualBandwidthHz);
+    qDebug() << "[bladeRF] set bandwidth best-effort"
+             << sampleRateHz
+             << "actual" << actualBandwidthHz
+             << "result" << ret;
+    ret = setBladeRfCenterFrequencySafely(bladeDevice, centerFrequencyHz);
+    qDebug() << "[bladeRF] set center frequency" << centerFrequencyHz << "result" << ret;
+    configured = configured && ret == 0;
+    ret = setBladeRfGainModeSafely(bladeDevice, 0);
+    qDebug() << "[bladeRF] set default gain mode best-effort result" << ret;
+
+    const uint32_t samplesPerBlock = (std::max)(blockSamples, MIN_ASYNC_BLOCK_SAMPLES);
+    const uint32_t bufferCount = (std::max)(asyncBufferCountForRate(sampleRate), 8u);
+    const uint32_t transferCount = (std::min)(bufferCount - 1, 16u);
+    ret = configureBladeRfSyncRxSafely(bladeDevice,
+                                       bufferCount,
+                                       samplesPerBlock,
+                                       transferCount,
+                                       1000);
+    qDebug() << "[bladeRF] sync_config"
+             << "buffers" << bufferCount
+             << "samplesPerBuffer" << samplesPerBlock
+             << "transfers" << transferCount
+             << "result" << ret;
+    configured = configured && ret == 0;
+
+    if (!running.load()) {
+        qDebug() << "[bladeRF] stop requested during configure; closing device";
+        closeBladeRfDeviceSafely(bladeDevice);
+        activeDevice = nullptr;
+        running = false;
+        return;
+    }
+
+    if (!configured) {
+        qDebug() << "[bladeRF] configure failed" << bladeRfLastErrorMessage();
+        closeBladeRfDeviceSafely(bladeDevice);
+        activeDevice = nullptr;
+        emit readerFailed(BLADERF_NATIVE_ERR_CONFIGURE, !running.load());
+        running = false;
+        return;
+    }
+
+    ret = enableBladeRfRxSafely(bladeDevice, true);
+    qDebug() << "[bladeRF] enable RX result" << ret;
+    if (ret != 0) {
+        qDebug() << "[bladeRF] enable RX failed" << bladeRfLastErrorMessage();
+        closeBladeRfDeviceSafely(bladeDevice);
+        activeDevice = nullptr;
+        emit readerFailed(BLADERF_NATIVE_ERR_STREAM, !running.load());
+        running = false;
+        return;
+    }
+
+    const double effectiveSampleRate = actualSampleRateHz > 0 ? static_cast<double>(actualSampleRateHz) : sampleRate;
+    std::vector<int16_t> sc16Buffer(static_cast<std::size_t>(samplesPerBlock) * FLOATS_PER_IQ_SAMPLE);
+    std::vector<float> floatBuffer(static_cast<std::size_t>(samplesPerBlock) * FLOATS_PER_IQ_SAMPLE);
+    IqBuffer::setSampleRateEstimate(effectiveSampleRate);
+    asyncMeasuredSamples = 0;
+    asyncCallbackCounter = 0;
+    asyncRateReportCount = 0;
+    asyncRateTimer.restart();
+    QElapsedTimer bladeRfStatsTimer;
+    bladeRfStatsTimer.start();
+    uint64_t bladeRfBlocksSinceLog = 0;
+    uint64_t bladeRfSamplesSinceLog = 0;
+    int16_t bladeRfMinI = 0;
+    int16_t bladeRfMaxI = 0;
+    int16_t bladeRfMinQ = 0;
+    int16_t bladeRfMaxQ = 0;
+    double bladeRfMeanI = 0.0;
+    double bladeRfMeanQ = 0.0;
+    uint64_t bladeRfInspected = 0;
+    uint64_t bladeRfClipped = 0;
+
+    qDebug() << "[bladeRF] sync_rx begin"
+             << "blockSamples" << samplesPerBlock
+             << "sampleRate" << effectiveSampleRate
+             << "center" << centerFrequency;
+    while (running.load()) {
+        ret = readBladeRfSyncRxSafely(bladeDevice,
+                                      sc16Buffer.data(),
+                                      samplesPerBlock,
+                                      BLADERF_SYNC_TIMEOUT_MS);
+        if (ret == 0) {
+            const bool collectBladeRfStats = fobosVerboseLoggingEnabled();
+            const uint32_t inspectStride = collectBladeRfStats
+                                               ? (std::max)(uint32_t(1), samplesPerBlock / 4096U)
+                                               : samplesPerBlock + 1U;
+            for (uint32_t i = 0; i < samplesPerBlock; ++i) {
+                const int16_t iRaw = sc16Buffer[i * 2];
+                const int16_t qRaw = sc16Buffer[i * 2 + 1];
+                floatBuffer[i * 2] = static_cast<float>(iRaw) / 2048.0f;
+                floatBuffer[i * 2 + 1] = static_cast<float>(qRaw) / 2048.0f;
+                if (collectBladeRfStats && (i % inspectStride) == 0) {
+                    if (bladeRfInspected == 0) {
+                        bladeRfMinI = bladeRfMaxI = iRaw;
+                        bladeRfMinQ = bladeRfMaxQ = qRaw;
+                    } else {
+                        bladeRfMinI = (std::min)(bladeRfMinI, iRaw);
+                        bladeRfMaxI = (std::max)(bladeRfMaxI, iRaw);
+                        bladeRfMinQ = (std::min)(bladeRfMinQ, qRaw);
+                        bladeRfMaxQ = (std::max)(bladeRfMaxQ, qRaw);
+                    }
+                    bladeRfMeanI += static_cast<double>(iRaw);
+                    bladeRfMeanQ += static_cast<double>(qRaw);
+                    if (std::abs(static_cast<int>(iRaw)) >= 2040 ||
+                        std::abs(static_cast<int>(qRaw)) >= 2040) {
+                        ++bladeRfClipped;
+                    }
+                    ++bladeRfInspected;
+                }
+            }
+            if (collectBladeRfStats) {
+                ++bladeRfBlocksSinceLog;
+                bladeRfSamplesSinceLog += samplesPerBlock;
+            }
+            if (collectBladeRfStats && bladeRfStatsTimer.elapsed() >= 3000) {
+                const double elapsedSeconds =
+                    static_cast<double>((std::max)(qint64(1), bladeRfStatsTimer.elapsed())) / 1000.0;
+                const double measuredRate = static_cast<double>(bladeRfSamplesSinceLog) / elapsedSeconds;
+                const double inspected = static_cast<double>((std::max)(uint64_t(1), bladeRfInspected));
+                const double clipPercent = 100.0 * static_cast<double>(bladeRfClipped) / inspected;
+                qDebug() << "[bladeRF] RX stats"
+                         << "blocks" << static_cast<qulonglong>(bladeRfBlocksSinceLog)
+                         << "samples" << static_cast<qulonglong>(bladeRfSamplesSinceLog)
+                         << "rateSps" << measuredRate
+                         << "minI" << bladeRfMinI
+                         << "maxI" << bladeRfMaxI
+                         << "minQ" << bladeRfMinQ
+                         << "maxQ" << bladeRfMaxQ
+                         << "meanI" << (bladeRfMeanI / inspected)
+                         << "meanQ" << (bladeRfMeanQ / inspected)
+                         << "clipPercent" << clipPercent;
+                bladeRfStatsTimer.restart();
+                bladeRfBlocksSinceLog = 0;
+                bladeRfSamplesSinceLog = 0;
+                bladeRfMinI = bladeRfMaxI = 0;
+                bladeRfMinQ = bladeRfMaxQ = 0;
+                bladeRfMeanI = 0.0;
+                bladeRfMeanQ = 0.0;
+                bladeRfInspected = 0;
+                bladeRfClipped = 0;
+            } else if (!collectBladeRfStats) {
+                bladeRfStatsTimer.restart();
+                bladeRfBlocksSinceLog = 0;
+                bladeRfSamplesSinceLog = 0;
+                bladeRfMinI = bladeRfMaxI = 0;
+                bladeRfMinQ = bladeRfMaxQ = 0;
+                bladeRfMeanI = 0.0;
+                bladeRfMeanQ = 0.0;
+                bladeRfInspected = 0;
+                bladeRfClipped = 0;
+            }
+            handleData(floatBuffer.data(), samplesPerBlock);
+            continue;
+        }
+        const bool stoppedByRequest = !running.load();
+        qDebug() << "[bladeRF] sync_rx returned"
+                 << "result" << ret
+                 << "stoppedByRequest" << stoppedByRequest
+                 << "error" << bladeRfLastErrorMessage();
+        if (!stoppedByRequest) {
+            emit readerFailed(ret, stoppedByRequest);
+        }
+        break;
+    }
+
+    const bool stoppedByRequest = !running.load();
+    qDebug() << "[bladeRF] sync_rx end" << "stoppedByRequest" << stoppedByRequest;
+    enableBladeRfRxSafely(bladeDevice, false);
+    closeBladeRfDeviceSafely(bladeDevice);
     activeDevice = nullptr;
     running = false;
 }
@@ -1999,6 +2239,22 @@ bool DataProcessor::retuneCenterFrequency(double centerFrequencyHz) {
                  << "result" << result;
         return result == 0;
     }
+    if (streamKind == ReceiverBackendStreamKind::BladeRfNative) {
+        void *bladeDevice = activeDevice.load();
+        if (!running.load() || !bladeDevice) {
+            qDebug() << "[bladeRF] live center retune requested without active handle"
+                     << "frequency" << centerFrequencyHz
+                     << "running" << running.load()
+                     << "device" << bladeDevice;
+            return false;
+        }
+        const uint64_t frequencyHz = static_cast<uint64_t>((std::max)(0.0, centerFrequencyHz));
+        const int result = setBladeRfCenterFrequencySafely(bladeDevice, frequencyHz);
+        qDebug() << "[bladeRF] live center retune"
+                 << "frequency" << frequencyHz
+                 << "result" << result;
+        return result == 0;
+    }
     if (streamKind != ReceiverBackendStreamKind::RtlSdrNative) {
         return false;
     }
@@ -2046,6 +2302,13 @@ void DataProcessor::requestStop() {
                 } else if (activeStreamKind == ReceiverBackendStreamKind::SoapySdr) {
                     if (fobosVerboseLoggingEnabled()) {
                         qDebug() << "[DataProcessor] SoapySDR stop requested; readStream loop will exit after timeout";
+                    }
+                } else if (activeStreamKind == ReceiverBackendStreamKind::BladeRfNative) {
+                    if (readerDevice) {
+                        enableBladeRfRxSafely(readerDevice, false);
+                    }
+                    if (fobosVerboseLoggingEnabled()) {
+                        qDebug() << "[DataProcessor] bladeRF stop requested; sync_rx loop will exit after timeout";
                     }
                 } else {
                     bool expected = false;

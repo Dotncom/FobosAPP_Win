@@ -9,6 +9,7 @@
 #include "qthlocator.h"
 #include "qthmapwidget.h"
 #include "receiverbackendregistry.h"
+#include "bladerfbackend.h"
 
 #include <QApplication>
 #include <QClipboard>
@@ -115,6 +116,7 @@ constexpr int NETWORK_CHANNEL_SPECTRUM_INTERVAL_MS = 160;
 constexpr int RTL_TCP_DEVICE_INDEX = -1000;
 constexpr int RTLSDR_NATIVE_DEVICE_INDEX_BASE = -2000;
 constexpr int SOAPY_SDR_DEVICE_INDEX = -3000;
+constexpr int BLADERF_NATIVE_DEVICE_INDEX_BASE = -4000;
 constexpr const char *RTL_TCP_DEFAULT_HOST = "127.0.0.1";
 constexpr quint16 RTL_TCP_DEFAULT_PORT = 1234;
 constexpr double FOBOS_DEFAULT_SAMPLE_RATE = 50000000.0;
@@ -550,6 +552,18 @@ bool realignDmrCenterToListening(RadioSettings &settings) {
     settings.actualFrequency = settings.listeningFrequency;
     normalizeTuning(settings, true);
     return true;
+}
+
+int bladeRfNativeComboValue(int nativeIndex) {
+    return BLADERF_NATIVE_DEVICE_INDEX_BASE - nativeIndex;
+}
+
+bool isBladeRfNativeComboValue(int value) {
+    return value <= BLADERF_NATIVE_DEVICE_INDEX_BASE && value > BLADERF_NATIVE_DEVICE_INDEX_BASE - 10000;
+}
+
+int bladeRfNativeIndexFromComboValue(int value) {
+    return BLADERF_NATIVE_DEVICE_INDEX_BASE - value;
 }
 
 int normalizedScanVisualMode(int value) {
@@ -11189,6 +11203,18 @@ void YourClassName::buildLocalReceiverDeviceChoices(QStringList &labels, QVector
 
     labels << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
     values << RTL_TCP_DEVICE_INDEX;
+
+    const QVector<BladeRfDeviceInfo> bladeRfDevices = enumerateBladeRfDevices();
+    if (bladeRfDevices.isEmpty()) {
+        labels << QStringLiteral("bladeRF native auto (bladeRF.dll)");
+        values << bladeRfNativeComboValue(0);
+    } else {
+        for (const BladeRfDeviceInfo &bladeInfo : bladeRfDevices) {
+            labels << bladeInfo.label;
+            values << bladeRfNativeComboValue(bladeInfo.nativeIndex);
+        }
+    }
+
     labels << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
     values << SOAPY_SDR_DEVICE_INDEX;
 
@@ -19620,6 +19646,18 @@ bool YourClassName::isSoapySdrSelected() const {
     return selected == SOAPY_SDR_DEVICE_INDEX;
 }
 
+bool YourClassName::isBladeRfNativeSelected() const {
+    int selected = pendingSettings.deviceIndex;
+    if (comboBox) {
+        bool ok = false;
+        const int value = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            selected = value;
+        }
+    }
+    return isBladeRfNativeComboValue(selected);
+}
+
 int YourClassName::selectedRtlSdrNativeIndex() const {
     int selected = pendingSettings.deviceIndex;
     if (comboBox) {
@@ -19632,12 +19670,24 @@ int YourClassName::selectedRtlSdrNativeIndex() const {
     return isRtlSdrNativeComboValue(selected) ? rtlSdrNativeIndexFromComboValue(selected) : 0;
 }
 
+int YourClassName::selectedBladeRfNativeIndex() const {
+    int selected = pendingSettings.deviceIndex;
+    if (comboBox) {
+        bool ok = false;
+        const int value = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            selected = value;
+        }
+    }
+    return isBladeRfNativeComboValue(selected) ? bladeRfNativeIndexFromComboValue(selected) : 0;
+}
+
 bool YourClassName::isRtlBackendSelected() const {
     return isRtlTcpSelected() || isRtlSdrNativeSelected();
 }
 
 bool YourClassName::isExternalReceiverBackendSelected() const {
-    return isRtlBackendSelected() || isSoapySdrSelected();
+    return isRtlBackendSelected() || isSoapySdrSelected() || isBladeRfNativeSelected();
 }
 
 bool YourClassName::normalizeRtlSdrSettings() {
@@ -19717,6 +19767,25 @@ ReceiverStreamDescriptor YourClassName::makeSoapySdrStreamDescriptor(bool queueA
     stream.sampleRateHz = pendingSettings.sampleRate;
     stream.centerFrequencyHz = pendingSettings.centerFrequency;
     stream.soapySdrDeviceIndex = 0;
+    stream.syncReader = false;
+    stream.queueAudioBlocks = queueAudioBlocks;
+    stream.publishIqSnapshot = publishIqSnapshot;
+    stream.emitIqFrames = emitIqFrames;
+    stream.agileScanEnabled = false;
+    return stream;
+}
+
+ReceiverStreamDescriptor YourClassName::makeBladeRfNativeStreamDescriptor(bool queueAudioBlocks,
+                                                                         bool publishIqSnapshot,
+                                                                         bool emitIqFrames) const {
+    ReceiverStreamDescriptor stream;
+    stream.kind = ReceiverBackendStreamKind::BladeRfNative;
+    stream.backendId = QStringLiteral("bladerf-native");
+    stream.backendName = QStringLiteral("bladeRF native");
+    stream.nativeDevice = nullptr;
+    stream.sampleRateHz = pendingSettings.sampleRate;
+    stream.centerFrequencyHz = pendingSettings.centerFrequency;
+    stream.bladeRfNativeDeviceIndex = selectedBladeRfNativeIndex();
     stream.syncReader = false;
     stream.queueAudioBlocks = queueAudioBlocks;
     stream.publishIqSnapshot = publishIqSnapshot;
@@ -20008,8 +20077,9 @@ void YourClassName::startFobosProcessing() {
     const bool rtlTcpSelected = isRtlTcpSelected();
     const bool rtlSdrNativeSelected = isRtlSdrNativeSelected();
     const bool soapySdrSelected = isSoapySdrSelected();
+    const bool bladeRfNativeSelected = isBladeRfNativeSelected();
     const bool rtlBackendSelected = rtlTcpSelected || rtlSdrNativeSelected;
-    const bool externalBackendSelected = rtlBackendSelected || soapySdrSelected;
+    const bool externalBackendSelected = rtlBackendSelected || soapySdrSelected || bladeRfNativeSelected;
     if (rtlBackendSelected) {
         normalizeRtlSdrSettings();
     }
@@ -20086,6 +20156,7 @@ void YourClassName::startFobosProcessing() {
                  << "native" << rtlSdrNativeSelected
                  << "tcp" << rtlTcpSelected
                  << "soapy" << soapySdrSelected
+                 << "bladerf" << bladeRfNativeSelected
                  << "host" << RTL_TCP_DEFAULT_HOST
                  << "port" << RTL_TCP_DEFAULT_PORT
                  << "frequency" << pendingSettings.centerFrequency
@@ -20169,9 +20240,10 @@ void YourClassName::startFobosProcessing() {
                                                serverChannelIqStreaming || channelIqRecording);
     }
     qDebug() << "[FobosLifecycle] starting DataProcessor"
-             << "backend" << (soapySdrSelected ? "soapy-sdr" :
+             << "backend" << (bladeRfNativeSelected ? "bladerf-native" :
+                               (soapySdrSelected ? "soapy-sdr" :
                                (rtlSdrNativeSelected ? "rtl-sdr-native" :
-                                (rtlTcpSelected ? "rtl_tcp" : fobosApiKindName(activeFobosApiKind))))
+                                (rtlTcpSelected ? "rtl_tcp" : fobosApiKindName(activeFobosApiKind)))))
              << "device" << activeFobosDevice()
              << "sampleRate" << pendingSettings.sampleRate
              << "syncEnabled" << pendingSettings.syncEnabled
@@ -20192,6 +20264,10 @@ void YourClassName::startFobosProcessing() {
         processor->startProcessing(makeSoapySdrStreamDescriptor(queueAudioBlocks,
                                                                 publishIqSnapshot,
                                                                 serverIqStreaming || channelIqRecording));
+    } else if (bladeRfNativeSelected) {
+        processor->startProcessing(makeBladeRfNativeStreamDescriptor(queueAudioBlocks,
+                                                                     publishIqSnapshot,
+                                                                     serverIqStreaming || channelIqRecording));
     } else {
         processor->startProcessing(makeFobosStreamDescriptor(activeFobosDevice(),
                                                              activeFobosApiKind,

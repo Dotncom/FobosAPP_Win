@@ -103,7 +103,7 @@ GNSS, GPS і QTH
     return QString::fromUtf8(R"HELP(FobosAPP: practical user guide
 
 Purpose
-FobosAPP is an SDR application for Fobos SDR, Fobos Agile, RTL-SDR, rtl_tcp and an experimental SoapySDR backend. It combines IQ reception, spectrum, waterfall, audio demodulation, scanning, recordings, presets, GNSS/QTH mapping, network mode and experimental digital decoders.
+FobosAPP is an SDR application for Fobos SDR, Fobos Agile, RTL-SDR, rtl_tcp, experimental native bladeRF RX and an experimental SoapySDR backend. It combines IQ reception, spectrum, waterfall, audio demodulation, scanning, recordings, presets, GNSS/QTH mapping, network mode and experimental digital decoders.
 
 Frequency model
 - Central Frequency is the SDR receiver center, the middle of the visible IQ span.
@@ -125,6 +125,7 @@ Receivers
 - Fobos Standard is the main mode for the standard firmware.
 - Fobos Agile supports firmware scan and live retuning.
 - RTL-SDR native first uses rtlsdr\\rtlsdr.dll and the matching rtlsdr\\libusb-1.0.dll; root-folder DLLs are only a fallback.
+- bladeRF native uses the bundled bladerf\\bladeRF.dll runtime in the Windows beta package, or a system libbladeRF installation. It is an RX-only experimental path without SoapySDR.
 - rtl_tcp connects to 127.0.0.1:1234.
 - SoapySDR is added as theoretical compatibility when SoapySDR.dll and device modules are installed.
 - The default Fobos sample rate is 50 MHz. The safe RTL default is 2.048 MHz.
@@ -145,7 +146,7 @@ Audio and demodulation
 
 Scanning
 - Agile scan works only with Fobos Agile firmware and scans ranges inside the firmware.
-- Standard scan works by live-retuning the receiver center through a list. It is available for Fobos, RTL, rtl_tcp and Soapy when the backend supports retune.
+- Standard scan works by live-retuning the receiver center through a list. It is available for Fobos, RTL, rtl_tcp, bladeRF and Soapy when the backend supports retune.
 - In Standard scan, enter center frequencies in MHz. The app keeps centers at least one sample rate apart to avoid overlapping spans.
 - +/- buttons add or remove neighboring centers from the low or high side.
 - Fill range generates a center list between the start and end frequencies.

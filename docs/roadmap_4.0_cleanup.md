@@ -379,7 +379,7 @@ Routine before each public build:
 5. Add GNSS non-coherent acquisition improvements.
 6. Audit Gqrx, SDR++, GNU Radio, and GNSS-SDR architecture for useful refactors, including remaining IQ stream contract diagnostics such as sequence/timestamp, queue depth, and drop reporting.
 7. Add external/non-SDR location fallbacks: NMEA GPS, OS location, network/manual presets.
-8. Keep receiver backend abstraction Fobos-first; only polish RTL/Soapy enough that optional fallback backends do not disturb the Fobos path.
+8. Keep receiver backend abstraction Fobos-first; only polish RTL/Soapy/bladeRF enough that optional fallback backends do not disturb the Fobos path.
 9. Build the DMR external decoder bridge for comparison.
 10. Return to DMR voice only with a repeatable offline harness and clearer stage-by-stage metrics.
 
@@ -393,12 +393,13 @@ Target architecture:
 
 1. Receiver side:
    - keep Fobos/Fobos Agile as the wideband RX frontend;
+   - keep bladeRF as an experimental native RX backend for community testing, not as a reason to slow down the primary Fobos path;
    - keep spectrum, waterfall, demodulation, scan, DMR/GNSS/video detectors, presets, and band plans inside FobosAPP;
    - keep RX-only operation safe and unchanged when no transmit module is connected.
 2. Transmit side:
    - define a `TransmitterBackend` interface separate from `ReceiverBackend`;
    - support PTT, TX frequency, TX mode, TX audio source, TX gain/power request, PA enable, bias/relay controls, ALC/power/SWR telemetry, and fault state;
-   - never assume the TX hardware is Fobos; it may be a custom DAC/modulator, external exciter, GPIO-controlled radio module, or later a different SDR.
+   - never assume the TX hardware is Fobos; it may be a custom DAC/modulator, external exciter, GPIO-controlled radio module, bladeRF, or later a different SDR.
 3. Raspberry/controller role:
    - run the trusted hardware-control service close to the radio hardware;
    - isolate GPIO, relays, bias tee, PA enable, cooling/fan, sensor reads, and watchdog logic from the desktop UI;
@@ -437,6 +438,7 @@ Suggested implementation order:
 6. Add external TX module control only after bench tests with dummy load and power/SWR sensors.
 7. Add band-plan TX hints and region profiles.
 8. Only then add real modulation/audio TX integration.
+9. Add bladeRF TX only as a laboratory backend after simulator, sequencing, dummy-load tests, and explicit TX enable/fault UI exist.
 
 ## Encrypted DMR Questions
 
