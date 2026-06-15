@@ -141,10 +141,11 @@ void FFTResult::performFFTInThread() {
 bool FFTResult::storeFFTResults(const RadioSettings &settings,
                                 std::vector<float> &outFrequencies,
                                 std::vector<float> &outMagnitudes,
-                                std::vector<float> *outReferenceMagnitudes) {
+                                std::vector<float> *outReferenceMagnitudes,
+                                IqBuffer::BlockMetadata *outMetadata) {
     const int currentFftLength = settings.fftLength;
     const double sampleRate = settings.sampleRate;
-    const double centerFrequency = settings.centerFrequency;
+    double centerFrequency = settings.centerFrequency;
     const int inputMode = settings.inputMode;
 
     if (currentFftLength <= 0 || sampleRate <= 0.0) {
@@ -163,18 +164,26 @@ bool FFTResult::storeFFTResults(const RadioSettings &settings,
     if (outReferenceMagnitudes) {
         outReferenceMagnitudes->clear();
     }
-    outFrequencies.resize(currentFftLength);
     std::vector<float> magnitude(currentFftLength);
     std::vector<float> iqSnapshot;
 
-    for (int i = 0; i < currentFftLength; ++i) {
-        outFrequencies[i] = (i - currentFftLength / 2) * (sampleRate / currentFftLength) + centerFrequency;
-    }
-
     const std::size_t requestedSnapshotFloats =
         static_cast<std::size_t>((std::max)(1, currentFftLength)) * 2U;
-    if (!IqBuffer::snapshotRecent(iqSnapshot, requestedSnapshotFloats)) {
+    IqBuffer::BlockMetadata snapshotMetadata;
+    if (!IqBuffer::snapshotRecent(iqSnapshot, requestedSnapshotFloats, nullptr, &snapshotMetadata)) {
         return false;
+    }
+    if (outMetadata) {
+        *outMetadata = snapshotMetadata;
+    }
+    if (snapshotMetadata.valid &&
+        std::isfinite(snapshotMetadata.centerFrequencyHz) &&
+        snapshotMetadata.centerFrequencyHz > 0.0) {
+        centerFrequency = snapshotMetadata.centerFrequencyHz;
+    }
+    outFrequencies.resize(currentFftLength);
+    for (int i = 0; i < currentFftLength; ++i) {
+        outFrequencies[i] = (i - currentFftLength / 2) * (sampleRate / currentFftLength) + centerFrequency;
     }
 
     const int availableIqSamples = static_cast<int>(iqSnapshot.size() / 2);

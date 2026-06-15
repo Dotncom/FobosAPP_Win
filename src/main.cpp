@@ -210,7 +210,7 @@ constexpr int LISTENING_SCAN_MAX_DWELL_MS = 600000;
 constexpr int LISTENING_SCAN_MIN_SETTLE_MS = 0;
 constexpr int LISTENING_SCAN_MAX_SETTLE_MS = 10000;
 constexpr int SPECTRUM_UPDATE_AUTO_MS = 0;
-constexpr int SPECTRUM_UPDATE_MIN_MS = 5;
+constexpr int SPECTRUM_UPDATE_MIN_MS = 1;
 constexpr int SPECTRUM_UPDATE_MAX_MS = 250;
 constexpr int WATERFALL_ROWS_PER_FRAME_MIN = 1;
 constexpr int WATERFALL_ROWS_PER_FRAME_DEFAULT = 1;
@@ -552,6 +552,36 @@ bool realignDmrCenterToListening(RadioSettings &settings) {
     return true;
 }
 
+int normalizedScanVisualMode(int value) {
+    return (std::clamp)(value,
+                        static_cast<int>(ScanVisualMode::CompressedMosaic),
+                        static_cast<int>(ScanVisualMode::PassComposite));
+}
+
+ScanVisualMode scanVisualModeFromInt(int value) {
+    return static_cast<ScanVisualMode>(normalizedScanVisualMode(value));
+}
+
+int nearestScanFrequencyIndex(const QVector<double> &frequencies, double centerHz) {
+    if (frequencies.isEmpty() || !std::isfinite(centerHz)) {
+        return -1;
+    }
+    int bestIndex = -1;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < frequencies.size(); ++i) {
+        const double frequency = frequencies.at(i);
+        if (!std::isfinite(frequency)) {
+            continue;
+        }
+        const double distance = std::abs(frequency - centerHz);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
+}
+
 QVector<ScanVisualSegment> scanSegmentsFromFrame(const QJsonObject &frame) {
     QVector<ScanVisualSegment> segments;
     const QJsonArray segmentArray = frame.value("scanSegments").toArray();
@@ -708,6 +738,8 @@ ScanVisualFrame windowedScanVisualFrame(const ScanVisualFrame &frame,
     ScanVisualFrame window;
     window.valid = true;
     window.mosaic = frame.mosaic;
+    window.fresh = frame.fresh;
+    window.showSegmentMarkers = frame.showSegmentMarkers;
     window.minFrequency = windowMinHz;
     window.maxFrequency = windowMaxHz;
     window.centerFrequency = (windowMinHz + windowMaxHz) * 0.5;
@@ -1730,6 +1762,26 @@ YourClassName::YourClassName(QWidget *parent)
     agileScanAutoStepCheckbox->setToolTip(uiText(
         QStringLiteral("agile_auto_step_tooltip"),
         QStringLiteral("Use the current sample rate in MHz as the Agile scan step.")));
+    scanVisualModeCombo = new QComboBox(this);
+    scanVisualModeCombo->addItem(uiText(QStringLiteral("scan_visual_compressed"),
+                                        QStringLiteral("Compressed/Mosaic")),
+                                 static_cast<int>(ScanVisualMode::CompressedMosaic));
+    scanVisualModeCombo->addItem(uiText(QStringLiteral("scan_visual_true_axis"),
+                                        QStringLiteral("Floating/True axis")),
+                                 static_cast<int>(ScanVisualMode::FloatingTrueAxis));
+    scanVisualModeCombo->addItem(uiText(QStringLiteral("scan_visual_pass_composite"),
+                                        QStringLiteral("Pass composite")),
+                                 static_cast<int>(ScanVisualMode::PassComposite));
+    scanVisualModeCombo->setMinimumContentsLength(14);
+    scanVisualModeCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    scanVisualModeCombo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    scanVisualModeCombo->setToolTip(uiText(
+        QStringLiteral("scan_visual_mode_tooltip"),
+        QStringLiteral("Choose how scan centers are stitched on the spectrum and waterfall.")));
+    {
+        const int index = scanVisualModeCombo->findData(normalizedScanVisualMode(scanVisualMode));
+        scanVisualModeCombo->setCurrentIndex(index >= 0 ? index : 0);
+    }
     scanMeasurementCheckbox = new QCheckBox("Measure spectrum", spectrumMeasurementBox);
     markTranslatable(scanMeasurementCheckbox, QStringLiteral("measure"), QStringLiteral("Measure spectrum"));
     scanMeasurementCheckbox->setToolTip(uiText(
@@ -1798,6 +1850,7 @@ YourClassName::YourClassName(QWidget *parent)
     QHBoxLayout *agileScanPresetLayout = new QHBoxLayout();
     QHBoxLayout *agileScanPresetButtonLayout = new QHBoxLayout();
     QHBoxLayout *agileScanRangeLayout = new QHBoxLayout();
+    QHBoxLayout *scanVisualModeLayout = new QHBoxLayout();
     QVBoxLayout *spectrumMeasurementLayout = new QVBoxLayout(spectrumMeasurementBox);
     QVBoxLayout *scanMeasurementPanelLayout = new QVBoxLayout();
     QHBoxLayout *scanMeasurementTopLayout = new QHBoxLayout();
@@ -1810,6 +1863,8 @@ YourClassName::YourClassName(QWidget *parent)
     markTranslatable(agileScanRangeLabel, QStringLiteral("ranges_mhz"), QStringLiteral("Ranges MHz:"));
     QLabel *agileScanStepLabel = new QLabel("Step:", agileScanBox);
     markTranslatable(agileScanStepLabel, QStringLiteral("step"), QStringLiteral("Step:"));
+    QLabel *scanVisualModeLabel = new QLabel("Scan visual:", this);
+    markTranslatable(scanVisualModeLabel, QStringLiteral("scan_visual_mode"), QStringLiteral("Scan visual:"));
     agileScanPresetButtonLayout->setContentsMargins(0, 0, 0, 0);
     agileScanPresetButtonLayout->setSpacing(4);
     agileScanPresetButtonLayout->addWidget(agileScanSavePresetButton);
@@ -1820,6 +1875,10 @@ YourClassName::YourClassName(QWidget *parent)
     agileScanPresetButtonLayout->addWidget(agileScanStepSpin);
     agileScanRangeLayout->addWidget(agileScanRangeLabel);
     agileScanRangeLayout->addWidget(agileScanRangesEdit, 1);
+    scanVisualModeLayout->setContentsMargins(0, 0, 0, 0);
+    scanVisualModeLayout->setSpacing(4);
+    scanVisualModeLayout->addWidget(scanVisualModeLabel);
+    scanVisualModeLayout->addWidget(scanVisualModeCombo, 1);
     QLabel *scanMeasurementBinLabel = new QLabel("Bin:", spectrumMeasurementBox);
     markTranslatable(scanMeasurementBinLabel, QStringLiteral("bin"), QStringLiteral("Bin:"));
     scanMeasurementBinSpin->setMaximumWidth(92);
@@ -2714,6 +2773,7 @@ YourClassName::YourClassName(QWidget *parent)
     hfCancelSection.contentLayout->addLayout(hfNoiseCancelLayout);
 
     CollapsibleSection scanSection = createCollapsibleSection(QStringLiteral("scan"), QStringLiteral("Scan"), false);
+    scanSection.contentLayout->addLayout(scanVisualModeLayout);
     scanSection.contentLayout->addWidget(agileScanBox);
     scanSection.contentLayout->addWidget(standardScanBox);
 
@@ -3616,6 +3676,19 @@ YourClassName::YourClassName(QWidget *parent)
         updateAgileScanControls();
         applyScanUiChange(true);
     });
+    connect(scanVisualModeCombo, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+        if (!scanVisualModeCombo || index < 0) {
+            return;
+        }
+        scanVisualMode = normalizedScanVisualMode(scanVisualModeCombo->itemData(index).toInt());
+        scanVisualAssembler.reset();
+        if (persistentSettingsReady) {
+            savePersistentSettings();
+        }
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+        }
+    });
     connect(agileScanPresetCombo, QOverload<int>::of(&QComboBox::activated), this, [this, applyScanUiChange](int index) {
         const QString name = agileScanPresetCombo ? agileScanPresetCombo->itemData(index).toString() : QString();
         if (name.isEmpty() || !agileScanPresets.contains(name)) {
@@ -4486,7 +4559,12 @@ bool YourClassName::restartStreamForHardwareChange() {
                                                          serverIqStreaming || channelIqRecording,
                                                          agileScanEnabled &&
                                                              !standardScanEnabled &&
-                                                             activeFobosApiKind == FobosApiKind::Agile));
+                                                             activeFobosApiKind == FobosApiKind::Agile,
+                                                         agileScanEnabled &&
+                                                                 !standardScanEnabled &&
+                                                                 activeFobosApiKind == FobosApiKind::Agile
+                                                             ? activeAgileScanFrequencies
+                                                             : QVector<double>()));
 
     if (activeFobosApiKind == FobosApiKind::Agile &&
         pendingSettings.inputMode == INPUT_RF &&
@@ -9524,7 +9602,7 @@ void YourClassName::openApplicationSettings() {
     spectrumUpdateSpin->setRange(SPECTRUM_UPDATE_AUTO_MS, SPECTRUM_UPDATE_MAX_MS);
     spectrumUpdateSpin->setSpecialValueText(uiText(QStringLiteral("auto"), QStringLiteral("Auto")));
     spectrumUpdateSpin->setSuffix(QStringLiteral(" ms"));
-    spectrumUpdateSpin->setSingleStep(5);
+    spectrumUpdateSpin->setSingleStep(1);
     spectrumUpdateSpin->setValue(spectrumUpdateIntervalMs);
     spectrumUpdateSpin->setToolTip(uiText(
         QStringLiteral("spectrum_update_interval_tooltip"),
@@ -10663,6 +10741,9 @@ void YourClassName::refreshSettingsFromUi() {
                                         AGILE_SCAN_MAX_STEP_MHZ);
     }
     applyAgileScanAutoStep(false);
+    if (scanVisualModeCombo) {
+        scanVisualMode = normalizedScanVisualMode(scanVisualModeCombo->currentData().toInt());
+    }
     if (standardScanCheckbox) {
         standardScanEnabled = standardScanCheckbox->isChecked();
     }
@@ -10991,6 +11072,7 @@ QJsonObject YourClassName::networkSettingsPatch(const QJsonObject &settings) con
 void YourClassName::applyAuthoritativeNetworkState(const QJsonObject &command) {
     const RadioSettings previousSettings = pendingSettings;
     const int previousFftLength = pendingSettings.fftLength;
+    const int previousScanVisualMode = scanVisualMode;
     const QJsonObject settings = command.value(QStringLiteral("settings")).toObject();
 
     applyNetworkStateFromCommand(command);
@@ -10999,6 +11081,9 @@ void YourClassName::applyAuthoritativeNetworkState(const QJsonObject &command) {
     publishSettingsToGlobals();
     if (previousFftLength != pendingSettings.fftLength) {
         applyFftLengthChange(pendingSettings.fftLength, false);
+    }
+    if (normalizedScanVisualMode(previousScanVisualMode) != normalizedScanVisualMode(scanVisualMode)) {
+        scanVisualAssembler.reset();
     }
     updateUiFromPendingSettings();
     updateUiForRunState();
@@ -11797,6 +11882,7 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["scalePercent"] = currentScale;
     settings["agileScanEnabled"] = agileScanEnabled;
     settings["agileScanAutoStepSampleRate"] = agileScanAutoStepSampleRate;
+    settings["scanVisualMode"] = normalizedScanVisualMode(scanVisualMode);
     settings["agileScanRangesMhz"] = agileScanRangesMhz;
     settings["agileScanStepMhz"] = agileScanStepMhz;
     settings["scanListeningLockEnabled"] = scanListeningLockEnabled;
@@ -12015,6 +12101,7 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool 
                                     AGILE_SCAN_MIN_STEP_MHZ,
                                     AGILE_SCAN_MAX_STEP_MHZ);
     applyAgileScanAutoStep(false);
+    scanVisualMode = normalizedScanVisualMode(readInt("scanVisualMode", scanVisualMode));
     scanListeningLockEnabled = readBool("scanListeningLockEnabled", scanListeningLockEnabled);
     standardScanEnabled = readBool("standardScanEnabled", standardScanEnabled);
     standardScanCentersMhz =
@@ -12298,6 +12385,11 @@ void YourClassName::loadUiTranslations() {
         {"step", "Step:"},
         {"agile_auto_step", "Step = SR"},
         {"agile_auto_step_tooltip", "Use the current sample rate in MHz as the Agile scan step."},
+        {"scan_visual_mode", "Scan visual:"},
+        {"scan_visual_compressed", "Compressed/Mosaic"},
+        {"scan_visual_true_axis", "Floating/True axis"},
+        {"scan_visual_pass_composite", "Pass composite"},
+        {"scan_visual_mode_tooltip", "Choose how scan centers are stitched on the spectrum and waterfall."},
         {"gps_qth", "GPS / QTH"},
         {"manual", "Manual"},
         {"nmea_gps", "NMEA GPS"},
@@ -12757,6 +12849,23 @@ void YourClassName::applyUiLanguage() {
                      static_cast<int>(RecordingManager::Mode::ChannelIqWav),
                      QStringLiteral("channel_iq_wav"),
                      QStringLiteral("Channel IQ WAV"));
+    setComboItemText(scanVisualModeCombo,
+                     static_cast<int>(ScanVisualMode::CompressedMosaic),
+                     QStringLiteral("scan_visual_compressed"),
+                     QStringLiteral("Compressed/Mosaic"));
+    setComboItemText(scanVisualModeCombo,
+                     static_cast<int>(ScanVisualMode::FloatingTrueAxis),
+                     QStringLiteral("scan_visual_true_axis"),
+                     QStringLiteral("Floating/True axis"));
+    setComboItemText(scanVisualModeCombo,
+                     static_cast<int>(ScanVisualMode::PassComposite),
+                     QStringLiteral("scan_visual_pass_composite"),
+                     QStringLiteral("Pass composite"));
+    if (scanVisualModeCombo) {
+        scanVisualModeCombo->setToolTip(uiText(
+            QStringLiteral("scan_visual_mode_tooltip"),
+            QStringLiteral("Choose how scan centers are stitched on the spectrum and waterfall.")));
+    }
     setComboItemText(qthSourceCombo,
                      QStringLiteral("manual"),
                      QStringLiteral("manual"),
@@ -13186,6 +13295,13 @@ void YourClassName::updateUiFromPendingSettings() {
         QSignalBlocker blocker(agileScanStepSpin);
         agileScanStepSpin->setValue(agileScanStepMhz);
     }
+    if (scanVisualModeCombo) {
+        QSignalBlocker blocker(scanVisualModeCombo);
+        const int index = scanVisualModeCombo->findData(normalizedScanVisualMode(scanVisualMode));
+        if (index >= 0) {
+            scanVisualModeCombo->setCurrentIndex(index);
+        }
+    }
     if (standardScanCheckbox) {
         QSignalBlocker blocker(standardScanCheckbox);
         standardScanCheckbox->setChecked(standardScanEnabled);
@@ -13412,6 +13528,8 @@ void YourClassName::loadPersistentSettings() {
                                     AGILE_SCAN_MIN_STEP_MHZ,
                                     AGILE_SCAN_MAX_STEP_MHZ);
     applyAgileScanAutoStep(false);
+    scanVisualMode =
+        normalizedScanVisualMode(settings.value("scan/visualMode", scanVisualMode).toInt());
     standardScanEnabled = settings.value("standardScan/enabled", standardScanEnabled).toBool();
     scanListeningLockEnabled = settings.value("standardScan/listenLock", scanListeningLockEnabled).toBool();
     standardScanCentersMhz = settings.value("standardScan/centersMhz", standardScanCentersMhz).toString().trimmed();
@@ -14042,6 +14160,7 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("agileScan/autoStepSampleRate", agileScanAutoStepSampleRate);
     settings.setValue("agileScan/rangesMhz", agileScanRangesMhz);
     settings.setValue("agileScan/stepMhz", agileScanStepMhz);
+    settings.setValue("scan/visualMode", normalizedScanVisualMode(scanVisualMode));
     settings.setValue("standardScan/enabled", standardScanEnabled);
     settings.setValue("standardScan/listenLock", scanListeningLockEnabled);
     settings.setValue("standardScan/centersMhz", standardScanCentersMhz);
@@ -14577,6 +14696,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         const bool previousAgileScanEnabled = agileScanEnabled;
         const QString previousAgileScanRangesMhz = agileScanRangesMhz;
         const double previousAgileScanStepMhz = agileScanStepMhz;
+        const int previousScanVisualMode = scanVisualMode;
         const bool previousStandardScanEnabled = standardScanEnabled;
         const QString previousStandardScanCentersMhz = standardScanCentersMhz;
         const int previousStandardScanDwellMs = standardScanDwellMs;
@@ -14615,6 +14735,11 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
             previousListeningScanTargetsMhz != listeningScanTargetsMhz ||
             previousListeningScanDwellMs != listeningScanDwellMs ||
             previousListeningScanSettleMs != listeningScanSettleMs;
+        const bool scanVisualModeChanged =
+            normalizedScanVisualMode(previousScanVisualMode) != normalizedScanVisualMode(scanVisualMode);
+        if (scanVisualModeChanged) {
+            scanVisualAssembler.reset();
+        }
 
         if (fftChanged) {
             applyFftLengthChange(pendingSettings.fftLength, false);
@@ -14674,7 +14799,9 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
                                              double frameCenterFrequency,
                                              double frameMinFrequency,
                                              double frameMaxFrequency,
-                                             const QVector<ScanVisualSegment> &scanSegments) {
+                                             const QVector<ScanVisualSegment> &scanSegments,
+                                             bool frameFresh,
+                                             bool showScanSegmentMarkers) {
     if (networkMode != NetworkMode::Server ||
         isFullIqProcessingMode() ||
         !networkController ||
@@ -14805,6 +14932,8 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
     frame["fftLength"] = targetCount;
     frame["sourceFftLength"] = dataCount;
     frame["fullResolution"] = networkFullResolutionSpectrumFrames;
+    frame["fresh"] = frameFresh;
+    frame["showScanSegmentMarkers"] = showScanSegmentMarkers;
     frame["minFrequency"] = frameMinFrequency;
     frame["maxFrequency"] = frameMaxFrequency;
     if (!scanSegments.isEmpty()) {
@@ -14906,7 +15035,10 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
     const double frameMinFrequency = frame.value("minFrequency").toDouble(minFrequency);
     const double frameMaxFrequency = frame.value("maxFrequency").toDouble(maxFrequency);
     const double frameCenterFrequency = frame.value("centerFrequency").toDouble(pendingSettings.centerFrequency);
+    const bool frameFresh = frame.value("fresh").toBool(true);
     const QVector<ScanVisualSegment> frameScanSegments = scanSegmentsFromFrame(frame);
+    const bool frameShowScanSegmentMarkers =
+        frame.value("showScanSegmentMarkers").toBool(!frameScanSegments.isEmpty());
     const double displayCenterFrequency = frameCenterFrequency;
     const double displayListeningFrequency = pendingSettings.listeningFrequency;
     const double displayBandwidth = pendingSettings.bandwidth;
@@ -14914,6 +15046,7 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
 
     if (scaleWidget) {
         scaleWidget->setScanSegments(frameScanSegments);
+        scaleWidget->setScanSegmentMarkersVisible(frameShowScanSegmentMarkers);
         scaleWidget->setTuning(displayListeningFrequency,
                                displayCenterFrequency,
                                displayBandwidth,
@@ -15012,6 +15145,7 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
 
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
         graphWidget->setScanSegments(frameScanSegments);
+        graphWidget->setScanSegmentMarkersVisible(frameShowScanSegmentMarkers);
         graphWidget->setData(graphFrequencies,
                              graphMagnitudes,
                              frameMinFrequency,
@@ -15022,10 +15156,13 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
                                     !measurementOverlay.empty() ||
                                         static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
     }
-    if (waterfallWidget) {
+    if (waterfallWidget && frameFresh) {
         waterfallWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength,
                                  secondGraph, contrast, sensitivity, displayLevelMin, displayLevelMax);
+    }
+    if (waterfallWidget) {
         waterfallWidget->setScanSegments(frameScanSegments);
+        waterfallWidget->setScanSegmentMarkersVisible(frameShowScanSegmentMarkers);
     }
 }
 
@@ -15086,7 +15223,10 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
     }
 
     const double frameCenterFrequency = frame.value("centerFrequency").toDouble(pendingSettings.centerFrequency);
+    const bool frameFresh = frame.value("fresh").toBool(true);
     const QVector<ScanVisualSegment> frameScanSegments = scanSegmentsFromFrame(frame);
+    const bool frameShowScanSegmentMarkers =
+        frame.value("showScanSegmentMarkers").toBool(!frameScanSegments.isEmpty());
     const double displayCenterFrequency = frameCenterFrequency;
     const double displayListeningFrequency = pendingSettings.listeningFrequency;
     const double displayBandwidth = pendingSettings.bandwidth;
@@ -15094,6 +15234,7 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
 
     if (scaleWidget) {
         scaleWidget->setScanSegments(frameScanSegments);
+        scaleWidget->setScanSegmentMarkersVisible(frameShowScanSegmentMarkers);
         scaleWidget->setTuning(displayListeningFrequency,
                                displayCenterFrequency,
                                displayBandwidth,
@@ -15184,6 +15325,7 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
 
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
         graphWidget->setScanSegments(frameScanSegments);
+        graphWidget->setScanSegmentMarkersVisible(frameShowScanSegmentMarkers);
         graphWidget->setData(graphFrequencies,
                              graphMagnitudes,
                              frameMinFrequency,
@@ -15194,10 +15336,13 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
                                     !measurementOverlay.empty() ||
                                         static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
     }
-    if (waterfallWidget) {
+    if (waterfallWidget && frameFresh) {
         waterfallWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength,
                                  secondGraph, contrast, sensitivity, displayLevelMin, displayLevelMax);
+    }
+    if (waterfallWidget) {
         waterfallWidget->setScanSegments(frameScanSegments);
+        waterfallWidget->setScanSegmentMarkersVisible(frameShowScanSegmentMarkers);
     }
 }
 
@@ -18397,9 +18542,32 @@ void YourClassName::updateSpectrum() {
     std::vector<float> referenceMagnitudes;
     bool haveSpectrum = false;
     RadioSettings spectrumSettings = spectrumProcessingSettings();
-    double scanCenterFrequency = currentAgileScanCenterFrequencyHz();
-    if (!std::isfinite(scanCenterFrequency)) {
-        scanCenterFrequency = currentStandardScanCenterFrequencyHz();
+
+    int scanIndexBeforeFft = -1;
+    int scanIndexAfterFft = -1;
+    double scanCenterBeforeFft = std::numeric_limits<double>::quiet_NaN();
+    double scanCenterAfterFft = std::numeric_limits<double>::quiet_NaN();
+    IqBuffer::BlockMetadata fftBlockMetadata;
+    QString scanVisualSource = QStringLiteral("none");
+    if (agileScanRunning &&
+        activeFobosApiKind == FobosApiKind::Agile &&
+        agileDevice &&
+        !activeAgileScanFrequencies.isEmpty()) {
+        scanVisualSource = QStringLiteral("agile");
+    } else if (standardScanRunning && !activeStandardScanFrequencies.isEmpty()) {
+        scanVisualSource = QStringLiteral("standard");
+        scanIndexBeforeFft = (std::clamp)(standardScanIndex,
+                                          0,
+                                          activeStandardScanFrequencies.size() - 1);
+        scanCenterBeforeFft = activeStandardScanFrequencies.at(scanIndexBeforeFft);
+    }
+
+    double scanCenterFrequency = scanCenterBeforeFft;
+    if (!std::isfinite(scanCenterFrequency) && scanVisualSource != QStringLiteral("agile")) {
+        scanCenterFrequency = currentAgileScanCenterFrequencyHz();
+        if (!std::isfinite(scanCenterFrequency)) {
+            scanCenterFrequency = currentStandardScanCenterFrequencyHz();
+        }
     }
     if (std::isfinite(scanCenterFrequency) && spectrumSettings.inputMode == INPUT_RF) {
         spectrumSettings.centerFrequency = scanCenterFrequency;
@@ -18452,7 +18620,8 @@ void YourClassName::updateSpectrum() {
         haveSpectrum = fftResult->storeFFTResults(spectrumSettings,
                                                   spectrumFrequencies,
                                                   spectrumMagnitudes,
-                                                  &referenceMagnitudes);
+                                                  &referenceMagnitudes,
+                                                  &fftBlockMetadata);
     } catch (const std::bad_alloc &error) {
         qCritical() << "[Spectrum] bad_alloc" << error.what()
                     << "sampleRate" << pendingSettings.sampleRate
@@ -18474,6 +18643,28 @@ void YourClassName::updateSpectrum() {
         finishTrace("no_data", spectrumFrequencies, spectrumMagnitudes);
         return;
     }
+
+    if (scanVisualSource == QStringLiteral("agile") &&
+        fftBlockMetadata.valid &&
+        fftBlockMetadata.scanIndex >= 0 &&
+        fftBlockMetadata.scanIndex < activeAgileScanFrequencies.size()) {
+        scanIndexBeforeFft = fftBlockMetadata.scanIndex;
+        scanIndexAfterFft = fftBlockMetadata.scanIndex;
+        scanCenterBeforeFft = fftBlockMetadata.centerFrequencyHz;
+        scanCenterAfterFft = fftBlockMetadata.centerFrequencyHz;
+        scanCenterFrequency = fftBlockMetadata.centerFrequencyHz;
+        if (std::isfinite(scanCenterFrequency) && spectrumSettings.inputMode == INPUT_RF) {
+            spectrumSettings.centerFrequency = scanCenterFrequency;
+            spectrumSettings.actualFrequency = scanCenterFrequency;
+        }
+    } else if (scanVisualSource == QStringLiteral("standard") &&
+               !activeStandardScanFrequencies.isEmpty()) {
+        scanIndexAfterFft = (std::clamp)(standardScanIndex,
+                                         0,
+                                         activeStandardScanFrequencies.size() - 1);
+        scanCenterAfterFft = activeStandardScanFrequencies.at(scanIndexAfterFft);
+    }
+
     updateSpurCalibration(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
     applySpurSuppression(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
     updateGnssSpurWatch(spectrumFrequencies, spectrumMagnitudes, spectrumSettings.centerFrequency);
@@ -18494,6 +18685,14 @@ void YourClassName::updateSpectrum() {
     double displayMaxFrequency = frameMaxFrequency;
     int displayFftLength = static_cast<int>(spectrumFrequencies.size());
     QVector<ScanVisualSegment> displayScanSegments;
+    bool displayScanSegmentMarkers = false;
+    bool updateWaterfallFrame = true;
+    bool scanVisualFrameValid = false;
+    bool scanVisualWindowed = false;
+    int scanVisualSelectedIndex = -1;
+    double scanVisualSelectedCenter = std::numeric_limits<double>::quiet_NaN();
+    double scanVisualFrameMin = std::numeric_limits<double>::quiet_NaN();
+    double scanVisualFrameMax = std::numeric_limits<double>::quiet_NaN();
     ScanVisualFrame scanFrame;
     ScanVisualFrame visibleScanFrame;
     const bool agileScanVisualActive =
@@ -18509,6 +18708,11 @@ void YourClassName::updateSpectrum() {
     const QVector<double> &scanVisualFrequencies =
         standardScanVisualActive ? activeStandardScanFrequencies : activeAgileScanFrequencies;
     if (scanVisualActive) {
+        scanVisualSelectedIndex =
+            nearestScanFrequencyIndex(scanVisualFrequencies, spectrumSettings.centerFrequency);
+        if (scanVisualSelectedIndex >= 0 && scanVisualSelectedIndex < scanVisualFrequencies.size()) {
+            scanVisualSelectedCenter = scanVisualFrequencies.at(scanVisualSelectedIndex);
+        }
         int scanVisualBins = 4096;
         if (graphWidget && graphWidget->width() > 0) {
             scanVisualBins = (std::max)(scanVisualBins, graphWidget->width() * 2);
@@ -18518,12 +18722,16 @@ void YourClassName::updateSpectrum() {
         }
         if (scanVisualAssembler.configure(scanVisualFrequencies,
                                           spectrumSettings.sampleRate,
-                                          scanVisualBins)) {
+                                          scanVisualBins,
+                                          scanVisualModeFromInt(scanVisualMode))) {
             scanFrame = scanVisualAssembler.update(spectrumSettings.centerFrequency,
                                                    spectrumFrequencies,
                                                    spectrumMagnitudes,
                                                    referenceMagnitudes);
             if (scanFrame.valid) {
+                scanVisualFrameValid = true;
+                scanVisualFrameMin = scanFrame.minFrequency;
+                scanVisualFrameMax = scanFrame.maxFrequency;
                 const double scanFullSpanHz = scanFrame.maxFrequency - scanFrame.minFrequency;
                 const double scanVisibleSpanHz =
                     std::isfinite(scanFullSpanHz) && scanFullSpanHz > 0.0
@@ -18540,6 +18748,7 @@ void YourClassName::updateSpectrum() {
                     visibleScanFrame =
                         windowedScanVisualFrame(scanFrame, scanVisibleCenterHz, scanVisibleSpanHz);
                     displayScanFrame = &visibleScanFrame;
+                    scanVisualWindowed = true;
                 }
 
                 displayFrequenciesPtr = &displayScanFrame->frequencies;
@@ -18551,6 +18760,8 @@ void YourClassName::updateSpectrum() {
                 displayMaxFrequency = displayScanFrame->maxFrequency;
                 displayFftLength = displayScanFrame->fftLength;
                 displayScanSegments = displayScanFrame->segments;
+                displayScanSegmentMarkers = displayScanFrame->showSegmentMarkers;
+                updateWaterfallFrame = displayScanFrame->fresh;
                 if (displayScanFrame->actualFrequencies.size() == displayScanFrame->magnitudes.size()) {
                     dmrHunterFrequenciesPtr = &displayScanFrame->actualFrequencies;
                     dmrHunterMagnitudesPtr = &displayScanFrame->magnitudes;
@@ -18563,6 +18774,78 @@ void YourClassName::updateSpectrum() {
         }
     } else {
         scanVisualAssembler.reset();
+    }
+
+    if (!scanVisualActive || !verboseLogging) {
+        scanVisualDebugFramesRemaining = 0;
+        scanVisualDebugSequence = 0;
+    } else {
+        if (scanVisualDebugFramesRemaining <= 0 && scanVisualDebugSequence == 0) {
+            scanVisualDebugFramesRemaining = 240;
+            qDebug() << "[ScanVisualDebug] capture begin"
+                     << "source" << scanVisualSource
+                     << "mode" << normalizedScanVisualMode(scanVisualMode)
+                     << "points" << scanVisualFrequencies.size()
+                     << "sampleRate" << spectrumSettings.sampleRate
+                     << "fftLength" << pendingSettings.fftLength
+                     << "rowsPerFrame" << waterfallRowsPerFrame
+                     << "updateMs" << updateTimer->interval();
+        }
+        if (scanVisualDebugFramesRemaining > 0) {
+            const IqBuffer::Stats iqStats = IqBuffer::stats();
+            const double inputFirstHz =
+                spectrumFrequencies.empty()
+                    ? std::numeric_limits<double>::quiet_NaN()
+                    : static_cast<double>(spectrumFrequencies.front());
+            const double inputLastHz =
+                spectrumFrequencies.empty()
+                    ? std::numeric_limits<double>::quiet_NaN()
+                    : static_cast<double>(spectrumFrequencies.back());
+            const double displayFirstHz =
+                displayFrequenciesPtr->empty()
+                    ? std::numeric_limits<double>::quiet_NaN()
+                    : static_cast<double>(displayFrequenciesPtr->front());
+            const double displayLastHz =
+                displayFrequenciesPtr->empty()
+                    ? std::numeric_limits<double>::quiet_NaN()
+                    : static_cast<double>(displayFrequenciesPtr->back());
+            qDebug() << "[ScanVisualDebug] row"
+                     << "seq" << static_cast<qulonglong>(++scanVisualDebugSequence)
+                     << "source" << scanVisualSource
+                     << "idxBefore0" << scanIndexBeforeFft
+                     << "idxAfter0" << scanIndexAfterFft
+                     << "idxBefore1" << (scanIndexBeforeFft >= 0 ? scanIndexBeforeFft + 1 : -1)
+                     << "idxAfter1" << (scanIndexAfterFft >= 0 ? scanIndexAfterFft + 1 : -1)
+                     << "centerBeforeMHz" << (scanCenterBeforeFft / 1000000.0)
+                     << "centerAfterMHz" << (scanCenterAfterFft / 1000000.0)
+                     << "centerUsedMHz" << (spectrumSettings.centerFrequency / 1000000.0)
+                     << "metaValid" << fftBlockMetadata.valid
+                     << "metaTuning" << fftBlockMetadata.tuning
+                     << "metaIndex0" << fftBlockMetadata.scanIndex
+                     << "metaIndex1" << (fftBlockMetadata.scanIndex >= 0 ? fftBlockMetadata.scanIndex + 1 : -1)
+                     << "metaCenterMHz" << (fftBlockMetadata.centerFrequencyHz / 1000000.0)
+                     << "metaSeq" << static_cast<qulonglong>(fftBlockMetadata.sequence)
+                     << "selected0" << scanVisualSelectedIndex
+                     << "selected1" << (scanVisualSelectedIndex >= 0 ? scanVisualSelectedIndex + 1 : -1)
+                     << "selectedMHz" << (scanVisualSelectedCenter / 1000000.0)
+                     << "frameValid" << scanVisualFrameValid
+                     << "fresh" << updateWaterfallFrame
+                     << "windowed" << scanVisualWindowed
+                     << "inputFirstMHz" << (inputFirstHz / 1000000.0)
+                     << "inputLastMHz" << (inputLastHz / 1000000.0)
+                     << "displayFirstMHz" << (displayFirstHz / 1000000.0)
+                     << "displayLastMHz" << (displayLastHz / 1000000.0)
+                     << "frameMinMHz" << (scanVisualFrameMin / 1000000.0)
+                     << "frameMaxMHz" << (scanVisualFrameMax / 1000000.0)
+                     << "iqSeq" << static_cast<qulonglong>(iqStats.sequence)
+                     << "iqSnapshotFloats" << iqStats.snapshotSize
+                     << "queuedBlocks" << iqStats.queuedBlocks;
+            --scanVisualDebugFramesRemaining;
+            if (scanVisualDebugFramesRemaining == 0) {
+                qDebug() << "[ScanVisualDebug] capture end"
+                         << "rows" << static_cast<qulonglong>(scanVisualDebugSequence);
+            }
+        }
     }
     const std::vector<float> &displayFrequencies = *displayFrequenciesPtr;
     const std::vector<float> &displayMagnitudes = *displayMagnitudesPtr;
@@ -18673,6 +18956,7 @@ void YourClassName::updateSpectrum() {
                 scaleListening = displayCenterFrequency;
             }
             scaleWidget->setScanSegments(displayScanSegments);
+            scaleWidget->setScanSegmentMarkersVisible(displayScanSegmentMarkers);
             scaleWidget->setTuning(scaleListening,
                                    displayCenterFrequency,
                                    pendingSettings.bandwidth,
@@ -18681,6 +18965,7 @@ void YourClassName::updateSpectrum() {
         }
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
         graphWidget->setScanSegments(displayScanSegments);
+        graphWidget->setScanSegmentMarkersVisible(displayScanSegmentMarkers);
         graphWidget->setData(displayFrequencies,
                              displayMagnitudes,
                              displayMinFrequency,
@@ -18700,17 +18985,20 @@ void YourClassName::updateSpectrum() {
         if (traceFrame) {
             qDebug() << "[Spectrum] before waterfall" << "elapsedMs" << traceTimer.elapsed();
         }
-        waterfallWidget->setData(displayFrequencies,
-                                 displayMagnitudes,
-                                 displayMinFrequency,
-                                 displayMaxFrequency,
-                                 displayFftLength,
-                                 secondGraph,
-                                 contrast,
-                                 sensitivity,
-                                 displayLevelMin,
-                                 displayLevelMax);
+        if (updateWaterfallFrame) {
+            waterfallWidget->setData(displayFrequencies,
+                                     displayMagnitudes,
+                                     displayMinFrequency,
+                                     displayMaxFrequency,
+                                     displayFftLength,
+                                     secondGraph,
+                                     contrast,
+                                     sensitivity,
+                                     displayLevelMin,
+                                     displayLevelMax);
+        }
         waterfallWidget->setScanSegments(displayScanSegments);
+        waterfallWidget->setScanSegmentMarkersVisible(displayScanSegmentMarkers);
     } else if (traceFrame) {
         qDebug() << "[Spectrum] local server visual update skipped" << "elapsedMs" << traceTimer.elapsed();
     }
@@ -18720,7 +19008,9 @@ void YourClassName::updateSpectrum() {
                              displayCenterFrequency,
                              displayMinFrequency,
                              displayMaxFrequency,
-                             displayScanSegments);
+                             displayScanSegments,
+                             updateWaterfallFrame,
+                             displayScanSegmentMarkers);
     finishTrace("end", displayFrequencies, displayMagnitudes);
     advanceStandardScanIfNeeded();
     //waterfallWidget->setData(fftFrequencies, fftMagnitudes, minFrequency, maxFrequency, fftLength, secondGraph, contrast, sensitivity);
@@ -19913,7 +20203,12 @@ void YourClassName::startFobosProcessing() {
                                                              serverIqStreaming || channelIqRecording,
                                                              agileScanEnabled &&
                                                                  !standardScanEnabled &&
-                                                                 activeFobosApiKind == FobosApiKind::Agile));
+                                                                 activeFobosApiKind == FobosApiKind::Agile,
+                                                             agileScanEnabled &&
+                                                                     !standardScanEnabled &&
+                                                                     activeFobosApiKind == FobosApiKind::Agile
+                                                                 ? activeAgileScanFrequencies
+                                                                 : QVector<double>()));
     }
     if (!externalBackendSelected &&
         activeFobosApiKind == FobosApiKind::Agile &&

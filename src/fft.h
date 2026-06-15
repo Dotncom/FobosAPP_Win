@@ -14,6 +14,7 @@
 #include <QWaitCondition>
 #include <algorithm>
 #include <QtConcurrent/QtConcurrent>
+#include "iqbuffer.h"
 #include "radiosettings.h"
 
 extern int DEFAULT_BUF_LEN;
@@ -37,7 +38,8 @@ public:
     bool storeFFTResults(const RadioSettings &settings,
                          std::vector<float> &outFrequencies,
                          std::vector<float> &outMagnitudes,
-                         std::vector<float> *outReferenceMagnitudes = nullptr);
+                         std::vector<float> *outReferenceMagnitudes = nullptr,
+                         IqBuffer::BlockMetadata *outMetadata = nullptr);
     void storeFFTResults();
     void resetHfNoiseCancelState();
     std::mutex fftMutex;

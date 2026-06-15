@@ -543,6 +543,7 @@ void MyWaterfallWidget::setRowsPerFrame(int rows) {
 }
 
 void MyWaterfallWidget::setLevelRange(float minLevel, float maxLevel) {
+    bool shouldScheduleUpdate = false;
     {
         QMutexLocker locker(&mutex);
         if (!std::isfinite(minLevel) || !std::isfinite(maxLevel) || maxLevel <= minLevel) {
@@ -552,14 +553,31 @@ void MyWaterfallWidget::setLevelRange(float minLevel, float maxLevel) {
         levelMax = maxLevel;
         yMin = minLevel;
         yMax = maxLevel;
+        if (!updateQueued) {
+            updateQueued = true;
+            shouldScheduleUpdate = true;
+        }
     }
-    computeLineData();
+    if (shouldScheduleUpdate) {
+        QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
+    }
 }
 
 void MyWaterfallWidget::setScanSegments(const QVector<ScanVisualSegment> &segments) {
     {
         QMutexLocker locker(&mutex);
         scanSegments = segments;
+    }
+    update();
+}
+
+void MyWaterfallWidget::setScanSegmentMarkersVisible(bool visible) {
+    {
+        QMutexLocker locker(&mutex);
+        if (scanSegmentMarkersVisible == visible) {
+            return;
+        }
+        scanSegmentMarkersVisible = visible;
     }
     update();
 }
@@ -714,7 +732,11 @@ void MyWaterfallWidget::paintGL() {
 
 void MyWaterfallWidget::drawScanSegments(QPainter &painter) const {
     QMutexLocker locker(&mutex);
-    if (scanSegments.size() < 2 || width() <= 0 || height() <= 0 || qFuzzyCompare(xMin, xMax)) {
+    if (!scanSegmentMarkersVisible ||
+        scanSegments.size() < 2 ||
+        width() <= 0 ||
+        height() <= 0 ||
+        qFuzzyCompare(xMin, xMax)) {
         return;
     }
 

@@ -30,7 +30,7 @@ class DataProcessor : public QThread {
 public:
     explicit DataProcessor( QObject *parent = nullptr);
     ~DataProcessor();
-    void handleData(float *buf, uint32_t buf_length);
+    void handleData(float *buf, uint32_t buf_length, int agileScanIndex = -1);
     //void startit();
     //void runit();
     void run() override;
@@ -49,6 +49,7 @@ public:
     bool forceStop(int timeoutMs = 1000);
     bool stop(int timeoutMs = 5000);
     uint64_t callbackCount() const;
+    bool wantsAgileScanMetadata() const;
     void setSampleRateHint(double sampleRate);
     void setCenterFrequencyHint(double centerFrequency);
     uint64_t beginIqRetuneBarrier();

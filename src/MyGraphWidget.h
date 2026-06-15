@@ -34,6 +34,7 @@ public:
     void setBandMarkersCompact(bool compact);
     void setBandMarkers(const QVector<GraphBandMarker> &markers);
     void setScanSegments(const QVector<ScanVisualSegment> &segments);
+    void setScanSegmentMarkersVisible(bool visible);
     void clearData();
 
 signals:
@@ -97,6 +98,7 @@ private:
     QPoint bandwidthMeasureEndPos;
     QVector<GraphBandMarker> bandMarkers;
     QVector<ScanVisualSegment> scanSegments;
+    bool scanSegmentMarkersVisible = true;
     QColor valueToColor(float value);
 };
 

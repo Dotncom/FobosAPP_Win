@@ -33,6 +33,14 @@ void ScaleWidget::setScanSegments(const QVector<ScanVisualSegment> &segments) {
     }
 }
 
+void ScaleWidget::setScanSegmentMarkersVisible(bool visible) {
+    if (scanSegmentMarkersVisible == visible) {
+        return;
+    }
+    scanSegmentMarkersVisible = visible;
+    update();
+}
+
 void ScaleWidget::setMarkerPosition(double position) {
     markerPosition = qBound(0.0, position, 1.0);
     update();
@@ -202,7 +210,7 @@ void ScaleWidget::paintEvent(QPaintEvent *event) {
             painter.drawLine(minorPos, height / 2 - 3, minorPos, height / 2 + 3);
         }
     }
-    if (!scanSegments.isEmpty() && maxValue > minValue) {
+    if (scanSegmentMarkersVisible && !scanSegments.isEmpty() && maxValue > minValue) {
         QPen segmentPen(QColor(120, 175, 235, 170));
         painter.setPen(segmentPen);
         for (const ScanVisualSegment &segment : scanSegments) {

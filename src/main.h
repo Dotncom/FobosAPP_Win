@@ -418,7 +418,9 @@ private:
                                   double frameCenterFrequency = std::numeric_limits<double>::quiet_NaN(),
                                   double frameMinFrequency = std::numeric_limits<double>::quiet_NaN(),
                                   double frameMaxFrequency = std::numeric_limits<double>::quiet_NaN(),
-                                  const QVector<ScanVisualSegment> &scanSegments = QVector<ScanVisualSegment>());
+                                  const QVector<ScanVisualSegment> &scanSegments = QVector<ScanVisualSegment>(),
+                                  bool frameFresh = true,
+                                  bool showScanSegmentMarkers = true);
     void displayNetworkSpectrumFrame(const QJsonObject &frame);
     void displayNetworkSpectrumFrameBinary(const QJsonObject &frame, const QByteArray &payload);
     void sendNetworkAudioFrame(const QByteArray &pcmData);
@@ -470,6 +472,7 @@ private:
     QComboBox *playbackFileCombo = nullptr;
     QComboBox *languageComboBox = nullptr;
     QComboBox *agileScanPresetCombo = nullptr;
+    QComboBox *scanVisualModeCombo = nullptr;
     QComboBox *standardScanPresetCombo = nullptr;
     QComboBox *listeningScanPresetCombo = nullptr;
     QComboBox *videoDemodCombo = nullptr;
@@ -732,6 +735,8 @@ private:
     bool hardwareSettingsApplied = false;
     int spectrumDebugFramesRemaining = 0;
     int spectrumTuningDebugFramesRemaining = 0;
+    int scanVisualDebugFramesRemaining = 0;
+    uint64_t scanVisualDebugSequence = 0;
     RadioRunState runState = RadioRunState::Idle;
     NetworkMode networkMode = NetworkMode::Disabled;
     NetworkProcessingMode networkProcessingMode = NetworkProcessingMode::ServerSide;
@@ -759,6 +764,7 @@ private:
     bool listeningScanRunning = false;
     bool scanListeningLockEnabled = true;
     bool agileScanAutoStepSampleRate = true;
+    int scanVisualMode = static_cast<int>(ScanVisualMode::CompressedMosaic);
     QString agileScanRangesMhz = QStringLiteral("430-432");
     double agileScanStepMhz = 0.0125;
     QString standardScanCentersMhz = QStringLiteral("430, 480");

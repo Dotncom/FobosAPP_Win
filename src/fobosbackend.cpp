@@ -60,7 +60,8 @@ ReceiverStreamDescriptor makeFobosStreamDescriptor(void *nativeDevice,
                                                    bool queueAudioBlocks,
                                                    bool publishIqSnapshot,
                                                    bool emitIqFrames,
-                                                   bool agileScanEnabled) {
+                                                   bool agileScanEnabled,
+                                                   const QVector<double> &agileScanFrequenciesHz) {
     ReceiverStreamDescriptor stream;
     stream.kind = apiKind == FobosApiKind::Agile
                       ? ReceiverBackendStreamKind::FobosAgile
@@ -80,6 +81,7 @@ ReceiverStreamDescriptor makeFobosStreamDescriptor(void *nativeDevice,
     stream.publishIqSnapshot = publishIqSnapshot;
     stream.emitIqFrames = emitIqFrames;
     stream.agileScanEnabled = agileScanEnabled;
+    stream.agileScanFrequenciesHz = agileScanFrequenciesHz;
     return stream;
 }
 

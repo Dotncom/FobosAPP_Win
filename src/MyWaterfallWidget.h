@@ -27,6 +27,7 @@ public:
     void setRowsPerFrame(int rows);
     void setLevelRange(float minLevel, float maxLevel);
     void setScanSegments(const QVector<ScanVisualSegment> &segments);
+    void setScanSegmentMarkersVisible(bool visible);
     void clearData();
     void computeLineData();
 signals:
@@ -75,6 +76,7 @@ private:
     bool textureClearRequested = false;
     bool updateQueued = false;
     QVector<ScanVisualSegment> scanSegments;
+    bool scanSegmentMarkersVisible = true;
 };
 
 #endif // MYWATERFALLWIDGET_H

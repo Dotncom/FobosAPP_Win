@@ -17,15 +17,28 @@ struct Stats {
     double sampleRateEstimate = 0.0;
 };
 
+struct BlockMetadata {
+    bool valid = false;
+    bool tuning = false;
+    int scanIndex = -1;
+    double centerFrequencyHz = 0.0;
+    std::uint64_t sequence = 0;
+    std::size_t floatCount = 0;
+};
+
 bool publish(const float *samples,
              std::size_t floatCount,
              bool queueBlock = true,
              bool updateSnapshot = true,
-             std::uint64_t expectedEpoch = 0);
-bool snapshot(std::vector<float> &out, std::uint64_t *sequence = nullptr);
+             std::uint64_t expectedEpoch = 0,
+             const BlockMetadata *metadata = nullptr);
+bool snapshot(std::vector<float> &out,
+              std::uint64_t *sequence = nullptr,
+              BlockMetadata *metadata = nullptr);
 bool snapshotRecent(std::vector<float> &out,
                     std::size_t maxFloatCount,
-                    std::uint64_t *sequence = nullptr);
+                    std::uint64_t *sequence = nullptr,
+                    BlockMetadata *metadata = nullptr);
 bool popBlock(std::vector<float> &out, std::uint64_t *sequence = nullptr);
 void clear(std::uint64_t epoch = 0);
 std::size_t size();

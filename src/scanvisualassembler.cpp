@@ -16,15 +16,24 @@ void ScanVisualAssembler::reset() {
     outputActualFrequencies.clear();
     outputLevels.clear();
     outputReferenceLevels.clear();
+    passLevels.clear();
+    passReferenceLevels.clear();
+    completePassLevels.clear();
+    completePassReferenceLevels.clear();
+    passSectorSeen.clear();
     configuredSampleRateHz = 0.0;
     minFrequencyHz = 0.0;
     maxFrequencyHz = 0.0;
     outputBinCount = 0;
+    configuredMode = ScanVisualMode::CompressedMosaic;
+    lastPassSectorIndex = -1;
+    haveCompletePass = false;
 }
 
 bool ScanVisualAssembler::configure(const QVector<double> &centerFrequenciesHz,
                                     double sampleRateHz,
-                                    int targetBins) {
+                                    int targetBins,
+                                    ScanVisualMode mode) {
     if (centerFrequenciesHz.size() < 2 ||
         !std::isfinite(sampleRateHz) ||
         sampleRateHz <= 0.0) {
@@ -72,15 +81,19 @@ bool ScanVisualAssembler::configure(const QVector<double> &centerFrequenciesHz,
     nextSectors.reserve(centers.size());
     for (std::size_t i = 0; i < centers.size(); ++i) {
         const double center = centers[i];
-        double leftHalf = nominalStepHz * 0.5;
-        double rightHalf = nominalStepHz * 0.5;
-        if (i > 0) {
-            const double delta = center - centers[i - 1];
-            leftHalf = delta <= gapThresholdHz ? delta * 0.5 : nominalStepHz * 0.5;
-        }
-        if (i + 1 < centers.size()) {
-            const double delta = centers[i + 1] - center;
-            rightHalf = delta <= gapThresholdHz ? delta * 0.5 : nominalStepHz * 0.5;
+        double leftHalf = halfSampleRateHz;
+        double rightHalf = halfSampleRateHz;
+        if (mode == ScanVisualMode::CompressedMosaic) {
+            leftHalf = nominalStepHz * 0.5;
+            rightHalf = nominalStepHz * 0.5;
+            if (i > 0) {
+                const double delta = center - centers[i - 1];
+                leftHalf = delta <= gapThresholdHz ? delta * 0.5 : nominalStepHz * 0.5;
+            }
+            if (i + 1 < centers.size()) {
+                const double delta = centers[i + 1] - center;
+                rightHalf = delta <= gapThresholdHz ? delta * 0.5 : nominalStepHz * 0.5;
+            }
         }
         leftHalf = (std::clamp)(leftHalf, 1.0, halfSampleRateHz);
         rightHalf = (std::clamp)(rightHalf, 1.0, halfSampleRateHz);
@@ -92,13 +105,21 @@ bool ScanVisualAssembler::configure(const QVector<double> &centerFrequenciesHz,
                                0.0});
     }
 
-    double displayCursorHz = nextSectors.front().actualStartHz;
-    for (Sector &sector : nextSectors) {
-        const double widthHz = (std::max)(1.0, sector.actualEndHz - sector.actualStartHz);
-        sector.displayStartHz = displayCursorHz;
-        sector.displayEndHz = displayCursorHz + widthHz;
-        sector.displayCenterHz = (sector.displayStartHz + sector.displayEndHz) * 0.5;
-        displayCursorHz = sector.displayEndHz;
+    if (mode == ScanVisualMode::CompressedMosaic) {
+        double displayCursorHz = nextSectors.front().actualStartHz;
+        for (Sector &sector : nextSectors) {
+            const double widthHz = (std::max)(1.0, sector.actualEndHz - sector.actualStartHz);
+            sector.displayStartHz = displayCursorHz;
+            sector.displayEndHz = displayCursorHz + widthHz;
+            sector.displayCenterHz = (sector.displayStartHz + sector.displayEndHz) * 0.5;
+            displayCursorHz = sector.displayEndHz;
+        }
+    } else {
+        for (Sector &sector : nextSectors) {
+            sector.displayStartHz = sector.actualStartHz;
+            sector.displayEndHz = sector.actualEndHz;
+            sector.displayCenterHz = sector.actualCenterHz;
+        }
     }
 
     const int nextOutputBinCount = (std::clamp)(targetBins,
@@ -107,7 +128,8 @@ bool ScanVisualAssembler::configure(const QVector<double> &centerFrequenciesHz,
     bool changed =
         sectors.size() != nextSectors.size() ||
         std::abs(configuredSampleRateHz - sampleRateHz) > 0.5 ||
-        outputBinCount != nextOutputBinCount;
+        outputBinCount != nextOutputBinCount ||
+        configuredMode != mode;
     if (!changed) {
         for (std::size_t i = 0; i < sectors.size(); ++i) {
             const Sector &current = sectors[i];
@@ -127,9 +149,15 @@ bool ScanVisualAssembler::configure(const QVector<double> &centerFrequenciesHz,
         sectors = std::move(nextSectors);
         configuredSampleRateHz = sampleRateHz;
         outputBinCount = nextOutputBinCount;
+        configuredMode = mode;
         minFrequencyHz = sectors.front().displayStartHz;
-        maxFrequencyHz = sectors.back().displayEndHz;
+        maxFrequencyHz = sectors.front().displayEndHz;
+        for (const Sector &sector : sectors) {
+            minFrequencyHz = (std::min)(minFrequencyHz, sector.displayStartHz);
+            maxFrequencyHz = (std::max)(maxFrequencyHz, sector.displayEndHz);
+        }
         rebuildOutputGrid();
+        resetPassBuffers();
     }
 
     return true;
@@ -151,6 +179,12 @@ ScanVisualFrame ScanVisualAssembler::update(double frameCenterFrequencyHz,
 
     const int sectorIndex = nearestSector(frameCenterFrequencyHz);
     if (sectorIndex < 0 || sectorIndex >= static_cast<int>(sectors.size())) {
+        if (configuredMode == ScanVisualMode::PassComposite && haveCompletePass) {
+            return composeFrame(!completePassReferenceLevels.empty(),
+                                &completePassLevels,
+                                &completePassReferenceLevels,
+                                false);
+        }
         return composeFrame(!outputReferenceLevels.empty());
     }
 
@@ -159,17 +193,34 @@ ScanVisualFrame ScanVisualAssembler::update(double frameCenterFrequencyHz,
         (std::clamp)(binForDisplayFrequency(sector.displayStartHz), 0, outputBinCount - 1);
     const int lastBin =
         (std::clamp)(binForDisplayFrequency(sector.displayEndHz), firstBin, outputBinCount - 1);
-    for (int bin = firstBin; bin <= lastBin; ++bin) {
-        outputLevels[static_cast<std::size_t>(bin)] = SCAN_VISUAL_FLOOR_DB;
-        if (!outputReferenceLevels.empty()) {
-            outputReferenceLevels[static_cast<std::size_t>(bin)] = SCAN_VISUAL_FLOOR_DB;
+    std::vector<float> &targetLevels =
+        configuredMode == ScanVisualMode::PassComposite ? passLevels : outputLevels;
+    std::vector<float> &targetReferenceLevels =
+        configuredMode == ScanVisualMode::PassComposite ? passReferenceLevels : outputReferenceLevels;
+
+    if (targetLevels.size() != static_cast<std::size_t>(outputBinCount)) {
+        targetLevels.assign(static_cast<std::size_t>(outputBinCount), SCAN_VISUAL_FLOOR_DB);
+    }
+    if (configuredMode == ScanVisualMode::FloatingTrueAxis) {
+        std::fill(targetLevels.begin(), targetLevels.end(), SCAN_VISUAL_FLOOR_DB);
+        if (!targetReferenceLevels.empty()) {
+            std::fill(targetReferenceLevels.begin(),
+                      targetReferenceLevels.end(),
+                      SCAN_VISUAL_FLOOR_DB);
+        }
+    } else if (configuredMode != ScanVisualMode::PassComposite) {
+        for (int bin = firstBin; bin <= lastBin; ++bin) {
+            targetLevels[static_cast<std::size_t>(bin)] = SCAN_VISUAL_FLOOR_DB;
+            if (!targetReferenceLevels.empty()) {
+                targetReferenceLevels[static_cast<std::size_t>(bin)] = SCAN_VISUAL_FLOOR_DB;
+            }
         }
     }
 
     const bool haveReference =
         static_cast<int>(referenceMagnitudes.size()) >= dataCount;
-    if (haveReference && outputReferenceLevels.empty()) {
-        outputReferenceLevels.assign(static_cast<std::size_t>(outputBinCount), SCAN_VISUAL_FLOOR_DB);
+    if (haveReference && targetReferenceLevels.empty()) {
+        targetReferenceLevels.assign(static_cast<std::size_t>(outputBinCount), SCAN_VISUAL_FLOOR_DB);
     }
 
     for (int i = 0; i < dataCount; ++i) {
@@ -185,19 +236,59 @@ ScanVisualFrame ScanVisualAssembler::update(double frameCenterFrequencyHz,
         }
         const float level = shiftedValueAt(magnitudes, i, dataCount);
         if (std::isfinite(level)) {
-            float &target = outputLevels[static_cast<std::size_t>(bin)];
+            float &target = targetLevels[static_cast<std::size_t>(bin)];
             target = (std::max)(target, level);
         }
         if (haveReference) {
             const float referenceLevel = shiftedValueAt(referenceMagnitudes, i, dataCount);
             if (std::isfinite(referenceLevel)) {
-                float &target = outputReferenceLevels[static_cast<std::size_t>(bin)];
+                float &target = targetReferenceLevels[static_cast<std::size_t>(bin)];
                 target = (std::max)(target, referenceLevel);
             }
         }
     }
 
-    return composeFrame(haveReference || !outputReferenceLevels.empty());
+    if (configuredMode != ScanVisualMode::PassComposite) {
+        return composeFrame(haveReference || !outputReferenceLevels.empty());
+    }
+
+    if (passSectorSeen.size() != sectors.size()) {
+        passSectorSeen.assign(sectors.size(), false);
+    }
+    passSectorSeen[static_cast<std::size_t>(sectorIndex)] = true;
+    lastPassSectorIndex = sectorIndex;
+
+    const bool passComplete =
+        !passSectorSeen.empty() &&
+        std::all_of(passSectorSeen.begin(), passSectorSeen.end(), [](bool seen) { return seen; });
+    if (passComplete) {
+        completePassLevels = passLevels;
+        completePassReferenceLevels =
+            passReferenceLevels.size() == static_cast<std::size_t>(outputBinCount)
+                ? passReferenceLevels
+                : std::vector<float>();
+        haveCompletePass = true;
+        passLevels.assign(static_cast<std::size_t>(outputBinCount), SCAN_VISUAL_FLOOR_DB);
+        passReferenceLevels.clear();
+        passSectorSeen.assign(sectors.size(), false);
+        lastPassSectorIndex = -1;
+        return composeFrame(!completePassReferenceLevels.empty(),
+                            &completePassLevels,
+                            &completePassReferenceLevels,
+                            true);
+    }
+
+    if (haveCompletePass) {
+        return composeFrame(!completePassReferenceLevels.empty(),
+                            &completePassLevels,
+                            &completePassReferenceLevels,
+                            false);
+    }
+
+    return composeFrame(haveReference || !passReferenceLevels.empty(),
+                        &passLevels,
+                        &passReferenceLevels,
+                        false);
 }
 
 bool ScanVisualAssembler::isConfigured() const {
@@ -233,6 +324,7 @@ void ScanVisualAssembler::rebuildOutputGrid() {
     outputActualFrequencies.assign(static_cast<std::size_t>(outputBinCount), 0.0f);
     outputLevels.assign(static_cast<std::size_t>(outputBinCount), SCAN_VISUAL_FLOOR_DB);
     outputReferenceLevels.clear();
+    resetPassBuffers();
 
     const double spanHz = maxFrequencyHz - minFrequencyHz;
     const double stepHz = spanHz / static_cast<double>((std::max)(1, outputBinCount - 1));
@@ -240,7 +332,7 @@ void ScanVisualAssembler::rebuildOutputGrid() {
         const double displayFrequency = minFrequencyHz + stepHz * static_cast<double>(i);
         outputFrequencies[static_cast<std::size_t>(i)] = static_cast<float>(displayFrequency);
 
-        double actualFrequency = sectors.empty() ? displayFrequency : sectors.back().actualEndHz;
+        double actualFrequency = displayFrequency;
         for (const Sector &sector : sectors) {
             if (displayFrequency < sector.displayStartHz || displayFrequency > sector.displayEndHz) {
                 continue;
@@ -256,14 +348,36 @@ void ScanVisualAssembler::rebuildOutputGrid() {
     }
 }
 
-ScanVisualFrame ScanVisualAssembler::composeFrame(bool includeReference) const {
+void ScanVisualAssembler::resetPassBuffers() {
+    passLevels.assign(static_cast<std::size_t>((std::max)(0, outputBinCount)), SCAN_VISUAL_FLOOR_DB);
+    passReferenceLevels.clear();
+    completePassLevels.clear();
+    completePassReferenceLevels.clear();
+    passSectorSeen.assign(sectors.size(), false);
+    lastPassSectorIndex = -1;
+    haveCompletePass = false;
+}
+
+ScanVisualFrame ScanVisualAssembler::composeFrame(bool includeReference,
+                                                  const std::vector<float> *levels,
+                                                  const std::vector<float> *referenceLevels,
+                                                  bool fresh) const {
     if (!isConfigured()) {
         return {};
     }
 
+    const std::vector<float> &sourceLevels =
+        (levels && levels->size() == static_cast<std::size_t>(outputBinCount)) ? *levels : outputLevels;
+    const std::vector<float> *sourceReferenceLevels =
+        (referenceLevels && referenceLevels->size() == static_cast<std::size_t>(outputBinCount))
+            ? referenceLevels
+            : &outputReferenceLevels;
+
     ScanVisualFrame frame;
     frame.valid = true;
     frame.mosaic = true;
+    frame.fresh = fresh;
+    frame.showSegmentMarkers = configuredMode == ScanVisualMode::CompressedMosaic;
     frame.minFrequency = minFrequencyHz;
     frame.maxFrequency = maxFrequencyHz;
     frame.centerFrequency = (minFrequencyHz + maxFrequencyHz) * 0.5;
@@ -288,14 +402,15 @@ ScanVisualFrame ScanVisualAssembler::composeFrame(bool includeReference) const {
     }
     for (int i = 0; i < outputBinCount; ++i) {
         frame.magnitudes[static_cast<std::size_t>((i + outputBinCount / 2) % outputBinCount)] =
-            outputLevels[static_cast<std::size_t>(i)];
+            sourceLevels[static_cast<std::size_t>(i)];
     }
     if (includeReference &&
-        outputReferenceLevels.size() == static_cast<std::size_t>(outputBinCount)) {
+        sourceReferenceLevels &&
+        sourceReferenceLevels->size() == static_cast<std::size_t>(outputBinCount)) {
         frame.referenceMagnitudes.assign(static_cast<std::size_t>(outputBinCount), SCAN_VISUAL_FLOOR_DB);
         for (int i = 0; i < outputBinCount; ++i) {
             frame.referenceMagnitudes[static_cast<std::size_t>((i + outputBinCount / 2) % outputBinCount)] =
-                outputReferenceLevels[static_cast<std::size_t>(i)];
+                (*sourceReferenceLevels)[static_cast<std::size_t>(i)];
         }
     }
     return frame;

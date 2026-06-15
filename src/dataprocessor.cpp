@@ -502,9 +502,12 @@ void DataProcessor::run() {
         int ret = FOBOS_ERR_NOT_OPEN;
         if (readerApiKind == FobosApiKind::Agile) {
             ret = readFobosAgileAsyncSafely(static_cast<fobos_sdr_dev_t*>(readerDevice),
-                                            [](float *buf, uint32_t buf_length, fobos_sdr_dev_t *, void *ctx) {
+                                            [](float *buf, uint32_t buf_length, fobos_sdr_dev_t *dev, void *ctx) {
                                                 auto *processor = static_cast<DataProcessor*>(ctx);
-                                                processor->handleData(buf, buf_length);
+                                                const int scanIndex = processor->wantsAgileScanMetadata()
+                                                                          ? getFobosAgileScanIndexSafely(dev)
+                                                                          : -1;
+                                                processor->handleData(buf, buf_length, scanIndex);
                                             },
                                             this,
                                             asyncBufferCount,
@@ -1138,7 +1141,7 @@ void DataProcessor::handleUnsigned8IqData(const unsigned char *buf, uint32_t byt
     }
 }
 
-void DataProcessor::handleData(float *buf, uint32_t buf_length) {
+void DataProcessor::handleData(float *buf, uint32_t buf_length, int agileScanIndex) {
     if (!running.load()) {
         return;
     }
@@ -1147,12 +1150,31 @@ void DataProcessor::handleData(float *buf, uint32_t buf_length) {
     captureRetuneRawDumpBlock(buf, buf_length, callbackEpoch);
     const bool queueAudioBlocks = requestedQueueAudioBlocks.load();
     const bool publishIqSnapshot = requestedPublishIqSnapshot.load();
+    const bool agileScanMetadataEnabled = wantsAgileScanMetadata();
+    IqBuffer::BlockMetadata blockMetadata;
+    if (agileScanMetadataEnabled) {
+        blockMetadata.tuning = agileScanIndex < 0;
+        blockMetadata.scanIndex = agileScanIndex;
+        if (agileScanIndex >= 0 &&
+            agileScanIndex < activeStreamDescriptor.agileScanFrequenciesHz.size()) {
+            blockMetadata.valid = true;
+            blockMetadata.centerFrequencyHz =
+                activeStreamDescriptor.agileScanFrequenciesHz.at(agileScanIndex);
+        }
+    }
+    if (agileScanMetadataEnabled && !blockMetadata.valid) {
+        updateStreamDiagnostics(buf, buf_length, "async-agile-tuning");
+        ++asyncCallbackCounter;
+        asyncMeasuredSamples += buf_length;
+        return;
+    }
     if (queueAudioBlocks || publishIqSnapshot) {
         if (!IqBuffer::publish(buf,
                                static_cast<size_t>(buf_length) * FLOATS_PER_IQ_SAMPLE,
                                queueAudioBlocks,
                                publishIqSnapshot,
-                               callbackEpoch)) {
+                               callbackEpoch,
+                               agileScanMetadataEnabled ? &blockMetadata : nullptr)) {
             return;
         }
     }
@@ -1692,6 +1714,12 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
 
 uint64_t DataProcessor::callbackCount() const {
     return totalCallbackCounter.load();
+}
+
+bool DataProcessor::wantsAgileScanMetadata() const {
+    return requestedAgileScanEnabled.load(std::memory_order_acquire) &&
+           activeStreamKind == ReceiverBackendStreamKind::FobosAgile &&
+           !activeStreamDescriptor.agileScanFrequenciesHz.isEmpty();
 }
 
 void DataProcessor::setSampleRateHint(double sampleRate) {

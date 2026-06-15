@@ -1,5 +1,23 @@
 # Changelog
 
+## 4.3.1 - 2026-06-15
+
+### Changed
+
+- Added block-level Agile scan IQ metadata so spectrum and waterfall stitching
+  use the scan point that actually produced each IQ block.
+- Improved scan visual behavior in `Floating/True axis` and `Pass composite`
+  modes by carrying scan-point metadata through `IqBuffer` and FFT processing.
+- Moved the scan visual mode selector above the scan controls so it is clearly
+  shared by all scan display modes.
+
+### Fixed
+
+- Fixed Agile scan waterfall rows being placed with a stale or unrelated scan
+  index, which caused irregular sector ordering and visual gaps.
+- Skipped tuning-period Agile scan IQ blocks (`scan_index == -1`) instead of
+  drawing them as if they belonged to a valid scan center.
+
 ## 4.2.2 - 2026-06-14
 
 ### Added

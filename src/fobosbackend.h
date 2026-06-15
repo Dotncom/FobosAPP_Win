@@ -27,7 +27,8 @@ ReceiverStreamDescriptor makeFobosStreamDescriptor(void *nativeDevice,
                                                    bool queueAudioBlocks,
                                                    bool publishIqSnapshot,
                                                    bool emitIqFrames,
-                                                   bool agileScanEnabled);
+                                                   bool agileScanEnabled,
+                                                   const QVector<double> &agileScanFrequenciesHz = QVector<double>());
 
 int getFobosStandardApiInfoSafely(char *libVersion, char *driverVersion);
 int getFobosAgileApiInfoSafely(char *libVersion, char *driverVersion);

@@ -19,6 +19,8 @@ struct ScanVisualSegment {
 struct ScanVisualFrame {
     bool valid = false;
     bool mosaic = false;
+    bool fresh = true;
+    bool showSegmentMarkers = false;
     double minFrequency = 0.0;
     double maxFrequency = 0.0;
     double centerFrequency = 0.0;
@@ -31,13 +33,20 @@ struct ScanVisualFrame {
     QVector<ScanVisualSegment> segments;
 };
 
+enum class ScanVisualMode {
+    CompressedMosaic = 0,
+    FloatingTrueAxis = 1,
+    PassComposite = 2
+};
+
 class ScanVisualAssembler {
 public:
     void reset();
 
     bool configure(const QVector<double> &centerFrequenciesHz,
                    double sampleRateHz,
-                   int targetBins);
+                   int targetBins,
+                   ScanVisualMode mode);
 
     ScanVisualFrame update(double frameCenterFrequencyHz,
                            const std::vector<float> &frequencies,
@@ -58,7 +67,11 @@ private:
 
     int nearestSector(double centerHz) const;
     void rebuildOutputGrid();
-    ScanVisualFrame composeFrame(bool includeReference) const;
+    void resetPassBuffers();
+    ScanVisualFrame composeFrame(bool includeReference,
+                                 const std::vector<float> *levels = nullptr,
+                                 const std::vector<float> *referenceLevels = nullptr,
+                                 bool fresh = true) const;
     int binForDisplayFrequency(double frequencyHz) const;
     int binForSectorFrequency(const Sector &sector, double frequencyHz) const;
     static float shiftedValueAt(const std::vector<float> &values, int index, int count);
@@ -68,10 +81,18 @@ private:
     std::vector<float> outputActualFrequencies;
     std::vector<float> outputLevels;
     std::vector<float> outputReferenceLevels;
+    std::vector<float> passLevels;
+    std::vector<float> passReferenceLevels;
+    std::vector<float> completePassLevels;
+    std::vector<float> completePassReferenceLevels;
+    std::vector<bool> passSectorSeen;
     double configuredSampleRateHz = 0.0;
     double minFrequencyHz = 0.0;
     double maxFrequencyHz = 0.0;
     int outputBinCount = 0;
+    ScanVisualMode configuredMode = ScanVisualMode::CompressedMosaic;
+    int lastPassSectorIndex = -1;
+    bool haveCompletePass = false;
 };
 
 #endif // SCANVISUALASSEMBLER_H

@@ -26,6 +26,7 @@ std::size_t g_iqQueuedFloatCount = 0;
 std::uint64_t g_iqSequence = 0;
 std::uint64_t g_iqEpoch = 1;
 double g_sampleRateEstimate = 0.0;
+IqBuffer::BlockMetadata g_latestMetadata;
 std::uint64_t g_traceEpoch = 0;
 int g_tracePublishRemaining = 0;
 int g_traceRejectRemaining = 0;
@@ -85,6 +86,7 @@ void appendToSnapshot(const float *samples, std::size_t floatCount) {
 bool copySnapshotTail(std::vector<float> &out,
                       std::size_t maxFloatCount,
                       std::uint64_t *sequence,
+                      IqBuffer::BlockMetadata *metadata,
                       const char *source) {
     const bool shouldTrace = traceMatchesCurrentEpoch() &&
                              g_traceSnapshotRemaining > 0;
@@ -92,6 +94,9 @@ bool copySnapshotTail(std::vector<float> &out,
         out.clear();
         if (sequence) {
             *sequence = g_iqSequence;
+        }
+        if (metadata) {
+            *metadata = g_latestMetadata;
         }
         if (shouldTrace) {
             --g_traceSnapshotRemaining;
@@ -114,6 +119,9 @@ bool copySnapshotTail(std::vector<float> &out,
         out.clear();
         if (sequence) {
             *sequence = g_iqSequence;
+        }
+        if (metadata) {
+            *metadata = g_latestMetadata;
         }
         if (shouldTrace) {
             --g_traceSnapshotRemaining;
@@ -158,6 +166,9 @@ bool copySnapshotTail(std::vector<float> &out,
     if (sequence) {
         *sequence = g_iqSequence;
     }
+    if (metadata) {
+        *metadata = g_latestMetadata;
+    }
     return true;
 }
 
@@ -184,7 +195,8 @@ bool publish(const float *samples,
              std::size_t floatCount,
              bool queueBlock,
              bool updateSnapshot,
-             std::uint64_t expectedEpoch) {
+             std::uint64_t expectedEpoch,
+             const BlockMetadata *metadata) {
     if (!samples || floatCount == 0) {
         return false;
     }
@@ -216,6 +228,9 @@ bool publish(const float *samples,
     if (updateSnapshot) {
         appendToSnapshot(samples, floatCount);
         ++g_iqSequence;
+        g_latestMetadata = metadata ? *metadata : BlockMetadata();
+        g_latestMetadata.sequence = g_iqSequence;
+        g_latestMetadata.floatCount = floatCount;
     }
 
     if (!queueBlock) {
@@ -266,16 +281,17 @@ bool publish(const float *samples,
     return true;
 }
 
-bool snapshot(std::vector<float> &out, std::uint64_t *sequence) {
+bool snapshot(std::vector<float> &out, std::uint64_t *sequence, BlockMetadata *metadata) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
-    return copySnapshotTail(out, g_iqSnapshotSize, sequence, "snapshot");
+    return copySnapshotTail(out, g_iqSnapshotSize, sequence, metadata, "snapshot");
 }
 
 bool snapshotRecent(std::vector<float> &out,
                     std::size_t maxFloatCount,
-                    std::uint64_t *sequence) {
+                    std::uint64_t *sequence,
+                    BlockMetadata *metadata) {
     std::lock_guard<std::mutex> lock(g_iqMutex);
-    return copySnapshotTail(out, maxFloatCount, sequence, "snapshotRecent");
+    return copySnapshotTail(out, maxFloatCount, sequence, metadata, "snapshotRecent");
 }
 
 bool popBlock(std::vector<float> &out, std::uint64_t *sequence) {
@@ -341,6 +357,7 @@ void clear(std::uint64_t epoch) {
     g_iqBlocks.clear();
     g_iqBlockSequences.clear();
     g_iqQueuedFloatCount = 0;
+    g_latestMetadata = BlockMetadata();
     ++g_iqSequence;
     if (epoch != 0 && traceMatchesCurrentEpoch()) {
         qDebug() << "[IqBufferTrace] clear"

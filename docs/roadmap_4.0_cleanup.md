@@ -2,6 +2,97 @@
 
 This file tracks the practical roadmap after the 4.0 release work. It should stay ordered by the next useful engineering steps, not by the order in which features were originally imagined.
 
+## Roadmap Inventory After 4.3.0
+
+This section is the current working inventory after the 4.3.0 release cleanup. Older sections below are kept as historical context and detailed task lists.
+
+Completed or usable enough to keep building on:
+
+1. Release and repository hygiene:
+   - public 4.3.0 release packages are rebuilt without local proxy/logger/lab tools;
+   - 4.2.0, 4.2.1, and 4.2.2 releases/tags were removed because their source packages exposed local diagnostic proxy tools;
+   - Windows package excludes local logs, captures, screenshots, user settings, and private files;
+   - Raspberry source package now excludes Android, Windows-only release scripts, sandbox files, lab replay tools, proxy loggers, local reference repositories, and generated artifacts.
+2. Windows desktop baseline:
+   - Fobos standard and Agile paths remain the primary supported receiver paths;
+   - Windows package includes Qt, FFTW, Fobos runtime DLLs, and separate RTL-SDR runtime files;
+   - startup from the staged release folder was verified during 4.3 packaging.
+3. Linux/Raspberry baseline:
+   - Linux build helpers exist for dependencies, Fobos libraries, build, and run;
+   - Raspberry source package is small and build-focused;
+   - `librtlsdr-dev` and `rtl-sdr` are now part of the Debian dependency helper;
+   - Linux runtime lookup now supports local/system `librtlsdr.so` candidates for native RTL-SDR.
+4. Android network/USB client:
+   - Android network client exists and can display spectrum/waterfall, control frequency, and play audio in network mode;
+   - Android USB work includes direct Fobos and RTL-SDR experiments through Android USB Host APIs;
+   - Android native bridge exists for heavier DSP/audio paths;
+   - Android UI now has receiver mode, controls/settings separation, pan/zoom, band overlays, fine tuning, and RTL sample-rate choices.
+   - RTL-SDR already served its main purpose as a lightweight reference receiver and performance baseline for average Android devices; do not treat perfect RTL audio as a core roadmap item.
+5. Network mode:
+   - desktop server/client control synchronization is much more consistent after the 4.3 pass;
+   - server is treated as the source of truth for receiver state;
+   - desktop clients can mirror scan visual frames and scan state;
+   - Android is intentionally kept lighter and does not mirror all heavy scan/GNSS/DMR state.
+6. Receiver backends:
+   - first backend boundary exists for Fobos, RTL-SDR native, RTL-TCP, and optional SoapySDR;
+   - RTL-SDR native works by runtime loading on desktop and direct USB experiments on Android;
+   - RTL-TCP path remains available for networked lightweight RTL tests;
+   - SoapySDR support is present as an optional runtime path, but mostly unverified.
+7. Scan and spectrum tools:
+   - Agile scan and standard retune-based scan exist;
+   - stitched scan visualization exists through `ScanVisualAssembler`;
+   - scan visualization now supports `Compressed/Mosaic`, `Floating/True axis`, and `Pass composite` modes;
+   - measurement overlays, bandwidth drag measurement, spur calibration/suppression, band-plan overlays, compact overlays, and editable presets/band plans exist.
+8. GNSS/QTH:
+   - QTH map, marker workflow, map providers/cache, NMEA paste import, Maidenhead locator, GNSS presets, IQ save, GPS L1 acquisition experiments, diagnostic reports, and synthetic solver tests exist;
+   - real GNSS lock is still not proven.
+9. DMR:
+   - DMR sync/metadata/voice path is active but still experimental;
+   - color code/timeslot/source/target metadata have appeared in lab tests, but not with enough repeatability;
+   - voice has produced recognizable fragments, but sync/framing/audio quality are not stable.
+10. FPV/video:
+   - FPV hunter controls, presets, sparse scans, analog video attempts, and digital-video detector scaffolding exist;
+   - real-world video decoding remains paused until better live signals are available.
+
+Still open or risky:
+
+1. DMR fundamentals:
+   - CACH/SlotType/LC/EMB/cadence voting must become deterministic before more AMBE tuning;
+   - offline replay must be the main comparison tool, not live trial-and-error only;
+   - external decoder comparison should verify metadata and burst timing stage by stage.
+2. GNSS:
+   - real GPS L1 C/A lock is not proven yet;
+   - a dedicated active/passive GNSS antenna and cleaner RF test conditions are still needed;
+   - acquisition logic exists, but needs real-signal validation against known-good recordings or a reference receiver.
+3. FPV/video:
+   - FPV/video hunter scaffolding exists, but real-world signal validation is incomplete;
+   - analog video demodulation and digital-video detection still need live captures and clearer output metrics.
+4. Transceiver architecture:
+   - RX path is useful, but TX/control path is only a plan;
+   - hardware interlocks, PTT sequencing, Raspberry service boundaries, and external TX module control are not implemented.
+5. Network completeness:
+   - DMR and GNSS network state are intentionally deferred;
+   - preset/band-plan sync is not automatic and should remain explicit import/export unless remote workflows demand more.
+6. UI architecture:
+   - `main.cpp` is still too large;
+   - settings, network, scan, GNSS, DMR, video, and receiver UI glue should continue moving to focused modules when risk is low.
+7. Regression watch:
+   - Fobos/Agile start, retune, and sample-rate behavior were heavily stabilized during Steam Deck work;
+   - keep them under release-test coverage, but do not make them the top active task unless the bug returns.
+8. Multi-receiver scan/display:
+   - future work: run two sources at once, such as two Fobos receivers, local Fobos plus remote Fobos, or Fobos plus RTL/Soapy;
+   - decide whether the UI should show sources as split spectrum/waterfall panes, transparent overlay layers, or detachable receiver windows;
+   - keep per-source control isolated so the primary Fobos path does not inherit latency from optional secondary receivers.
+
+Near-term order after 4.3:
+
+1. Build a repeatable DMR offline harness around real known Motorola recordings before more live voice changes.
+2. Finish CACH/LC/EMB/cadence voting diagnostics and expose confidence metrics for CC/TS/SRC/TG/encryption state.
+3. Keep GNSS ready for the next antenna/test opportunity: acquisition replay, reporting, and reference-tool comparison.
+4. Resume FPV/video only when live signals or saved captures are available, then improve detector output before deep demodulation work.
+5. Start transceiver-mode architecture with a simulator-only `TransmitterBackend` and no real TX control yet.
+6. Treat Android RTL as a completed reference experiment unless a specific transceiver/mobile use case makes it important again.
+
 ## Current 4.0 State
 
 Completed or good enough for the current release:
@@ -291,3 +382,89 @@ Routine before each public build:
 8. Keep receiver backend abstraction Fobos-first; only polish RTL/Soapy enough that optional fallback backends do not disturb the Fobos path.
 9. Build the DMR external decoder bridge for comparison.
 10. Return to DMR voice only with a repeatable offline harness and clearer stage-by-stage metrics.
+
+## Future Transceiver Mode
+
+Long-term goal: use Fobos SDR, Raspberry Pi, FobosAPP, and custom modules as the receive/control side of a homebuilt transceiver.
+
+Important boundary: Fobos is a receiver. Transmit support must be designed as a separate controlled subsystem, not as a hidden extension of the receive path.
+
+Target architecture:
+
+1. Receiver side:
+   - keep Fobos/Fobos Agile as the wideband RX frontend;
+   - keep spectrum, waterfall, demodulation, scan, DMR/GNSS/video detectors, presets, and band plans inside FobosAPP;
+   - keep RX-only operation safe and unchanged when no transmit module is connected.
+2. Transmit side:
+   - define a `TransmitterBackend` interface separate from `ReceiverBackend`;
+   - support PTT, TX frequency, TX mode, TX audio source, TX gain/power request, PA enable, bias/relay controls, ALC/power/SWR telemetry, and fault state;
+   - never assume the TX hardware is Fobos; it may be a custom DAC/modulator, external exciter, GPIO-controlled radio module, or later a different SDR.
+3. Raspberry/controller role:
+   - run the trusted hardware-control service close to the radio hardware;
+   - isolate GPIO, relays, bias tee, PA enable, cooling/fan, sensor reads, and watchdog logic from the desktop UI;
+   - provide a network API for FobosAPP clients to request TX state changes.
+4. Safety interlocks:
+   - hardware PTT interlock independent of the UI;
+   - RX mute/protect relay before TX;
+   - PA enable only after frequency/mode/path validation;
+   - emergency TX inhibit;
+   - timeout timer;
+   - SWR/overcurrent/overtemperature shutdown;
+   - band-plan based TX permission hints, with user-region profiles.
+5. Duplex and sequencing:
+   - support RX-only, simplex PTT, split RX/TX, and repeater-style offset profiles;
+   - sequencer order should be configurable: mute RX, switch relays, enable exciter, enable PA, transmit, disable PA, disable exciter, restore relays, unmute RX;
+   - expose timing in milliseconds for relays and PA settling.
+6. Audio/baseband path:
+   - start with microphone/line-in audio routed to an external TX chain;
+   - later add generated tones, CW keying, digital mode audio, and test carriers;
+   - keep modulation generation modular so FM/SSB/AM/digital transmit experiments do not pollute receive DSP.
+7. UI concept:
+   - add a dedicated Transceiver panel, initially disabled unless a TX backend is configured;
+   - show RX frequency, TX frequency, split/offset, PTT state, selected antenna/path, PA state, power/SWR/current/temp, and fault reason;
+   - require an explicit "Enable TX controls" step before any transmit-capable command is accepted.
+8. Configuration:
+   - add transceiver profiles for bands, antennas, offsets, power limits, GPIO mapping, relay timing, and TX permissions;
+   - keep profiles exportable/importable and do not ship dangerous defaults that can key unknown hardware.
+
+Suggested implementation order:
+
+1. Write a TX backend contract and a dummy simulator backend that cannot transmit.
+2. Add UI/state plumbing with simulator-only PTT, sequencing, and fault display.
+3. Add Raspberry-side GPIO/service prototype with no RF connected.
+4. Add hardware interlock and watchdog tests.
+5. Add RX mute/protect sequencing around existing Fobos RX.
+6. Add external TX module control only after bench tests with dummy load and power/SWR sensors.
+7. Add band-plan TX hints and region profiles.
+8. Only then add real modulation/audio TX integration.
+
+## Encrypted DMR Questions
+
+Scope note: DMR encryption must be handled carefully. The project can identify that a call is encrypted and expose legal/user-provided metadata, but it should not include bypass/decryption features for traffic the user is not authorized to access.
+
+Useful supported goals:
+
+1. Detect and display encrypted/privacy status:
+   - Basic Privacy / Enhanced Privacy indicators if recoverable from DMR signaling;
+   - privacy algorithm or key ID fields only if they are explicitly present in metadata;
+   - color code, timeslot, call type, source ID, target ID, and group ID should still be decoded when unencrypted signaling permits it.
+2. Improve operator feedback:
+   - show "encrypted voice" rather than silent failure or broken AMBE audio;
+   - suppress or mark voice decoding attempts when frames are privacy-protected;
+   - log encrypted-call cadence and metadata confidence for diagnostics.
+3. Authorized lab mode:
+   - allow known test fixtures with user-owned radios and user-provided keys to validate detection and metadata handling;
+   - if any future decryption support is considered, it must be opt-in, local-only, documented as "authorized systems only", and separated from normal release builds unless legal/safety review says otherwise.
+4. Questions to answer:
+   - Which DMR privacy indicators are visible in the bursts we already parse?
+   - Can CACH/LC/SlotType identify privacy before AMBE frames are handed to the vocoder?
+   - How do Motorola Basic Privacy and Enhanced Privacy differ in visible metadata?
+   - What should the UI show when metadata is clear but voice is encrypted?
+   - Should encrypted-call detection be network-synchronized to clients as a status-only field?
+
+Non-goals for the public app:
+
+1. No recovery of unknown keys.
+2. No bypass of access controls.
+3. No hidden decryption pipeline.
+4. No claim that encrypted DMR audio can be monitored unless the operator owns the system and provides lawful keys/configuration.

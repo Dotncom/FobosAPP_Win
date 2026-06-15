@@ -86,6 +86,7 @@ struct ReceiverStreamDescriptor {
     bool publishIqSnapshot = true;
     bool emitIqFrames = false;
     bool agileScanEnabled = false;
+    QVector<double> agileScanFrequenciesHz;
 };
 
 using ReceiverIqCallback = std::function<void(const ReceiverIqFrame &)>;

@@ -98,6 +98,14 @@ void MyGraphWidget::setScanSegments(const QVector<ScanVisualSegment> &segments) 
     update();
 }
 
+void MyGraphWidget::setScanSegmentMarkersVisible(bool visible) {
+    if (scanSegmentMarkersVisible == visible) {
+        return;
+    }
+    scanSegmentMarkersVisible = visible;
+    update();
+}
+
 void MyGraphWidget::clearData() {
     xData.clear();
     yData.clear();
@@ -589,14 +597,18 @@ int MyGraphWidget::bottomMargin() const {
     if (compactBandMarkersEnabled && (generalBandMarkersEnabled || amateurBandMarkersEnabled)) {
         margin = (std::max)(margin, GRAPH_COMPACT_BAND_BOTTOM_MARGIN);
     }
-    if (!scanSegments.isEmpty()) {
+    if (scanSegmentMarkersVisible && !scanSegments.isEmpty()) {
         margin = (std::max)(margin, GRAPH_SCAN_SEGMENT_BOTTOM_MARGIN);
     }
     return margin;
 }
 
 void MyGraphWidget::drawScanSegments(QPainter &painter) const {
-    if (scanSegments.size() < 2 || width() <= 0 || height() <= 0 || qFuzzyCompare(xMin, xMax)) {
+    if (!scanSegmentMarkersVisible ||
+        scanSegments.size() < 2 ||
+        width() <= 0 ||
+        height() <= 0 ||
+        qFuzzyCompare(xMin, xMax)) {
         return;
     }
 

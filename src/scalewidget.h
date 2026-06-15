@@ -18,6 +18,7 @@ public:
 	
     void setRange(double min, double max);
     void setScanSegments(const QVector<ScanVisualSegment> &segments);
+    void setScanSegmentMarkersVisible(bool visible);
     void setMarkerPosition(double position);
     void setTuning(double listeningFrequency, double centerFrequency, double bandwidth);
     void setTuning(double listeningFrequency, double centerFrequency, double bandwidth, int modulationType);
@@ -46,6 +47,7 @@ private:
     double bandwidthValue;
     int modulationTypeValue;
     QVector<ScanVisualSegment> scanSegments;
+    bool scanSegmentMarkersVisible = true;
     
     bool dragging = false;
     int lastMouseX = 0;
