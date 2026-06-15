@@ -16,8 +16,20 @@ android {
         applicationId 'com.fobosapp.networkclient'
         minSdk 26
         targetSdk 35
-        versionCode 9
-        versionName '4.2.2-usb-network'
+        versionCode 10
+        versionName '4.3.0-usb-network'
+
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++17'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+        }
     }
 
     compileOptions {

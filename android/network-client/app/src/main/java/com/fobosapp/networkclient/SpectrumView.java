@@ -18,6 +18,10 @@ public final class SpectrumView extends View {
         void onTuneRequested(double frequencyHz);
     }
 
+    public interface CenterTuneRequestListener {
+        void onCenterTuneRequested(double frequencyHz);
+    }
+
     public interface PanTuneRequestListener {
         void onPanTuneRequested(double deltaHz);
     }
@@ -111,9 +115,14 @@ public final class SpectrumView extends View {
     private Bitmap waterfall;
     private int[] waterfallPixels = new int[0];
     private TuneRequestListener tuneRequestListener;
+    private CenterTuneRequestListener centerTuneRequestListener;
     private PanTuneRequestListener panTuneRequestListener;
     private float downX = 0.0f;
     private float downY = 0.0f;
+    private float lastTapX = Float.NaN;
+    private float lastTapY = Float.NaN;
+    private long lastTapTimeMs = 0L;
+    private long doubleTapTimeoutMs = 280L;
     private float lastPanX = 0.0f;
     private float tapSlopPx = 24.0f;
     private float pinchStartDistance = 0.0f;
@@ -134,6 +143,10 @@ public final class SpectrumView extends View {
 
     public synchronized void setTuneRequestListener(TuneRequestListener listener) {
         tuneRequestListener = listener;
+    }
+
+    public synchronized void setCenterTuneRequestListener(CenterTuneRequestListener listener) {
+        centerTuneRequestListener = listener;
     }
 
     public synchronized void setPanTuneRequestListener(PanTuneRequestListener listener) {
@@ -276,8 +289,8 @@ public final class SpectrumView extends View {
                 }
                 return true;
             case MotionEvent.ACTION_UP:
-                if (!gestureMoved && tuneRequestListener != null) {
-                    tuneRequestListener.onTuneRequested(frequencyAtX(event.getX(), getWidth()));
+                if (!gestureMoved) {
+                    handleTap(event);
                 }
                 pinching = false;
                 return true;
@@ -326,7 +339,30 @@ public final class SpectrumView extends View {
 
     private void init() {
         tapSlopPx = Math.max(18.0f, ViewConfiguration.get(getContext()).getScaledTouchSlop() * 2.5f);
+        doubleTapTimeoutMs = ViewConfiguration.getDoubleTapTimeout();
         paint.setTypeface(android.graphics.Typeface.MONOSPACE);
+    }
+
+    private void handleTap(MotionEvent event) {
+        float x = event.getX();
+        float y = event.getY();
+        long now = event.getEventTime();
+        boolean doubleTap = lastTapTimeMs > 0 &&
+                now - lastTapTimeMs <= doubleTapTimeoutMs &&
+                Math.abs(x - lastTapX) <= tapSlopPx &&
+                Math.abs(y - lastTapY) <= tapSlopPx;
+        double frequency = frequencyAtX(x, getWidth());
+        if (doubleTap && centerTuneRequestListener != null) {
+            lastTapTimeMs = 0L;
+            centerTuneRequestListener.onCenterTuneRequested(frequency);
+            return;
+        }
+        lastTapTimeMs = now;
+        lastTapX = x;
+        lastTapY = y;
+        if (tuneRequestListener != null) {
+            tuneRequestListener.onTuneRequested(frequency);
+        }
     }
 
     private void drawSpectrum(Canvas canvas, int width, int spectrumHeight) {
@@ -668,9 +704,8 @@ public final class SpectrumView extends View {
         if (count <= 0 || magnitudes.length == 0) {
             return -160.0f;
         }
-        int shiftedIndex = (frequencyIndex + count / 2) % count;
-        shiftedIndex = Math.max(0, Math.min(magnitudes.length - 1, shiftedIndex));
-        float value = magnitudes[shiftedIndex];
+        int index = Math.max(0, Math.min(magnitudes.length - 1, frequencyIndex));
+        float value = magnitudes[index];
         return Float.isFinite(value) ? value : -160.0f;
     }
 

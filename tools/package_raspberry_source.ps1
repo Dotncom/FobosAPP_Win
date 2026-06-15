@@ -27,13 +27,26 @@ New-Item -ItemType Directory -Path $Stage | Out-Null
 $files = git -C $Workspace ls-files --cached --others --exclude-standard
 $excludePrefixes = @(
     "android/",
+    "release/",
+    "build/",
     "third_party/patched/libfobos/showimg/",
     "third_party/patched/libfobos-sdr-agile/showimg/",
-    "sandbox/"
+    "sandbox/",
+    "tools/fobos_proxy_logger/",
+    "tools/rtlsdr_proxy_logger/"
 )
 $excludeExactPaths = @(
     "third_party/mbelib-neo",
-    "third_party/softdmr"
+    "third_party/softdmr",
+    "tools/analyze_retune_raw_dump.py",
+    "tools/dmr_lab_replay.cpp",
+    "docs/dmr_lab_replay.md",
+    "docs/dmr_external_backend.md",
+    "config/dmr_backends.example.json",
+    "tools/build_windows_local.ps1",
+    "tools/deploy_windows.ps1",
+    "tools/package_windows_release.ps1",
+    "tools/sign_windows.ps1"
 )
 
 foreach ($file in $files) {
@@ -54,6 +67,9 @@ foreach ($file in $files) {
     }
 
     $source = Join-Path $Workspace $file
+    if (-not (Test-Path -LiteralPath $source)) {
+        continue
+    }
     $dest = Join-Path $Stage $file
     $destDir = Split-Path -Parent $dest
     if (-not (Test-Path -LiteralPath $destDir)) {

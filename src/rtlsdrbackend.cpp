@@ -58,12 +58,19 @@ RtlSdrApi &api() {
 QStringList libraryCandidates() {
     const QString appDir = QCoreApplication::applicationDirPath();
     return {
+#ifdef _WIN32
         QDir(appDir).absoluteFilePath(QStringLiteral("rtlsdr/rtlsdr.dll")),
         QDir(appDir).absoluteFilePath(QStringLiteral("rtlsdr/librtlsdr.dll")),
         QDir(appDir).absoluteFilePath(QStringLiteral("rtlsdr/rtl-sdr.dll")),
         QDir(appDir).absoluteFilePath(QStringLiteral("rtlsdr.dll")),
         QDir(appDir).absoluteFilePath(QStringLiteral("librtlsdr.dll")),
         QDir(appDir).absoluteFilePath(QStringLiteral("rtl-sdr.dll")),
+#else
+        QDir(appDir).absoluteFilePath(QStringLiteral("rtlsdr/librtlsdr.so")),
+        QDir(appDir).absoluteFilePath(QStringLiteral("rtlsdr/rtl-sdr.so")),
+        QDir(appDir).absoluteFilePath(QStringLiteral("librtlsdr.so")),
+        QDir(appDir).absoluteFilePath(QStringLiteral("rtl-sdr.so")),
+#endif
         QStringLiteral("rtlsdr"),
         QStringLiteral("librtlsdr"),
         QStringLiteral("rtl-sdr")

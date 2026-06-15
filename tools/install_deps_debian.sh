@@ -16,6 +16,8 @@ sudo apt-get install -y \
     libqt5multimedia5-plugins \
     libfftw3-dev \
     libusb-1.0-0-dev \
+    librtlsdr-dev \
+    rtl-sdr \
     mesa-common-dev \
     libgl1-mesa-dev
 

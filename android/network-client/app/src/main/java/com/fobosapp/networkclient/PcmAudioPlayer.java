@@ -12,10 +12,10 @@ import java.util.Locale;
 final class PcmAudioPlayer {
     private static final int SAMPLE_RATE = 48_000;
     private static final int BYTES_PER_SAMPLE = 2;
-    private static final int MAX_QUEUED_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE * 3 / 4;
-    private static final int START_BUFFER_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE / 25;
-    private static final int MIN_BUFFER_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE / 10;
-    private static final int TARGET_CHUNK_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE / 200;
+    private static final int MAX_QUEUED_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE * 2;
+    private static final int START_BUFFER_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE / 10;
+    private static final int MIN_BUFFER_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE / 4;
+    private static final int TARGET_CHUNK_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE / 50;
 
     private final Object lock = new Object();
     private final ArrayDeque<byte[]> queue = new ArrayDeque<>();
@@ -56,11 +56,37 @@ final class PcmAudioPlayer {
         }
     }
 
+    void playTestTone() {
+        int durationMs = 700;
+        int samples = SAMPLE_RATE * durationMs / 1000;
+        byte[] pcm = new byte[samples * BYTES_PER_SAMPLE];
+        double frequencyHz = 1000.0;
+        double amplitude = 0.35 * Short.MAX_VALUE;
+        for (int i = 0; i < samples; ++i) {
+            double envelope = 1.0;
+            int fadeSamples = SAMPLE_RATE / 50;
+            if (i < fadeSamples) {
+                envelope = i / (double) fadeSamples;
+            } else if (i > samples - fadeSamples) {
+                envelope = Math.max(0.0, (samples - i) / (double) fadeSamples);
+            }
+            short value = (short) Math.round(Math.sin(2.0 * Math.PI * frequencyHz * i / SAMPLE_RATE)
+                    * amplitude * envelope);
+            int offset = i * BYTES_PER_SAMPLE;
+            pcm[offset] = (byte) (value & 0xff);
+            pcm[offset + 1] = (byte) ((value >>> 8) & 0xff);
+        }
+        playPcm(pcm);
+    }
+
     void stop() {
         synchronized (lock) {
             queue.clear();
             queuedBytes = 0;
             pendingBytes = 0;
+            droppedBytesTotal = 0;
+            underrunsTotal = 0;
+            writtenBytesTotal = 0;
             releaseTrackLocked();
             lock.notifyAll();
         }

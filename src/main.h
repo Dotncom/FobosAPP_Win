@@ -33,6 +33,7 @@
 #include <QCloseEvent>
 #include <QMessageBox>
 #include <QByteArray>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
 #include <QStringList>
@@ -366,13 +367,29 @@ private:
     bool isClientIqProcessingMode(NetworkProcessingMode mode) const;
     void appendNetworkState(QJsonObject &command) const;
     void applyNetworkStateFromCommand(const QJsonObject &command);
+    QJsonObject networkSettingsPatch(const QJsonObject &settings) const;
+    void applyAuthoritativeNetworkState(const QJsonObject &command);
+    void sendSettingsAckToPeer(const QString &peerId,
+                               bool ok,
+                               const QString &requestId = QString(),
+                               const QString &reason = QString());
+    void startNetworkSettingsAckWait();
+    void handleNetworkSettingsAckTimeout();
+    void buildLocalReceiverDeviceChoices(QStringList &labels, QVector<int> &values) const;
+    void rebuildReceiverDeviceCombo();
+    QJsonArray receiverDeviceListToJson() const;
+    bool applyReceiverDeviceListFromJson(const QJsonArray &devices);
+    void clearRemoteReceiverDeviceList();
+    void sendServerStateToClients();
     bool sendRemoteControlCommand(const QString &action, const QJsonObject &extra = QJsonObject());
     void scheduleRemoteSettingsCommand(int delayMs = 120);
     void cancelPendingRemoteSettingsCommand();
     QJsonObject settingsToJson() const;
-    void applySettingsFromJson(const QJsonObject &settingsJson);
+    void applySettingsFromJson(const QJsonObject &settingsJson, bool normalizeAfterApply = true);
     void updateUiFromPendingSettings();
     void loadUiTranslations();
+    QString normalizedUiLanguage(const QString &language) const;
+    void populateLanguageCombo(QComboBox *combo) const;
     QString uiText(const QString &key, const QString &fallback) const;
     QString localizedStatusText(const QString &status) const;
     void markTranslatable(QWidget *widget, const QString &key, const QString &fallback);
@@ -568,6 +585,8 @@ private:
     QLabel *playbackStatusLabel = nullptr;
 
     QJsonObject uiTranslations;
+    QMap<QString, QString> uiLanguageNames;
+    QStringList uiLanguageOrder;
     QString uiLanguage = QStringLiteral("en");
        
     QLineEdit *dmrLabSourceIdEdit = nullptr;
@@ -645,6 +664,7 @@ private:
     QTimer *stopPollTimer = nullptr;
     QTimer *streamWatchdogTimer = nullptr;
     QTimer *networkSettingsDebounceTimer = nullptr;
+    QTimer *networkSettingsAckTimer = nullptr;
     QTimer *standardScanAdvanceTimer = nullptr;
     QTimer *listeningScanAdvanceTimer = nullptr;
     QTimer *videoSnapshotTimer = nullptr;
@@ -704,6 +724,9 @@ private:
     double networkSpectrumFrameMaxFrequency = 0.0;
     int networkSpectrumFrameFftLength = 0;
     QVector<FobosDeviceInfo> availableFobosDevices;
+    QStringList remoteReceiverDeviceLabels;
+    QVector<int> remoteReceiverDeviceValues;
+    bool remoteReceiverDeviceListValid = false;
     RadioSettings pendingSettings;
     RadioSettings appliedHardwareSettings;
     bool hardwareSettingsApplied = false;
@@ -930,7 +953,10 @@ private:
     uint64_t networkSpectrumFrameSequence = 0;
     uint64_t networkIqFrameSequence = 0;
     uint64_t networkIqFramesDropped = 0;
-    QElapsedTimer networkClientSettingsGuardTimer;
+    QJsonObject networkClientConfirmedSettingsJson;
+    bool networkClientConfirmedSettingsValid = false;
+    bool networkClientAwaitingSettingsAck = false;
+    quint64 networkClientSettingsRequestCounter = 0;
     bool audioRelayTransmitEnabled = false;
     QString audioRelayHost = "127.0.0.1";
     quint16 audioRelayPort = 21091;

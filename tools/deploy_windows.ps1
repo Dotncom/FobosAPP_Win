@@ -3,7 +3,6 @@ param(
     [string]$DeployDir = "release\bin",
     [string]$QtRoot = "C:\Qt\5.15.2\msvc2019_64",
     [string]$VcRedistDir = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT",
-    [switch]$IncludeLabTools,
     [switch]$Sign,
     [string]$PfxPath = $env:FOBOSAPP_CODESIGN_PFX,
     [string]$CertPassword = $env:FOBOSAPP_CODESIGN_PASSWORD,
@@ -49,13 +48,9 @@ if ($RtlSdrRuntime) {
     $RootFiles += $RtlSdrRuntime
 }
 
-if ($IncludeLabTools) {
-    $RootFiles += @{ Source = Join-Path $BuildPath "dmr_lab_replay.exe"; Name = "dmr_lab_replay.exe" }
-} else {
-    $StaleLabTool = Join-Path $DeployPath "dmr_lab_replay.exe"
-    if (Test-Path -LiteralPath $StaleLabTool) {
-        Remove-Item -LiteralPath $StaleLabTool -Force
-    }
+$StaleLabTool = Join-Path $DeployPath "dmr_lab_replay.exe"
+if (Test-Path -LiteralPath $StaleLabTool) {
+    Remove-Item -LiteralPath $StaleLabTool -Force
 }
 
 foreach ($File in $RootFiles) {
@@ -193,27 +188,14 @@ foreach ($Notice in $DmrVoiceBackendNotices) {
     }
 }
 
-if ($IncludeLabTools) {
-    $DmrLabDocs = @(
-        @{ Source = Join-Path $Workspace "docs\dmr_lab_replay.md"; Destination = Join-Path $DeployPath "docs\dmr_lab_replay.md" },
-        @{ Source = Join-Path $Workspace "docs\dmr_external_backend.md"; Destination = Join-Path $DeployPath "docs\dmr_external_backend.md" },
-        @{ Source = Join-Path $Workspace "config\dmr_backends.example.json"; Destination = Join-Path $DeployPath "config\dmr_backends.example.json" }
-    )
-
-    foreach ($Doc in $DmrLabDocs) {
-        if (Test-Path -LiteralPath $Doc.Source) {
-            New-Item -ItemType Directory -Path (Split-Path -Parent $Doc.Destination) -Force | Out-Null
-            Copy-Item -LiteralPath $Doc.Source -Destination $Doc.Destination -Force
-        }
-    }
-} else {
-    $StaleLabDocs = @(
-        Join-Path $DeployPath "docs\dmr_lab_replay.md"
-    )
-    foreach ($StaleDoc in $StaleLabDocs) {
-        if (Test-Path -LiteralPath $StaleDoc) {
-            Remove-Item -LiteralPath $StaleDoc -Force
-        }
+$StaleLabDocs = @(
+    (Join-Path $DeployPath "docs\dmr_lab_replay.md"),
+    (Join-Path $DeployPath "docs\dmr_external_backend.md"),
+    (Join-Path $DeployPath "config\dmr_backends.example.json")
+)
+foreach ($StaleDoc in $StaleLabDocs) {
+    if (Test-Path -LiteralPath $StaleDoc) {
+        Remove-Item -LiteralPath $StaleDoc -Force
     }
 }
 

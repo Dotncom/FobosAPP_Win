@@ -159,7 +159,7 @@ constexpr int NETWORK_FULL_RESOLUTION_SPECTRUM_INTERVAL_MS = 50;
 constexpr qint64 NETWORK_IQ_MAX_PENDING_BYTES = 8 * 1024 * 1024;
 constexpr qint64 NETWORK_CHANNEL_IQ_LOW_LATENCY_PENDING_BYTES = 2 * 1024 * 1024;
 constexpr uint64_t NETWORK_IQ_DROP_LOG_INTERVAL = 200;
-constexpr qint64 NETWORK_CLIENT_SETTINGS_GUARD_MS = 1500;
+constexpr int NETWORK_SETTINGS_ACK_TIMEOUT_MS = 1000;
 constexpr double NETWORK_AUDIO_PREBUFFER_SECONDS = 0.55;
 constexpr qint64 NETWORK_SPECTRUM_MAX_PENDING_BYTES = 4 * 1024 * 1024;
 constexpr int AUDIO_RELAY_HEADER_BYTES = 12;
@@ -405,6 +405,19 @@ bool frequencyListChanged(const QVector<double> &a, const QVector<double> &b, do
         }
     }
     return false;
+}
+
+bool jsonValuesEquivalent(const QJsonValue &left, const QJsonValue &right) {
+    if (left.type() != right.type()) {
+        if (left.isDouble() && right.isDouble()) {
+            return std::abs(left.toDouble() - right.toDouble()) <= 0.5;
+        }
+        return false;
+    }
+    if (left.isDouble()) {
+        return std::abs(left.toDouble() - right.toDouble()) <= 0.5;
+    }
+    return left == right;
 }
 
 double autoTuneRoundingStepHz(double frequencyHz, double visibleSpanHz) {
@@ -1101,7 +1114,7 @@ YourClassName::YourClassName(QWidget *parent)
     resize(1920, 1000);
     setMinimumSize(1180, 720);
 
-    QStringList devices = getFobosDevices();
+    refreshFobosDeviceList();
 
     centralWidget = new QWidget(this);
     QScrollArea *graphScrollArea = new QScrollArea(this);
@@ -1456,9 +1469,8 @@ YourClassName::YourClassName(QWidget *parent)
     sampleBox = new QComboBox(this);
     clkBox = new QComboBox(this);
     languageComboBox = new QComboBox(this);
-    languageComboBox->addItem("English", QStringLiteral("en"));
+    populateLanguageCombo(languageComboBox);
     languageComboBox->hide();
-    languageComboBox->addItem(QString::fromUtf8("Українська"), QStringLiteral("uk"));
     
     audioCheckbox = new QCheckBox("Audio", this);
     markTranslatable(audioCheckbox, QStringLiteral("audio"), QStringLiteral("Audio"));
@@ -1477,31 +1489,7 @@ YourClassName::YourClassName(QWidget *parent)
     graphCheckbox->hide();
     colorCheckbox->hide();
 
-    comboBox->addItems(getFobosDevices());
-    for (int i = 0; i < comboBox->count(); ++i) {
-        comboBox->setItemData(i, i);
-    }
-    const QVector<RtlSdrDeviceInfo> initialRtlDevices = enumerateRtlSdrDevices();
-    int comboDataIndex = availableFobosDevices.size();
-    if (!initialRtlDevices.isEmpty()) {
-        for (const RtlSdrDeviceInfo &rtlInfo : initialRtlDevices) {
-            if (comboBox->count() <= comboDataIndex) {
-                break;
-            }
-            comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(rtlInfo.nativeIndex));
-            ++comboDataIndex;
-        }
-    } else if (comboBox->count() > comboDataIndex) {
-        comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(0));
-        ++comboDataIndex;
-    }
-    if (comboBox->count() > comboDataIndex) {
-        comboBox->setItemData(comboDataIndex, RTL_TCP_DEVICE_INDEX);
-        ++comboDataIndex;
-    }
-    if (comboBox->count() > comboDataIndex) {
-        comboBox->setItemData(comboDataIndex, SOAPY_SDR_DEVICE_INDEX);
-    }
+    rebuildReceiverDeviceCombo();
     modeBox->addItem("RF", INPUT_RF);
     modeBox->addItem("HF1 + HF2", INPUT_HF_COMBINED);
     modeBox->addItem("HF1", INPUT_HF1);
@@ -1537,8 +1525,12 @@ YourClassName::YourClassName(QWidget *parent)
     networkSettingsDebounceTimer = new QTimer(this);
     networkSettingsDebounceTimer->setSingleShot(true);
     connect(networkSettingsDebounceTimer, &QTimer::timeout, this, [this]() {
-        sendRemoteControlCommand("settings");
+        sendRemoteControlCommand("setParameters");
     });
+    networkSettingsAckTimer = new QTimer(this);
+    networkSettingsAckTimer->setSingleShot(true);
+    networkSettingsAckTimer->setInterval(NETWORK_SETTINGS_ACK_TIMEOUT_MS);
+    connect(networkSettingsAckTimer, &QTimer::timeout, this, &YourClassName::handleNetworkSettingsAckTimeout);
     connectDataProcessorSignals();
     
     graphWidget = new MyGraphWidget(this);
@@ -3022,59 +3014,19 @@ YourClassName::YourClassName(QWidget *parent)
     connect(modeBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onDirectSamplingChanged);
     connect(clkBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onClkChanged);
     connect(refreshButton, &QPushButton::clicked, [this]() {
-        refreshFobosDeviceList(true);
+        if (isNetworkClientMode()) {
+            sendRemoteControlCommand(QStringLiteral("refreshDevices"));
+            return;
+        }
 
-        comboBox->blockSignals(true);
-        comboBox->clear();
-        QStringList deviceLabels;
-        for (const FobosDeviceInfo &info : std::as_const(availableFobosDevices)) {
-            deviceLabels << info.label;
-        }
-        const QVector<RtlSdrDeviceInfo> rtlDevices = enumerateRtlSdrDevices();
-        if (rtlDevices.isEmpty()) {
-            deviceLabels << QStringLiteral("RTL-SDR native auto (rtlsdr.dll)");
-        } else {
-            for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
-                deviceLabels << rtlSdrNativeDeviceLabel(rtlInfo.nativeIndex, rtlInfo.name);
-            }
-        }
-        deviceLabels << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
-        deviceLabels << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
-        if (deviceLabels.isEmpty()) {
-            deviceLabels << uiText(QStringLiteral("no_fobos_devices_detected"),
-                                   QStringLiteral("No Fobos devices detected"));
-        }
-        comboBox->addItems(deviceLabels);
-        for (int i = 0; i < availableFobosDevices.size() && i < comboBox->count(); ++i) {
-            comboBox->setItemData(i, i);
-        }
-        int comboDataIndex = availableFobosDevices.size();
-        if (!rtlDevices.isEmpty()) {
-            for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
-                if (comboBox->count() <= comboDataIndex) {
-                    break;
-                }
-                comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(rtlInfo.nativeIndex));
-                ++comboDataIndex;
-            }
-        } else if (comboBox->count() > comboDataIndex) {
-            comboBox->setItemData(comboDataIndex, rtlSdrNativeComboValue(0));
-            ++comboDataIndex;
-        }
-        if (comboBox->count() > comboDataIndex) {
-            comboBox->setItemData(comboDataIndex, RTL_TCP_DEVICE_INDEX);
-            ++comboDataIndex;
-        }
-        if (comboBox->count() > comboDataIndex) {
-            comboBox->setItemData(comboDataIndex, SOAPY_SDR_DEVICE_INDEX);
-        }
-        if (!availableFobosDevices.isEmpty()) {
+        refreshFobosDeviceList(true);
+        rebuildReceiverDeviceCombo();
+        if (!availableFobosDevices.isEmpty() && comboBox) {
             pendingSettings.deviceIndex = comboBox->currentData().toInt();
             if (!isRtlBackendSelected() && isKnownRtlSampleRate(pendingSettings.sampleRate)) {
                 pendingSettings.sampleRate = FOBOS_DEFAULT_SAMPLE_RATE;
             }
         }
-        comboBox->blockSignals(false);
         if (sampleBox) {
             sampleBox->clear();
             populateSampleRates();
@@ -3114,6 +3066,12 @@ YourClassName::YourClassName(QWidget *parent)
             populateSampleRates();
         }
         qDebug() << "[FobosDevices] selected logical device" << pendingSettings.deviceIndex;
+        if (persistentSettingsReady) {
+            savePersistentSettings();
+        }
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+        }
     });
     connect(fobosButton, &QPushButton::clicked, this, &YourClassName::listFobosDevices);
     connect(networkButton, &QPushButton::clicked, this, &YourClassName::openNetworkSettingsDialog);
@@ -3130,10 +3088,13 @@ YourClassName::YourClassName(QWidget *parent)
                 }
             }
             QTimer::singleShot(0, this, [this]() {
-                sendRemoteControlCommand(runState == RadioRunState::Running ? "start" : "settings");
+                sendRemoteControlCommand(QStringLiteral("requestServerState"));
             });
         } else if (networkMode == NetworkMode::Server && runState == RadioRunState::Running) {
             applyServerLocalOutputPolicy();
+            sendServerStateToClients();
+        } else if (networkMode == NetworkMode::Server) {
+            sendServerStateToClients();
         }
     });
     connect(networkController, &NetworkController::channelError, this, [this](const QString &message) {
@@ -3500,7 +3461,7 @@ YourClassName::YourClassName(QWidget *parent)
         if (nextLanguage.isEmpty() || nextLanguage == uiLanguage) {
             return;
         }
-        uiLanguage = nextLanguage == QStringLiteral("uk") ? QStringLiteral("uk") : QStringLiteral("en");
+        uiLanguage = normalizedUiLanguage(nextLanguage);
         applyUiLanguage();
         savePersistentSettings();
     });
@@ -3878,6 +3839,12 @@ YourClassName::YourClassName(QWidget *parent)
         }
         updateAgileScanControls();
         updateScanMeasurementStatus();
+        if (persistentSettingsReady) {
+            savePersistentSettings();
+        }
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+        }
     });
     connect(scanMeasurementBinSpin,
             QOverload<double>::of(&QDoubleSpinBox::valueChanged),
@@ -3887,6 +3854,12 @@ YourClassName::YourClassName(QWidget *parent)
                                                      SCAN_MEASUREMENT_MIN_BIN_MHZ,
                                                      SCAN_MEASUREMENT_MAX_BIN_MHZ);
                 clearScanMeasurement();
+                if (persistentSettingsReady) {
+                    savePersistentSettings();
+                }
+                if (isNetworkClientMode()) {
+                    scheduleRemoteSettingsCommand();
+                }
             });
     connect(scanMeasurementBaselineButton, &QPushButton::toggled, this, [this](bool checked) {
         scanMeasurementBaselineRecording = checked;
@@ -9533,8 +9506,7 @@ void YourClassName::openApplicationSettings() {
 
     QFormLayout *generalLayout = new QFormLayout();
     QComboBox *languageCombo = new QComboBox(&dialog);
-    languageCombo->addItem(QStringLiteral("English"), QStringLiteral("en"));
-    languageCombo->addItem(QString::fromUtf8("Українська"), QStringLiteral("uk"));
+    populateLanguageCombo(languageCombo);
     languageCombo->setCurrentIndex(languageCombo->findData(uiLanguage));
     if (languageCombo->currentIndex() < 0) {
         languageCombo->setCurrentIndex(0);
@@ -9653,7 +9625,7 @@ void YourClassName::openApplicationSettings() {
 
     auto applyLanguage = [this, languageCombo]() {
         const QString nextLanguage = languageCombo->currentData().toString();
-        uiLanguage = nextLanguage == QStringLiteral("uk") ? QStringLiteral("uk") : QStringLiteral("en");
+        uiLanguage = normalizedUiLanguage(nextLanguage);
         applyUiLanguage();
         savePersistentSettings();
     };
@@ -10401,6 +10373,8 @@ bool YourClassName::applyListeningScanTarget(double targetFrequencyHz, const cha
     settingRange();
     if (isNetworkClientMode()) {
         scheduleRemoteSettingsCommand(80);
+    } else if (networkMode == NetworkMode::Server) {
+        sendServerStateToClients();
     }
 
     listeningScanSettleTimer.restart();
@@ -10998,6 +10972,266 @@ void YourClassName::applyNetworkStateFromCommand(const QJsonObject &command) {
     onNetworkStatusChanged(networkController ? networkController->statusText() : QString());
 }
 
+QJsonObject YourClassName::networkSettingsPatch(const QJsonObject &settings) const {
+    if (!networkClientConfirmedSettingsValid) {
+        return settings;
+    }
+
+    QJsonObject patch;
+    for (auto it = settings.constBegin(); it != settings.constEnd(); ++it) {
+        const QJsonValue confirmedValue = networkClientConfirmedSettingsJson.value(it.key());
+        if (!networkClientConfirmedSettingsJson.contains(it.key()) ||
+            !jsonValuesEquivalent(it.value(), confirmedValue)) {
+            patch.insert(it.key(), it.value());
+        }
+    }
+    return patch;
+}
+
+void YourClassName::applyAuthoritativeNetworkState(const QJsonObject &command) {
+    const RadioSettings previousSettings = pendingSettings;
+    const int previousFftLength = pendingSettings.fftLength;
+    const QJsonObject settings = command.value(QStringLiteral("settings")).toObject();
+
+    applyNetworkStateFromCommand(command);
+    applyReceiverDeviceListFromJson(command.value(QStringLiteral("receiverDevices")).toArray());
+    applySettingsFromJson(settings, false);
+    publishSettingsToGlobals();
+    if (previousFftLength != pendingSettings.fftLength) {
+        applyFftLengthChange(pendingSettings.fftLength, false);
+    }
+    updateUiFromPendingSettings();
+    updateUiForRunState();
+
+    const bool demodSettingsChanged =
+        previousSettings.modulationType != pendingSettings.modulationType ||
+        std::abs(previousSettings.bandwidth - pendingSettings.bandwidth) > 0.5 ||
+        std::abs(previousSettings.audioLowPassHz - pendingSettings.audioLowPassHz) > 0.5 ||
+        std::abs(previousSettings.audioHighPassHz - pendingSettings.audioHighPassHz) > 0.5 ||
+        previousSettings.audioEnabled != pendingSettings.audioEnabled;
+    if (demodSettingsChanged) {
+        updateDigitalDecoderMode();
+        updateVideoProcessorMode();
+        if (isClientIqProcessingMode() && audioProcessor) {
+            audioProcessor->configure(audioProcessorSettings());
+        }
+    }
+
+    if (!settings.isEmpty()) {
+        networkClientConfirmedSettingsJson = settings;
+        networkClientConfirmedSettingsValid = true;
+    }
+    networkClientAwaitingSettingsAck = false;
+    if (networkSettingsAckTimer) {
+        networkSettingsAckTimer->stop();
+    }
+}
+
+void YourClassName::sendSettingsAckToPeer(const QString &peerId,
+                                          bool ok,
+                                          const QString &requestId,
+                                          const QString &reason) {
+    if (networkMode != NetworkMode::Server || !networkController || peerId.isEmpty()) {
+        return;
+    }
+
+    QJsonObject ack;
+    ack["type"] = "control";
+    ack["action"] = "settingsAck";
+    ack["ok"] = ok;
+    if (!requestId.isEmpty()) {
+        ack["requestId"] = requestId;
+    }
+    if (!reason.isEmpty()) {
+        ack["reason"] = reason;
+    }
+    appendNetworkState(ack);
+    ack["settings"] = settingsToJson();
+    ack["receiverDevices"] = receiverDeviceListToJson();
+    networkController->sendControlCommandToPeer(peerId, ack);
+}
+
+void YourClassName::startNetworkSettingsAckWait() {
+    if (!isNetworkClientMode()) {
+        return;
+    }
+
+    networkClientAwaitingSettingsAck = true;
+    if (networkSettingsAckTimer) {
+        networkSettingsAckTimer->start();
+    }
+}
+
+void YourClassName::handleNetworkSettingsAckTimeout() {
+    if (!isNetworkClientMode() || !networkClientAwaitingSettingsAck) {
+        return;
+    }
+
+    networkClientAwaitingSettingsAck = false;
+    qDebug() << "[Network] settings ack timeout; restoring last confirmed server state";
+    if (networkClientConfirmedSettingsValid) {
+        const int previousFftLength = pendingSettings.fftLength;
+        applySettingsFromJson(networkClientConfirmedSettingsJson, false);
+        publishSettingsToGlobals();
+        if (previousFftLength != pendingSettings.fftLength) {
+            applyFftLengthChange(pendingSettings.fftLength, false);
+        }
+        updateUiFromPendingSettings();
+        updateUiForRunState();
+    }
+    sendRemoteControlCommand(QStringLiteral("requestServerState"));
+}
+
+void YourClassName::buildLocalReceiverDeviceChoices(QStringList &labels, QVector<int> &values) const {
+    labels.clear();
+    values.clear();
+
+    for (int i = 0; i < availableFobosDevices.size(); ++i) {
+        labels << availableFobosDevices.at(i).label;
+        values << i;
+    }
+
+    const QVector<RtlSdrDeviceInfo> rtlDevices = enumerateRtlSdrDevices();
+    if (rtlDevices.isEmpty()) {
+        labels << QStringLiteral("RTL-SDR native auto (rtlsdr.dll)");
+        values << rtlSdrNativeComboValue(0);
+    } else {
+        for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
+            labels << rtlSdrNativeDeviceLabel(rtlInfo.nativeIndex, rtlInfo.name);
+            values << rtlSdrNativeComboValue(rtlInfo.nativeIndex);
+        }
+    }
+
+    labels << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
+    values << RTL_TCP_DEVICE_INDEX;
+    labels << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
+    values << SOAPY_SDR_DEVICE_INDEX;
+
+    if (labels.isEmpty()) {
+        labels << uiText(QStringLiteral("no_fobos_devices_detected"),
+                         QStringLiteral("No Fobos devices detected"));
+        values << 0;
+    }
+}
+
+void YourClassName::rebuildReceiverDeviceCombo() {
+    if (!comboBox) {
+        return;
+    }
+
+    QStringList labels;
+    QVector<int> values;
+    if (isNetworkClientMode() && remoteReceiverDeviceListValid) {
+        labels = remoteReceiverDeviceLabels;
+        values = remoteReceiverDeviceValues;
+    } else {
+        if (!isNetworkClientMode() &&
+            !deviceOpened &&
+            !(processor && processor->isRunning()) &&
+            availableFobosDevices.isEmpty()) {
+            refreshFobosDeviceList();
+        }
+        buildLocalReceiverDeviceChoices(labels, values);
+    }
+
+    if (labels.size() != values.size()) {
+        labels.clear();
+        values.clear();
+    }
+    if (labels.isEmpty()) {
+        labels << (isNetworkClientMode()
+                       ? QStringLiteral("Waiting for server receiver list...")
+                       : uiText(QStringLiteral("no_fobos_devices_detected"),
+                                QStringLiteral("No Fobos devices detected")));
+        values << pendingSettings.deviceIndex;
+    }
+
+    QSignalBlocker blocker(comboBox);
+    comboBox->clear();
+    for (int i = 0; i < labels.size(); ++i) {
+        comboBox->addItem(labels.at(i), values.at(i));
+    }
+
+    int selectedIndex = comboBox->findData(pendingSettings.deviceIndex);
+    if (selectedIndex < 0 &&
+        pendingSettings.deviceIndex >= 0 &&
+        pendingSettings.deviceIndex < comboBox->count()) {
+        selectedIndex = pendingSettings.deviceIndex;
+    }
+    if (selectedIndex < 0 && comboBox->count() > 0) {
+        selectedIndex = 0;
+    }
+    if (selectedIndex >= 0) {
+        comboBox->setCurrentIndex(selectedIndex);
+        bool ok = false;
+        const int selectedDevice = comboBox->itemData(selectedIndex).toInt(&ok);
+        if (ok) {
+            pendingSettings.deviceIndex = selectedDevice;
+        }
+    }
+}
+
+QJsonArray YourClassName::receiverDeviceListToJson() const {
+    QStringList labels;
+    QVector<int> values;
+    buildLocalReceiverDeviceChoices(labels, values);
+
+    QJsonArray array;
+    const int count = std::min(labels.size(), values.size());
+    for (int i = 0; i < count; ++i) {
+        QJsonObject object;
+        object["label"] = labels.at(i);
+        object["deviceIndex"] = values.at(i);
+        array.append(object);
+    }
+    return array;
+}
+
+bool YourClassName::applyReceiverDeviceListFromJson(const QJsonArray &devices) {
+    QStringList labels;
+    QVector<int> values;
+    for (const QJsonValue &value : devices) {
+        const QJsonObject object = value.toObject();
+        const QString label = object.value(QStringLiteral("label")).toString().trimmed();
+        if (label.isEmpty()) {
+            continue;
+        }
+        labels << label;
+        values << object.value(QStringLiteral("deviceIndex")).toInt(values.size());
+    }
+
+    remoteReceiverDeviceLabels = labels;
+    remoteReceiverDeviceValues = values;
+    remoteReceiverDeviceListValid = !labels.isEmpty() && labels.size() == values.size();
+    rebuildReceiverDeviceCombo();
+    return remoteReceiverDeviceListValid;
+}
+
+void YourClassName::clearRemoteReceiverDeviceList() {
+    remoteReceiverDeviceLabels.clear();
+    remoteReceiverDeviceValues.clear();
+    remoteReceiverDeviceListValid = false;
+    rebuildReceiverDeviceCombo();
+}
+
+void YourClassName::sendServerStateToClients() {
+    if (networkMode != NetworkMode::Server || !networkController || !networkController->isControlReady()) {
+        return;
+    }
+    if (!isRunningOrTransitioning() && !(processor && processor->isRunning())) {
+        refreshFobosDeviceList();
+        rebuildReceiverDeviceCombo();
+    }
+
+    QJsonObject state;
+    state["type"] = "control";
+    state["action"] = "serverState";
+    appendNetworkState(state);
+    state["settings"] = settingsToJson();
+    state["receiverDevices"] = receiverDeviceListToJson();
+    networkController->sendControlCommand(state);
+}
+
 void YourClassName::handleDataProcessorFailure(int errorCode, bool stoppedByRequest) {
     const bool unexpectedCleanEnd = errorCode == FOBOS_ERR_OK;
     qDebug() << "[FobosLifecycle] DataProcessor reader failure"
@@ -11576,6 +11810,8 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["listeningScanTargetsMhz"] = listeningScanTargetsMhz;
     settings["listeningScanDwellMs"] = listeningScanDwellMs;
     settings["listeningScanSettleMs"] = listeningScanSettleMs;
+    settings["scanMeasurementEnabled"] = scanMeasurementEnabled;
+    settings["scanMeasurementBinMhz"] = scanMeasurementBinMhz;
     settings["qthLatitude"] = qthLatitude;
     settings["qthLongitude"] = qthLongitude;
     settings["qthSource"] = qthSource;
@@ -11634,29 +11870,41 @@ bool YourClassName::sendRemoteControlCommand(const QString &action, const QJsonO
         return false;
     }
 
-    if (action != QStringLiteral("settings")) {
+    if (action != QStringLiteral("setParameters") &&
+        action != QStringLiteral("settings")) {
         cancelPendingRemoteSettingsCommand();
     }
 
     const bool controlActionAllowed =
         action == QStringLiteral("requestPriority") ||
-        action == QStringLiteral("priorityResponse");
+        action == QStringLiteral("priorityResponse") ||
+        action == QStringLiteral("requestServerState");
     if (!networkController->clientHasControl() && !controlActionAllowed) {
         qDebug() << "[Network] remote command blocked because this client is observer" << action;
         return false;
     }
 
-    if (action == QStringLiteral("settings") || action == QStringLiteral("start")) {
-        networkClientSettingsGuardTimer.restart();
+    const bool carriesSettings =
+        action == QStringLiteral("setParameters") ||
+        action == QStringLiteral("settings") ||
+        action == QStringLiteral("start");
+    QJsonObject currentSettings;
+    if (carriesSettings) {
+        refreshSettingsFromUi();
+        currentSettings = settingsToJson();
     }
-
-    refreshSettingsFromUi();
 
     QJsonObject command;
     command["type"] = "control";
     command["action"] = action;
     appendNetworkState(command);
-    command["settings"] = settingsToJson();
+    if (carriesSettings) {
+        command["requestId"] = QString::number(++networkClientSettingsRequestCounter);
+        command["settings"] =
+            action == QStringLiteral("setParameters")
+                ? networkSettingsPatch(currentSettings)
+                : currentSettings;
+    }
     for (auto it = extra.constBegin(); it != extra.constEnd(); ++it) {
         command[it.key()] = it.value();
     }
@@ -11665,6 +11913,9 @@ bool YourClassName::sendRemoteControlCommand(const QString &action, const QJsonO
     if (!sent) {
         qDebug() << "[Network] remote command could not be sent" << action;
     } else {
+        if (carriesSettings) {
+            startNetworkSettingsAckWait();
+        }
         qDebug() << "[Network] remote command sent" << action;
     }
     return sent;
@@ -11677,17 +11928,15 @@ void YourClassName::scheduleRemoteSettingsCommand(int delayMs) {
         return;
     }
 
-    networkClientSettingsGuardTimer.restart();
-
     if (!networkSettingsDebounceTimer) {
-        sendRemoteControlCommand("settings");
+        sendRemoteControlCommand("setParameters");
         return;
     }
 
     const int clampedDelayMs = (std::clamp)(delayMs, 0, 1000);
     if (clampedDelayMs == 0) {
         networkSettingsDebounceTimer->stop();
-        sendRemoteControlCommand("settings");
+        sendRemoteControlCommand("setParameters");
         return;
     }
 
@@ -11702,7 +11951,7 @@ void YourClassName::cancelPendingRemoteSettingsCommand() {
     }
 }
 
-void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
+void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool normalizeAfterApply) {
     auto readInt = [&settingsJson](const char *key, int currentValue) {
         return settingsJson.contains(key) ? settingsJson.value(key).toInt(currentValue) : currentValue;
     };
@@ -11789,6 +12038,16 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
     listeningScanSettleMs = (std::clamp)(readInt("listeningScanSettleMs", listeningScanSettleMs),
                                          LISTENING_SCAN_MIN_SETTLE_MS,
                                          LISTENING_SCAN_MAX_SETTLE_MS);
+    const bool previousScanMeasurementEnabled = scanMeasurementEnabled;
+    const double previousScanMeasurementBinMhz = scanMeasurementBinMhz;
+    scanMeasurementEnabled = readBool("scanMeasurementEnabled", scanMeasurementEnabled);
+    scanMeasurementBinMhz = (std::clamp)(readDouble("scanMeasurementBinMhz", scanMeasurementBinMhz),
+                                         SCAN_MEASUREMENT_MIN_BIN_MHZ,
+                                         SCAN_MEASUREMENT_MAX_BIN_MHZ);
+    if (previousScanMeasurementEnabled != scanMeasurementEnabled ||
+        std::abs(previousScanMeasurementBinMhz - scanMeasurementBinMhz) > 0.000001) {
+        clearScanMeasurement();
+    }
     qthLatitude = (std::clamp)(readDouble("qthLatitude", qthLatitude), -90.0, 90.0);
     qthLongitude = (std::clamp)(readDouble("qthLongitude", qthLongitude), -180.0, 180.0);
     qthSource = settingsJson.value("qthSource").toString(qthSource).trimmed();
@@ -11908,7 +12167,9 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson) {
         spurSuppressionCheckbox->setChecked(spurSuppressionEnabled);
     }
     updateSpurSuppressionStatus();
-    normalizeTuning(pendingSettings);
+    if (normalizeAfterApply) {
+        normalizeTuning(pendingSettings);
+    }
 }
 
 void YourClassName::loadUiTranslations() {
@@ -11922,6 +12183,7 @@ void YourClassName::loadUiTranslations() {
 
     uiTranslations = QJsonObject();
     uiTranslations[QStringLiteral("en")] = baseLanguage({
+        {"__language_name", "English"},
         {"controls", "Controls"},
         {"digital_audio", "Digital Audio"},
         {"video", "Video"},
@@ -12162,6 +12424,7 @@ void YourClassName::loadUiTranslations() {
         {"gnss_raw_logged", "GNSS raw context written to the log."}
     });
     uiTranslations[QStringLiteral("uk")] = baseLanguage({
+        {"__language_name", "Ukrainian"},
         {"controls", "Керування"},
         {"digital_audio", "Цифрове аудіо"},
         {"video", "Відео"},
@@ -12257,9 +12520,13 @@ void YourClassName::loadUiTranslations() {
             continue;
         }
         const QJsonObject externalRoot = document.object();
-        for (const QString &language : {QStringLiteral("en"), QStringLiteral("uk")}) {
+        for (auto langIt = externalRoot.constBegin(); langIt != externalRoot.constEnd(); ++langIt) {
+            const QString language = langIt.key().trimmed();
+            if (language.isEmpty() || language.startsWith(QLatin1Char('_')) || !langIt.value().isObject()) {
+                continue;
+            }
             QJsonObject merged = uiTranslations.value(language).toObject();
-            const QJsonObject externalLanguage = externalRoot.value(language).toObject();
+            const QJsonObject externalLanguage = langIt.value().toObject();
             for (auto it = externalLanguage.constBegin(); it != externalLanguage.constEnd(); ++it) {
                 merged[it.key()] = it.value();
             }
@@ -12268,10 +12535,76 @@ void YourClassName::loadUiTranslations() {
         qDebug() << "[Translations] loaded" << path;
         break;
     }
+
+    uiLanguageNames.clear();
+    uiLanguageOrder.clear();
+    auto rememberLanguage = [this](const QString &code) {
+        if (code.isEmpty() || code.startsWith(QLatin1Char('_')) || !uiTranslations.value(code).isObject()) {
+            return;
+        }
+        if (!uiLanguageOrder.contains(code)) {
+            uiLanguageOrder.append(code);
+        }
+        const QJsonObject language = uiTranslations.value(code).toObject();
+        QString name = language.value(QStringLiteral("__language_name")).toString().trimmed();
+        if (name.isEmpty()) {
+            name = code.toUpper();
+        }
+        uiLanguageNames.insert(code, name);
+    };
+
+    rememberLanguage(QStringLiteral("en"));
+    rememberLanguage(QStringLiteral("uk"));
+
+    QStringList extraLanguages;
+    for (const QString &code : uiTranslations.keys()) {
+        if (code == QStringLiteral("en") ||
+            code == QStringLiteral("uk") ||
+            code.startsWith(QLatin1Char('_')) ||
+            !uiTranslations.value(code).isObject()) {
+            continue;
+        }
+        extraLanguages.append(code);
+    }
+    extraLanguages.sort(Qt::CaseInsensitive);
+    for (const QString &code : extraLanguages) {
+        rememberLanguage(code);
+    }
+    uiLanguage = normalizedUiLanguage(uiLanguage);
+}
+
+QString YourClassName::normalizedUiLanguage(const QString &language) const {
+    const QString code = language.trimmed();
+    if (!code.isEmpty() && uiTranslations.value(code).isObject()) {
+        return code;
+    }
+    if (uiTranslations.value(QStringLiteral("en")).isObject()) {
+        return QStringLiteral("en");
+    }
+    for (const QString &fallbackCode : uiLanguageOrder) {
+        if (uiTranslations.value(fallbackCode).isObject()) {
+            return fallbackCode;
+        }
+    }
+    return QStringLiteral("en");
+}
+
+void YourClassName::populateLanguageCombo(QComboBox *combo) const {
+    if (!combo) {
+        return;
+    }
+    const QSignalBlocker blocker(combo);
+    combo->clear();
+    for (const QString &code : uiLanguageOrder) {
+        combo->addItem(uiLanguageNames.value(code, code.toUpper()), code);
+    }
+    if (combo->count() == 0) {
+        combo->addItem(QStringLiteral("English"), QStringLiteral("en"));
+    }
 }
 
 QString YourClassName::uiText(const QString &key, const QString &fallback) const {
-    const QJsonObject language = uiTranslations.value(uiLanguage).toObject();
+    const QJsonObject language = uiTranslations.value(normalizedUiLanguage(uiLanguage)).toObject();
     const QString translated = language.value(key).toString();
     if (!translated.isEmpty()) {
         return translated;
@@ -12400,6 +12733,22 @@ void YourClassName::applyUiLanguage() {
     setComboItemText(modeBox, static_cast<int>(INPUT_HF_NOISE_CANCEL),
                      QStringLiteral("hf_cancel_lab"),
                      QStringLiteral("HF1 - HF2 cancel lab"));
+    setComboItemText(dmrLabCallTypeCombo,
+                     QStringLiteral("group"),
+                     QStringLiteral("dmr_group"),
+                     QStringLiteral("Group"));
+    setComboItemText(dmrLabCallTypeCombo,
+                     QStringLiteral("private"),
+                     QStringLiteral("dmr_private"),
+                     QStringLiteral("Private"));
+    setComboItemText(dmrLabCallTypeCombo,
+                     QStringLiteral("all_call"),
+                     QStringLiteral("dmr_all"),
+                     QStringLiteral("All"));
+    setComboItemText(dmrAmbeLayoutCombo,
+                     DMR_AMBE_LAYOUT_AUTO,
+                     QStringLiteral("auto"),
+                     QStringLiteral("Auto"));
     setComboItemText(recordingModeCombo,
                      static_cast<int>(RecordingManager::Mode::AudioWav),
                      QStringLiteral("audio_wav"),
@@ -13476,9 +13825,7 @@ void YourClassName::loadPersistentSettings() {
     }
     updateSpurSuppressionStatus();
     volumePercent = (std::clamp)(settings.value("audio/volumePercent", volumePercent).toInt(), 0, 200);
-    uiLanguage = settings.value("ui/language", uiLanguage).toString() == QStringLiteral("uk")
-                     ? QStringLiteral("uk")
-                     : QStringLiteral("en");
+    uiLanguage = normalizedUiLanguage(settings.value("ui/language", uiLanguage).toString());
     fineTuneControlMode = (std::clamp)(settings.value("ui/fineTuneControlMode", fineTuneControlMode).toInt(),
                                        FINE_TUNE_MODE_SCALE,
                                        FINE_TUNE_MODE_DIAL);
@@ -14012,6 +14359,24 @@ void YourClassName::applyLiveRemoteSettings(const RadioSettings &previousSetting
         }
     }
 
+    const bool demodSettingsChanged =
+        previousSettings.modulationType != pendingSettings.modulationType ||
+        std::abs(previousSettings.bandwidth - pendingSettings.bandwidth) > 0.5 ||
+        std::abs(previousSettings.audioLowPassHz - pendingSettings.audioLowPassHz) > 0.5 ||
+        std::abs(previousSettings.audioHighPassHz - pendingSettings.audioHighPassHz) > 0.5;
+    if (demodSettingsChanged) {
+        qDebug() << "[Network] applying live demod settings"
+                 << "modulation" << pendingSettings.modulationType
+                 << "bandwidth" << pendingSettings.bandwidth
+                 << "audioLPF" << pendingSettings.audioLowPassHz
+                 << "audioHPF" << pendingSettings.audioHighPassHz;
+        updateDigitalDecoderMode();
+        updateVideoProcessorMode();
+        if (audioProcessor) {
+            audioProcessor->configure(audioProcessorSettings());
+        }
+    }
+
     if (std::abs(previousSettings.sampleRate - pendingSettings.sampleRate) > 0.5 ||
         previousSettings.inputMode != pendingSettings.inputMode ||
         previousSettings.clockSource != pendingSettings.clockSource) {
@@ -14037,6 +14402,17 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
 
     if (networkMode == NetworkMode::Client && command.value("type").toString() == "control") {
         const QString action = command.value("action").toString();
+        if (action == QStringLiteral("serverState") ||
+            action == QStringLiteral("settingsAck")) {
+            const bool ok = command.value(QStringLiteral("ok")).toBool(true);
+            if (!ok) {
+                qDebug() << "[Network] settings command rejected by server"
+                         << command.value(QStringLiteral("reason")).toString();
+            }
+            applyAuthoritativeNetworkState(command);
+            return;
+        }
+
         if (action == QStringLiteral("role")) {
             const bool canControl = command.value("canControl").toBool(true);
             const QString peerLabel = command.value("peerLabel").toString();
@@ -14095,6 +14471,11 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
     const QString peerId = command.value("_networkPeerId").toString();
     const QString peerLabel = command.value("_networkPeerLabel").toString(QStringLiteral("unknown client"));
     const bool peerIsController = command.value("_networkPeerIsController").toBool(true);
+
+    if (action == QStringLiteral("requestServerState")) {
+        sendServerStateToClients();
+        return;
+    }
 
     if (action == QStringLiteral("requestPriority")) {
         if (!networkController || peerId.isEmpty()) {
@@ -14177,6 +14558,13 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         return;
     }
 
+    if (action == QStringLiteral("refreshDevices")) {
+        refreshFobosDeviceList(true);
+        rebuildReceiverDeviceCombo();
+        sendServerStateToClients();
+        return;
+    }
+
     const NetworkProcessingMode previousProcessingMode = networkProcessingMode;
     const bool previousServerDisableLocalVisualAudio = serverDisableLocalVisualAudio;
     applyNetworkStateFromCommand(command);
@@ -14184,7 +14572,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         previousServerDisableLocalVisualAudio != serverDisableLocalVisualAudio;
     qDebug() << "[Network] received remote control command" << action;
 
-    if (action == "settings" || action == "start") {
+    if (action == "setParameters" || action == "settings" || action == "start") {
         const RadioSettings previousSettings = pendingSettings;
         const bool previousAgileScanEnabled = agileScanEnabled;
         const QString previousAgileScanRangesMhz = agileScanRangesMhz;
@@ -14192,9 +14580,13 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         const bool previousStandardScanEnabled = standardScanEnabled;
         const QString previousStandardScanCentersMhz = standardScanCentersMhz;
         const int previousStandardScanDwellMs = standardScanDwellMs;
+        const int previousStandardScanSettleMs = standardScanSettleMs;
+        const QString previousStandardScanRangeStartMhz = standardScanRangeStartMhz;
+        const QString previousStandardScanRangeEndMhz = standardScanRangeEndMhz;
         const bool previousListeningScanEnabled = listeningScanEnabled;
         const QString previousListeningScanTargetsMhz = listeningScanTargetsMhz;
         const int previousListeningScanDwellMs = listeningScanDwellMs;
+        const int previousListeningScanSettleMs = listeningScanSettleMs;
         applySettingsFromJson(settingsJson);
         publishSettingsToGlobals();
         updateUiFromPendingSettings();
@@ -14214,11 +14606,15 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         const bool standardScanChanged =
             previousStandardScanEnabled != standardScanEnabled ||
             previousStandardScanCentersMhz != standardScanCentersMhz ||
-            previousStandardScanDwellMs != standardScanDwellMs;
+            previousStandardScanDwellMs != standardScanDwellMs ||
+            previousStandardScanSettleMs != standardScanSettleMs ||
+            previousStandardScanRangeStartMhz != standardScanRangeStartMhz ||
+            previousStandardScanRangeEndMhz != standardScanRangeEndMhz;
         const bool listeningScanChanged =
             previousListeningScanEnabled != listeningScanEnabled ||
             previousListeningScanTargetsMhz != listeningScanTargetsMhz ||
-            previousListeningScanDwellMs != listeningScanDwellMs;
+            previousListeningScanDwellMs != listeningScanDwellMs ||
+            previousListeningScanSettleMs != listeningScanSettleMs;
 
         if (fftChanged) {
             applyFftLengthChange(pendingSettings.fftLength, false);
@@ -14257,6 +14653,8 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         if (processor && processor->isRunning()) {
             updateIqFrameProducerSettings();
         }
+        sendSettingsAckToPeer(peerId, true, command.value(QStringLiteral("requestId")).toString());
+        sendServerStateToClients();
     }
 
     if (action == "start") {
@@ -14326,18 +14724,8 @@ void YourClassName::sendNetworkSpectrumFrame(const std::vector<float> &frequenci
         frameMaxFrequency = frequencies.back();
     }
     double frameListeningFrequency = pendingSettings.listeningFrequency;
-    const bool scanListeningValid =
-        !scanSegments.isEmpty() &&
-        actualFrequencyInsideScanSegments(frameListeningFrequency, scanSegments);
-    if (!std::isfinite(frameListeningFrequency) ||
-        (!scanListeningValid &&
-         (scanSegments.isEmpty() ||
-          frameListeningFrequency < frameMinFrequency ||
-          frameListeningFrequency > frameMaxFrequency))) {
-        frameListeningFrequency =
-            !scanSegments.isEmpty()
-                ? fallbackActualFrequencyForScanSegments(scanSegments, frameCenterFrequency)
-                : frameCenterFrequency;
+    if (!std::isfinite(frameListeningFrequency)) {
+        frameListeningFrequency = frameCenterFrequency;
     }
 
     auto lower = std::lower_bound(frequencies.begin(), frequencies.begin() + dataCount, static_cast<float>(frameMinFrequency));
@@ -14518,63 +14906,11 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
     const double frameMinFrequency = frame.value("minFrequency").toDouble(minFrequency);
     const double frameMaxFrequency = frame.value("maxFrequency").toDouble(maxFrequency);
     const double frameCenterFrequency = frame.value("centerFrequency").toDouble(pendingSettings.centerFrequency);
-    const double frameListeningFrequency = frame.value("listeningFrequency").toDouble(pendingSettings.listeningFrequency);
-    const double frameSampleRate = frame.value("sampleRate").toDouble(pendingSettings.sampleRate);
-    const double frameBandwidth = frame.value("bandwidth").toDouble(pendingSettings.bandwidth);
-    const int frameModulationType = frame.value("modulationType").toInt(pendingSettings.modulationType);
-    const int frameInputMode = (std::clamp)(frame.value("inputMode").toInt(pendingSettings.inputMode),
-                                            static_cast<int>(INPUT_RF),
-                                            static_cast<int>(INPUT_HF_NOISE_CANCEL));
     const QVector<ScanVisualSegment> frameScanSegments = scanSegmentsFromFrame(frame);
-
-    const bool protectLocalControlSettings =
-        networkController &&
-        networkController->clientHasControl() &&
-        networkClientSettingsGuardTimer.isValid() &&
-        networkClientSettingsGuardTimer.elapsed() < NETWORK_CLIENT_SETTINGS_GUARD_MS;
-
-    double displayCenterFrequency = frameCenterFrequency;
-    double displayListeningFrequency = frameListeningFrequency;
-    double displayBandwidth = frameBandwidth;
-    int displayModulationType = frameModulationType;
-
-    if (protectLocalControlSettings) {
-        displayCenterFrequency = pendingSettings.centerFrequency;
-        displayListeningFrequency = pendingSettings.listeningFrequency;
-        displayBandwidth = pendingSettings.bandwidth;
-        displayModulationType = pendingSettings.modulationType;
-    } else {
-        bool settingsChanged = false;
-        auto updateDouble = [&settingsChanged](double &target, double value) {
-            if (std::isfinite(value) && std::abs(target - value) > 0.5) {
-                target = value;
-                settingsChanged = true;
-            }
-        };
-        auto updateInt = [&settingsChanged](int &target, int value) {
-            if (target != value) {
-                target = value;
-                settingsChanged = true;
-            }
-        };
-
-        updateDouble(pendingSettings.centerFrequency, frameCenterFrequency);
-        updateDouble(pendingSettings.listeningFrequency, frameListeningFrequency);
-        updateDouble(pendingSettings.sampleRate, frameSampleRate);
-        updateDouble(pendingSettings.bandwidth, frameBandwidth);
-        updateInt(pendingSettings.modulationType, frameModulationType);
-        updateInt(pendingSettings.inputMode, frameInputMode);
-
-        if (settingsChanged) {
-            normalizeTuning(pendingSettings);
-            displayCenterFrequency = pendingSettings.centerFrequency;
-            displayListeningFrequency = pendingSettings.listeningFrequency;
-            displayBandwidth = pendingSettings.bandwidth;
-            displayModulationType = pendingSettings.modulationType;
-            updateUiFromPendingSettings();
-        }
-        publishSettingsToGlobals();
-    }
+    const double displayCenterFrequency = frameCenterFrequency;
+    const double displayListeningFrequency = pendingSettings.listeningFrequency;
+    const double displayBandwidth = pendingSettings.bandwidth;
+    const int displayModulationType = pendingSettings.modulationType;
 
     if (scaleWidget) {
         scaleWidget->setScanSegments(frameScanSegments);
@@ -14594,6 +14930,7 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
     updateFpvHunter(detectorFrequencies,
                     magnitudes);
     updateDigitalVideoHunter(detectorFrequencies, magnitudes);
+    updateScanMeasurement(detectorFrequencies, magnitudes);
 
     const int frameFftLength = static_cast<int>(frequencies.size());
     const bool spectrumShapeChanged =
@@ -14662,6 +14999,16 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
                     peakReferenceMagnitude;
             }
         }
+        const std::vector<float> graphMeasurementFrequencies =
+            !frameScanSegments.isEmpty()
+                ? actualFrequenciesFromScanSegments(graphFrequencies, frameScanSegments)
+                : std::vector<float>();
+        const std::vector<float> &measurementFrequencies =
+            graphMeasurementFrequencies.size() == graphFrequencies.size()
+                ? graphMeasurementFrequencies
+                : graphFrequencies;
+        const std::vector<float> measurementOverlay =
+            scanMeasurementOverlay(measurementFrequencies, graphTargetCount);
 
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
         graphWidget->setScanSegments(frameScanSegments);
@@ -14671,8 +15018,9 @@ void YourClassName::displayNetworkSpectrumFrame(const QJsonObject &frame) {
                              frameMaxFrequency,
                              graphTargetCount,
                              colorf);
-        graphWidget->setOverlayData(graphReferenceMagnitudes,
-                                    static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
+        graphWidget->setOverlayData(!measurementOverlay.empty() ? measurementOverlay : graphReferenceMagnitudes,
+                                    !measurementOverlay.empty() ||
+                                        static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
     }
     if (waterfallWidget) {
         waterfallWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength,
@@ -14738,63 +15086,11 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
     }
 
     const double frameCenterFrequency = frame.value("centerFrequency").toDouble(pendingSettings.centerFrequency);
-    const double frameListeningFrequency = frame.value("listeningFrequency").toDouble(pendingSettings.listeningFrequency);
-    const double frameSampleRate = frame.value("sampleRate").toDouble(pendingSettings.sampleRate);
-    const double frameBandwidth = frame.value("bandwidth").toDouble(pendingSettings.bandwidth);
-    const int frameModulationType = frame.value("modulationType").toInt(pendingSettings.modulationType);
-    const int frameInputMode = (std::clamp)(frame.value("inputMode").toInt(pendingSettings.inputMode),
-                                            static_cast<int>(INPUT_RF),
-                                            static_cast<int>(INPUT_HF_NOISE_CANCEL));
     const QVector<ScanVisualSegment> frameScanSegments = scanSegmentsFromFrame(frame);
-
-    const bool protectLocalControlSettings =
-        networkController &&
-        networkController->clientHasControl() &&
-        networkClientSettingsGuardTimer.isValid() &&
-        networkClientSettingsGuardTimer.elapsed() < NETWORK_CLIENT_SETTINGS_GUARD_MS;
-
-    double displayCenterFrequency = frameCenterFrequency;
-    double displayListeningFrequency = frameListeningFrequency;
-    double displayBandwidth = frameBandwidth;
-    int displayModulationType = frameModulationType;
-
-    if (protectLocalControlSettings) {
-        displayCenterFrequency = pendingSettings.centerFrequency;
-        displayListeningFrequency = pendingSettings.listeningFrequency;
-        displayBandwidth = pendingSettings.bandwidth;
-        displayModulationType = pendingSettings.modulationType;
-    } else {
-        bool settingsChanged = false;
-        auto updateDouble = [&settingsChanged](double &target, double value) {
-            if (std::isfinite(value) && std::abs(target - value) > 0.5) {
-                target = value;
-                settingsChanged = true;
-            }
-        };
-        auto updateInt = [&settingsChanged](int &target, int value) {
-            if (target != value) {
-                target = value;
-                settingsChanged = true;
-            }
-        };
-
-        updateDouble(pendingSettings.centerFrequency, frameCenterFrequency);
-        updateDouble(pendingSettings.listeningFrequency, frameListeningFrequency);
-        updateDouble(pendingSettings.sampleRate, frameSampleRate);
-        updateDouble(pendingSettings.bandwidth, frameBandwidth);
-        updateInt(pendingSettings.modulationType, frameModulationType);
-        updateInt(pendingSettings.inputMode, frameInputMode);
-
-        if (settingsChanged) {
-            normalizeTuning(pendingSettings);
-            displayCenterFrequency = pendingSettings.centerFrequency;
-            displayListeningFrequency = pendingSettings.listeningFrequency;
-            displayBandwidth = pendingSettings.bandwidth;
-            displayModulationType = pendingSettings.modulationType;
-            updateUiFromPendingSettings();
-        }
-        publishSettingsToGlobals();
-    }
+    const double displayCenterFrequency = frameCenterFrequency;
+    const double displayListeningFrequency = pendingSettings.listeningFrequency;
+    const double displayBandwidth = pendingSettings.bandwidth;
+    const int displayModulationType = pendingSettings.modulationType;
 
     if (scaleWidget) {
         scaleWidget->setScanSegments(frameScanSegments);
@@ -14814,6 +15110,7 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
     updateFpvHunter(detectorFrequencies,
                     magnitudes);
     updateDigitalVideoHunter(detectorFrequencies, magnitudes);
+    updateScanMeasurement(detectorFrequencies, magnitudes);
 
     const bool spectrumShapeChanged =
         !networkSpectrumFrameMetadataValid ||
@@ -14874,6 +15171,16 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
                     peakReferenceMagnitude;
             }
         }
+        const std::vector<float> graphMeasurementFrequencies =
+            !frameScanSegments.isEmpty()
+                ? actualFrequenciesFromScanSegments(graphFrequencies, frameScanSegments)
+                : std::vector<float>();
+        const std::vector<float> &measurementFrequencies =
+            graphMeasurementFrequencies.size() == graphFrequencies.size()
+                ? graphMeasurementFrequencies
+                : graphFrequencies;
+        const std::vector<float> measurementOverlay =
+            scanMeasurementOverlay(measurementFrequencies, graphTargetCount);
 
         graphWidget->setLevelRange(displayLevelMin, displayLevelMax);
         graphWidget->setScanSegments(frameScanSegments);
@@ -14883,8 +15190,9 @@ void YourClassName::displayNetworkSpectrumFrameBinary(const QJsonObject &frame, 
                              frameMaxFrequency,
                              graphTargetCount,
                              colorf);
-        graphWidget->setOverlayData(graphReferenceMagnitudes,
-                                    static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
+        graphWidget->setOverlayData(!measurementOverlay.empty() ? measurementOverlay : graphReferenceMagnitudes,
+                                    !measurementOverlay.empty() ||
+                                        static_cast<int>(graphReferenceMagnitudes.size()) == graphTargetCount);
     }
     if (waterfallWidget) {
         waterfallWidget->setData(frequencies, magnitudes, frameMinFrequency, frameMaxFrequency, frameFftLength,
@@ -16265,47 +16573,6 @@ void YourClassName::handleNetworkIqPayload(const QJsonObject &frame, QByteArray 
         if (audioProcessor) {
             audioProcessor->configure(iqSettings);
         }
-    } else {
-        const bool protectLocalControlSettings =
-            networkController &&
-            networkController->clientHasControl() &&
-            networkClientSettingsGuardTimer.isValid() &&
-            networkClientSettingsGuardTimer.elapsed() < NETWORK_CLIENT_SETTINGS_GUARD_MS;
-        bool processingSettingsChanged = false;
-        auto updateDouble = [&processingSettingsChanged](double &target, double value) {
-            if (std::abs(target - value) > 0.5) {
-                target = value;
-                processingSettingsChanged = true;
-            }
-        };
-        auto updateInt = [&processingSettingsChanged](int &target, int value) {
-            if (target != value) {
-                target = value;
-                processingSettingsChanged = true;
-            }
-        };
-
-        if (!protectLocalControlSettings) {
-            updateDouble(pendingSettings.sampleRate, iqSettings.sampleRate);
-            updateDouble(pendingSettings.centerFrequency, iqSettings.centerFrequency);
-            updateDouble(pendingSettings.actualFrequency, iqSettings.actualFrequency);
-            updateDouble(pendingSettings.listeningFrequency, iqSettings.listeningFrequency);
-            updateDouble(pendingSettings.bandwidth, iqSettings.bandwidth);
-            updateInt(pendingSettings.modulationType, iqSettings.modulationType);
-            updateInt(pendingSettings.inputMode, iqSettings.inputMode);
-        } else if (fobosVerboseLoggingEnabled()) {
-            qDebug() << "[NetworkIQ] preserving local controller tuning while settings command settles"
-                     << "frameCenter" << iqSettings.centerFrequency
-                     << "frameListening" << iqSettings.listeningFrequency
-                     << "localCenter" << pendingSettings.centerFrequency
-                     << "localListening" << pendingSettings.listeningFrequency
-                     << "guardMs" << networkClientSettingsGuardTimer.elapsed();
-        }
-
-        if (processingSettingsChanged && !protectLocalControlSettings) {
-            publishSettingsToGlobals();
-            settingRange();
-        }
     }
 
     const bool streamShapeChanged =
@@ -16384,8 +16651,8 @@ void YourClassName::updateUiForRunState() {
             runState == RadioRunState::Running;
         stopButton->setEnabled(canStop && (clientCanControl || isNetworkClientMode()));
     }
-    if (comboBox) comboBox->setEnabled(idle);
-    if (refreshButton) refreshButton->setEnabled(idle);
+    if (comboBox) comboBox->setEnabled(idle && clientCanControl);
+    if (refreshButton) refreshButton->setEnabled(idle && clientCanControl);
     if (fobosButton) fobosButton->setEnabled(idle);
     if (modeBox) modeBox->setEnabled(true);
     if (sampleBox) sampleBox->setEnabled(true);
@@ -16968,7 +17235,7 @@ void YourClassName::updateTuningFromScale(double tunedListeningFrequency, double
     }
     settingRange();
     if (isNetworkClientMode()) {
-        scheduleRemoteSettingsCommand();
+        scheduleRemoteSettingsCommand(0);
     }
 }
 
@@ -17622,6 +17889,7 @@ void YourClassName::openNetworkSettingsDialog() {
         if (networkMode == NetworkMode::Disabled) {
             if (previousNetworkMode == NetworkMode::Client) {
                 stopNetworkClientProcessing();
+                clearRemoteReceiverDeviceList();
             } else if (previousNetworkMode == NetworkMode::Server && runState == RadioRunState::Running) {
                 if (audioProcessor) {
                     audioProcessor->setLocalPlaybackEnabled(true);
@@ -17643,12 +17911,14 @@ void YourClassName::openNetworkSettingsDialog() {
 
         if (previousNetworkMode == NetworkMode::Client && networkMode != NetworkMode::Client) {
             stopNetworkClientProcessing();
+            clearRemoteReceiverDeviceList();
         }
 
         if (remoteAudioPlayer && networkMode != NetworkMode::Client) {
             remoteAudioPlayer->stop();
         }
         if (networkMode == NetworkMode::Server) {
+            clearRemoteReceiverDeviceList();
             networkController->startServer(networkBindAddress, networkControlPort);
             const bool restartRequired =
                 runState == RadioRunState::Running &&
@@ -17671,6 +17941,9 @@ void YourClassName::openNetworkSettingsDialog() {
             }
         }
 
+        if (networkMode == NetworkMode::Client) {
+            clearRemoteReceiverDeviceList();
+        }
         networkController->testClientConnection(networkServerAddress, networkControlPort);
         savePersistentSettings();
     });
@@ -17689,6 +17962,7 @@ void YourClassName::openNetworkSettingsDialog() {
         }
         if (previousNetworkMode == NetworkMode::Client) {
             stopNetworkClientProcessing();
+            clearRemoteReceiverDeviceList();
         } else if (previousNetworkMode == NetworkMode::Server && runState == RadioRunState::Running) {
             if (audioProcessor) {
                 audioProcessor->setLocalPlaybackEnabled(true);
@@ -17961,6 +18235,11 @@ void YourClassName::populateSampleRates() {
         }
         qDebug() << "[FobosDevices] using fallback sample-rate list; no local receiver is required for client control";
     };
+
+    if (isNetworkClientMode()) {
+        addDefaultSampleRates();
+        return;
+    }
 
     void *sampleRateDevice = activeFobosDevice();
     FobosApiKind sampleRateApiKind = activeFobosApiKind;
@@ -18666,7 +18945,9 @@ void YourClassName::applyListeningFrequencyDelta(double deltaHz, int networkDela
 
     settingRange();
     if (isNetworkClientMode()) {
-        scheduleRemoteSettingsCommand(networkDelayMs);
+        scheduleRemoteSettingsCommand((std::min)(networkDelayMs, 20));
+    } else if (networkMode == NetworkMode::Server) {
+        sendServerStateToClients();
     }
 }
 
@@ -18717,7 +18998,9 @@ void YourClassName::onListeningFrequencyEntered() {
     settingRange();
     savePersistentSettings();
     if (isNetworkClientMode()) {
-        scheduleRemoteSettingsCommand();
+        scheduleRemoteSettingsCommand(0);
+    } else if (networkMode == NetworkMode::Server) {
+        sendServerStateToClients();
     }
 }
     
@@ -18779,7 +19062,9 @@ void YourClassName::onFrequencyEntered() {
         savePersistentSettings();
     }
     if (isNetworkClientMode()) {
-        scheduleRemoteSettingsCommand();
+        scheduleRemoteSettingsCommand(0);
+    } else if (networkMode == NetworkMode::Server) {
+        sendServerStateToClients();
     }
 }
 
@@ -18984,23 +19269,8 @@ QStringList YourClassName::getFobosDevices() {
     }
 
     QStringList deviceList;
-    for (const FobosDeviceInfo &info : std::as_const(availableFobosDevices)) {
-        deviceList << info.label;
-    }
-    const QVector<RtlSdrDeviceInfo> rtlDevices = enumerateRtlSdrDevices();
-    if (rtlDevices.isEmpty()) {
-        deviceList << QStringLiteral("RTL-SDR native auto (rtlsdr.dll)");
-    } else {
-        for (const RtlSdrDeviceInfo &rtlInfo : rtlDevices) {
-            deviceList << rtlSdrNativeDeviceLabel(rtlInfo.nativeIndex, rtlInfo.name);
-        }
-    }
-    deviceList << QStringLiteral("RTL-SDR via rtl_tcp (127.0.0.1:1234)");
-    deviceList << QStringLiteral("SoapySDR auto (SoapySDR.dll)");
-    if (deviceList.isEmpty()) {
-        deviceList << uiText(QStringLiteral("no_fobos_devices_detected"),
-                             QStringLiteral("No Fobos devices detected"));
-    }
+    QVector<int> values;
+    buildLocalReceiverDeviceChoices(deviceList, values);
     return deviceList;
 }
 
@@ -19296,13 +19566,13 @@ void YourClassName::settingRange() {
     const double availableRange = (std::max)(1.0, overallMax - overallMin);
     newRange = (std::clamp)(newRange, 1.0, availableRange);
 
-    double clampedListening = (std::clamp)(pendingSettings.listeningFrequency, overallMin, overallMax);
-	double newMin = clampedListening - newRange / 2.0;
+    const double displayAnchorListening = (std::clamp)(pendingSettings.listeningFrequency, overallMin, overallMax);
+	double newMin = displayAnchorListening - newRange / 2.0;
     newMin = (std::clamp)(newMin, overallMin, overallMax - newRange);
     double newMax = newMin + newRange;
     minFrequency = newMin;
     maxFrequency = newMax;
-    scaleWidget->setTuning(clampedListening, globalFrequency, globalBandwidth, globalModulationType);
+    scaleWidget->setTuning(pendingSettings.listeningFrequency, globalFrequency, globalBandwidth, globalModulationType);
     scaleWidget->setRange(minFrequency, maxFrequency);
     updateFineTuneLabel();
 }

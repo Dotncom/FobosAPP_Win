@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.2.2)
+project(FobosAPP VERSION 4.3.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -202,30 +202,6 @@ elseif(NOT WIN32)
 endif()
 
 install(TARGETS FobosAPP RUNTIME DESTINATION bin)
-
-add_executable(dmr_lab_replay
-    tools/dmr_lab_replay.cpp
-    src/dmrdecoder.cpp
-    src/dmrdecoder.h
-    src/dmrvocoder.cpp
-    src/dmrvocoder.h
-)
-
-target_include_directories(dmr_lab_replay PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/FobosDMRVoiceBackend-gpl/include
-)
-
-target_link_libraries(dmr_lab_replay PRIVATE
-    Qt5::Core
-)
-
-if(FOBOS_HAS_MBELIB_NEO)
-    target_link_libraries(dmr_lab_replay PRIVATE mbe_neo::mbe_static)
-    target_compile_definitions(dmr_lab_replay PRIVATE FOBOSAPP_HAS_MBELIB_NEO=1)
-endif()
-
-install(TARGETS dmr_lab_replay RUNTIME DESTINATION bin)
 
 if(UNIX AND NOT APPLE)
     install(FILES packaging/linux/99-fobos-sdr.rules

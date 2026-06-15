@@ -91,6 +91,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private Spinner inputSpinner;
     private Spinner modulationSpinner;
     private CheckBox audioCheck;
+    private CheckBox bindTuningToCenterCheck;
     private CheckBox suppressServerCheck;
     private CheckBox fullResolutionSpectrumCheck;
     private CheckBox generalBandMarkersCheck;
@@ -110,7 +111,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private Button usbReadButton;
     private Button usbCloseButton;
     private Button usbSampleButton;
+    private Button usbNativeBenchButton;
     private Button usbToolsButton;
+    private Button usbTargetButton;
     private TextView statusText;
     private TextView levelMinLabel;
     private TextView levelMaxLabel;
@@ -145,13 +148,22 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private boolean showGeneralBandMarkers = false;
     private boolean showAmateurBandMarkers = false;
     private boolean usbToolsVisible = false;
+    private boolean bindListeningToCenter = false;
+    private int usbReceiverTarget = UsbSandbox.USB_TARGET_AUTO;
     private int receiverMode = RECEIVER_MODE_NETWORK;
     private long lastPanRetuneMs = 0L;
 
-    private final double[] sampleRates = new double[] {
+    private boolean sampleRateOptionsAreRtl = false;
+
+    private final double[] fobosSampleRates = new double[] {
             8_000_000.0, 10_000_000.0, 12_500_000.0, 16_000_000.0,
             20_000_000.0, 25_000_000.0, 32_000_000.0, 40_000_000.0,
             50_000_000.0, 64_000_000.0, 80_000_000.0
+    };
+    private final double[] rtlSampleRates = new double[] {
+            256_000.0, 300_000.0, 1_024_000.0, 1_400_000.0,
+            1_800_000.0, 2_048_000.0, 2_400_000.0, 2_560_000.0,
+            2_880_000.0, 3_200_000.0
     };
     private final int[] fftLengths = new int[] {
             2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072,
@@ -411,7 +423,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         usbReadButton = button("OTG read");
         usbCloseButton = button("OTG close");
         usbSampleButton = button("OTG sample test");
+        usbNativeBenchButton = button("Native bench");
         usbToolsButton = button("Tools");
+        usbTargetButton = button("USB Auto");
         usbScanButton.setOnClickListener(v -> scanUsbDevices());
         usbPermissionButton.setOnClickListener(v -> requestUsbPermission());
         usbOpenButton.setOnClickListener(v -> openUsbOtgSession());
@@ -419,16 +433,19 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         usbReadButton.setOnClickListener(v -> readUsbOtgProbe());
         usbCloseButton.setOnClickListener(v -> closeUsbOtgSession());
         usbSampleButton.setOnClickListener(v -> runUsbOtgSampleTest());
+        usbNativeBenchButton.setOnClickListener(v -> runUsbOtgNativeBenchmark());
         usbToolsButton.setOnClickListener(v -> toggleUsbTools());
-        usbPrimaryRow.addView(usbInfoButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
-        usbPrimaryRow.addView(usbToolsButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbTargetButton.setOnClickListener(v -> cycleUsbReceiverTarget());
+        usbPrimaryRow.addView(usbTargetButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbPrimaryRow.addView(usbInfoButton, new LinearLayout.LayoutParams(0, dp(44), 0.8f));
+        usbPrimaryRow.addView(usbToolsButton, new LinearLayout.LayoutParams(0, dp(44), 0.8f));
         usbToolsRow.addView(usbScanButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         usbToolsRow.addView(usbPermissionButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         usbSessionRow.addView(usbOpenButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         usbSessionRow.addView(usbReadButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         usbSessionRow.addView(usbCloseButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
-        usbSampleRow.addView(usbSampleButton, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
+        usbSampleRow.addView(usbSampleButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
+        usbSampleRow.addView(usbNativeBenchButton, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         updateUsbToolsVisibility();
 
         LinearLayout freqRow = row();
@@ -484,7 +501,35 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         suppressServerCheck.setTextColor(0xffe7edf2);
         suppressServerCheck.setChecked(true);
         suppressServerCheck.setOnCheckedChangeListener((buttonView, isChecked) -> scheduleSettingsApply(FAST_APPLY_DELAY_MS));
+        bindTuningToCenterCheck = new CheckBox(this);
+        bindTuningToCenterCheck.setText("Center=tune");
+        bindTuningToCenterCheck.setTextColor(0xffe7edf2);
+        bindTuningToCenterCheck.setChecked(bindListeningToCenter);
+        bindTuningToCenterCheck.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (suppressUiCallbacks) {
+                bindListeningToCenter = isChecked;
+                return;
+            }
+            bindListeningToCenter = isChecked;
+            collectSettingsFromUi();
+            enforceListeningCenterBinding();
+            setFrequencyTextsFromSettings(true);
+            if (spectrumView != null) {
+                spectrumView.setListeningFrequency(settings.listeningFrequency);
+            }
+            savePrefs();
+            applyRetuneSettingsNow(false);
+        });
+        Button toneButton = button("Tone");
+        toneButton.setOnClickListener(v -> {
+            if (audioPlayer != null) {
+                audioPlayer.playTestTone();
+                statusText.setText("Audio test tone");
+            }
+        });
         optionsRow.addView(audioCheck, new LinearLayout.LayoutParams(0, dp(44), 0.7f));
+        optionsRow.addView(toneButton, new LinearLayout.LayoutParams(0, dp(44), 0.6f));
+        optionsRow.addView(bindTuningToCenterCheck, new LinearLayout.LayoutParams(0, dp(44), 1.0f));
         optionsRow.addView(suppressServerCheck, new LinearLayout.LayoutParams(0, dp(44), 1.3f));
 
         LinearLayout markerRow = row();
@@ -543,6 +588,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         updateBandMarkerVisibility();
         spectrumView.setTuneRequestListener(frequencyHz -> {
             tuneToFrequency(frequencyHz, true);
+        });
+        spectrumView.setCenterTuneRequestListener(frequencyHz -> {
+            centerToFrequency(frequencyHz, true);
         });
         spectrumView.setPanTuneRequestListener(deltaHz -> applySpectrumPanDelta(deltaHz));
 
@@ -695,9 +743,94 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         appendUsbLog(usbSandbox.runReceiverSampleTest());
     }
 
+    private void runUsbOtgNativeBenchmark() {
+        Log.d(USB_LOG_TAG, "OTG native benchmark button clicked");
+        if (usbSandbox == null) {
+            appendLog("[USB] sandbox is not ready");
+            return;
+        }
+        appendUsbLog(usbSandbox.runNativeBulkBenchmark());
+    }
+
     private void toggleUsbTools() {
         usbToolsVisible = !usbToolsVisible;
         updateUsbToolsVisibility();
+    }
+
+    private void cycleUsbReceiverTarget() {
+        if (usbReceiverTarget == UsbSandbox.USB_TARGET_AUTO) {
+            usbReceiverTarget = UsbSandbox.USB_TARGET_RTL_SDR;
+        } else if (usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR) {
+            usbReceiverTarget = UsbSandbox.USB_TARGET_FOBOS;
+        } else {
+            usbReceiverTarget = UsbSandbox.USB_TARGET_AUTO;
+        }
+        if (usbSandbox != null) {
+            appendUsbLogIfNotEmpty(usbSandbox.closeReceiverSession());
+        }
+        applyUsbReceiverTarget();
+        appendLog("USB target: " + usbReceiverTargetLabel());
+        savePrefs();
+    }
+
+    private void applyUsbReceiverTarget() {
+        if (usbSandbox != null) {
+            usbSandbox.setPreferredReceiverTarget(usbReceiverTarget);
+        }
+        if (usbTargetButton != null) {
+            usbTargetButton.setText("USB " + usbReceiverTargetLabel());
+        }
+        normalizeSettingsForReceiverTarget();
+        refreshSampleRateOptions(false);
+        updateReceiverTargetControls();
+    }
+
+    private String usbReceiverTargetLabel() {
+        if (usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR) {
+            return "RTL";
+        }
+        if (usbReceiverTarget == UsbSandbox.USB_TARGET_FOBOS) {
+            return "Fobos";
+        }
+        return "Auto";
+    }
+
+    private boolean isRtlUsbTarget() {
+        return usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR;
+    }
+
+    private void normalizeSettingsForReceiverTarget() {
+        if (!isRtlUsbTarget()) {
+            return;
+        }
+        settings.inputMode = RadioSettings.INPUT_RF;
+        if (!isFinite(settings.centerFrequency) || settings.centerFrequency < RF_MIN_CENTER_FREQUENCY) {
+            settings.centerFrequency = isFinite(settings.listeningFrequency) &&
+                    settings.listeningFrequency >= RF_MIN_LISTENING_FREQUENCY
+                    ? settings.listeningFrequency
+                    : 100_000_000.0;
+        }
+        settings.actualFrequency = settings.centerFrequency;
+        if (!isFinite(settings.listeningFrequency) ||
+                settings.listeningFrequency < RF_MIN_LISTENING_FREQUENCY ||
+                settings.listeningFrequency > RF_EXPERIMENTAL_MAX_FREQUENCY) {
+            settings.listeningFrequency = settings.centerFrequency;
+        }
+    }
+
+    private void updateReceiverTargetControls() {
+        if (inputSpinner == null) {
+            return;
+        }
+        boolean rtl = isRtlUsbTarget();
+        boolean previousSuppress = suppressUiCallbacks;
+        suppressUiCallbacks = true;
+        if (rtl) {
+            inputSpinner.setSelection(RadioSettings.INPUT_RF, false);
+        }
+        inputSpinner.setEnabled(!rtl);
+        inputSpinner.setAlpha(rtl ? 0.55f : 1.0f);
+        suppressUiCallbacks = previousSuppress;
     }
 
     private void updateUsbToolsVisibility() {
@@ -750,6 +883,10 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void applyUsbOtgPreviewSettings(boolean logExplicitly) {
+        applyUsbOtgPreviewSettings(logExplicitly, true);
+    }
+
+    private void applyUsbOtgPreviewSettings(boolean logExplicitly, boolean collectUi) {
         if (!isUsbOtgPreviewRunning()) {
             if (logExplicitly) {
                 appendUsbLog("[USB OTG] settings will apply on next Start");
@@ -757,7 +894,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return;
         }
         localSettingsGuardUntilMs = SystemClock.uptimeMillis() + REMOTE_ECHO_GUARD_MS;
-        collectSettingsFromUi();
+        if (collectUi) {
+            collectSettingsFromUi();
+        }
         String message = usbSandbox.applyReceiverPreviewSettings(
                 settings.centerFrequency,
                 settings.listeningFrequency,
@@ -777,6 +916,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 settings.inputMode,
                 settings.modulationType,
                 settings.bandwidth));
+        Log.d(USB_LOG_TAG, "applyUsbOtgPreviewSettings result " + message);
         if (logExplicitly) {
             appendUsbLog(message);
         }
@@ -866,15 +1006,21 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private void collectSettingsFromUi() {
+        if (isRtlUsbTarget()) {
+            settings.inputMode = RadioSettings.INPUT_RF;
+        }
         int sampleIndex = sampleRateSpinner.getSelectedItemPosition();
-        if (sampleIndex >= 0 && sampleIndex < sampleRates.length) {
-            settings.sampleRate = sampleRates[sampleIndex];
+        double[] rates = activeSampleRates();
+        if (sampleIndex >= 0 && sampleIndex < rates.length) {
+            settings.sampleRate = rates[sampleIndex];
         }
         int fftIndex = fftSpinner.getSelectedItemPosition();
         if (fftIndex >= 0 && fftIndex < fftLengths.length) {
             settings.fftLength = fftLengths[fftIndex];
         }
-        settings.inputMode = Math.max(0, inputSpinner.getSelectedItemPosition());
+        settings.inputMode = isRtlUsbTarget()
+                ? RadioSettings.INPUT_RF
+                : Math.max(0, inputSpinner.getSelectedItemPosition());
         double requestedListening =
                 safeDouble(listenEdit.getText().toString(), settings.listeningFrequency / 1_000_000.0) *
                         1_000_000.0;
@@ -900,8 +1046,19 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         if (modulationIndex >= 0 && modulationIndex < modulationIds.length) {
             settings.modulationType = modulationIds[modulationIndex];
         }
+        enforceListeningCenterBinding();
         settings.audioEnabled = audioCheck.isChecked();
         audioPlaybackEnabled = settings.audioEnabled;
+    }
+
+    private void enforceListeningCenterBinding() {
+        if (!bindListeningToCenter || RadioSettings.isDirectInput(settings.inputMode)) {
+            return;
+        }
+        settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.centerFrequency));
+        settings.actualFrequency = settings.centerFrequency;
+        settings.listeningFrequency = settings.centerFrequency;
     }
 
     private void updateButtons() {
@@ -944,6 +1101,12 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         fineTuneHoldMode = prefs.getBoolean("fineTuneHoldMode", fineTuneHoldMode);
         showGeneralBandMarkers = prefs.getBoolean("showGeneralBandMarkers", showGeneralBandMarkers);
         showAmateurBandMarkers = prefs.getBoolean("showAmateurBandMarkers", showAmateurBandMarkers);
+        bindListeningToCenter = prefs.getBoolean("bindListeningToCenter", bindListeningToCenter);
+        usbReceiverTarget = prefs.getInt("usbReceiverTarget", UsbSandbox.USB_TARGET_AUTO);
+        if (usbReceiverTarget != UsbSandbox.USB_TARGET_RTL_SDR &&
+                usbReceiverTarget != UsbSandbox.USB_TARGET_FOBOS) {
+            usbReceiverTarget = UsbSandbox.USB_TARGET_AUTO;
+        }
         receiverMode = prefs.getInt("receiverMode", receiverMode) == RECEIVER_MODE_OTG
                 ? RECEIVER_MODE_OTG
                 : RECEIVER_MODE_NETWORK;
@@ -961,6 +1124,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         suppressUiCallbacks = true;
         audioCheck.setChecked(settings.audioEnabled);
         audioPlaybackEnabled = settings.audioEnabled;
+        bindTuningToCenterCheck.setChecked(bindListeningToCenter);
         fullResolutionSpectrumCheck.setChecked(fullResolutionSpectrumFrames);
         generalBandMarkersCheck.setChecked(showGeneralBandMarkers);
         amateurBandMarkersCheck.setChecked(showAmateurBandMarkers);
@@ -968,6 +1132,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         if (fineTuneDial != null) {
             fineTuneDial.setHoldOffsetMode(fineTuneHoldMode);
         }
+        applyUsbReceiverTarget();
         updateFineTuneModeButton();
         updateBandMarkerVisibility();
         suppressUiCallbacks = false;
@@ -999,6 +1164,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 .putBoolean("fineTuneHoldMode", fineTuneHoldMode)
                 .putBoolean("showGeneralBandMarkers", showGeneralBandMarkers)
                 .putBoolean("showAmateurBandMarkers", showAmateurBandMarkers)
+                .putBoolean("bindListeningToCenter", bindListeningToCenter)
+                .putInt("usbReceiverTarget", usbReceiverTarget)
                 .putInt("receiverMode", receiverMode)
                 .putBoolean("suppressServer", suppressServerCheck.isChecked())
                 .putFloat("levelMin", displayLevelMin)
@@ -1008,6 +1175,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
 
     private void updateControlsFromSettings(boolean force) {
         normalizeSettingsForCurrentInput();
+        refreshSampleRateOptions(false);
+        normalizeSettingsForReceiverTarget();
+        enforceListeningCenterBinding();
         suppressUiCallbacks = true;
         setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), force);
         setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), force);
@@ -1016,6 +1186,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         fftSpinner.setSelection(indexOfFftLength(settings.fftLength));
         inputSpinner.setSelection(Math.max(0, Math.min(inputSpinner.getCount() - 1, settings.inputMode)));
         modulationSpinner.setSelection(indexOfModulation(settings.modulationType));
+        updateReceiverTargetControls();
         boolean directInput = RadioSettings.isDirectInput(settings.inputMode);
         centerEdit.setEnabled(!directInput);
         centerEdit.setAlpha(directInput ? 0.55f : 1.0f);
@@ -1058,6 +1229,17 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         }
         if (!text.contentEquals(editText.getText())) {
             editText.setText(text);
+        }
+    }
+
+    private void setFrequencyTextsFromSettings(boolean force) {
+        boolean previousSuppress = suppressUiCallbacks;
+        suppressUiCallbacks = true;
+        try {
+            setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), force);
+            setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), force);
+        } finally {
+            suppressUiCallbacks = previousSuppress;
         }
     }
 
@@ -1337,19 +1519,25 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         } else {
             settings.listeningFrequency = Math.max(RF_MIN_LISTENING_FREQUENCY,
                     Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency));
-            double halfRate = Math.max(1.0, settings.sampleRate * 0.5);
-            if (settings.listeningFrequency < settings.centerFrequency - halfRate) {
+            if (bindListeningToCenter) {
                 settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
-                        Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency + halfRate));
+                        Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency));
                 settings.actualFrequency = settings.centerFrequency;
-            } else if (settings.listeningFrequency > settings.centerFrequency + halfRate) {
-                settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
-                        Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency - halfRate));
-                settings.actualFrequency = settings.centerFrequency;
+                settings.listeningFrequency = settings.centerFrequency;
+            } else {
+                double halfRate = Math.max(1.0, settings.sampleRate * 0.5);
+                if (settings.listeningFrequency < settings.centerFrequency - halfRate) {
+                    settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                            Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency + halfRate));
+                    settings.actualFrequency = settings.centerFrequency;
+                } else if (settings.listeningFrequency > settings.centerFrequency + halfRate) {
+                    settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                            Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.listeningFrequency - halfRate));
+                    settings.actualFrequency = settings.centerFrequency;
+                }
             }
         }
-        setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
-        setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
+        setFrequencyTextsFromSettings(true);
         scheduleSettingsApply(FAST_APPLY_DELAY_MS);
     }
 
@@ -1368,12 +1556,19 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                     settings.sampleRate,
                     frequencyHz);
         } else {
-            settings.listeningFrequency = Math.max(RF_MIN_LISTENING_FREQUENCY,
+            double clamped = Math.max(RF_MIN_LISTENING_FREQUENCY,
                     Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, frequencyHz));
-            keepRfListeningInsideVisiblePassband();
+            if (bindListeningToCenter) {
+                settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                        Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, clamped));
+                settings.actualFrequency = settings.centerFrequency;
+                settings.listeningFrequency = settings.centerFrequency;
+            } else {
+                settings.listeningFrequency = clamped;
+                keepRfListeningInsideVisiblePassband();
+            }
         }
-        setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
-        setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
+        setFrequencyTextsFromSettings(true);
         if (spectrumView != null) {
             spectrumView.setListeningFrequency(settings.listeningFrequency);
         }
@@ -1385,6 +1580,46 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 beforeListen / 1_000_000.0,
                 settings.listeningFrequency / 1_000_000.0,
                 settings.inputMode));
+        if (immediate) {
+            sendReliableSettingsNow();
+        } else {
+            scheduleSettingsApply(FAST_APPLY_DELAY_MS);
+        }
+    }
+
+    private void centerToFrequency(double frequencyHz, boolean immediate) {
+        if (!isFinite(frequencyHz)) {
+            return;
+        }
+        double beforeCenter = settings.centerFrequency;
+        double beforeListen = settings.listeningFrequency;
+        collectSettingsFromUi();
+        if (RadioSettings.isDirectInput(settings.inputMode)) {
+            return;
+        }
+        double oldCenter = settings.centerFrequency;
+        settings.centerFrequency = Math.max(RF_MIN_CENTER_FREQUENCY,
+                Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, frequencyHz));
+        settings.actualFrequency = settings.centerFrequency;
+        double appliedDelta = settings.centerFrequency - oldCenter;
+        if (bindListeningToCenter) {
+            settings.listeningFrequency = settings.centerFrequency;
+        }
+        setFrequencyTextsFromSettings(true);
+        if (spectrumView != null) {
+            if (Math.abs(appliedDelta) >= 1.0) {
+                spectrumView.shiftFrequencyDisplay(appliedDelta);
+            }
+            spectrumView.setListeningFrequency(settings.listeningFrequency);
+        }
+        Log.d(USB_LOG_TAG, String.format(Locale.US,
+                "centerToFrequency doubleTap %.3f MHz center %.3f->%.3f listen %.3f->%.3f bind %s",
+                frequencyHz / 1_000_000.0,
+                beforeCenter / 1_000_000.0,
+                settings.centerFrequency / 1_000_000.0,
+                beforeListen / 1_000_000.0,
+                settings.listeningFrequency / 1_000_000.0,
+                bindListeningToCenter));
         if (immediate) {
             sendReliableSettingsNow();
         } else {
@@ -1411,15 +1646,18 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                     Math.min(RF_EXPERIMENTAL_MAX_FREQUENCY, settings.centerFrequency + deltaHz));
             appliedDelta = settings.centerFrequency - oldCenter;
             settings.actualFrequency = settings.centerFrequency;
+            if (bindListeningToCenter) {
+                settings.listeningFrequency = settings.centerFrequency;
+            }
         }
         if (Math.abs(appliedDelta) < 1.0) {
             return;
         }
         if (spectrumView != null) {
             spectrumView.shiftFrequencyDisplay(appliedDelta);
+            spectrumView.setListeningFrequency(settings.listeningFrequency);
         }
-        setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), true);
-        setTextIfNotFocused(listenEdit, formatMhz(settings.listeningFrequency), true);
+        setFrequencyTextsFromSettings(true);
         Log.d(USB_LOG_TAG, String.format(Locale.US,
                 "pan delta %.0f applied %.0f center %.3f->%.3f listen %.3f->%.3f input %d",
                 deltaHz,
@@ -1449,7 +1687,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
 
     private void applyRetuneSettingsNow(boolean logExplicitly) {
         if (isUsbOtgPreviewRunning()) {
-            applyUsbOtgPreviewSettings(logExplicitly);
+            applyUsbOtgPreviewSettings(logExplicitly, false);
             return;
         }
         if (client != null && client.isConnected() && client.canControl()) {
@@ -1540,8 +1778,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 if (settings.inputMode != nextMode) {
                     settings.inputMode = nextMode;
                     int sampleIndex = sampleRateSpinner.getSelectedItemPosition();
-                    if (sampleIndex >= 0 && sampleIndex < sampleRates.length) {
-                        settings.sampleRate = sampleRates[sampleIndex];
+                    double[] rates = activeSampleRates();
+                    if (sampleIndex >= 0 && sampleIndex < rates.length) {
+                        settings.sampleRate = rates[sampleIndex];
                     }
                     if (RadioSettings.isDirectInput(nextMode)) {
                         settings.centerFrequency = 0.0;
@@ -1632,10 +1871,52 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         return new LinearLayout.LayoutParams(0, dp(42), 1.0f);
     }
 
+    private double[] activeSampleRates() {
+        return usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR ? rtlSampleRates : fobosSampleRates;
+    }
+
+    private void refreshSampleRateOptions(boolean force) {
+        if (sampleRateSpinner == null) {
+            return;
+        }
+        boolean rtlOptions = usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR;
+        if (!force && sampleRateOptionsAreRtl == rtlOptions &&
+                sampleRateSpinner.getAdapter() != null) {
+            return;
+        }
+        sampleRateOptionsAreRtl = rtlOptions;
+        boolean previousSuppress = suppressUiCallbacks;
+        suppressUiCallbacks = true;
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this,
+                android.R.layout.simple_spinner_item,
+                sampleRateLabels());
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        sampleRateSpinner.setAdapter(adapter);
+        settings.sampleRate = nearestSampleRate(settings.sampleRate);
+        sampleRateSpinner.setSelection(indexOfSampleRate(settings.sampleRate), false);
+        suppressUiCallbacks = previousSuppress;
+    }
+
+    private double nearestSampleRate(double value) {
+        double[] rates = activeSampleRates();
+        if (rates.length == 0) {
+            return value;
+        }
+        if (!isFinite(value) || value <= 0.0) {
+            return usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR ? 2_400_000.0 : rates[0];
+        }
+        if (usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR && value > 3_200_000.0) {
+            return 2_400_000.0;
+        }
+        return rates[indexOfSampleRate(value)];
+    }
+
     private String[] sampleRateLabels() {
-        String[] labels = new String[sampleRates.length];
-        for (int i = 0; i < sampleRates.length; ++i) {
-            labels[i] = formatMhz(sampleRates[i]);
+        double[] rates = activeSampleRates();
+        String[] labels = new String[rates.length];
+        for (int i = 0; i < rates.length; ++i) {
+            labels[i] = formatMhz(rates[i]);
         }
         return labels;
     }
@@ -1657,10 +1938,11 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private int indexOfSampleRate(double value) {
+        double[] rates = activeSampleRates();
         int best = 0;
         double bestDelta = Double.MAX_VALUE;
-        for (int i = 0; i < sampleRates.length; ++i) {
-            double delta = Math.abs(sampleRates[i] - value);
+        for (int i = 0; i < rates.length; ++i) {
+            double delta = Math.abs(rates[i] - value);
             if (delta < bestDelta) {
                 bestDelta = delta;
                 best = i;

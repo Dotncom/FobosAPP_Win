@@ -41,6 +41,37 @@ The useful 4.1 candidate is a GNSS/QTH laboratory release:
 6. Receiver-backend abstraction, RTL-SDR native/runtime loading, and optional SoapySDR runtime loading are now first-pass implemented.
 7. Startup/close freezes are tracked as a separate stability task; current logs show close can spend several seconds waiting while the IQ reader still receives blocks.
 
+## Network Synchronization Backlog
+
+Current near-term rule: keep Android lightweight, and use the desktop-to-desktop network path for heavier remote-control workflows.
+
+Implemented or in progress:
+
+1. Scan state is part of the desktop network settings contract:
+   - Agile scan enabled/ranges/step/auto-step;
+   - standard scan enabled/centers/dwell/settle/range start/range end;
+   - listening scan enabled/targets/dwell/settle;
+   - scan listening lock;
+   - spectrum measurement enabled/bin size.
+2. Scan visual frames carry scan segments so a desktop client can render stitched scan spectrum/waterfall views.
+
+Deferred until the feature modules are complete:
+
+1. DMR network sync:
+   - DMR lock/lab fields such as color code, timeslot, source ID, target ID, call type, radio label, and notes;
+   - DMR metadata/status events;
+   - DMR hunter settings if remote operation needs the detector state mirrored.
+2. GNSS network sync:
+   - GNSS acquisition/runtime status, plots, and reports;
+   - GNSS monitor history and spur-watch state;
+   - explicit remote commands for tune, scan, acquire, deep acquire, replay, and network time.
+
+Keep local by default:
+
+1. UI language, layout, collapsed panels, graph/waterfall levels, and local audio devices.
+2. Preset databases and band plans, unless a future explicit import/export or send-to-peer workflow is added.
+3. Measurement baseline/peak history, because it belongs to the operator's current analysis session.
+
 ## Active Focus: GNSS/GPS
 
 Goal: determine whether the current Fobos RF path can acquire real GNSS signals, then decide how far raw-SDR positioning should go inside FobosAPP.
