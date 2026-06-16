@@ -163,6 +163,7 @@ struct RadioSettings {
     int dmrLabSourceId = 0;
     int dmrLabTargetId = 0;
     int dmrBasebandSampleRate = DMR_DEFAULT_BASEBAND_SAMPLE_RATE;
+    int dmrChannelSampleRate = 0;
     bool dmrManualTimingEnabled = false;
     int dmrManualTimingOffset = 0;
     double dmrSlicerRatio = 0.625;

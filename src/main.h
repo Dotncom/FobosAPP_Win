@@ -107,6 +107,8 @@ class QDialog;
 class QStackedWidget;
 class QToolButton;
 class QthMapWidget;
+class DsdNeoBridge;
+class GopherTrunkBridge;
 extern int deviceID;
 
 class YourClassName : public QMainWindow {
@@ -232,7 +234,8 @@ private:
     void abandonFobosSessionWithoutClose(const char *reason);
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
-    bool applyFobosSettings();
+    bool applyFobosSettings(bool forceFrequencyApply = false);
+    bool performAgileStartupFrequencyJog();
     bool applyAgileScanSettings(bool forceStop = false);
     bool applyStandardScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
@@ -446,6 +449,10 @@ private:
     void processAptAudioFrame(const QByteArray &pcmData);
     void processWefaxAudioFrame(const QByteArray &pcmData);
     void updateDigitalDecoderMode();
+    int selectedDmrBackend() const;
+    QStringList dsdNeoProcessArguments() const;
+    void updateDsdNeoBridgeSettings();
+    void updateGopherTrunkBridgeSettings();
     bool isVideoDecodeActive() const;
     void processVideoIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     void processVideoSnapshotFrame();
@@ -486,7 +493,10 @@ private:
     QComboBox *dmrLabSlotCombo = nullptr;
     QComboBox *dmrLabCallTypeCombo = nullptr;
     QComboBox *dmrBasebandRateCombo = nullptr;
+    QComboBox *dmrChannelRateCombo = nullptr;
     QComboBox *dmrAmbeLayoutCombo = nullptr;
+    QComboBox *dmrBackendCombo = nullptr;
+    QLineEdit *dsdNeoProgramEdit = nullptr;
     QComboBox *qthSourceCombo = nullptr;
     QComboBox *gnssSystemCombo = nullptr;
     QCheckBox *dmrManualTimingCheckbox = nullptr;
@@ -495,6 +505,9 @@ private:
     QSpinBox *gnssDopplerSpanSpin = nullptr;
     QSpinBox *gnssDopplerStepSpin = nullptr;
     QCheckBox *dmrAdaptiveSlicerCheckbox = nullptr;
+    QCheckBox *dsdNeoAutoStartCheckbox = nullptr;
+    QSpinBox *dsdNeoInputPortSpin = nullptr;
+    QSpinBox *dsdNeoUdpOutputPortSpin = nullptr;
     QButtonGroup *modulationButtonGroup = nullptr;
     
     QPushButton *refreshButton = nullptr;
@@ -663,6 +676,7 @@ private:
     QLabel *gnssMonitorStatusLabel = nullptr;
     QLabel *gnssAcquireStatusLabel = nullptr;
     QLabel *gnssAcquisitionPlotLabel = nullptr;
+    QLabel *dsdNeoStatusLabel = nullptr;
 
     FrequencyControl *frequencyControl = nullptr;
     FrequencyControl *listeningFrequencyControl = nullptr;
@@ -683,6 +697,8 @@ private:
     DataProcessor *processor = nullptr;
     AudioProcessor *audioProcessor = nullptr;
     DigitalDecoder *digitalDecoder = nullptr;
+    DsdNeoBridge *dsdNeoBridge = nullptr;
+    GopherTrunkBridge *gopherTrunkBridge = nullptr;
     QThread *digitalDecoderThread = nullptr;
     VideoProcessor *videoProcessor = nullptr;
     QThread *videoProcessorThread = nullptr;
@@ -756,6 +772,12 @@ private:
     bool digitalDecodeEnabled = false;
     QByteArray pendingDmrDecoderPcm;
     int pendingDmrDecoderSampleRate = 48000;
+    int pendingDmrMetadataColorCode = -2;
+    int pendingDmrMetadataTimeslot = -1;
+    quint32 pendingDmrMetadataTargetId = 0;
+    quint32 pendingDmrMetadataSourceId = 0;
+    int pendingDmrMetadataFlco = -2;
+    int pendingDmrMetadataStableHits = 0;
     std::atomic<uint64_t> digitalDecoderGeneration {0};
     std::atomic<int> pendingDigitalDecoderFrames {0};
     std::atomic<int> droppedDigitalDecoderFramesSinceLog {0};

@@ -75,6 +75,7 @@ GNSS, GPS і QTH
 
 Цифрові режими
 - Digital Audio містить DMR-дослідний декодер. Він може визначати частину метаданих і працювати з зовнішнім voice backend, але DMR-голос поки експериментальний.
+- DMR backend обирає FobosAPP+mbelib, FobosAPP+OpenDMR/OP25 або DSD-neo; DSD-neo передає DMR PCM дискримінатора через TCP і може приймати декодоване аудіо назад через UDP.
 - Lock DMR фіксує обрані параметри DMR, корисно коли на частоті є різні color code/timeslot/contact.
 - DMR hunter, FPV hunter і Digital Video hunter шукають характерні сигнали на спектрі за шириною/порогом.
 - Video блок зараз дослідний; повноцінні відеодекодери можуть бути вимкнені у збірці.
@@ -174,6 +175,7 @@ GNSS, GPS and QTH
 
 Digital modes
 - Digital Audio contains the experimental DMR decoder. It can detect some metadata and work with an external voice backend, but DMR voice is still experimental.
+- DMR backend selects FobosAPP+mbelib, FobosAPP+OpenDMR/OP25 or DSD-neo; DSD-neo mirrors DMR discriminator PCM over TCP and can receive decoded audio back over UDP.
 - Lock DMR fixes selected DMR parameters, useful when several color code/timeslot/contact combinations share a frequency.
 - DMR hunter, FPV hunter and Digital Video hunter look for characteristic signals by width and threshold.
 - Video is currently experimental; full video decoders may be disabled in the build.

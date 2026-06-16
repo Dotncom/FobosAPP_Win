@@ -100,6 +100,7 @@ foreach ($DocFile in $DocFiles) {
 
 $ReleaseDocFiles = @(
     "docs\bladerf_native_beta.md",
+    "docs\dmr_external_backend.md",
     "docs\gnss_preflight_4.1.md",
     "docs\iq_pipeline_audit.md",
     "docs\roadmap_4.0_cleanup.md"
@@ -121,6 +122,33 @@ if (Test-Path -LiteralPath $LicensePath) {
     }
     New-Item -ItemType Directory -Path $DeployLicensePath -Force | Out-Null
     Copy-Item -Path (Join-Path $LicensePath "*") -Destination $DeployLicensePath -Recurse -Force
+}
+
+$DsdNeoExtractPath = Join-Path $Workspace "downloads\dsd-neo\extracted"
+$DsdNeoBinPath = Join-Path $DsdNeoExtractPath "bin"
+$DsdNeoExePath = Join-Path $DsdNeoBinPath "dsd-neo.exe"
+if (Test-Path -LiteralPath $DsdNeoExePath) {
+    $DsdNeoDeployPath = Join-Path $DeployPath "dsd-neo"
+    New-Item -ItemType Directory -Path $DsdNeoDeployPath -Force | Out-Null
+    Copy-Item -Path (Join-Path $DsdNeoBinPath "*") -Destination $DsdNeoDeployPath -Force
+
+    $DsdNeoLicenseDeployPath = Join-Path $DeployPath "licenses\dsd-neo"
+    New-Item -ItemType Directory -Path $DsdNeoLicenseDeployPath -Force | Out-Null
+    $DsdNeoDocPath = Join-Path $DsdNeoExtractPath "share\doc\dsd-neo"
+    if (Test-Path -LiteralPath $DsdNeoDocPath) {
+        Copy-Item -Path (Join-Path $DsdNeoDocPath "*") -Destination $DsdNeoLicenseDeployPath -Recurse -Force
+    }
+    $DsdNeoSpdxPath = Join-Path $Workspace "downloads\dsd-neo\dsd-neo-msvc-x86_64-native-v2.1.0.zip.spdx.json"
+    if (Test-Path -LiteralPath $DsdNeoSpdxPath) {
+        Copy-Item -LiteralPath $DsdNeoSpdxPath -Destination (Join-Path $DsdNeoLicenseDeployPath "dsd-neo-msvc-x86_64-native-v2.1.0.zip.spdx.json") -Force
+    }
+}
+
+$GopherTrunkExePath = Join-Path $Workspace "downloads\gophertrunk\bin\fobos-dmr-virtual.exe"
+if (Test-Path -LiteralPath $GopherTrunkExePath) {
+    $GopherTrunkDeployPath = Join-Path $DeployPath "gophertrunk"
+    New-Item -ItemType Directory -Path $GopherTrunkDeployPath -Force | Out-Null
+    Copy-Item -LiteralPath $GopherTrunkExePath -Destination (Join-Path $GopherTrunkDeployPath "fobos-dmr-virtual.exe") -Force
 }
 
 $ConfigDeployPath = Join-Path $DeployPath "config"
@@ -190,9 +218,7 @@ foreach ($Notice in $DmrVoiceBackendNotices) {
 }
 
 $StaleLabDocs = @(
-    (Join-Path $DeployPath "docs\dmr_lab_replay.md"),
-    (Join-Path $DeployPath "docs\dmr_external_backend.md"),
-    (Join-Path $DeployPath "config\dmr_backends.example.json")
+    (Join-Path $DeployPath "docs\dmr_lab_replay.md")
 )
 foreach ($StaleDoc in $StaleLabDocs) {
     if (Test-Path -LiteralPath $StaleDoc) {

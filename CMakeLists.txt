@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.3.2)
+project(FobosAPP VERSION 4.4.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -94,6 +94,10 @@ set(SOURCES
     src/dmrdecoder.h
     src/dmrvocoder.cpp
     src/dmrvocoder.h
+    src/dsdneobridge.cpp
+    src/dsdneobridge.h
+    src/gophertrunkbridge.cpp
+    src/gophertrunkbridge.h
     src/dmrhunterdetector.cpp
     src/dmrhunterdetector.h
     src/digitalvideohunterdetector.cpp

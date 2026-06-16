@@ -15,12 +15,21 @@
 
 class DmrDecoder {
 public:
+    struct DibitBurst {
+        QString dibits;
+        quint64 sample = 0;
+        int burstIndex = 0;
+        int cadenceSymbols = 0;
+        int colorCode = -1;
+    };
+
     struct Result {
         QString decodedText;
         QString statusText;
         std::vector<QString> ambeFrames;
         std::vector<DmrAmbeSoftFrame> ambeSoftFrames;
         std::vector<DmrAmbePayload> ambePayloads;
+        std::vector<DibitBurst> dibitBursts;
         int ambeFecCorrections = 0;
         bool voiceAudioTrusted = false;
         int voiceAudioConfidence = 0;
@@ -357,6 +366,7 @@ private:
     std::deque<DmrAmbeSoftFrame> pendingAmbeSoftFrames;
     std::deque<DmrAmbePayload> pendingAmbePayloads;
     std::deque<quint64> queuedVoicePayloadBurstSamples;
+    std::vector<DibitBurst> pendingDibitBursts;
     std::vector<QString> voiceLcRawSinceReport;
     int voicePayloadCadenceScore30 = 0;
     int voicePayloadCadenceScore60 = 0;

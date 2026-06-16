@@ -5,6 +5,8 @@
 #include "presethelpers.h"
 #include "iqbuffer.h"
 #include "diagnosticlogging.h"
+#include "dsdneobridge.h"
+#include "gophertrunkbridge.h"
 #include "finetunewidget.h"
 #include "qthlocator.h"
 #include "qthmapwidget.h"
@@ -117,10 +119,36 @@ constexpr int RTL_TCP_DEVICE_INDEX = -1000;
 constexpr int RTLSDR_NATIVE_DEVICE_INDEX_BASE = -2000;
 constexpr int SOAPY_SDR_DEVICE_INDEX = -3000;
 constexpr int BLADERF_NATIVE_DEVICE_INDEX_BASE = -4000;
+constexpr int DMR_BACKEND_FOBOS_MBELIB = 0;
+constexpr int DMR_BACKEND_FOBOS_OPENDMR = 1;
+constexpr int DMR_BACKEND_DSD_NEO = 2;
+constexpr int DMR_BACKEND_GOPHERTRUNK = 3;
 constexpr const char *RTL_TCP_DEFAULT_HOST = "127.0.0.1";
 constexpr quint16 RTL_TCP_DEFAULT_PORT = 1234;
 constexpr double FOBOS_DEFAULT_SAMPLE_RATE = 50000000.0;
 constexpr double RTL_TCP_SAFE_SAMPLE_RATE = 2048000.0;
+
+QString defaultDsdNeoProgramPath() {
+#if defined(_WIN32)
+    return QStringLiteral("dsd-neo/dsd-neo.exe");
+#else
+    return QStringLiteral("dsd-neo");
+#endif
+}
+
+bool isLegacyDsdNeoProgramName(const QString &program) {
+    const QString trimmed = program.trimmed();
+    return trimmed.compare(QStringLiteral("dsd-neo.exe"), Qt::CaseInsensitive) == 0 ||
+           trimmed.compare(QStringLiteral("dsd-neo"), Qt::CaseInsensitive) == 0;
+}
+
+QString defaultGopherTrunkProgramPath() {
+#if defined(_WIN32)
+    return QStringLiteral("gophertrunk/fobos-dmr-virtual.exe");
+#else
+    return QStringLiteral("gophertrunk/fobos-dmr-virtual");
+#endif
+}
 
 int rtlSdrNativeComboValue(int nativeIndex) {
     return RTLSDR_NATIVE_DEVICE_INDEX_BASE - nativeIndex;
@@ -534,22 +562,35 @@ void normalizeTuning(RadioSettings &settings, bool preserveCenter = false) {
     }
 }
 
-constexpr double DMR_CENTER_REALIGN_THRESHOLD_HZ = 100000.0;
-bool shouldRealignDmrCenterToListening(const RadioSettings &settings) {
+constexpr double DMR_CENTER_MIN_OFFSET_HZ = 25000.0;
+bool shouldOffsetDmrCenterFromListening(const RadioSettings &settings) {
     return settings.inputMode == INPUT_RF &&
            settings.modulationType == MOD_DMR &&
            std::isfinite(settings.centerFrequency) &&
            std::isfinite(settings.listeningFrequency) &&
-           std::abs(settings.centerFrequency - settings.listeningFrequency) >
-               DMR_CENTER_REALIGN_THRESHOLD_HZ;
+           std::abs(settings.centerFrequency - settings.listeningFrequency) <
+               DMR_CENTER_MIN_OFFSET_HZ;
 }
 
-bool realignDmrCenterToListening(RadioSettings &settings) {
-    if (!shouldRealignDmrCenterToListening(settings)) {
+bool offsetDmrCenterFromListening(RadioSettings &settings) {
+    if (!shouldOffsetDmrCenterFromListening(settings)) {
         return false;
     }
-    settings.centerFrequency = settings.listeningFrequency;
-    settings.actualFrequency = settings.listeningFrequency;
+
+    const double halfRate = settings.sampleRate > 0.0
+                                ? settings.sampleRate * 0.5
+                                : DMR_CENTER_MIN_OFFSET_HZ * 2.0;
+    const double safeOffset =
+        (std::min)(DMR_CENTER_MIN_OFFSET_HZ,
+                   (std::max)(1000.0, halfRate * 0.25));
+    double newCenter = settings.listeningFrequency - safeOffset;
+    if (newCenter < RF_MIN_CENTER_FREQUENCY) {
+        newCenter = settings.listeningFrequency + safeOffset;
+    }
+    settings.centerFrequency = (std::clamp)(newCenter,
+                                            RF_MIN_CENTER_FREQUENCY,
+                                            RF_EXPERIMENTAL_MAX_FREQUENCY);
+    settings.actualFrequency = settings.centerFrequency;
     normalizeTuning(settings, true);
     return true;
 }
@@ -1206,6 +1247,20 @@ YourClassName::YourClassName(QWidget *parent)
     digitalDecodeCheckbox = new QCheckBox("Decode", digitalWidget);
     markTranslatable(digitalDecodeCheckbox, QStringLiteral("decode"), QStringLiteral("Decode"));
     digitalDecodeCheckbox->setChecked(digitalDecodeEnabled);
+    dmrBackendCombo = new QComboBox(digitalWidget);
+    dmrBackendCombo->addItem(uiText(QStringLiteral("dmr_backend_fobos_mbelib"),
+                                    QStringLiteral("FobosAPP + mbelib")),
+                             DMR_BACKEND_FOBOS_MBELIB);
+    dmrBackendCombo->addItem(uiText(QStringLiteral("dmr_backend_fobos_opendmr"),
+                                    QStringLiteral("FobosAPP + OpenDMR/OP25")),
+                             DMR_BACKEND_FOBOS_OPENDMR);
+    dmrBackendCombo->addItem(QStringLiteral("DSD-neo"), DMR_BACKEND_DSD_NEO);
+    dmrBackendCombo->addItem(uiText(QStringLiteral("dmr_backend_gopher_future"),
+                                    QStringLiteral("GopherTrunk bridge")),
+                             DMR_BACKEND_GOPHERTRUNK);
+    dmrBackendCombo->setMaximumWidth(170);
+    dmrBackendCombo->setToolTip(uiText(QStringLiteral("dmr_backend_tooltip"),
+                                       QStringLiteral("Choose which DMR decoder path receives the selected channel.")));
     dmrLabCaptureCheckbox = new QCheckBox("Lock DMR", digitalWidget);
     markTranslatable(dmrLabCaptureCheckbox, QStringLiteral("dmr_lock"), QStringLiteral("Lock DMR"));
     dmrLabCaptureCheckbox->setToolTip(uiText(QStringLiteral("dmr_lock_tooltip"),
@@ -1232,6 +1287,14 @@ YourClassName::YourClassName(QWidget *parent)
     dmrBasebandRateCombo->addItem("384 kHz", 384000);
     dmrBasebandRateCombo->setToolTip(uiText(QStringLiteral("dmr_4fsk_rate_tooltip"),
                                             QStringLiteral("DMR 4FSK discriminator output sample rate before symbol slicing.")));
+    dmrChannelRateCombo = new QComboBox(digitalWidget);
+    dmrChannelRateCombo->addItem(uiText(QStringLiteral("auto"), QStringLiteral("Auto")), 0);
+    dmrChannelRateCombo->addItem("192 kHz", 192000);
+    dmrChannelRateCombo->addItem("384 kHz", 384000);
+    dmrChannelRateCombo->addItem("768 kHz", 768000);
+    dmrChannelRateCombo->addItem("1536 kHz", 1536000);
+    dmrChannelRateCombo->setToolTip(uiText(QStringLiteral("dmr_channel_rate_tooltip"),
+                                           QStringLiteral("Intermediate DMR IQ channel rate before FM/4FSK discrimination. Use this to compare high-rate receiver channelizers.")));
     dmrAmbeLayoutCombo = new QComboBox(digitalWidget);
     dmrAmbeLayoutCombo->addItem(uiText(QStringLiteral("auto"), QStringLiteral("Auto")), DMR_AMBE_LAYOUT_AUTO);
     dmrAmbeLayoutCombo->addItem("Linear72", DMR_AMBE_LAYOUT_LINEAR72);
@@ -1262,6 +1325,30 @@ YourClassName::YourClassName(QWidget *parent)
     dmrAdaptiveSlicerCheckbox->setChecked(true);
     dmrAdaptiveSlicerCheckbox->setToolTip(uiText(QStringLiteral("dmr_adaptive_tooltip"),
                                                  QStringLiteral("Use local 4-level clustering for voice payloads; disable to force the manual slicer ratio.")));
+    dsdNeoAutoStartCheckbox = new QCheckBox("Auto start", digitalWidget);
+    markTranslatable(dsdNeoAutoStartCheckbox, QStringLiteral("auto_start"), QStringLiteral("Auto start"));
+    dsdNeoAutoStartCheckbox->setToolTip(uiText(QStringLiteral("dsd_neo_autostart_tooltip"),
+                                               QStringLiteral("Start dsd-neo automatically with UDP PCM input and UDP decoded-audio output.")));
+    dsdNeoProgramEdit = new QLineEdit(digitalWidget);
+    dsdNeoProgramEdit->setPlaceholderText(defaultDsdNeoProgramPath());
+    dsdNeoProgramEdit->setToolTip(uiText(QStringLiteral("dsd_neo_program_tooltip"),
+                                         QStringLiteral("Path to dsd-neo executable. Default release layout uses dsd-neo/dsd-neo.exe next to FobosAPP.")));
+    dsdNeoInputPortSpin = new QSpinBox(digitalWidget);
+    dsdNeoInputPortSpin->setRange(1024, 65535);
+    dsdNeoInputPortSpin->setValue(7355);
+    dsdNeoInputPortSpin->setPrefix(QStringLiteral("UDP in "));
+    dsdNeoInputPortSpin->setToolTip(uiText(QStringLiteral("dsd_neo_tcp_tooltip"),
+                                           QStringLiteral("Local UDP port where dsd-neo listens for raw PCM16LE DMR input from FobosAPP.")));
+    dsdNeoUdpOutputPortSpin = new QSpinBox(digitalWidget);
+    dsdNeoUdpOutputPortSpin->setRange(1024, 65535);
+    dsdNeoUdpOutputPortSpin->setValue(23456);
+    dsdNeoUdpOutputPortSpin->setPrefix(QStringLiteral("UDP "));
+    dsdNeoUdpOutputPortSpin->setToolTip(uiText(QStringLiteral("dsd_neo_udp_tooltip"),
+                                               QStringLiteral("Local UDP port where FobosAPP listens for decoded PCM audio from dsd-neo.")));
+    dsdNeoStatusLabel = new QLabel(uiText(QStringLiteral("dsd_neo_idle"), QStringLiteral("DSD-neo bridge idle")), digitalWidget);
+    dsdNeoStatusLabel->setWordWrap(false);
+    dsdNeoStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    dsdNeoStatusLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     dmrLabSourceIdEdit = new QLineEdit(digitalWidget);
     dmrLabSourceIdEdit->setPlaceholderText(uiText(QStringLiteral("dmr_src_id"), QStringLiteral("Src ID")));
     dmrLabTargetIdEdit = new QLineEdit(digitalWidget);
@@ -1274,9 +1361,13 @@ YourClassName::YourClassName(QWidget *parent)
     dmrLabSlotCombo->setMaximumWidth(72);
     dmrLabCallTypeCombo->setMaximumWidth(92);
     dmrBasebandRateCombo->setMaximumWidth(96);
-    dmrAmbeLayoutCombo->setMaximumWidth(140);
+    dmrChannelRateCombo->setMaximumWidth(96);
+    dmrAmbeLayoutCombo->setMaximumWidth(128);
     dmrTimingOffsetSpin->setMaximumWidth(70);
     dmrSlicerRatioSpin->setMaximumWidth(84);
+    dsdNeoProgramEdit->setMaximumWidth(160);
+    dsdNeoInputPortSpin->setMaximumWidth(82);
+    dsdNeoUdpOutputPortSpin->setMaximumWidth(82);
     QPushButton *digitalClearButton = new QPushButton("Clear", digitalWidget);
     markTranslatable(digitalClearButton, QStringLiteral("clear"), QStringLiteral("Clear"));
     digitalStatusLabel = new QLabel(uiText(QStringLiteral("digital_audio_idle"), QStringLiteral("Digital audio decoder idle")), digitalWidget);
@@ -1321,8 +1412,12 @@ YourClassName::YourClassName(QWidget *parent)
     dmrLabLayout->addWidget(dmrBasebandRateCombo, 2, 1);
     QLabel *dmrAmbeLayoutLabel = new QLabel("AMBE layout:", digitalWidget);
     markTranslatable(dmrAmbeLayoutLabel, QStringLiteral("dmr_ambe_layout"), QStringLiteral("AMBE layout:"));
-    dmrLabLayout->addWidget(dmrAmbeLayoutLabel, 2, 2);
-    dmrLabLayout->addWidget(dmrAmbeLayoutCombo, 2, 3);
+    QLabel *dmrChannelRateLabel = new QLabel("Ch:", digitalWidget);
+    markTranslatable(dmrChannelRateLabel, QStringLiteral("dmr_channel_rate"), QStringLiteral("Ch:"));
+    dmrLabLayout->addWidget(dmrChannelRateLabel, 2, 2);
+    dmrLabLayout->addWidget(dmrChannelRateCombo, 2, 3);
+    dmrLabLayout->addWidget(dmrAmbeLayoutLabel, 2, 4);
+    dmrLabLayout->addWidget(dmrAmbeLayoutCombo, 2, 5, 1, 2);
     dmrLabLayout->addWidget(dmrManualTimingCheckbox, 3, 0);
     dmrLabLayout->addWidget(dmrTimingOffsetSpin, 3, 1);
     QLabel *dmrSlicerLabel = new QLabel("Slicer:", digitalWidget);
@@ -1331,7 +1426,19 @@ YourClassName::YourClassName(QWidget *parent)
     dmrLabLayout->addWidget(dmrSlicerRatioSpin, 3, 3);
     dmrLabLayout->addWidget(dmrAdaptiveSlicerCheckbox, 3, 4, 1, 3);
     dmrLabLayout->addWidget(dmrLabNotesEdit, 4, 0, 1, 7);
+    dmrLabLayout->addWidget(dsdNeoAutoStartCheckbox, 5, 0, 1, 2);
+    dmrLabLayout->addWidget(dsdNeoProgramEdit, 5, 2, 1, 2);
+    QLabel *dsdNeoPortLabel = new QLabel("Ports:", digitalWidget);
+    markTranslatable(dsdNeoPortLabel, QStringLiteral("ports"), QStringLiteral("Ports:"));
+    dmrLabLayout->addWidget(dsdNeoPortLabel, 5, 4);
+    dmrLabLayout->addWidget(dsdNeoInputPortSpin, 5, 5);
+    dmrLabLayout->addWidget(dsdNeoUdpOutputPortSpin, 5, 6);
+    dmrLabLayout->addWidget(dsdNeoStatusLabel, 6, 0, 1, 7);
     digitalHeaderLayout->addWidget(digitalDecodeCheckbox);
+    QLabel *dmrBackendLabel = new QLabel("DMR backend:", digitalWidget);
+    markTranslatable(dmrBackendLabel, QStringLiteral("dmr_backend"), QStringLiteral("DMR backend:"));
+    digitalHeaderLayout->addWidget(dmrBackendLabel);
+    digitalHeaderLayout->addWidget(dmrBackendCombo);
     digitalHeaderLayout->addStretch();
     digitalHeaderLayout->addWidget(digitalClearButton);
     digitalLayout->addLayout(digitalHeaderLayout);
@@ -1553,6 +1660,8 @@ YourClassName::YourClassName(QWidget *parent)
     digitalDecoder->moveToThread(digitalDecoderThread);
     connect(digitalDecoderThread, &QThread::finished, digitalDecoder, &QObject::deleteLater);
     digitalDecoderThread->start();
+    dsdNeoBridge = new DsdNeoBridge(this);
+    gopherTrunkBridge = new GopherTrunkBridge(this);
     videoProcessorThread = new QThread(this);
     videoProcessorThread->setObjectName(QStringLiteral("VideoProcessorThread"));
     videoProcessor = new VideoProcessor();
@@ -3253,11 +3362,17 @@ YourClassName::YourClassName(QWidget *parent)
             dmrLabRadioEdit,
             dmrLabNotesEdit,
             dmrBasebandRateCombo,
+            dmrChannelRateCombo,
             dmrAmbeLayoutCombo,
             dmrManualTimingCheckbox,
             dmrTimingOffsetSpin,
             dmrSlicerRatioSpin,
             dmrAdaptiveSlicerCheckbox,
+            dmrBackendCombo,
+            dsdNeoAutoStartCheckbox,
+            dsdNeoProgramEdit,
+            dsdNeoInputPortSpin,
+            dsdNeoUdpOutputPortSpin,
         };
         for (QWidget *control : controls) {
             if (control) {
@@ -3295,6 +3410,7 @@ YourClassName::YourClassName(QWidget *parent)
                  << "timingOffset" << (dmrTimingOffsetSpin ? dmrTimingOffsetSpin->value() : 0)
                  << "slicerRatio" << (dmrSlicerRatioSpin ? dmrSlicerRatioSpin->value() : 0.625)
                  << "adaptiveSlicer" << (!dmrAdaptiveSlicerCheckbox || dmrAdaptiveSlicerCheckbox->isChecked())
+                 << "channelRate" << (dmrChannelRateCombo ? dmrChannelRateCombo->currentData().toInt() : 0)
                  << "ambeLayout"
                  << (dmrAmbeLayoutCombo
                          ? dmrAmbeLayoutName(dmrAmbeLayoutCombo->currentData().toInt())
@@ -3323,8 +3439,32 @@ YourClassName::YourClassName(QWidget *parent)
                 if (audioProcessor) {
                     audioProcessor->configure(audioProcessorSettings());
                 }
+                updateDsdNeoBridgeSettings();
                 updateDigitalDecoderMode();
                 updateIqFrameProducerSettings();
+            });
+    connect(dmrChannelRateCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            [this, resetDmrLabDecoderState]() {
+                if (!dmrChannelRateCombo) {
+                    return;
+                }
+                const int selectedRate = dmrChannelRateCombo->currentData().toInt();
+                if (pendingSettings.dmrChannelSampleRate == selectedRate) {
+                    return;
+                }
+                const int previousRate = pendingSettings.dmrChannelSampleRate;
+                pendingSettings.dmrChannelSampleRate = selectedRate;
+                resetDmrLabDecoderState("channelRate");
+                qDebug() << "[DMR lab] channel sample-rate selected"
+                         << "oldRate" << previousRate
+                         << "newRate" << selectedRate;
+                if (audioProcessor) {
+                    audioProcessor->configure(audioProcessorSettings());
+                }
+                updateDigitalDecoderMode();
+                savePersistentSettings();
             });
     connect(dmrAmbeLayoutCombo,
             QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -3379,6 +3519,66 @@ YourClassName::YourClassName(QWidget *parent)
         resetDmrLabDecoderState("adaptiveSlicer");
         updateDigitalDecoderMode();
     });
+    const auto updateDsdNeoUi = [this]() {
+        const bool enabled = selectedDmrBackend() == DMR_BACKEND_DSD_NEO;
+        if (dsdNeoAutoStartCheckbox) {
+            dsdNeoAutoStartCheckbox->setEnabled(enabled);
+        }
+        if (dsdNeoProgramEdit) {
+            dsdNeoProgramEdit->setEnabled(enabled && dsdNeoAutoStartCheckbox && dsdNeoAutoStartCheckbox->isChecked());
+        }
+        if (dsdNeoInputPortSpin) {
+            dsdNeoInputPortSpin->setEnabled(enabled);
+        }
+        if (dsdNeoUdpOutputPortSpin) {
+            dsdNeoUdpOutputPortSpin->setEnabled(enabled);
+        }
+    };
+    const auto onDsdNeoChanged = [this, updateDsdNeoUi]() {
+        updateDsdNeoUi();
+        updateDsdNeoBridgeSettings();
+        updateGopherTrunkBridgeSettings();
+        updateDigitalDecoderMode();
+        if (audioProcessor) {
+            audioProcessor->clearExternalPcm();
+        }
+        savePersistentSettings();
+    };
+    connect(dmrBackendCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, onDsdNeoChanged);
+    connect(dsdNeoAutoStartCheckbox, &QCheckBox::toggled, this, onDsdNeoChanged);
+    connect(dsdNeoProgramEdit, &QLineEdit::editingFinished, this, onDsdNeoChanged);
+    connect(dsdNeoInputPortSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, onDsdNeoChanged);
+    connect(dsdNeoUdpOutputPortSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, onDsdNeoChanged);
+    if (dsdNeoBridge) {
+        connect(dsdNeoBridge, &DsdNeoBridge::statusChanged, this, [this](const QString &status) {
+            if (dsdNeoStatusLabel) {
+                dsdNeoStatusLabel->setText(status);
+            }
+        });
+        connect(dsdNeoBridge,
+                &DsdNeoBridge::decodedPcmReady,
+                audioProcessor,
+                &AudioProcessor::enqueueExternalPcm,
+                Qt::QueuedConnection);
+    }
+    if (gopherTrunkBridge) {
+        connect(gopherTrunkBridge, &GopherTrunkBridge::statusChanged, this, [this](const QString &status) {
+            if (dsdNeoStatusLabel) {
+                dsdNeoStatusLabel->setText(status);
+            }
+        });
+        connect(gopherTrunkBridge,
+                &GopherTrunkBridge::decodedPcmReady,
+                audioProcessor,
+                &AudioProcessor::enqueueExternalPcm,
+                Qt::QueuedConnection);
+        connect(digitalDecoder,
+                &DigitalDecoder::dmrDibitBurstReady,
+                gopherTrunkBridge,
+                &GopherTrunkBridge::sendDibitBurst,
+                Qt::QueuedConnection);
+    }
+    updateDsdNeoUi();
     updateDmrLabControls(dmrLabCaptureCheckbox && dmrLabCaptureCheckbox->isChecked());
     connect(digitalDecoder, &DigitalDecoder::textDecoded, this, &YourClassName::onDigitalTextDecoded);
     connect(digitalDecoder, &DigitalDecoder::statusChanged, this, &YourClassName::onDigitalDecoderStatusChanged);
@@ -3491,6 +3691,9 @@ YourClassName::YourClassName(QWidget *parent)
             this,
             [this](const QByteArray &pcmData, int sampleRate) {
                 if (pendingSettings.modulationType == MOD_DMR) {
+                    if (dsdNeoBridge && dsdNeoBridge->isEnabled()) {
+                        dsdNeoBridge->sendInputPcm(pcmData, sampleRate);
+                    }
                     processDigitalAudioFrame(pcmData, sampleRate);
                 }
             },
@@ -4462,6 +4665,55 @@ bool YourClassName::restartStreamForHardwareChange() {
         updateRecordingStatus(QStringLiteral("Recording stopped: Channel IQ cannot run during Full IQ streaming"));
     }
 
+    const bool externalBackendSelected = isExternalReceiverBackendSelected();
+    if (externalBackendSelected && processor && processor->isRunning()) {
+        qDebug() << "[LiveHardware] restarting external receiver stream for hardware change"
+                 << "state" << runStateName(runState)
+                 << "deviceOpened" << deviceOpened
+                 << "sampleRate" << pendingSettings.sampleRate;
+
+        runState = RadioRunState::Stopping;
+        updateUiForRunState();
+        if (streamWatchdogTimer) streamWatchdogTimer->stop();
+        if (stopPollTimer) stopPollTimer->stop();
+        if (updateTimer) updateTimer->stop();
+        pendingAudioStartAfterStreamReady = false;
+        if (audioProcessor) audioProcessor->stopDemodulation();
+        digitalDecoderGeneration.fetch_add(1, std::memory_order_relaxed);
+        pendingDmrDecoderPcm.clear();
+        pendingDmrDecoderSampleRate = 48000;
+        droppedDigitalDecoderFramesSinceLog.store(0);
+        if (digitalDecoder) {
+            QMetaObject::invokeMethod(digitalDecoder,
+                                      [decoder = digitalDecoder]() {
+                                          decoder->reset();
+                                      },
+                                      Qt::QueuedConnection);
+        }
+
+        processor->requestStop();
+        if (!processor->wait(3000)) {
+            const bool forced = processor->forceStop(1000);
+            qDebug() << "[LiveHardware] forced external DataProcessor stop during live restart"
+                     << forced
+                     << "processorRunning" << processor->isRunning();
+            if (!forced || processor->isRunning()) {
+                qDebug() << "[LiveHardware] external DataProcessor is still running; restart aborted";
+                stopCancelRetryCount = 0;
+                stopElapsedTimer.restart();
+                if (stopPollTimer) stopPollTimer->start();
+                updateUiForRunState();
+                return false;
+            }
+        }
+        processor->finalizeStopped();
+        deviceOpened = false;
+        runState = RadioRunState::Idle;
+        updateUiForRunState();
+        QTimer::singleShot(0, this, &YourClassName::startFobosProcessing);
+        return true;
+    }
+
     if (isIdle()) {
         if (!hasActiveFobosDevice()) {
             qDebug() << "[LiveHardware] settings changed while idle; no open Fobos session to restart";
@@ -4471,9 +4723,13 @@ bool YourClassName::restartStreamForHardwareChange() {
     }
 
     if (!hasActiveFobosDevice()) {
-        qDebug() << "[LiveHardware] cannot restart stream because Fobos session is missing";
-        deviceOpened = false;
-        runState = RadioRunState::Idle;
+        qDebug() << "[LiveHardware] cannot restart stream because Fobos session is missing"
+                 << "externalBackend" << externalBackendSelected
+                 << "processorRunning" << (processor && processor->isRunning());
+        if (!(processor && processor->isRunning())) {
+            deviceOpened = false;
+            runState = RadioRunState::Idle;
+        }
         updateUiForRunState();
         return false;
     }
@@ -12322,6 +12578,20 @@ void YourClassName::loadUiTranslations() {
         {"none", "none"},
         {"decode", "Decode"},
         {"dmr_lock", "Lock DMR"},
+        {"dmr_backend", "DMR backend:"},
+        {"dmr_backend_fobos_mbelib", "FobosAPP + mbelib"},
+        {"dmr_backend_fobos_opendmr", "FobosAPP + OpenDMR/OP25"},
+        {"dmr_backend_gopher_future", "GopherTrunk bridge"},
+        {"dmr_backend_tooltip", "Choose which DMR decoder path receives the selected channel."},
+        {"dmr_channel_rate", "Ch:"},
+        {"dmr_channel_rate_tooltip", "Intermediate DMR IQ channel rate before FM/4FSK discrimination."},
+        {"auto_start", "Auto start"},
+        {"dsd_neo_autostart_tooltip", "Start dsd-neo automatically with UDP PCM input and UDP decoded-audio output."},
+        {"dsd_neo_program_tooltip", "Path to dsd-neo executable. Default release layout uses dsd-neo/dsd-neo.exe next to FobosAPP."},
+        {"dsd_neo_tcp_tooltip", "Local UDP port where dsd-neo listens for raw PCM16LE DMR input from FobosAPP."},
+        {"dsd_neo_udp_tooltip", "Local UDP port where FobosAPP listens for decoded PCM audio from dsd-neo."},
+        {"dsd_neo_idle", "DSD-neo bridge idle"},
+        {"ports", "Ports:"},
         {"clear", "Clear"},
         {"invert", "Invert"},
         {"test", "Test"},
@@ -12549,6 +12819,20 @@ void YourClassName::loadUiTranslations() {
         {"settings_short", "Cfg"},
         {"decode", "Декод"},
         {"dmr_lock", "Lock DMR"},
+        {"dmr_backend", "DMR backend:"},
+        {"dmr_backend_fobos_mbelib", "FobosAPP + mbelib"},
+        {"dmr_backend_fobos_opendmr", "FobosAPP + OpenDMR/OP25"},
+        {"dmr_backend_gopher_future", "GopherTrunk bridge"},
+        {"dmr_backend_tooltip", "Вибір DMR-декодера, який отримує вибраний канал."},
+        {"dmr_channel_rate", "Канал:"},
+        {"dmr_channel_rate_tooltip", "Проміжна частота DMR IQ-каналу перед FM/4FSK-дискримінатором."},
+        {"auto_start", "Автостарт"},
+        {"dsd_neo_autostart_tooltip", "Автоматично запускати dsd-neo з UDP PCM-входом і UDP-виходом декодованого аудіо."},
+        {"dsd_neo_program_tooltip", "Шлях до dsd-neo. У стандартному релізі це dsd-neo/dsd-neo.exe поруч із FobosAPP."},
+        {"dsd_neo_tcp_tooltip", "Локальний UDP-порт, де dsd-neo слухає raw PCM16LE DMR від FobosAPP."},
+        {"dsd_neo_udp_tooltip", "Локальний UDP-порт, де FobosAPP чекає декодоване PCM-аудіо від dsd-neo."},
+        {"dsd_neo_idle", "DSD-neo міст неактивний"},
+        {"ports", "Порти:"},
         {"clear", "Очистити"},
         {"invert", "Інверсія"},
         {"test", "Тест"},
@@ -12867,6 +13151,23 @@ void YourClassName::applyUiLanguage() {
                      DMR_AMBE_LAYOUT_AUTO,
                      QStringLiteral("auto"),
                      QStringLiteral("Auto"));
+    setComboItemText(dmrBackendCombo,
+                     DMR_BACKEND_FOBOS_MBELIB,
+                     QStringLiteral("dmr_backend_fobos_mbelib"),
+                     QStringLiteral("FobosAPP + mbelib"));
+    setComboItemText(dmrBackendCombo,
+                     DMR_BACKEND_FOBOS_OPENDMR,
+                     QStringLiteral("dmr_backend_fobos_opendmr"),
+                     QStringLiteral("FobosAPP + OpenDMR/OP25"));
+    setComboItemText(dmrBackendCombo,
+                     DMR_BACKEND_GOPHERTRUNK,
+                     QStringLiteral("dmr_backend_gopher_future"),
+                     QStringLiteral("GopherTrunk bridge"));
+    if (dmrBackendCombo) {
+        dmrBackendCombo->setToolTip(uiText(
+            QStringLiteral("dmr_backend_tooltip"),
+            QStringLiteral("Choose which DMR decoder path receives the selected channel.")));
+    }
     setComboItemText(recordingModeCombo,
                      static_cast<int>(RecordingManager::Mode::AudioWav),
                      QStringLiteral("audio_wav"),
@@ -14035,6 +14336,17 @@ void YourClassName::loadPersistentSettings() {
         normalizedDmrBasebandSampleRate(settings.value("digital/dmrBasebandSampleRate",
                                                        pendingSettings.dmrBasebandSampleRate).toInt());
     setComboToData(dmrBasebandRateCombo, pendingSettings.dmrBasebandSampleRate);
+    pendingSettings.dmrChannelSampleRate =
+        settings.value("digital/dmrChannelSampleRate",
+                       pendingSettings.dmrChannelSampleRate).toInt();
+    if (pendingSettings.dmrChannelSampleRate != 0 &&
+        pendingSettings.dmrChannelSampleRate != 192000 &&
+        pendingSettings.dmrChannelSampleRate != 384000 &&
+        pendingSettings.dmrChannelSampleRate != 768000 &&
+        pendingSettings.dmrChannelSampleRate != 1536000) {
+        pendingSettings.dmrChannelSampleRate = 0;
+    }
+    setComboToData(dmrChannelRateCombo, pendingSettings.dmrChannelSampleRate);
     pendingSettings.dmrAmbeLayout =
         normalizedDmrAmbeLayout(settings.value("digital/dmrAmbeLayout",
                                                pendingSettings.dmrAmbeLayout).toInt());
@@ -14079,6 +14391,43 @@ void YourClassName::loadPersistentSettings() {
     if (dmrLabNotesEdit) {
         dmrLabNotesEdit->setText(settings.value("digital/dmrLabNotes").toString());
     }
+    {
+        const QSignalBlocker backendBlocker(dmrBackendCombo);
+        const QSignalBlocker autoBlocker(dsdNeoAutoStartCheckbox);
+        const QSignalBlocker programBlocker(dsdNeoProgramEdit);
+        const QSignalBlocker inputPortBlocker(dsdNeoInputPortSpin);
+        const QSignalBlocker outputPortBlocker(dsdNeoUdpOutputPortSpin);
+        if (dmrBackendCombo) {
+            int backend = settings.value("digital/dmrBackend", DMR_BACKEND_FOBOS_MBELIB).toInt();
+            if (settings.value("digital/dsdNeoBridgeEnabled", false).toBool()) {
+                backend = DMR_BACKEND_DSD_NEO;
+            }
+            const int backendIndex = dmrBackendCombo->findData(backend);
+            dmrBackendCombo->setCurrentIndex(backendIndex >= 0 ? backendIndex : 0);
+        }
+        if (dsdNeoAutoStartCheckbox) {
+            dsdNeoAutoStartCheckbox->setChecked(settings.value("digital/dsdNeoAutoStart", false).toBool());
+        }
+        if (dsdNeoProgramEdit) {
+            const QString savedProgram =
+                settings.value("digital/dsdNeoProgram", defaultDsdNeoProgramPath()).toString();
+            dsdNeoProgramEdit->setText(isLegacyDsdNeoProgramName(savedProgram)
+                                           ? defaultDsdNeoProgramPath()
+                                           : savedProgram);
+        }
+        if (dsdNeoInputPortSpin) {
+            dsdNeoInputPortSpin->setValue((std::clamp)(settings.value("digital/dsdNeoInputPort", 7355).toInt(),
+                                                       1024,
+                                                       65535));
+        }
+        if (dsdNeoUdpOutputPortSpin) {
+            dsdNeoUdpOutputPortSpin->setValue((std::clamp)(settings.value("digital/dsdNeoUdpOutputPort", 23456).toInt(),
+                                                           1024,
+                                                           65535));
+        }
+    }
+    updateDsdNeoBridgeSettings();
+    updateGopherTrunkBridgeSettings();
     videoDecodeEnabled = settings.value("video/decodeEnabled", videoDecodeEnabled).toBool();
     if (videoDemodCombo) {
         const int demodMode = settings.value("video/demodMode", VideoProcessor::FmVideo).toInt();
@@ -14104,10 +14453,10 @@ void YourClassName::loadPersistentSettings() {
     }
 
     normalizeTuning(pendingSettings);
-    const bool dmrCenterRealigned = realignDmrCenterToListening(pendingSettings);
+    const bool dmrCenterOffset = offsetDmrCenterFromListening(pendingSettings);
     updateFrequencyPresetControls();
-    if (dmrCenterRealigned) {
-        qDebug() << "[Settings] DMR center realigned to listening frequency while loading"
+    if (dmrCenterOffset) {
+        qDebug() << "[Settings] DMR center offset from listening frequency while loading"
                  << "center" << pendingSettings.centerFrequency
                  << "listening" << pendingSettings.listeningFrequency;
     }
@@ -14160,7 +14509,7 @@ void YourClassName::savePersistentSettings() {
 
     QSettings settings(persistentSettingsFilePath(), QSettings::IniFormat);
     RadioSettings settingsToSave = pendingSettings;
-    const bool savedDmrCenterRealigned = realignDmrCenterToListening(settingsToSave);
+    const bool savedDmrCenterOffset = offsetDmrCenterFromListening(settingsToSave);
 
     settings.setValue("receiver/deviceIndex", settingsToSave.deviceIndex);
     settings.setValue("receiver/clockSource", settingsToSave.clockSource);
@@ -14177,8 +14526,8 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("receiver/audioDeviceId", settingsToSave.audioDeviceId);
     settings.setValue("receiver/audioEnabled", settingsToSave.audioEnabled);
     settings.setValue("receiver/gpoValue", static_cast<int>(settingsToSave.gpoValue));
-    if (savedDmrCenterRealigned) {
-        qDebug() << "[Settings] DMR center realigned to listening frequency while saving"
+    if (savedDmrCenterOffset) {
+        qDebug() << "[Settings] DMR center offset from listening frequency while saving"
                  << "center" << settingsToSave.centerFrequency
                  << "listening" << settingsToSave.listeningFrequency;
     }
@@ -14439,6 +14788,10 @@ void YourClassName::savePersistentSettings() {
                       dmrBasebandRateCombo
                           ? normalizedDmrBasebandSampleRate(dmrBasebandRateCombo->currentData().toInt())
                           : normalizedDmrBasebandSampleRate(pendingSettings.dmrBasebandSampleRate));
+    settings.setValue("digital/dmrChannelSampleRate",
+                      dmrChannelRateCombo
+                          ? dmrChannelRateCombo->currentData().toInt()
+                          : pendingSettings.dmrChannelSampleRate);
     settings.setValue("digital/dmrAmbeLayout",
                       dmrAmbeLayoutCombo
                           ? normalizedDmrAmbeLayout(dmrAmbeLayoutCombo->currentData().toInt())
@@ -14455,6 +14808,12 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("digital/dmrLabTargetId", dmrLabTargetIdEdit ? dmrLabTargetIdEdit->text().trimmed() : QString());
     settings.setValue("digital/dmrLabRadio", dmrLabRadioEdit ? dmrLabRadioEdit->text().trimmed() : QString());
     settings.setValue("digital/dmrLabNotes", dmrLabNotesEdit ? dmrLabNotesEdit->text().trimmed() : QString());
+    settings.setValue("digital/dmrBackend", selectedDmrBackend());
+    settings.setValue("digital/dsdNeoBridgeEnabled", selectedDmrBackend() == DMR_BACKEND_DSD_NEO);
+    settings.setValue("digital/dsdNeoAutoStart", dsdNeoAutoStartCheckbox && dsdNeoAutoStartCheckbox->isChecked());
+    settings.setValue("digital/dsdNeoProgram", dsdNeoProgramEdit ? dsdNeoProgramEdit->text().trimmed() : defaultDsdNeoProgramPath());
+    settings.setValue("digital/dsdNeoInputPort", dsdNeoInputPortSpin ? dsdNeoInputPortSpin->value() : 7355);
+    settings.setValue("digital/dsdNeoUdpOutputPort", dsdNeoUdpOutputPortSpin ? dsdNeoUdpOutputPortSpin->value() : 23456);
     settings.setValue("video/decodeEnabled", videoDecodeEnabled);
     settings.setValue("video/demodMode", videoDemodCombo ? videoDemodCombo->currentData().toInt() : VideoProcessor::FmVideo);
     settings.setValue("video/standardIndex", videoStandardCombo ? videoStandardCombo->currentIndex() : 0);
@@ -15611,6 +15970,120 @@ void YourClassName::sendAudioHttpFrame(const QByteArray &pcmData) {
     }
 }
 
+int YourClassName::selectedDmrBackend() const {
+    if (!dmrBackendCombo) {
+        return DMR_BACKEND_FOBOS_MBELIB;
+    }
+    const int backend = dmrBackendCombo->currentData().toInt();
+    switch (backend) {
+    case DMR_BACKEND_FOBOS_MBELIB:
+    case DMR_BACKEND_FOBOS_OPENDMR:
+    case DMR_BACKEND_DSD_NEO:
+    case DMR_BACKEND_GOPHERTRUNK:
+        return backend;
+    default:
+        return DMR_BACKEND_FOBOS_MBELIB;
+    }
+}
+
+QStringList YourClassName::dsdNeoProcessArguments() const {
+    const int sampleRate =
+        dmrBasebandRateCombo
+            ? normalizedDmrBasebandSampleRate(dmrBasebandRateCombo->currentData().toInt())
+            : normalizedDmrBasebandSampleRate(pendingSettings.dmrBasebandSampleRate);
+    const quint16 inputPort =
+        dsdNeoInputPortSpin ? static_cast<quint16>(dsdNeoInputPortSpin->value()) : quint16(7355);
+    const quint16 outputPort =
+        dsdNeoUdpOutputPortSpin ? static_cast<quint16>(dsdNeoUdpOutputPortSpin->value()) : quint16(23456);
+
+    return {
+        QStringLiteral("-fs"),
+        QStringLiteral("-i"),
+        QStringLiteral("udp:127.0.0.1:%1").arg(inputPort),
+        QStringLiteral("-s"),
+        QString::number(sampleRate),
+        QStringLiteral("-o"),
+        QStringLiteral("udp:127.0.0.1:%1").arg(outputPort),
+        QStringLiteral("-nm")
+    };
+}
+
+void YourClassName::updateDsdNeoBridgeSettings() {
+    if (!dsdNeoBridge) {
+        return;
+    }
+
+    const bool enabled = selectedDmrBackend() == DMR_BACKEND_DSD_NEO;
+    const bool autoStart = dsdNeoAutoStartCheckbox && dsdNeoAutoStartCheckbox->isChecked();
+    const quint16 inputPort =
+        dsdNeoInputPortSpin ? static_cast<quint16>(dsdNeoInputPortSpin->value()) : quint16(7355);
+    const quint16 outputPort =
+        dsdNeoUdpOutputPortSpin ? static_cast<quint16>(dsdNeoUdpOutputPortSpin->value()) : quint16(23456);
+    const QString rawProgram =
+        dsdNeoProgramEdit ? dsdNeoProgramEdit->text().trimmed() : QString();
+    QString program = rawProgram.isEmpty() ? defaultDsdNeoProgramPath() : rawProgram;
+    const QString bundledProgram =
+        QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(defaultDsdNeoProgramPath());
+    if ((rawProgram.isEmpty() || isLegacyDsdNeoProgramName(rawProgram)) &&
+        QFileInfo::exists(bundledProgram)) {
+        program = bundledProgram;
+        if (dsdNeoProgramEdit && dsdNeoProgramEdit->text().trimmed() != defaultDsdNeoProgramPath()) {
+            const QSignalBlocker blocker(dsdNeoProgramEdit);
+            dsdNeoProgramEdit->setText(defaultDsdNeoProgramPath());
+        }
+    }
+    QFileInfo programInfo(program);
+    if (!programInfo.isAbsolute() &&
+        (program.contains(QLatin1Char('/')) || program.contains(QLatin1Char('\\')))) {
+        program = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(program);
+        programInfo.setFile(program);
+    }
+    const QString workingDirectory =
+        programInfo.isAbsolute() ? programInfo.absolutePath() : QString();
+
+    if (dsdNeoAutoStartCheckbox) {
+        dsdNeoAutoStartCheckbox->setEnabled(enabled);
+    }
+    if (dsdNeoProgramEdit) {
+        dsdNeoProgramEdit->setEnabled(enabled && autoStart);
+    }
+    if (dsdNeoInputPortSpin) {
+        dsdNeoInputPortSpin->setEnabled(enabled);
+    }
+    if (dsdNeoUdpOutputPortSpin) {
+        dsdNeoUdpOutputPortSpin->setEnabled(enabled);
+    }
+
+    dsdNeoBridge->configureInputServer(true, inputPort);
+    dsdNeoBridge->configureUdpOutput(true, outputPort, 1);
+    dsdNeoBridge->configureProcess(autoStart, program, dsdNeoProcessArguments(), workingDirectory);
+    dsdNeoBridge->setEnabled(enabled);
+
+    if (dsdNeoStatusLabel && !enabled) {
+        dsdNeoStatusLabel->setText(uiText(QStringLiteral("dsd_neo_idle"),
+                                          QStringLiteral("DSD-neo bridge idle")));
+    }
+}
+
+void YourClassName::updateGopherTrunkBridgeSettings() {
+    if (!gopherTrunkBridge) {
+        return;
+    }
+
+    const bool enabled = selectedDmrBackend() == DMR_BACKEND_GOPHERTRUNK;
+    const quint16 outputPort =
+        dsdNeoUdpOutputPortSpin ? static_cast<quint16>(dsdNeoUdpOutputPortSpin->value()) : quint16(23456);
+    QString program = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(defaultGopherTrunkProgramPath());
+    QFileInfo programInfo(program);
+    const QString workingDirectory = programInfo.absolutePath();
+    gopherTrunkBridge->configure(true, program, quint16(7460), outputPort, workingDirectory);
+    gopherTrunkBridge->setEnabled(enabled);
+    if (dsdNeoStatusLabel && !enabled && selectedDmrBackend() != DMR_BACKEND_DSD_NEO) {
+        dsdNeoStatusLabel->setText(uiText(QStringLiteral("dsd_neo_idle"),
+                                          QStringLiteral("DSD-neo bridge idle")));
+    }
+}
+
 void YourClassName::processDigitalAudioFrame(const QByteArray &pcmData, int sampleRate) {
     if (!digitalDecoder ||
         !digitalDecoderThread ||
@@ -15635,6 +16108,9 @@ void YourClassName::processDigitalAudioFrame(const QByteArray &pcmData, int samp
         dmrBasebandRateCombo
             ? normalizedDmrBasebandSampleRate(dmrBasebandRateCombo->currentData().toInt())
             : normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
+    if (dmrChannelRateCombo) {
+        settings.dmrChannelSampleRate = dmrChannelRateCombo->currentData().toInt();
+    }
     settings.dmrAmbeLayout =
         dmrAmbeLayoutCombo
             ? normalizedDmrAmbeLayout(dmrAmbeLayoutCombo->currentData().toInt())
@@ -15822,6 +16298,16 @@ void YourClassName::updateDigitalDecoderMode() {
         return;
     }
     const bool enabled = digitalDecodeEnabled;
+    QString preferredDmrVoiceBackendId;
+    const int dmrBackend = selectedDmrBackend();
+    if (dmrBackend == DMR_BACKEND_FOBOS_MBELIB) {
+        preferredDmrVoiceBackendId = QStringLiteral("fobos.dmr.voice.mbelib");
+    } else if (dmrBackend == DMR_BACKEND_FOBOS_OPENDMR) {
+        preferredDmrVoiceBackendId = QStringLiteral("fobos.dmr.voice.opendmr");
+    }
+    const bool internalDmrVoiceOutput =
+        dmrBackend != DMR_BACKEND_DSD_NEO &&
+        dmrBackend != DMR_BACKEND_GOPHERTRUNK;
     RadioSettings settings = pendingSettings;
     settings.dmrBasebandSampleRate =
         dmrBasebandRateCombo
@@ -15842,8 +16328,15 @@ void YourClassName::updateDigitalDecoderMode() {
     const int decoderSampleRate =
         settings.modulationType == MOD_DMR ? settings.dmrBasebandSampleRate : 48000;
     QMetaObject::invokeMethod(digitalDecoder,
-                              [decoder = digitalDecoder, enabled, settings, decoderSampleRate]() {
+                              [decoder = digitalDecoder,
+                               enabled,
+                               settings,
+                               decoderSampleRate,
+                               preferredDmrVoiceBackendId,
+                               internalDmrVoiceOutput]() {
                                   decoder->setEnabled(enabled);
+                                  decoder->setDmrVoiceBackendId(preferredDmrVoiceBackendId);
+                                  decoder->setDmrVoiceOutputEnabled(internalDmrVoiceOutput);
                                   decoder->configure(settings, decoderSampleRate);
                               },
                               Qt::QueuedConnection);
@@ -16167,6 +16660,9 @@ RadioSettings YourClassName::audioProcessorSettings() const {
         settings.dmrBasebandSampleRate =
             normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
     }
+    if (dmrChannelRateCombo) {
+        settings.dmrChannelSampleRate = dmrChannelRateCombo->currentData().toInt();
+    }
     if (dmrAmbeLayoutCombo) {
         settings.dmrAmbeLayout =
             normalizedDmrAmbeLayout(dmrAmbeLayoutCombo->currentData().toInt());
@@ -16191,6 +16687,9 @@ RadioSettings YourClassName::spectrumProcessingSettings() const {
     } else {
         settings.dmrBasebandSampleRate =
             normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
+    }
+    if (dmrChannelRateCombo) {
+        settings.dmrChannelSampleRate = dmrChannelRateCombo->currentData().toInt();
     }
     if (dmrAmbeLayoutCombo) {
         settings.dmrAmbeLayout =
@@ -16809,7 +17308,8 @@ void YourClassName::handleNetworkIqPayload(const QJsonObject &frame, QByteArray 
 }
 
 void YourClassName::updateUiForRunState() {
-    const bool idle = isIdle();
+    const bool processorRunning = processor && processor->isRunning();
+    const bool idle = isIdle() && !processorRunning;
     const bool clientCanControl =
         !isNetworkClientMode() ||
         !networkController ||
@@ -16819,7 +17319,8 @@ void YourClassName::updateUiForRunState() {
     if (stopButton) {
         const bool canStop =
             runState == RadioRunState::Starting ||
-            runState == RadioRunState::Running;
+            runState == RadioRunState::Running ||
+            processorRunning;
         stopButton->setEnabled(canStop && (clientCanControl || isNetworkClientMode()));
     }
     if (comboBox) comboBox->setEnabled(idle && clientCanControl);
@@ -17180,7 +17681,7 @@ void YourClassName::abandonFobosSessionWithoutClose(const char *reason) {
     openedDeviceApiKind = FobosApiKind::Standard;
 }
 
-bool YourClassName::applyFobosSettings() {
+bool YourClassName::applyFobosSettings(bool forceFrequencyApply) {
     if (!hasActiveFobosDevice()) {
         qDebug() << "Cannot apply Fobos settings without an active device.";
         return false;
@@ -17201,6 +17702,7 @@ bool YourClassName::applyFobosSettings() {
              << "inputMode" << pendingSettings.inputMode
              << "sampleRate" << pendingSettings.sampleRate
              << "centerFrequency" << pendingSettings.centerFrequency
+             << "forceFrequencyApply" << forceFrequencyApply
              << "lna" << pendingSettings.lnaGain
              << "vga" << pendingSettings.vgaGain
              << "gpo" << pendingSettings.gpoValue;
@@ -17265,6 +17767,7 @@ bool YourClassName::applyFobosSettings() {
 
     if (pendingSettings.inputMode == INPUT_RF) {
         if (firstApply ||
+            forceFrequencyApply ||
             appliedHardwareSettings.inputMode != pendingSettings.inputMode ||
             changedDouble(appliedHardwareSettings.centerFrequency, pendingSettings.centerFrequency)) {
             qDebug() << "[FobosLifecycle] set frequency begin" << "requested" << pendingSettings.centerFrequency;
@@ -17358,6 +17861,71 @@ bool YourClassName::applyFobosSettings() {
     }
     settingRange();
     qDebug() << "[FobosLifecycle] applyFobosSettings exit";
+    return true;
+}
+
+bool YourClassName::performAgileStartupFrequencyJog() {
+    if (!hasActiveFobosDevice() ||
+        activeFobosApiKind != FobosApiKind::Agile ||
+        pendingSettings.inputMode != INPUT_RF ||
+        agileScanEnabled) {
+        return true;
+    }
+
+    normalizeTuning(pendingSettings);
+    const double targetFrequency = pendingSettings.centerFrequency;
+    if (!std::isfinite(targetFrequency) || targetFrequency <= 0.0) {
+        return true;
+    }
+
+    const double sampleRate = (std::max)(pendingSettings.sampleRate, 1.0);
+    const double jogHz = (std::clamp)(sampleRate * 0.05, 250000.0, 1000000.0);
+    const double jogFrequency = targetFrequency + jogHz;
+    qDebug() << "[FobosLifecycle] Agile startup frequency jog begin"
+             << "target" << targetFrequency
+             << "jog" << jogFrequency
+             << "jogHz" << jogHz;
+
+    double jogActual = jogFrequency;
+    int result = setActiveFrequencySafely(jogFrequency, &jogActual);
+    qDebug() << "[FobosLifecycle] Agile startup frequency jog intermediate"
+             << "requested" << jogFrequency
+             << "result" << result
+             << "actual" << jogActual;
+    if (result != FOBOS_ERR_OK) {
+        qDebug() << "[FobosLifecycle] Agile startup frequency jog intermediate failed; trying target anyway";
+    } else {
+        QThread::msleep(25);
+    }
+
+    double targetActual = targetFrequency;
+    result = setActiveFrequencySafely(targetFrequency, &targetActual);
+    qDebug() << "[FobosLifecycle] Agile startup frequency jog target"
+             << "requested" << targetFrequency
+             << "result" << result
+             << "actual" << targetActual;
+    if (result != FOBOS_ERR_OK) {
+        qDebug() << "[FobosLifecycle] Agile startup frequency jog failed to restore target";
+        return false;
+    }
+
+    const double autoBandwidthRatio = agileRfAutoBandwidthRatio(pendingSettings.sampleRate);
+    const int bandwidthResult = setFobosAgileAutoBandwidthSafely(agileDevice, autoBandwidthRatio);
+    qDebug() << "[FobosLifecycle] Agile startup frequency jog bandwidth"
+             << "ratio" << autoBandwidthRatio
+             << "result" << bandwidthResult;
+
+    pendingSettings.actualFrequency = targetActual;
+    actualFrequency = targetActual;
+    if (hardwareSettingsApplied) {
+        appliedHardwareSettings.centerFrequency = targetFrequency;
+        appliedHardwareSettings.actualFrequency = targetActual;
+    }
+    publishSettingsToGlobals();
+    updateIqFrameProducerSettings();
+    qDebug() << "[FobosLifecycle] Agile startup frequency jog done"
+             << "target" << targetFrequency
+             << "actual" << targetActual;
     return true;
 }
 
@@ -17528,6 +18096,38 @@ void YourClassName::onDmrMetadataDetected(int colorCode,
                                           quint32 sourceId,
                                           int flco) {
     if (dmrLabCaptureCheckbox && dmrLabCaptureCheckbox->isChecked()) {
+        return;
+    }
+
+    const bool sameMetadata =
+        colorCode == pendingDmrMetadataColorCode &&
+        timeslot == pendingDmrMetadataTimeslot &&
+        targetId == pendingDmrMetadataTargetId &&
+        sourceId == pendingDmrMetadataSourceId &&
+        flco == pendingDmrMetadataFlco;
+    if (sameMetadata) {
+        ++pendingDmrMetadataStableHits;
+    } else {
+        pendingDmrMetadataColorCode = colorCode;
+        pendingDmrMetadataTimeslot = timeslot;
+        pendingDmrMetadataTargetId = targetId;
+        pendingDmrMetadataSourceId = sourceId;
+        pendingDmrMetadataFlco = flco;
+        pendingDmrMetadataStableHits = 1;
+    }
+
+    const bool hasIdMetadata = targetId > 0 || sourceId > 0;
+    const int requiredStableHits = hasIdMetadata ? 2 : 4;
+    if (pendingDmrMetadataStableHits < requiredStableHits) {
+        if (fobosVerboseLoggingEnabled() && pendingDmrMetadataStableHits == 1) {
+            qDebug() << "[DMR metadata] waiting for stable repeat"
+                     << "cc" << colorCode
+                     << "ts" << timeslot
+                     << "target" << targetId
+                     << "source" << sourceId
+                     << "flco" << flco
+                     << "need" << requiredStableHits;
+        }
         return;
     }
 
@@ -19084,6 +19684,13 @@ void YourClassName::onSampleRateChanged(int index) {
     publishSettingsToGlobals();
     settingRange();
 
+    if (runState == RadioRunState::Idle && processor && processor->isRunning()) {
+        qDebug() << "[FobosLifecycle] repairing Idle state with active processor before sample-rate restart";
+        deviceOpened = true;
+        runState = RadioRunState::Running;
+        updateUiForRunState();
+    }
+
     if (isNetworkClientMode()) {
         if (isClientIqProcessingMode()) {
             resetNetworkIqReceptionState(false, false, pendingSettings.audioEnabled && !isFullIqProcessingMode());
@@ -20052,16 +20659,31 @@ void YourClassName::startFobosProcessing() {
              << "startupRetryCount" << streamStartupRetryCount;
     logMemorySnapshot("before start");
     if (!isIdle() || deviceOpened || (processor && processor->isRunning())) {
-        qDebug() << "Warning: Processor is already running!";
-        return;
+        if (isIdle() && !deviceOpened && processor && processor->isRunning()) {
+            qDebug() << "[FobosLifecycle] stale DataProcessor detected while UI is idle; stopping before start";
+            processor->requestStop();
+            if (!processor->wait(1500)) {
+                qDebug() << "[FobosLifecycle] stale DataProcessor wait timed out; forcing stop before start";
+                processor->forceStop(1000);
+            }
+            processor->finalizeStopped();
+            if (processor->isRunning()) {
+                qDebug() << "[FobosLifecycle] stale DataProcessor is still running; start aborted";
+                return;
+            }
+            qDebug() << "[FobosLifecycle] stale DataProcessor stopped; continuing start";
+        } else {
+            qDebug() << "Warning: Processor is already running!";
+            return;
+        }
     }
 
     runState = RadioRunState::Starting;
     qDebug() << "[FobosLifecycle] state changed" << runStateName(runState);
     updateUiForRunState();
     refreshSettingsFromUi();
-    if (realignDmrCenterToListening(pendingSettings)) {
-        qDebug() << "[FobosLifecycle] DMR start realigned RF center to listening frequency"
+    if (offsetDmrCenterFromListening(pendingSettings)) {
+        qDebug() << "[FobosLifecycle] DMR start offset RF center from listening frequency"
                  << "center" << pendingSettings.centerFrequency
                  << "listening" << pendingSettings.listeningFrequency;
         if (frequencyControl) {
@@ -20183,8 +20805,17 @@ void YourClassName::startFobosProcessing() {
         }
 
         qDebug() << "[FobosLifecycle] applying Fobos settings";
-        if (!applyFobosSettings()) {
+        const bool forceStartFrequencyApply = pendingSettings.inputMode == INPUT_RF;
+        if (!applyFobosSettings(forceStartFrequencyApply)) {
             qDebug() << "Start aborted because Fobos settings could not be applied; closing Fobos session before retry.";
+            closeFobosSession(true);
+            clearLiveSpectrumSnapshot();
+            runState = RadioRunState::Idle;
+            updateUiForRunState();
+            return;
+        }
+        if (!performAgileStartupFrequencyJog()) {
+            qDebug() << "Start aborted because Agile startup frequency jog failed; closing Fobos session before retry.";
             closeFobosSession(true);
             clearLiveSpectrumSnapshot();
             runState = RadioRunState::Idle;

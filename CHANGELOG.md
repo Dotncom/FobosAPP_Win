@@ -1,5 +1,28 @@
 # Changelog
 
+## 4.4.0 - 2026-06-16
+
+### Added
+
+- Added selectable DMR backend routing for the internal mbelib path, the
+  internal OpenDMR/OP25-compatible path, DSD-neo, and the experimental
+  GopherTrunk bridge.
+- Added DSD-neo bridge controls, UDP PCM handoff, decoded PCM return path, and
+  release packaging support for bundled optional DSD-neo runtime files.
+- Added the experimental GopherTrunk bridge scaffold for future virtual-source
+  tests.
+- Added DMR channel-rate control and improved DMR metadata stability filtering.
+
+### Fixed
+
+- Stabilized Fobos Agile RF startup with a short startup frequency jog before
+  the first IQ reader starts, reducing the shifted/mirrored spectrum state that
+  manual retune previously had to clear.
+- Reworked stale `DataProcessor` recovery so the Start button no longer silently
+  switches the UI to Running when the reader is stuck in an idle-looking state.
+- Kept the DMR center offset workaround active so DMR decoding is not run with
+  listening and RF center exactly equal on Fobos Agile.
+
 ## 4.3.2-beta - 2026-06-15
 
 ### Added

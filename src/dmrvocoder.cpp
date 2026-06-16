@@ -427,6 +427,13 @@ struct DmrVocoder::Impl {
             return QFileInfo(library.fileName()).fileName();
         }
 
+        QString backendId() const {
+            if (info && info->backend_id) {
+                return QString::fromUtf8(info->backend_id);
+            }
+            return QFileInfo(library.fileName()).completeBaseName();
+        }
+
         QLibrary library;
         QString loadError;
         const fobos_dmr_voice_backend_info *info = nullptr;
@@ -523,7 +530,26 @@ struct DmrVocoder::Impl {
         }
     }
 
+    bool backendMatchesPreference(const Backend *backend) const {
+        if (!backend || preferredBackendId.isEmpty()) {
+            return true;
+        }
+        const QString needle = preferredBackendId.toLower();
+        return backend->backendId().toLower().contains(needle) ||
+               backend->displayName().toLower().contains(needle);
+    }
+
     Backend *backendWith(quint32 capability) const {
+        if (!preferredBackendId.isEmpty()) {
+            for (const std::unique_ptr<Backend> &backend : backends) {
+                if (backend &&
+                    (backend->capabilities & capability) != 0 &&
+                    backendMatchesPreference(backend.get())) {
+                    return backend.get();
+                }
+            }
+            return nullptr;
+        }
         for (const std::unique_ptr<Backend> &backend : backends) {
             if (backend && (backend->capabilities & capability) != 0) {
                 return backend.get();
@@ -541,7 +567,7 @@ struct DmrVocoder::Impl {
 
     bool fallbackAvailable() const {
 #ifdef FOBOSAPP_HAS_MBELIB_NEO
-        return true;
+        return preferredBackendId.isEmpty() || preferredBackendId.contains(QStringLiteral("mbelib"), Qt::CaseInsensitive);
 #else
         return false;
 #endif
@@ -549,6 +575,7 @@ struct DmrVocoder::Impl {
 
     std::vector<std::unique_ptr<Backend>> backends;
     bool loadAttempted = false;
+    QString preferredBackendId;
 
 #ifdef FOBOSAPP_HAS_MBELIB_NEO
     mbe_parms cur;
@@ -569,6 +596,20 @@ DmrVocoder::~DmrVocoder() {
 
 bool DmrVocoder::isAvailable() const {
     return impl && (impl->hasBackendDecoder() || impl->fallbackAvailable());
+}
+
+void DmrVocoder::setPreferredBackendId(const QString &backendId) {
+    if (!impl) {
+        return;
+    }
+    const QString clean = backendId.trimmed();
+    if (impl->preferredBackendId == clean) {
+        return;
+    }
+    impl->preferredBackendId = clean;
+    qDebug() << "[DMR voice backend] preferred backend"
+             << (clean.isEmpty() ? QStringLiteral("auto") : clean);
+    reset();
 }
 
 void DmrVocoder::reset() {
@@ -632,7 +673,7 @@ QByteArray DmrVocoder::decodeFrames(const std::vector<QString> &frames,
     }
 
 #ifdef FOBOSAPP_HAS_MBELIB_NEO
-    if (!impl || frames.empty()) {
+    if (!impl || !impl->fallbackAvailable() || frames.empty()) {
         return pcm;
     }
     if (!initialized) {
@@ -732,7 +773,7 @@ QByteArray DmrVocoder::decodeSoftFrames(const std::vector<DmrAmbeSoftFrame> &fra
     }
 
 #ifdef FOBOSAPP_HAS_MBELIB_NEO
-    if (!impl || frames.empty()) {
+    if (!impl || !impl->fallbackAvailable() || frames.empty()) {
         return pcm;
     }
     if (!initialized) {
@@ -828,7 +869,7 @@ QByteArray DmrVocoder::decodePayloads(const std::vector<DmrAmbePayload> &payload
     }
 
 #ifdef FOBOSAPP_HAS_MBELIB_NEO
-    if (!impl || payloads.empty()) {
+    if (!impl || !impl->fallbackAvailable() || payloads.empty()) {
         return pcm;
     }
     if (!initialized) {

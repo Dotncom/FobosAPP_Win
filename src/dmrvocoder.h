@@ -16,6 +16,7 @@ public:
     DmrVocoder &operator=(const DmrVocoder &) = delete;
 
     bool isAvailable() const;
+    void setPreferredBackendId(const QString &backendId);
     void reset();
     QByteArray decodeSoftFrames(const std::vector<DmrAmbeSoftFrame> &frames,
                                 int *decodedFrames = nullptr,

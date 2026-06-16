@@ -1099,6 +1099,27 @@ void DigitalDecoder::configure(const RadioSettings &settings, int sampleRate) {
     configureForMode(settings.modulationType, sampleRate);
 }
 
+void DigitalDecoder::setDmrVoiceBackendId(const QString &backendId) {
+    const QString clean = backendId.trimmed();
+    if (preferredDmrVoiceBackendId == clean) {
+        return;
+    }
+    preferredDmrVoiceBackendId = clean;
+    dmrVocoder.setPreferredBackendId(clean);
+    dmrPayloadProbeVocoder.setPreferredBackendId(clean);
+    dmrRawProbeVocoder.setPreferredBackendId(clean);
+    dmrCanonicalProbeVocoder.setPreferredBackendId(clean);
+    clearDmrVoicePcmBuffer();
+}
+
+void DigitalDecoder::setDmrVoiceOutputEnabled(bool enabled) {
+    if (dmrVoiceOutputEnabled == enabled) {
+        return;
+    }
+    dmrVoiceOutputEnabled = enabled;
+    clearDmrVoicePcmBuffer();
+}
+
 void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSettings &settings, int sampleRate) {
     if (!decoderEnabled) {
         return;
@@ -1141,6 +1162,13 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
                                      result.metadataTargetId,
                                      result.metadataSourceId,
                                      result.metadataFlco);
+        }
+        for (const DmrDecoder::DibitBurst &burst : result.dibitBursts) {
+            emit dmrDibitBurstReady(burst.dibits,
+                                    burst.sample,
+                                    burst.burstIndex,
+                                    burst.cadenceSymbols,
+                                    burst.colorCode);
         }
         if (result.lockAcquired) {
             dmrVocoder.reset();
@@ -1595,7 +1623,7 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
                 dmrVocoderFrameCount += decodedVoiceFrames;
                 dmrVocoderErrorCount += vocoderErrors;
             }
-            if (!voicePcm.isEmpty()) {
+            if (!voicePcm.isEmpty() && dmrVoiceOutputEnabled) {
                 queueDmrVoicePcm(voicePcm);
             }
             if (previousPayloadCount == 0 ||

@@ -1121,6 +1121,7 @@ void DmrDecoder::reset() {
     pendingAmbeSoftFrames.clear();
     pendingAmbePayloads.clear();
     queuedVoicePayloadBurstSamples.clear();
+    pendingDibitBursts.clear();
     voiceLcRawSinceReport.clear();
     voicePayloadCadenceScore30 = 0;
     voicePayloadCadenceScore60 = 0;
@@ -1370,6 +1371,10 @@ DmrDecoder::Result DmrDecoder::processPcmFrame(const QByteArray &pcmData, int sa
         std::vector<DmrAmbePayload> payloads = takePendingAmbePayloads(&correctedErrors);
         value.ambePayloads.insert(value.ambePayloads.end(), payloads.begin(), payloads.end());
         value.ambeFecCorrections += correctedErrors;
+        value.dibitBursts.insert(value.dibitBursts.end(),
+                                 pendingDibitBursts.begin(),
+                                 pendingDibitBursts.end());
+        pendingDibitBursts.clear();
         int confidence = 0;
         value.voiceAudioTrusted = hasTrustedVoiceAudio(&confidence);
         value.voiceAudioConfidence = confidence;
@@ -4550,6 +4555,35 @@ void DmrDecoder::queueVoicePayloadFrames(const PendingEmb &pending,
     }
     lastVoicePayloadAmbeLayout = bestCandidate.ambeLayout;
     lastVoicePayloadBitMapVariant = bestCandidate.bitMapVariant;
+    VoicePayloadBits gopherPayload = bestCandidate.payload;
+    if (gopherPayload.leftDibits.isEmpty() ||
+        gopherPayload.syncDibits.isEmpty() ||
+        gopherPayload.rightDibits.isEmpty()) {
+        gopherPayload = decodeVoicePayloadAt(pending,
+                                             bestCandidate.inverted,
+                                             bestCandidate.timingOffset,
+                                             bestCandidate.slicerRatio,
+                                             bestCandidate.useAdaptiveSlicer,
+                                             bestCandidate.ambeLayout,
+                                             bestCandidate.bitMapVariant,
+                                             true);
+    }
+    const QString gopherDibits =
+        gopherPayload.leftDibits +
+        gopherPayload.syncDibits +
+        gopherPayload.rightDibits;
+    if (gopherDibits.size() == 132) {
+        pendingDibitBursts.push_back({gopherDibits,
+                                      pending.absoluteSample,
+                                      pending.burstIndex,
+                                      pending.cadenceSymbols,
+                                      selectedVoicePayloadColorCode});
+        if (pendingDibitBursts.size() > 64) {
+            pendingDibitBursts.erase(pendingDibitBursts.begin(),
+                                     pendingDibitBursts.begin() +
+                                         static_cast<std::ptrdiff_t>(pendingDibitBursts.size() - 64));
+        }
+    }
 
     if (dmrDibitDumpRemaining > 0 && fobosVerboseLoggingEnabled()) {
         VoicePayloadBits debugPayload =

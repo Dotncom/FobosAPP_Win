@@ -1,7 +1,7 @@
 {
   "schema": "fobosapp-dmr-backends",
-  "schemaVersion": 1,
-  "defaultBackend": "internal",
+  "schemaVersion": 2,
+  "defaultBackend": "fobos-mbelib",
   "pcm": {
     "sampleRate": 48000,
     "format": "s16le",
@@ -9,31 +9,93 @@
   },
   "backends": [
     {
-      "id": "internal",
-      "label": "Internal DMR monitor",
+      "id": "fobos-mbelib",
+      "label": "FobosAPP + mbelib",
       "type": "internal",
-      "enabled": true
+      "enabled": true,
+      "preferredVoiceBackendId": "fobos.dmr.voice.mbelib"
     },
     {
-      "id": "dsd-neo-tcp",
-      "label": "DSD-neo TCP PCM16LE",
-      "type": "tcp_pcm16le",
+      "id": "fobos-opendmr",
+      "label": "FobosAPP + OpenDMR/OP25",
+      "type": "internal",
       "enabled": false,
-      "host": "127.0.0.1",
-      "port": 7355,
-      "notes": "Start dsd-neo separately with TCP PCM16LE input and DMR mono options."
+      "preferredVoiceBackendId": "fobos.dmr.voice.opendmr"
     },
     {
-      "id": "dsd-neo-process",
-      "label": "DSD-neo process",
-      "type": "process",
+      "id": "dsd-neo-bridge",
+      "label": "DSD-neo bridge",
+      "type": "udp_pcm16le_plus_udp_audio",
       "enabled": false,
-      "program": "dsd-neo",
+      "program": "dsd-neo/dsd-neo.exe",
+      "input": {
+        "direction": "fobosapp_to_dsd_neo",
+        "transport": "udp_sender",
+        "host": "127.0.0.1",
+        "port": 7355,
+        "format": "s16le",
+        "channels": 1,
+        "sampleRate": 48000
+      },
+      "output": {
+        "direction": "dsd_neo_to_fobosapp",
+        "transport": "udp_listener",
+        "host": "127.0.0.1",
+        "port": 23456,
+        "format": "s16le",
+        "channels": 1,
+        "sampleRate": 8000
+      },
       "arguments": [
         "-fs",
+        "-i",
+        "udp:127.0.0.1:7355",
+        "-s",
+        "48000",
+        "-o",
+        "udp:127.0.0.1:23456",
         "-nm"
       ],
-      "notes": "Process bridging is a placeholder until exact stdin/file/TCP mode is selected per platform."
+      "notes": "Select DSD-neo in the Digital Audio DMR backend combo. Auto start uses these arguments, with -s updated to the selected DMR 4FSK baseband rate."
+    },
+    {
+      "id": "gophertrunk-virtual-dibit-source",
+      "label": "GopherTrunk virtual dibit source",
+      "type": "tcp_ndjson_dibit_stream_plus_udp_audio",
+      "enabled": false,
+      "program": "gophertrunk/fobos-dmr-virtual.exe",
+      "input": {
+        "direction": "fobosapp_to_gophertrunk",
+        "transport": "tcp_client",
+        "host": "127.0.0.1",
+        "port": 7460,
+        "format": "ndjson",
+        "packetExamples": [
+          {
+            "baseIdx": 0,
+            "dibits": "010310020223332030"
+          },
+          {
+            "reset": true
+          }
+        ]
+      },
+      "output": {
+        "direction": "gophertrunk_to_fobosapp",
+        "transport": "udp_listener",
+        "host": "127.0.0.1",
+        "port": 23456,
+        "format": "s16le",
+        "channels": 1,
+        "sampleRate": 8000
+      },
+      "arguments": [
+        "-listen",
+        "127.0.0.1:7460",
+        "-audio-udp",
+        "127.0.0.1:23456"
+      ],
+      "notes": "Lab-only integration target. FobosAPP should send full 132-dibit DMR bursts with a monotonic baseIdx, not extracted AMBE payloads."
     }
   ]
 }

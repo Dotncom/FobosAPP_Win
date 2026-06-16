@@ -22,6 +22,8 @@ public:
     bool isEnabled() const;
     void reset();
     void configure(const RadioSettings &settings, int sampleRate = 48000);
+    void setDmrVoiceBackendId(const QString &backendId);
+    void setDmrVoiceOutputEnabled(bool enabled);
     void processPcmFrame(const QByteArray &pcmData, const RadioSettings &settings, int sampleRate = 48000);
 
 signals:
@@ -33,6 +35,11 @@ signals:
                              quint32 targetId,
                              quint32 sourceId,
                              int flco);
+    void dmrDibitBurstReady(const QString &dibits,
+                            quint64 sample,
+                            int burstIndex,
+                            int cadenceSymbols,
+                            int colorCode);
 
 private:
     enum class RttyState {
@@ -82,6 +89,8 @@ private:
     double fskLevel = 0.0;
     double signalQuality = 0.0;
     RadioSettings currentSettings;
+    QString preferredDmrVoiceBackendId;
+    bool dmrVoiceOutputEnabled = true;
     std::vector<float> ft8AudioBuffer;
     int ft8SamplesSinceAnalysis = 0;
     int ft8AnalysisCounter = 0;

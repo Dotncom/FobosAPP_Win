@@ -31,6 +31,8 @@ constexpr double SSB_MAX_AUDIO_HZ = 3600.0;
 constexpr double SAM_LOCK_RANGE_HZ = 1500.0;
 constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
 constexpr double DMR_CHANNEL_RATE = 192000.0;
+constexpr double DMR_HIGH_RF_CHANNEL_RATE = 768000.0;
+constexpr double DMR_HIGH_RF_THRESHOLD = 10000000.0;
 constexpr double DMR_FOURFSK_CHANNEL_CUTOFF_HZ = 9500.0;
 constexpr double DMR_FOURFSK_SYMBOL_FILTER_HZ = 6200.0;
 constexpr double DMR_FOURFSK_DC_TRACK_HZ = 12.0;
@@ -680,8 +682,18 @@ void AudioProcessor::processDmrIqDemodulatorBlock(const std::vector<float>& iqBl
     const std::size_t iqSamples = iqBlock.size() / 2;
     const int requestedOutputRate =
         normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
+    const int manualChannelRate = settings.dmrChannelSampleRate;
+    const bool manualChannelProfile =
+        manualChannelRate == 192000 ||
+        manualChannelRate == 384000 ||
+        manualChannelRate == 768000 ||
+        manualChannelRate == 1536000;
+    const double preferredDmrChannelRate =
+        manualChannelProfile
+            ? static_cast<double>(manualChannelRate)
+            : (rfInputRate >= DMR_HIGH_RF_THRESHOLD ? DMR_HIGH_RF_CHANNEL_RATE : DMR_CHANNEL_RATE);
     const double dmrChannelTargetRate =
-        (std::max)(DMR_CHANNEL_RATE, static_cast<double>(requestedOutputRate));
+        (std::max)(preferredDmrChannelRate, static_cast<double>(requestedOutputRate));
     const int decimationFactor =
         (std::max)(1, static_cast<int>(std::floor(rfInputRate / dmrChannelTargetRate)));
     const double channelRate = rfInputRate / static_cast<double>(decimationFactor);
@@ -733,6 +745,12 @@ void AudioProcessor::processDmrIqDemodulatorBlock(const std::vector<float>& iqBl
                      << "targetChannelRate" << dmrChannelTargetRate
                      << "channelRate" << channelRate
                      << "decimation" << decimationFactor
+                     << "profile" << (manualChannelProfile
+                                           ? QStringLiteral("manual")
+                                           : (rfInputRate >= DMR_HIGH_RF_THRESHOLD
+                                                  ? QStringLiteral("high-rf")
+                                                  : QStringLiteral("normal")))
+                     << "manualChannelRate" << manualChannelRate
                      << "outputRate" << requestedOutputRate
                      << "samplesPerSymbol"
                      << (static_cast<double>(requestedOutputRate) / 4800.0)
@@ -1310,6 +1328,7 @@ void AudioProcessor::SDRThread() {
     double activeAudioHighPassHz = activeSettings.audioHighPassHz;
     int activeDmrBasebandSampleRate =
         normalizedDmrBasebandSampleRate(activeSettings.dmrBasebandSampleRate);
+    int activeDmrChannelSampleRate = activeSettings.dmrChannelSampleRate;
 
     while (running) {
         const RadioSettings settings = currentSettingsSnapshot();
@@ -1322,6 +1341,7 @@ void AudioProcessor::SDRThread() {
             std::abs(activeBandwidth - settings.bandwidth) > 1.0 ||
             std::abs(activeAudioLowPassHz - settings.audioLowPassHz) > 1.0 ||
             std::abs(activeAudioHighPassHz - settings.audioHighPassHz) > 1.0 ||
+            activeDmrChannelSampleRate != settings.dmrChannelSampleRate ||
             activeDmrBasebandSampleRate !=
                 normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate)) {
             activeInputMode = settings.inputMode;
@@ -1332,6 +1352,7 @@ void AudioProcessor::SDRThread() {
             activeBandwidth = settings.bandwidth;
             activeAudioLowPassHz = settings.audioLowPassHz;
             activeAudioHighPassHz = settings.audioHighPassHz;
+            activeDmrChannelSampleRate = settings.dmrChannelSampleRate;
             activeDmrBasebandSampleRate =
                 normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);
             resetDemodulatorState();

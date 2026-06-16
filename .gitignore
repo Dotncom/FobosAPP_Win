@@ -69,6 +69,7 @@ build/
 out/
 release/
 release.zip
+downloads/
 recordings/
 .gradle/
 local.properties

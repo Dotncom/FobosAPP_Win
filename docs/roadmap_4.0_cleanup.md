@@ -322,7 +322,7 @@ Current status:
 
 1. DMR is experimental/lab quality.
 2. The app can expose metadata and attempt voice, but real Motorola DMR voice quality has been inconsistent.
-3. Optional AMBE/voice backend architecture exists, but the sync/framing/voice path is not stable enough to call complete.
+3. Optional AMBE/voice backend architecture exists, and a DSD-neo external bridge is available for lab comparison, but the sync/framing/voice path is not stable enough to call complete.
 
 Next DMR steps:
 
@@ -330,9 +330,9 @@ Next DMR steps:
 2. Preserve the current optional GPL backend approach:
    - internal test backend;
    - optional mbelib/OpenDMR style backend;
-   - external process bridge later.
-3. External decoder bridge for lab comparison:
-   - mirror selected narrow DMR baseband/audio frames to an external decoder;
+   - DSD-neo external process bridge for comparison.
+3. Use the DSD-neo bridge for lab comparison:
+   - mirror selected narrow DMR baseband/audio frames to DSD-neo;
    - compare CC/TS/SRC/TG and audio output against our parser;
    - keep this as a verifier, not as a hidden dependency.
 4. Only consider a custom AMBE decoder after sync/framing is proven with clean synthetic and real IQ.

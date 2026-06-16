@@ -82,12 +82,35 @@ On Linux/Raspberry Pi the same backend project builds shared libraries with
 `libfobos_dmr_voice_opendmr.so`; place them in the application runtime
 `dmr_voice_backends/` directory.
 
+## Optional DSD-neo DMR Bridge
+
+The Digital Audio dock has a `DMR backend` selector:
+
+- `FobosAPP + mbelib`
+- `FobosAPP + OpenDMR/OP25`
+- `DSD-neo`
+- `GopherTrunk (future)` reserved for later work
+
+The optional DSD-neo bridge is disabled by default. When selected, FobosAPP
+forwards the selected DMR discriminator PCM as raw mono PCM16LE over local UDP and
+can accept decoded DMR voice audio back over UDP.
+
+Manual DSD-neo command matching the default ports:
+
+```powershell
+.\dsd-neo\dsd-neo.exe -fs -i udp:127.0.0.1:7355 -s 48000 -o udp:127.0.0.1:23456 -nm
+```
+
+See `docs/dmr_external_backend.md` and `config/dmr_backends.example.json` for
+the full bridge contract. DSD-neo is an external optional tool; it is not
+required for normal SDR, scan, GNSS, or internal DMR metadata use.
+
 ## Main Features
 
 - AM, SAM, NFM, WFM, USB, LSB, DSB, CW, FT8, RTTY, FSK, PSK, ATV, SSTV, APT,
   WEFAX, Meteor LRPT beta, and DMR beta mode selection.
-- Digital Audio dock with FT8/RTTY/FSK/PSK decoding work and DMR beta
-  sync/activity monitoring.
+- Digital Audio dock with FT8/RTTY/FSK/PSK decoding work, DMR beta
+  sync/activity monitoring, and an optional DSD-neo lab bridge.
 - DMR Lab Capture metadata fields and JSON sidecar files for controlled audio
   and Channel IQ recordings.
 - Video dock with analog TV, SSTV, NOAA APT, HF WEFAX, and Meteor LRPT beta
