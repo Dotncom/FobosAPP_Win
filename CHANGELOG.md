@@ -15,13 +15,16 @@
 
 ### Fixed
 
-- Stabilized Fobos Agile RF startup with a short startup frequency jog before
-  the first IQ reader starts, reducing the shifted/mirrored spectrum state that
-  manual retune previously had to clear.
 - Reworked stale `DataProcessor` recovery so the Start button no longer silently
   switches the UI to Running when the reader is stuck in an idle-looking state.
 - Kept the DMR center offset workaround active so DMR decoding is not run with
   listening and RF center exactly equal on Fobos Agile.
+
+### Notes
+
+- The attempted Agile startup frequency jog was removed after field testing
+  showed it could make the shifted spectrum state persistent. Startup retune
+  recovery remains under investigation and should not be released as fixed yet.
 
 ## 4.3.2-beta - 2026-06-15
 

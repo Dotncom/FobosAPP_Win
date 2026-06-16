@@ -17864,71 +17864,6 @@ bool YourClassName::applyFobosSettings(bool forceFrequencyApply) {
     return true;
 }
 
-bool YourClassName::performAgileStartupFrequencyJog() {
-    if (!hasActiveFobosDevice() ||
-        activeFobosApiKind != FobosApiKind::Agile ||
-        pendingSettings.inputMode != INPUT_RF ||
-        agileScanEnabled) {
-        return true;
-    }
-
-    normalizeTuning(pendingSettings);
-    const double targetFrequency = pendingSettings.centerFrequency;
-    if (!std::isfinite(targetFrequency) || targetFrequency <= 0.0) {
-        return true;
-    }
-
-    const double sampleRate = (std::max)(pendingSettings.sampleRate, 1.0);
-    const double jogHz = (std::clamp)(sampleRate * 0.05, 250000.0, 1000000.0);
-    const double jogFrequency = targetFrequency + jogHz;
-    qDebug() << "[FobosLifecycle] Agile startup frequency jog begin"
-             << "target" << targetFrequency
-             << "jog" << jogFrequency
-             << "jogHz" << jogHz;
-
-    double jogActual = jogFrequency;
-    int result = setActiveFrequencySafely(jogFrequency, &jogActual);
-    qDebug() << "[FobosLifecycle] Agile startup frequency jog intermediate"
-             << "requested" << jogFrequency
-             << "result" << result
-             << "actual" << jogActual;
-    if (result != FOBOS_ERR_OK) {
-        qDebug() << "[FobosLifecycle] Agile startup frequency jog intermediate failed; trying target anyway";
-    } else {
-        QThread::msleep(25);
-    }
-
-    double targetActual = targetFrequency;
-    result = setActiveFrequencySafely(targetFrequency, &targetActual);
-    qDebug() << "[FobosLifecycle] Agile startup frequency jog target"
-             << "requested" << targetFrequency
-             << "result" << result
-             << "actual" << targetActual;
-    if (result != FOBOS_ERR_OK) {
-        qDebug() << "[FobosLifecycle] Agile startup frequency jog failed to restore target";
-        return false;
-    }
-
-    const double autoBandwidthRatio = agileRfAutoBandwidthRatio(pendingSettings.sampleRate);
-    const int bandwidthResult = setFobosAgileAutoBandwidthSafely(agileDevice, autoBandwidthRatio);
-    qDebug() << "[FobosLifecycle] Agile startup frequency jog bandwidth"
-             << "ratio" << autoBandwidthRatio
-             << "result" << bandwidthResult;
-
-    pendingSettings.actualFrequency = targetActual;
-    actualFrequency = targetActual;
-    if (hardwareSettingsApplied) {
-        appliedHardwareSettings.centerFrequency = targetFrequency;
-        appliedHardwareSettings.actualFrequency = targetActual;
-    }
-    publishSettingsToGlobals();
-    updateIqFrameProducerSettings();
-    qDebug() << "[FobosLifecycle] Agile startup frequency jog done"
-             << "target" << targetFrequency
-             << "actual" << targetActual;
-    return true;
-}
-
 void YourClassName::updateFrequency() {
    const double frequency = scaleWidget ? scaleWidget->currentListeningFrequency() : listeningFrequency;
    if (listeningFrequencyControl) {
@@ -20808,14 +20743,6 @@ void YourClassName::startFobosProcessing() {
         const bool forceStartFrequencyApply = pendingSettings.inputMode == INPUT_RF;
         if (!applyFobosSettings(forceStartFrequencyApply)) {
             qDebug() << "Start aborted because Fobos settings could not be applied; closing Fobos session before retry.";
-            closeFobosSession(true);
-            clearLiveSpectrumSnapshot();
-            runState = RadioRunState::Idle;
-            updateUiForRunState();
-            return;
-        }
-        if (!performAgileStartupFrequencyJog()) {
-            qDebug() << "Start aborted because Agile startup frequency jog failed; closing Fobos session before retry.";
             closeFobosSession(true);
             clearLiveSpectrumSnapshot();
             runState = RadioRunState::Idle;

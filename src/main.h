@@ -235,7 +235,6 @@ private:
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
     bool applyFobosSettings(bool forceFrequencyApply = false);
-    bool performAgileStartupFrequencyJog();
     bool applyAgileScanSettings(bool forceStop = false);
     bool applyStandardScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
