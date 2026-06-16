@@ -343,6 +343,14 @@ void QthMapWidget::setGridPrecision(int precision) {
     update();
 }
 
+void QthMapWidget::setPositionVisible(bool visible) {
+    if (positionVisible == visible) {
+        return;
+    }
+    positionVisible = visible;
+    update();
+}
+
 void QthMapWidget::centerOnPosition() {
     viewCenterLatitude = (std::clamp)(latitude, -kMercatorMaxLatitude, kMercatorMaxLatitude);
     viewCenterLongitude = longitude;
@@ -979,7 +987,7 @@ void QthMapWidget::drawMapMarker(QPainter &painter,
 }
 
 int QthMapWidget::userMarkerAtPosition(const QPointF &point, const QRectF &mapRect) const {
-    constexpr double kHitRadiusPx = 14.0;
+    constexpr double kHitRadiusPx = 24.0;
     constexpr double kHitRadiusSquared = kHitRadiusPx * kHitRadiusPx;
     int hitIndex = -1;
     double bestDistanceSquared = kHitRadiusSquared;
@@ -1001,8 +1009,19 @@ bool QthMapWidget::searchMarkerAtPosition(const QPointF &point, const QRectF &ma
     if (!hasSearchMarker) {
         return false;
     }
-    constexpr double kHitRadiusPx = 14.0;
+    constexpr double kHitRadiusPx = 24.0;
     const QPointF markerPoint = geoToPoint(searchMarker.latitude, searchMarker.longitude, mapRect);
+    const double dx = markerPoint.x() - point.x();
+    const double dy = markerPoint.y() - point.y();
+    return (dx * dx + dy * dy) <= kHitRadiusPx * kHitRadiusPx;
+}
+
+bool QthMapWidget::currentPositionAtPosition(const QPointF &point, const QRectF &mapRect) const {
+    if (!positionVisible) {
+        return false;
+    }
+    constexpr double kHitRadiusPx = 24.0;
+    const QPointF markerPoint = geoToPoint(latitude, longitude, mapRect);
     const double dx = markerPoint.x() - point.x();
     const double dy = markerPoint.y() - point.y();
     return (dx * dx + dy * dy) <= kHitRadiusPx * kHitRadiusPx;
@@ -1031,6 +1050,21 @@ void QthMapWidget::drawUserMarkers(QPainter &painter, const QRectF &mapRect) {
 }
 
 void QthMapWidget::drawMarkerAndTitle(QPainter &painter, const QRectF &mapRect) {
+    if (!positionVisible) {
+        const bool ukrainian = uiLanguage.startsWith(QStringLiteral("uk"));
+        painter.setPen(QColor(230, 235, 240));
+        QFont titleFont = painter.font();
+        titleFont.setBold(true);
+        titleFont.setPointSize(titleFont.pointSize() + 1);
+        painter.setFont(titleFont);
+        painter.drawText(QRectF(mapRect.left(), mapRect.top() + 8, mapRect.width(), 24),
+                         Qt::AlignHCenter,
+                         ukrainian
+                             ? QStringLiteral("\u041F\u043E\u0442\u043E\u0447\u043D\u0443 QTH-\u043F\u043E\u0437\u0438\u0446\u0456\u044E \u043E\u0447\u0438\u0449\u0435\u043D\u043E")
+                             : QStringLiteral("Current QTH position cleared"));
+        return;
+    }
+
     drawMapMarker(painter,
                   mapRect,
                   latitude,
@@ -1164,7 +1198,9 @@ void QthMapWidget::paintEvent(QPaintEvent *event) {
     }
 
     drawMaidenheadGrid(painter, mapRect);
-    drawCurrentLocator(painter, mapRect);
+    if (positionVisible) {
+        drawCurrentLocator(painter, mapRect);
+    }
     drawUserMarkers(painter, mapRect);
     drawMarkerAndTitle(painter, mapRect);
     drawFooter(painter, mapRect);
@@ -1190,7 +1226,17 @@ void QthMapWidget::mousePressEvent(QMouseEvent *event) {
             return;
         }
         if (searchMarkerAtPosition(mousePosition, mapRect)) {
+            const qth::UserMarker marker = searchMarker;
+            const QString label = markerDisplayLabel(marker);
             clearSearchMarker();
+            emit userMarkerRemoved(marker.latitude, marker.longitude, label, marker.number);
+            event->accept();
+            return;
+        }
+        if (currentPositionAtPosition(mousePosition, mapRect)) {
+            positionVisible = false;
+            emit currentPositionCleared();
+            update();
             event->accept();
             return;
         }

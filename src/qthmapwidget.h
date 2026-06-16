@@ -36,6 +36,7 @@ public:
     void setMapZoomRange(int minimumZoom, int maximumZoom);
     void setMapZoom(int zoom);
     void setGridPrecision(int precision);
+    void setPositionVisible(bool visible);
     void centerOnPosition();
     void centerOn(double latitude, double longitude);
     void setSearchMarker(double latitude, double longitude, const QString &label);
@@ -49,6 +50,7 @@ signals:
     void userMarkersChanged();
     void userMarkerAdded(double latitude, double longitude, const QString &label, int number);
     void userMarkerRemoved(double latitude, double longitude, const QString &label, int number);
+    void currentPositionCleared();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -87,12 +89,14 @@ private:
                        bool drawLabel);
     int userMarkerAtPosition(const QPointF &point, const QRectF &mapRect) const;
     bool searchMarkerAtPosition(const QPointF &point, const QRectF &mapRect) const;
+    bool currentPositionAtPosition(const QPointF &point, const QRectF &mapRect) const;
     void drawUserMarkers(QPainter &painter, const QRectF &mapRect);
     void drawMarkerAndTitle(QPainter &painter, const QRectF &mapRect);
     void drawFooter(QPainter &painter, const QRectF &mapRect);
 
     double latitude = 0.0;
     double longitude = 0.0;
+    bool positionVisible = true;
     double viewCenterLatitude = 0.0;
     double viewCenterLongitude = 0.0;
     bool viewCenterInitialized = false;

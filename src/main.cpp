@@ -57,6 +57,7 @@
 #include <QRegularExpression>
 #include <QScopeGuard>
 #include <QSettings>
+#include <QSerialPort>
 #include <QUrl>
 #if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
 #include <QAudioDeviceInfo>
@@ -127,6 +128,76 @@ constexpr const char *RTL_TCP_DEFAULT_HOST = "127.0.0.1";
 constexpr quint16 RTL_TCP_DEFAULT_PORT = 1234;
 constexpr double FOBOS_DEFAULT_SAMPLE_RATE = 50000000.0;
 constexpr double RTL_TCP_SAFE_SAMPLE_RATE = 2048000.0;
+
+struct NmeaSerialStatus {
+    bool recognized = false;
+    QString talker;
+    QString sentence;
+    QString utc;
+    int fixQuality = -1;
+    int fixMode = -1;
+    int satellitesUsed = -1;
+    int satellitesInView = -1;
+};
+
+int parseNmeaIntField(const QStringList &fields, int index, int fallback = -1) {
+    if (index < 0 || index >= fields.size()) {
+        return fallback;
+    }
+    bool ok = false;
+    const int value = fields.at(index).trimmed().toInt(&ok);
+    return ok ? value : fallback;
+}
+
+NmeaSerialStatus parseNmeaSerialStatusSentence(const QString &line) {
+    NmeaSerialStatus status;
+    QString sentence = line.trimmed();
+    if (sentence.isEmpty()) {
+        return status;
+    }
+    const int start = sentence.indexOf(QLatin1Char('$'));
+    if (start >= 0) {
+        sentence = sentence.mid(start + 1);
+    } else if (sentence.startsWith(QLatin1Char('!'))) {
+        sentence.remove(0, 1);
+    }
+    const int checksumPos = sentence.indexOf(QLatin1Char('*'));
+    const QString body = checksumPos >= 0 ? sentence.left(checksumPos) : sentence;
+    const QStringList fields = body.split(QLatin1Char(','));
+    if (fields.isEmpty()) {
+        return status;
+    }
+
+    const QString type = fields.at(0).trimmed().toUpper();
+    if (type.size() < 5) {
+        return status;
+    }
+    status.talker = type.left(type.size() - 3);
+    status.sentence = type.right(3);
+
+    if (status.sentence == QStringLiteral("GGA")) {
+        status.recognized = true;
+        status.utc = fields.size() > 1 ? fields.at(1).trimmed() : QString();
+        status.fixQuality = parseNmeaIntField(fields, 6);
+        status.satellitesUsed = parseNmeaIntField(fields, 7);
+    } else if (status.sentence == QStringLiteral("RMC")) {
+        status.recognized = true;
+        status.utc = fields.size() > 1 ? fields.at(1).trimmed() : QString();
+        status.fixQuality = (fields.size() > 2 && fields.at(2).trimmed().toUpper() == QStringLiteral("A")) ? 1 : 0;
+    } else if (status.sentence == QStringLiteral("GSA")) {
+        status.recognized = true;
+        status.fixMode = parseNmeaIntField(fields, 2);
+    } else if (status.sentence == QStringLiteral("GSV")) {
+        status.recognized = true;
+        status.satellitesInView = parseNmeaIntField(fields, 3);
+    } else if (status.sentence == QStringLiteral("GLL")) {
+        status.recognized = true;
+        status.utc = fields.size() > 5 ? fields.at(5).trimmed() : QString();
+        status.fixQuality = (fields.size() > 6 && fields.at(6).trimmed().toUpper() == QStringLiteral("A")) ? 1 : 0;
+    }
+
+    return status;
+}
 
 QString defaultDsdNeoProgramPath() {
 #if defined(_WIN32)
@@ -1674,6 +1745,12 @@ YourClassName::YourClassName(QWidget *parent)
     remoteAudioPlayer = new RemoteAudioPlayer(this);
     audioRelaySocket = new QUdpSocket(this);
     gnssNtpSocket = new QUdpSocket(this);
+    gnssSerialPort = new QSerialPort(this);
+    connect(gnssSerialPort, &QSerialPort::readyRead, this, &YourClassName::handleGnssSerialReadyRead);
+    connect(gnssSerialPort,
+            QOverload<QSerialPort::SerialPortError>::of(&QSerialPort::errorOccurred),
+            this,
+            &YourClassName::handleGnssSerialError);
     connect(audioRelaySocket, &QUdpSocket::readyRead, this, &YourClassName::receiveAudioRelayDatagrams);
     audioHttpServer = new QTcpServer(this);
     connect(audioHttpServer, &QTcpServer::newConnection, this, &YourClassName::acceptAudioHttpClient);
@@ -2421,11 +2498,36 @@ YourClassName::YourClassName(QWidget *parent)
     markTranslatable(qthMapButton, QStringLiteral("qth_map"), QStringLiteral("Map"));
     qthCopyButton = new QPushButton("Copy", qthBox);
     markTranslatable(qthCopyButton, QStringLiteral("copy_qth"), QStringLiteral("Copy"));
+    qthClearButton = new QPushButton("Clear", qthBox);
+    markTranslatable(qthClearButton, QStringLiteral("clear_qth"), QStringLiteral("Clear"));
+    qthClearButton->setToolTip(uiText(
+        QStringLiteral("clear_qth_tooltip"),
+        QStringLiteral("Hide the current real QTH position from the map and clear the live location state.")));
     qthPasteNmeaButton = new QPushButton("Paste NMEA", qthBox);
     markTranslatable(qthPasteNmeaButton, QStringLiteral("paste_nmea"), QStringLiteral("NMEA"));
     qthPasteNmeaButton->setToolTip(uiText(
         QStringLiteral("nmea_paste_tooltip"),
         QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
+    gnssSerialPortEdit = new QLineEdit(qthBox);
+    gnssSerialPortEdit->setText(gnssSerialPortName);
+    gnssSerialPortEdit->setPlaceholderText(QStringLiteral("COM4"));
+    gnssSerialPortEdit->setMaximumWidth(76);
+    gnssSerialPortEdit->setToolTip(uiText(
+        QStringLiteral("gnss_serial_port_tooltip"),
+        QStringLiteral("Serial port for an external NMEA GNSS receiver, for example COM4 or /dev/ttyUSB0.")));
+    gnssSerialBaudSpin = new QSpinBox(qthBox);
+    gnssSerialBaudSpin->setRange(1200, 921600);
+    gnssSerialBaudSpin->setSingleStep(4800);
+    gnssSerialBaudSpin->setValue(gnssSerialBaud);
+    gnssSerialBaudSpin->setMaximumWidth(86);
+    gnssSerialBaudSpin->setToolTip(uiText(
+        QStringLiteral("gnss_serial_baud_tooltip"),
+        QStringLiteral("NMEA serial baud rate. Most NEO-M8N modules use 9600 by default.")));
+    gnssSerialButton = new QPushButton("Connect", qthBox);
+    markTranslatable(gnssSerialButton, QStringLiteral("connect"), QStringLiteral("Connect"));
+    gnssSerialButton->setToolTip(uiText(
+        QStringLiteral("gnss_serial_connect_tooltip"),
+        QStringLiteral("Open the serial NMEA stream and use valid GGA/RMC fixes as the current QTH.")));
     gnssTuneButton = new QPushButton("Tune", qthBox);
     markTranslatable(gnssTuneButton, QStringLiteral("tune_gnss_l1"), QStringLiteral("Tune"));
     gnssScanButton = new QPushButton("Scan", qthBox);
@@ -2479,6 +2581,8 @@ YourClassName::YourClassName(QWidget *parent)
         QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
     gnssMonitorStatusLabel = new QLabel(qthBox);
     prepareGnssStatusLabel(gnssMonitorStatusLabel);
+    gnssSerialStatusLabel = new QLabel(qthBox);
+    prepareGnssStatusLabel(gnssSerialStatusLabel);
     gnssAcquireStatusLabel = new QLabel(qthBox);
     prepareGnssStatusLabel(gnssAcquireStatusLabel);
     gnssAcquisitionPlotDialog = new QDialog(this);
@@ -2518,6 +2622,7 @@ YourClassName::YourClassName(QWidget *parent)
              gnssOfflineAcquireButton,
              gnssSelfTestButton,
              gnssPositionSelfTestButton,
+             gnssSerialButton,
              gnssNetworkTimeButton,
              gnssPlotButton,
              gnssMonitorResetButton}) {
@@ -2540,6 +2645,8 @@ YourClassName::YourClassName(QWidget *parent)
     markTranslatable(qthLonLabel, QStringLiteral("longitude_short"), QStringLiteral("Lon:"));
     QLabel *qthLocatorTitleLabel = new QLabel("QTH:", qthBox);
     markTranslatable(qthLocatorTitleLabel, QStringLiteral("qth_locator_short"), QStringLiteral("QTH:"));
+    QLabel *gnssSerialLabel = new QLabel("NMEA:", qthBox);
+    markTranslatable(gnssSerialLabel, QStringLiteral("nmea_serial"), QStringLiteral("NMEA:"));
 
     QGridLayout *qthLayout = new QGridLayout(qthBox);
     qthLayout->setContentsMargins(6, 8, 6, 6);
@@ -2564,22 +2671,28 @@ YourClassName::YourClassName(QWidget *parent)
     qthLayout->addWidget(qthLocatorLabel, 7, 1, 1, 2);
     qthLayout->addWidget(qthMapButton, 8, 0);
     qthLayout->addWidget(qthCopyButton, 8, 1);
-    qthLayout->addWidget(qthPasteNmeaButton, 8, 2);
-    qthLayout->addWidget(gnssTuneButton, 9, 0);
-    qthLayout->addWidget(gnssScanButton, 9, 1);
-    qthLayout->addWidget(gnssSelfTestButton, 9, 2);
-    qthLayout->addWidget(gnssRawLogButton, 10, 0);
-    qthLayout->addWidget(gnssAcquireButton, 10, 1);
-    qthLayout->addWidget(gnssDeepAcquireButton, 10, 2);
-    qthLayout->addWidget(gnssNetworkTimeButton, 11, 0);
-    qthLayout->addWidget(gnssOfflineAcquireButton, 11, 1);
-    qthLayout->addWidget(gnssPositionSelfTestButton, 11, 2);
-    qthLayout->addWidget(gnssMonitorCheckbox, 12, 0);
-    qthLayout->addWidget(gnssPlotButton, 12, 1);
-    qthLayout->addWidget(gnssMonitorResetButton, 12, 2);
-    qthLayout->addWidget(gnssMonitorStatusLabel, 13, 0, 1, 3);
-    qthLayout->addWidget(gnssAcquireStatusLabel, 14, 0, 1, 3);
-    qthLayout->addWidget(qthStatusLabel, 15, 0, 1, 3);
+    qthLayout->addWidget(qthClearButton, 8, 2);
+    qthLayout->addWidget(gnssSerialLabel, 9, 0);
+    qthLayout->addWidget(gnssSerialPortEdit, 9, 1);
+    qthLayout->addWidget(gnssSerialBaudSpin, 9, 2);
+    qthLayout->addWidget(gnssSerialButton, 10, 0);
+    qthLayout->addWidget(qthPasteNmeaButton, 10, 1);
+    qthLayout->addWidget(gnssSerialStatusLabel, 11, 0, 1, 3);
+    qthLayout->addWidget(gnssTuneButton, 12, 0);
+    qthLayout->addWidget(gnssScanButton, 12, 1);
+    qthLayout->addWidget(gnssSelfTestButton, 12, 2);
+    qthLayout->addWidget(gnssRawLogButton, 13, 0);
+    qthLayout->addWidget(gnssAcquireButton, 13, 1);
+    qthLayout->addWidget(gnssDeepAcquireButton, 13, 2);
+    qthLayout->addWidget(gnssNetworkTimeButton, 14, 0);
+    qthLayout->addWidget(gnssOfflineAcquireButton, 14, 1);
+    qthLayout->addWidget(gnssPositionSelfTestButton, 14, 2);
+    qthLayout->addWidget(gnssMonitorCheckbox, 15, 0);
+    qthLayout->addWidget(gnssPlotButton, 15, 1);
+    qthLayout->addWidget(gnssMonitorResetButton, 15, 2);
+    qthLayout->addWidget(gnssMonitorStatusLabel, 16, 0, 1, 3);
+    qthLayout->addWidget(gnssAcquireStatusLabel, 17, 0, 1, 3);
+    qthLayout->addWidget(qthStatusLabel, 18, 0, 1, 3);
 
     dmrHunterControls = new SpectrumHunterControls(
         QStringLiteral("DMR Hunter"),
@@ -3162,7 +3275,23 @@ YourClassName::YourClassName(QWidget *parent)
     });
     connect(qthMapButton, &QPushButton::clicked, this, &YourClassName::openQthMapWindow);
     connect(qthCopyButton, &QPushButton::clicked, this, &YourClassName::copyQthLocator);
+    connect(qthClearButton, &QPushButton::clicked, this, &YourClassName::clearQthPosition);
     connect(qthPasteNmeaButton, &QPushButton::clicked, this, &YourClassName::pasteNmeaPositionFromClipboard);
+    connect(gnssSerialButton, &QPushButton::clicked, this, &YourClassName::toggleGnssSerial);
+    connect(gnssSerialPortEdit, &QLineEdit::editingFinished, this, [this]() {
+        if (gnssSerialPortEdit) {
+            gnssSerialPortName = gnssSerialPortEdit->text().trimmed();
+            if (gnssSerialPortName.isEmpty()) {
+                gnssSerialPortName = QStringLiteral("COM4");
+                gnssSerialPortEdit->setText(gnssSerialPortName);
+            }
+            savePersistentSettings();
+        }
+    });
+    connect(gnssSerialBaudSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        gnssSerialBaud = value;
+        savePersistentSettings();
+    });
     connect(gnssTuneButton, &QPushButton::clicked, this, &YourClassName::tuneGnssL1Preset);
     connect(gnssScanButton, &QPushButton::clicked, this, &YourClassName::applyGnssScanPreset);
     connect(gnssRawLogButton, &QPushButton::clicked, this, &YourClassName::logGnssRawContext);
@@ -4492,6 +4621,7 @@ YourClassName::~YourClassName() {
     if (remoteAudioPlayer) {
         remoteAudioPlayer->stop();
     }
+    stopGnssSerial();
     if (audioHttpServer) {
         audioHttpServer->close();
     }
@@ -7332,6 +7462,26 @@ void YourClassName::updateQthControls() {
         QSignalBlocker blocker(qthLongitudeSpin);
         qthLongitudeSpin->setValue(qthLongitude);
     }
+    if (gnssSerialPortEdit) {
+        QSignalBlocker blocker(gnssSerialPortEdit);
+        gnssSerialPortEdit->setText(gnssSerialPortName.isEmpty()
+                                        ? QStringLiteral("COM4")
+                                        : gnssSerialPortName);
+    }
+    if (gnssSerialBaudSpin) {
+        QSignalBlocker blocker(gnssSerialBaudSpin);
+        gnssSerialBaudSpin->setValue((std::clamp)(gnssSerialBaud, 1200, 921600));
+    }
+    if (gnssSerialButton) {
+        const bool connected = gnssSerialPort && gnssSerialPort->isOpen();
+        gnssSerialButton->setText(connected
+                                      ? uiText(QStringLiteral("disconnect"), QStringLiteral("Disconnect"))
+                                      : uiText(QStringLiteral("connect"), QStringLiteral("Connect")));
+    }
+    if (gnssSerialStatusLabel && (!gnssSerialPort || !gnssSerialPort->isOpen()) && gnssSerialStatusLabel->text().isEmpty()) {
+        gnssSerialStatusLabel->setText(uiText(QStringLiteral("gnss_serial_idle"),
+                                              QStringLiteral("NMEA serial: disconnected")));
+    }
     if (qthLocatorLabel) {
         qthLocatorLabel->setText(locator);
     }
@@ -7349,6 +7499,7 @@ void YourClassName::updateQthControls() {
     if (qthMapWidget) {
         qthMapWidget->setUiLanguage(uiLanguage);
         qthMapWidget->setPosition(qthLatitude, qthLongitude);
+        qthMapWidget->setPositionVisible(qthPositionVisible);
         qthMapWidget->setTileLayerMode(qthMapLayer == 1
                                            ? QthMapWidget::TileLayerMode::LocalXyz
                                            : (qthMapLayer == 2
@@ -7366,7 +7517,10 @@ void YourClassName::updateQthControls() {
     updateQthMapControls();
     if (qthStatusLabel) {
         const bool manual = qthSource == QStringLiteral("manual") || qthSource.isEmpty();
-        if (manual) {
+        if (!qthPositionVisible) {
+            qthStatusLabel->setText(uiText(QStringLiteral("qth_status_cleared"),
+                                           QStringLiteral("Current QTH position is cleared. Manual/NMEA update will show it again.")));
+        } else if (manual) {
             qthStatusLabel->setText(uiText(QStringLiteral("qth_status_manual"),
                                            QStringLiteral("Manual QTH. Use Save GNSS IQ to write the current raw IQ snapshot.")));
         } else if (qthSource == QStringLiteral("nmea")) {
@@ -7418,7 +7572,28 @@ void YourClassName::applyQthPositionFromUi() {
             qthSource = QStringLiteral("manual");
         }
     }
+    qthPositionVisible = true;
     updateQthControls();
+    savePersistentSettings();
+}
+
+void YourClassName::clearQthPosition() {
+    qthPositionVisible = false;
+    stopGnssSerial();
+    updateQthControls();
+    if (qthMapWidget) {
+        qthMapWidget->setPositionVisible(false);
+    }
+
+    const QString status = uiText(
+        QStringLiteral("qth_position_cleared"),
+        QStringLiteral("Current QTH position cleared. NMEA reception is stopped; connect again or edit coordinates to show a new position."));
+    if (qthStatusLabel) {
+        qthStatusLabel->setText(status);
+    }
+    if (qthMapStatusLabel) {
+        qthMapStatusLabel->setText(status);
+    }
     savePersistentSettings();
 }
 
@@ -7468,6 +7643,7 @@ bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMe
     qthLatitude = parsed.latitude;
     qthLongitude = parsed.longitude;
     qthSource = QStringLiteral("nmea");
+    qthPositionVisible = true;
     const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
     updateQthControls();
     if (qthMapWidget) {
@@ -7494,6 +7670,251 @@ bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMe
              << "qth" << locator
              << "utc" << parsed.utc;
     return true;
+}
+
+void YourClassName::toggleGnssSerial() {
+    if (gnssSerialPort && gnssSerialPort->isOpen()) {
+        stopGnssSerial();
+    } else {
+        startGnssSerial();
+    }
+}
+
+void YourClassName::startGnssSerial() {
+    if (!gnssSerialPort) {
+        updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_unavailable"),
+                                      QStringLiteral("NMEA serial: Qt serial port is unavailable.")));
+        return;
+    }
+    if (gnssSerialPort->isOpen()) {
+        stopGnssSerial();
+    }
+
+    if (gnssSerialPortEdit) {
+        gnssSerialPortName = gnssSerialPortEdit->text().trimmed();
+    }
+    if (gnssSerialPortName.isEmpty()) {
+        gnssSerialPortName = QStringLiteral("COM4");
+    }
+    if (gnssSerialBaudSpin) {
+        gnssSerialBaud = gnssSerialBaudSpin->value();
+    }
+    gnssSerialBaud = (std::clamp)(gnssSerialBaud, 1200, 921600);
+    gnssSerialBuffer.clear();
+    gnssSerialSentenceCount = 0;
+    gnssSerialFixCount = 0;
+    gnssSerialFixQuality = -1;
+    gnssSerialFixMode = -1;
+    gnssSerialSatellitesUsed = -1;
+    gnssSerialGpsSatellites = -1;
+    gnssSerialGlonassSatellites = -1;
+    gnssSerialGalileoSatellites = -1;
+    gnssSerialBeidouSatellites = -1;
+    gnssSerialOtherSatellites = -1;
+    gnssSerialUtc.clear();
+
+    gnssSerialPort->setPortName(gnssSerialPortName);
+    gnssSerialPort->setBaudRate(gnssSerialBaud);
+    gnssSerialPort->setDataBits(QSerialPort::Data8);
+    gnssSerialPort->setParity(QSerialPort::NoParity);
+    gnssSerialPort->setStopBits(QSerialPort::OneStop);
+    gnssSerialPort->setFlowControl(QSerialPort::NoFlowControl);
+
+    if (!gnssSerialPort->open(QIODevice::ReadOnly)) {
+        const QString message = uiText(QStringLiteral("gnss_serial_open_failed"),
+                                       QStringLiteral("NMEA serial: cannot open %1 at %2 baud (%3)."))
+                                    .arg(gnssSerialPortName)
+                                    .arg(gnssSerialBaud)
+                                    .arg(gnssSerialPort->errorString());
+        updateGnssSerialStatus(message);
+        qDebug() << "[GNSS serial] open failed"
+                 << "port" << gnssSerialPortName
+                 << "baud" << gnssSerialBaud
+                 << "error" << gnssSerialPort->errorString();
+        return;
+    }
+
+    qthSource = QStringLiteral("nmea");
+    updateQthControls();
+    savePersistentSettings();
+    updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_waiting"),
+                                  QStringLiteral("NMEA serial: %1 open at %2 baud, waiting for fix..."))
+                               .arg(gnssSerialPortName)
+                               .arg(gnssSerialBaud));
+    qDebug() << "[GNSS serial] open"
+             << "port" << gnssSerialPortName
+             << "baud" << gnssSerialBaud;
+}
+
+void YourClassName::stopGnssSerial() {
+    if (gnssSerialPort && gnssSerialPort->isOpen()) {
+        qDebug() << "[GNSS serial] close" << "port" << gnssSerialPort->portName();
+        gnssSerialPort->close();
+    }
+    gnssSerialBuffer.clear();
+    gnssSerialSentenceCount = 0;
+    gnssSerialFixCount = 0;
+    gnssSerialFixQuality = -1;
+    gnssSerialFixMode = -1;
+    gnssSerialSatellitesUsed = -1;
+    gnssSerialGpsSatellites = -1;
+    gnssSerialGlonassSatellites = -1;
+    gnssSerialGalileoSatellites = -1;
+    gnssSerialBeidouSatellites = -1;
+    gnssSerialOtherSatellites = -1;
+    gnssSerialUtc.clear();
+    if (gnssSerialButton) {
+        gnssSerialButton->setText(uiText(QStringLiteral("connect"), QStringLiteral("Connect")));
+    }
+    updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_idle"),
+                                  QStringLiteral("NMEA serial: disconnected")));
+}
+
+void YourClassName::handleGnssSerialReadyRead() {
+    if (!gnssSerialPort) {
+        return;
+    }
+    gnssSerialBuffer.append(gnssSerialPort->readAll());
+    if (gnssSerialBuffer.size() > 8192) {
+        gnssSerialBuffer = gnssSerialBuffer.right(4096);
+    }
+
+    while (true) {
+        int lineEnd = gnssSerialBuffer.indexOf('\n');
+        if (lineEnd < 0) {
+            lineEnd = gnssSerialBuffer.indexOf('\r');
+        }
+        if (lineEnd < 0) {
+            break;
+        }
+
+        const QByteArray rawLine = gnssSerialBuffer.left(lineEnd);
+        gnssSerialBuffer.remove(0, lineEnd + 1);
+        const QString line = QString::fromLatin1(rawLine).trimmed();
+        if (line.isEmpty()) {
+            continue;
+        }
+        const bool looksLikeNmea = line.startsWith(QLatin1Char('$'));
+        if (looksLikeNmea) {
+            ++gnssSerialSentenceCount;
+        }
+
+        const NmeaSerialStatus serialStatus = parseNmeaSerialStatusSentence(line);
+        if (serialStatus.recognized) {
+            if (!serialStatus.utc.isEmpty()) {
+                gnssSerialUtc = serialStatus.utc;
+            }
+            if (serialStatus.fixQuality >= 0) {
+                gnssSerialFixQuality = serialStatus.fixQuality;
+            }
+            if (serialStatus.fixMode >= 0) {
+                gnssSerialFixMode = serialStatus.fixMode;
+            }
+            if (serialStatus.satellitesUsed >= 0) {
+                gnssSerialSatellitesUsed = serialStatus.satellitesUsed;
+            }
+            if (serialStatus.satellitesInView >= 0) {
+                if (serialStatus.talker == QStringLiteral("GP")) {
+                    gnssSerialGpsSatellites = serialStatus.satellitesInView;
+                } else if (serialStatus.talker == QStringLiteral("GL")) {
+                    gnssSerialGlonassSatellites = serialStatus.satellitesInView;
+                } else if (serialStatus.talker == QStringLiteral("GA")) {
+                    gnssSerialGalileoSatellites = serialStatus.satellitesInView;
+                } else if (serialStatus.talker == QStringLiteral("GB") ||
+                           serialStatus.talker == QStringLiteral("BD")) {
+                    gnssSerialBeidouSatellites = serialStatus.satellitesInView;
+                } else {
+                    gnssSerialOtherSatellites = serialStatus.satellitesInView;
+                }
+            }
+        }
+
+        ParsedNmeaPosition parsed;
+        if (!parseNmeaPositionSentence(line, &parsed)) {
+            if (looksLikeNmea && (gnssSerialSentenceCount <= 4 || (gnssSerialSentenceCount % 32) == 0)) {
+                QStringList parts;
+                if (gnssSerialFixQuality >= 0) {
+                    parts << QStringLiteral("fix %1").arg(gnssSerialFixQuality);
+                }
+                if (gnssSerialFixMode >= 0) {
+                    parts << QStringLiteral("mode %1").arg(gnssSerialFixMode);
+                }
+                if (gnssSerialSatellitesUsed >= 0) {
+                    parts << QStringLiteral("used %1").arg(gnssSerialSatellitesUsed);
+                }
+                QStringList viewParts;
+                if (gnssSerialGpsSatellites >= 0) {
+                    viewParts << QStringLiteral("GPS %1").arg(gnssSerialGpsSatellites);
+                }
+                if (gnssSerialGlonassSatellites >= 0) {
+                    viewParts << QStringLiteral("GLO %1").arg(gnssSerialGlonassSatellites);
+                }
+                if (gnssSerialGalileoSatellites >= 0) {
+                    viewParts << QStringLiteral("GAL %1").arg(gnssSerialGalileoSatellites);
+                }
+                if (gnssSerialBeidouSatellites >= 0) {
+                    viewParts << QStringLiteral("BDS %1").arg(gnssSerialBeidouSatellites);
+                }
+                if (gnssSerialOtherSatellites >= 0) {
+                    viewParts << QStringLiteral("other %1").arg(gnssSerialOtherSatellites);
+                }
+                if (!viewParts.isEmpty()) {
+                    parts << QStringLiteral("view %1").arg(viewParts.join(QLatin1Char('/')));
+                }
+                if (!gnssSerialUtc.isEmpty()) {
+                    parts << QStringLiteral("UTC %1").arg(gnssSerialUtc);
+                }
+                const QString detail = parts.isEmpty()
+                                           ? QStringLiteral("waiting for fix")
+                                           : parts.join(QStringLiteral(", "));
+                updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_receiving"),
+                                              QStringLiteral("NMEA serial: receiving (%1 sentences), %2"))
+                                           .arg(gnssSerialSentenceCount)
+                                           .arg(detail));
+            }
+            if (looksLikeNmea && fobosVerboseLoggingEnabled()) {
+                qDebug() << "[GNSS serial] ignored NMEA" << line.left(16);
+            }
+            continue;
+        }
+
+        QString status;
+        if (applyNmeaPositionText(line, &status)) {
+            ++gnssSerialFixCount;
+            updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_fix"),
+                                          QStringLiteral("NMEA serial: %1 fix %2, %3 (%4), #%5"))
+                                       .arg(QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence))
+                                       .arg(qthLatitude, 0, 'f', 6)
+                                       .arg(qthLongitude, 0, 'f', 6)
+                                       .arg(qth::maidenheadLocator(qthLatitude, qthLongitude, 6))
+                                       .arg(gnssSerialFixCount));
+        }
+    }
+}
+
+void YourClassName::handleGnssSerialError(QSerialPort::SerialPortError error) {
+    if (error == QSerialPort::NoError || error == QSerialPort::TimeoutError) {
+        return;
+    }
+    const QString message = uiText(QStringLiteral("gnss_serial_error"),
+                                   QStringLiteral("NMEA serial error: %1"))
+                                .arg(gnssSerialPort ? gnssSerialPort->errorString() : QString::number(error));
+    updateGnssSerialStatus(message);
+    qDebug() << "[GNSS serial] error"
+             << "code" << error
+             << "message" << (gnssSerialPort ? gnssSerialPort->errorString() : QString());
+}
+
+void YourClassName::updateGnssSerialStatus(const QString &message) {
+    if (gnssSerialStatusLabel) {
+        gnssSerialStatusLabel->setText(message);
+    }
+    if (gnssSerialButton) {
+        const bool connected = gnssSerialPort && gnssSerialPort->isOpen();
+        gnssSerialButton->setText(connected
+                                      ? uiText(QStringLiteral("disconnect"), QStringLiteral("Disconnect"))
+                                      : uiText(QStringLiteral("connect"), QStringLiteral("Connect")));
+    }
 }
 
 void YourClassName::updateQthMapControls() {
@@ -7747,6 +8168,7 @@ void YourClassName::openQthMapWindow() {
         qthMapWidget = new QthMapWidget(qthMapDialog);
         qthMapWidget->setUiLanguage(uiLanguage);
         qthMapWidget->setPosition(qthLatitude, qthLongitude);
+        qthMapWidget->setPositionVisible(qthPositionVisible);
         qthMapWidget->setTileLayerMode(qthMapLayer == 1
                                            ? QthMapWidget::TileLayerMode::LocalXyz
                                            : (qthMapLayer == 2
@@ -7769,6 +8191,10 @@ void YourClassName::openQthMapWindow() {
         QPushButton *copyButton =
             buttonBox->addButton(uiText(QStringLiteral("copy_qth"),
                                         QStringLiteral("Copy QTH")),
+                                 QDialogButtonBox::ActionRole);
+        QPushButton *clearQthButton =
+            buttonBox->addButton(uiText(QStringLiteral("clear_qth"),
+                                        QStringLiteral("Clear")),
                                  QDialogButtonBox::ActionRole);
         if (QPushButton *closeButton = buttonBox->button(QDialogButtonBox::Close)) {
             closeButton->setText(uiText(QStringLiteral("close"), QStringLiteral("Close")));
@@ -7899,6 +8325,9 @@ void YourClassName::openQthMapWindow() {
                                      QString::number(markerLon, 'f', 6)));
                     }
                 });
+        connect(qthMapWidget, &QthMapWidget::currentPositionCleared, qthMapDialog, [this]() {
+            clearQthPosition();
+        });
         connect(openOsmButton, &QPushButton::clicked, qthMapDialog, [this]() {
             const QString lat = QString::number(qthLatitude, 'f', 6);
             const QString lon = QString::number(qthLongitude, 'f', 6);
@@ -7906,6 +8335,7 @@ void YourClassName::openQthMapWindow() {
                                                .arg(lat, lon)));
         });
         connect(copyButton, &QPushButton::clicked, this, &YourClassName::copyQthLocator);
+        connect(clearQthButton, &QPushButton::clicked, this, &YourClassName::clearQthPosition);
         connect(buttonBox, &QDialogButtonBox::rejected, qthMapDialog, &QDialog::close);
         connect(qthMapDialog, &QObject::destroyed, this, [this]() {
             qthMapDialog = nullptr;
@@ -7999,6 +8429,13 @@ void YourClassName::applyQthMapSearch() {
 }
 
 void YourClassName::copyQthLocator() {
+    if (!qthPositionVisible) {
+        if (qthStatusLabel) {
+            qthStatusLabel->setText(uiText(QStringLiteral("qth_copy_no_position"),
+                                           QStringLiteral("QTH copy skipped: current position is cleared.")));
+        }
+        return;
+    }
     const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
     if (QClipboard *clipboard = QApplication::clipboard()) {
         clipboard->setText(locator);
@@ -9502,6 +9939,7 @@ void YourClassName::runGnssPositionSelfTest() {
     qthLatitude = result.latitude;
     qthLongitude = result.longitude;
     qthSource = QStringLiteral("manual");
+    qthPositionVisible = true;
     const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
     updateQthControls();
     openQthMapWindow();
@@ -11086,6 +11524,15 @@ void YourClassName::refreshSettingsFromUi() {
             qthSource = QStringLiteral("manual");
         }
     }
+    if (gnssSerialPortEdit) {
+        gnssSerialPortName = gnssSerialPortEdit->text().trimmed();
+        if (gnssSerialPortName.isEmpty()) {
+            gnssSerialPortName = QStringLiteral("COM4");
+        }
+    }
+    if (gnssSerialBaudSpin) {
+        gnssSerialBaud = (std::clamp)(gnssSerialBaudSpin->value(), 1200, 921600);
+    }
     if (gnssSystemCombo) {
         gnssSystemId = gnssSystemCombo->currentData().toString().trimmed();
         if (gnssSystemId.isEmpty()) {
@@ -12182,7 +12629,10 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["scanMeasurementBinMhz"] = scanMeasurementBinMhz;
     settings["qthLatitude"] = qthLatitude;
     settings["qthLongitude"] = qthLongitude;
+    settings["qthPositionVisible"] = qthPositionVisible;
     settings["qthSource"] = qthSource;
+    settings["gnssSerialPortName"] = gnssSerialPortName;
+    settings["gnssSerialBaud"] = gnssSerialBaud;
     settings["qthTileDirectory"] = qthTileDirectory;
     settings["qthMapLayer"] = qthMapLayer;
     settings["qthMapZoom"] = qthMapZoom;
@@ -12419,10 +12869,16 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool 
     }
     qthLatitude = (std::clamp)(readDouble("qthLatitude", qthLatitude), -90.0, 90.0);
     qthLongitude = (std::clamp)(readDouble("qthLongitude", qthLongitude), -180.0, 180.0);
+    qthPositionVisible = settingsJson.value("qthPositionVisible").toBool(qthPositionVisible);
     qthSource = settingsJson.value("qthSource").toString(qthSource).trimmed();
     if (qthSource.isEmpty()) {
         qthSource = QStringLiteral("manual");
     }
+    gnssSerialPortName = settingsJson.value("gnssSerialPortName").toString(gnssSerialPortName).trimmed();
+    if (gnssSerialPortName.isEmpty()) {
+        gnssSerialPortName = QStringLiteral("COM4");
+    }
+    gnssSerialBaud = (std::clamp)(readInt("gnssSerialBaud", gnssSerialBaud), 1200, 921600);
     qthTileDirectory = settingsJson.value("qthTileDirectory").toString(qthTileDirectory).trimmed();
     qthMapLayer = (std::clamp)(readInt("qthMapLayer", qthMapLayer), 0, 2);
     qthMapZoom = (std::clamp)(readInt("qthMapZoom", qthMapZoom), 0, 19);
@@ -12695,6 +13151,19 @@ void YourClassName::loadUiTranslations() {
         {"nmea_paste_tooltip", "Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH."},
         {"nmea_parse_failed", "NMEA: no valid GGA/RMC position found in clipboard."},
         {"nmea_position_applied", "NMEA QTH: %1 %2, %3 (%4)"},
+        {"nmea_serial", "NMEA:"},
+        {"connect", "Connect"},
+        {"disconnect", "Disconnect"},
+        {"gnss_serial_port_tooltip", "Serial port for an external NMEA GNSS receiver, for example COM4 or /dev/ttyUSB0."},
+        {"gnss_serial_baud_tooltip", "NMEA serial baud rate. Most NEO-M8N modules use 9600 by default."},
+        {"gnss_serial_connect_tooltip", "Open the serial NMEA stream and use valid GGA/RMC fixes as the current QTH."},
+        {"gnss_serial_unavailable", "NMEA serial: Qt serial port is unavailable."},
+        {"gnss_serial_open_failed", "NMEA serial: cannot open %1 at %2 baud (%3)."},
+        {"gnss_serial_waiting", "NMEA serial: %1 open at %2 baud, waiting for fix..."},
+        {"gnss_serial_receiving", "NMEA serial: receiving (%1 sentences), %2"},
+        {"gnss_serial_idle", "NMEA serial: disconnected"},
+        {"gnss_serial_fix", "NMEA serial: %1 fix %2, %3 (%4), #%5"},
+        {"gnss_serial_error", "NMEA serial error: %1"},
         {"source", "Source:"},
         {"gnss_system", "System:"},
         {"gnss_system_tooltip", "Select which GNSS signal family the tune, scan and acquisition controls should target."},
@@ -12720,6 +13189,11 @@ void YourClassName::loadUiTranslations() {
         {"qth_locator_short", "QTH:"},
         {"qth_map", "Map"},
         {"copy_qth", "Copy"},
+        {"clear_qth", "Clear"},
+        {"clear_qth_tooltip", "Hide the current real QTH position from the map and clear the live location state."},
+        {"qth_position_cleared", "Current QTH position cleared. NMEA reception is stopped; connect again or edit coordinates to show a new position."},
+        {"qth_status_cleared", "Current QTH position is cleared. Manual/NMEA update will show it again."},
+        {"qth_copy_no_position", "QTH copy skipped: current position is cleared."},
         {"tune_gnss_l1", "Tune"},
         {"use_gnss_scan", "Scan"},
         {"gps_ca_scan", "Accum"},
@@ -13219,6 +13693,26 @@ void YourClassName::applyUiLanguage() {
         qthPasteNmeaButton->setToolTip(uiText(
             QStringLiteral("nmea_paste_tooltip"),
             QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
+    }
+    if (qthClearButton) {
+        qthClearButton->setToolTip(uiText(
+            QStringLiteral("clear_qth_tooltip"),
+            QStringLiteral("Hide the current real QTH position from the map and clear the live location state.")));
+    }
+    if (gnssSerialPortEdit) {
+        gnssSerialPortEdit->setToolTip(uiText(
+            QStringLiteral("gnss_serial_port_tooltip"),
+            QStringLiteral("Serial port for an external NMEA GNSS receiver, for example COM4 or /dev/ttyUSB0.")));
+    }
+    if (gnssSerialBaudSpin) {
+        gnssSerialBaudSpin->setToolTip(uiText(
+            QStringLiteral("gnss_serial_baud_tooltip"),
+            QStringLiteral("NMEA serial baud rate. Most NEO-M8N modules use 9600 by default.")));
+    }
+    if (gnssSerialButton) {
+        gnssSerialButton->setToolTip(uiText(
+            QStringLiteral("gnss_serial_connect_tooltip"),
+            QStringLiteral("Open the serial NMEA stream and use valid GGA/RMC fixes as the current QTH.")));
     }
     if (gnssAcquisitionPlotDialog) {
         gnssAcquisitionPlotDialog->setWindowTitle(uiText(
@@ -13878,10 +14372,20 @@ void YourClassName::loadPersistentSettings() {
                                          LISTENING_SCAN_MAX_SETTLE_MS);
     qthLatitude = (std::clamp)(settings.value("gpsQth/latitude", qthLatitude).toDouble(), -90.0, 90.0);
     qthLongitude = (std::clamp)(settings.value("gpsQth/longitude", qthLongitude).toDouble(), -180.0, 180.0);
+    qthPositionVisible = settings.value("gpsQth/positionVisible", qthPositionVisible).toBool();
     qthSource = settings.value("gpsQth/source", qthSource).toString().trimmed();
     if (qthSource.isEmpty()) {
         qthSource = QStringLiteral("manual");
     }
+    gnssSerialPortName =
+        settings.value("gpsQth/nmeaSerialPort", gnssSerialPortName).toString().trimmed();
+    if (gnssSerialPortName.isEmpty()) {
+        gnssSerialPortName = QStringLiteral("COM4");
+    }
+    gnssSerialBaud =
+        (std::clamp)(settings.value("gpsQth/nmeaSerialBaud", gnssSerialBaud).toInt(),
+                     1200,
+                     921600);
     qthTileDirectory = settings.value("gpsQth/tileDirectory", qthTileDirectory).toString().trimmed();
     qthMapLayer = (std::clamp)(settings.value("gpsQth/mapLayer", qthMapLayer).toInt(), 0, 2);
     qthMapZoom = (std::clamp)(settings.value("gpsQth/mapZoom", qthMapZoom).toInt(), 0, 19);
@@ -14549,7 +15053,10 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("listeningScan/settleMs", listeningScanSettleMs);
     settings.setValue("gpsQth/latitude", qthLatitude);
     settings.setValue("gpsQth/longitude", qthLongitude);
+    settings.setValue("gpsQth/positionVisible", qthPositionVisible);
     settings.setValue("gpsQth/source", qthSource);
+    settings.setValue("gpsQth/nmeaSerialPort", gnssSerialPortName);
+    settings.setValue("gpsQth/nmeaSerialBaud", gnssSerialBaud);
     settings.setValue("gpsQth/tileDirectory", qthTileDirectory);
     settings.setValue("gpsQth/mapLayer", qthMapLayer);
     settings.setValue("gpsQth/mapZoom", qthMapZoom);

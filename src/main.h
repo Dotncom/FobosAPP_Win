@@ -51,6 +51,7 @@
 #include <QUdpSocket>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QSerialPort>
 #include <cstdint>
 #ifdef _WIN32
 #include <windows.h>
@@ -321,8 +322,15 @@ private:
     void importSettingsBackup();
     void updateQthControls();
     void applyQthPositionFromUi();
+    void clearQthPosition();
     void pasteNmeaPositionFromClipboard();
     bool applyNmeaPositionText(const QString &text, QString *statusMessage = nullptr);
+    void toggleGnssSerial();
+    void startGnssSerial();
+    void stopGnssSerial();
+    void handleGnssSerialReadyRead();
+    void handleGnssSerialError(QSerialPort::SerialPortError error);
+    void updateGnssSerialStatus(const QString &message);
     void openQthMapWindow();
     void copyQthLocator();
     void updateGnssSystemSelection();
@@ -524,7 +532,9 @@ private:
     QPushButton *stopButton = nullptr;
     QPushButton *qthMapButton = nullptr;
     QPushButton *qthCopyButton = nullptr;
+    QPushButton *qthClearButton = nullptr;
     QPushButton *qthPasteNmeaButton = nullptr;
+    QPushButton *gnssSerialButton = nullptr;
     QPushButton *gnssTuneButton = nullptr;
     QPushButton *gnssScanButton = nullptr;
     QPushButton *gnssRawLogButton = nullptr;
@@ -623,6 +633,7 @@ private:
     QLineEdit *qthOnlineAttributionEdit = nullptr;
     QLineEdit *qthOnlineApiKeyEdit = nullptr;
     QLineEdit *qthMapSearchEdit = nullptr;
+    QLineEdit *gnssSerialPortEdit = nullptr;
     QDoubleSpinBox *agileScanStepSpin = nullptr;
     QCheckBox *agileScanAutoStepCheckbox = nullptr;
     QDoubleSpinBox *qthLatitudeSpin = nullptr;
@@ -633,6 +644,7 @@ private:
     QSpinBox *listeningScanDwellSpin = nullptr;
     QSpinBox *listeningScanSettleSpin = nullptr;
     QSpinBox *gnssIntegrationSpin = nullptr;
+    QSpinBox *gnssSerialBaudSpin = nullptr;
     QDoubleSpinBox *scanMeasurementBinSpin = nullptr;
     QPushButton *agileScanSavePresetButton = nullptr;
     QPushButton *agileScanDeletePresetButton = nullptr;
@@ -672,6 +684,7 @@ private:
     QLabel *qthLocatorLabel = nullptr;
     QLabel *qthStatusLabel = nullptr;
     QLabel *qthMapStatusLabel = nullptr;
+    QLabel *gnssSerialStatusLabel = nullptr;
     QLabel *gnssMonitorStatusLabel = nullptr;
     QLabel *gnssAcquireStatusLabel = nullptr;
     QLabel *gnssAcquisitionPlotLabel = nullptr;
@@ -692,6 +705,7 @@ private:
     QTimer *agileLiveRetuneTimer = nullptr;
     QTimer *persistentSettingsSaveTimer = nullptr;
     QUdpSocket *gnssNtpSocket = nullptr;
+    QSerialPort *gnssSerialPort = nullptr;
 
     DataProcessor *processor = nullptr;
     AudioProcessor *audioProcessor = nullptr;
@@ -935,6 +949,20 @@ private:
     QVector<double> gnssPeakToSecondHistoryDb;
     QString gnssSystemId = QStringLiteral("gps_l1_ca");
     QString gnssAcquisitionSource = QStringLiteral("live");
+    QString gnssSerialPortName = QStringLiteral("COM4");
+    int gnssSerialBaud = 9600;
+    QByteArray gnssSerialBuffer;
+    quint64 gnssSerialSentenceCount = 0;
+    quint64 gnssSerialFixCount = 0;
+    int gnssSerialFixQuality = -1;
+    int gnssSerialFixMode = -1;
+    int gnssSerialSatellitesUsed = -1;
+    int gnssSerialGpsSatellites = -1;
+    int gnssSerialGlonassSatellites = -1;
+    int gnssSerialGalileoSatellites = -1;
+    int gnssSerialBeidouSatellites = -1;
+    int gnssSerialOtherSatellites = -1;
+    QString gnssSerialUtc;
     int gnssAcquisitionIntegrationMs = 24;
     double gnssChannelFilterCutoffHz = 1800000.0;
     int gnssDopplerSpanHz = 25000;
@@ -948,6 +976,7 @@ private:
     QDialog *gnssAcquisitionPlotDialog = nullptr;
     double qthLatitude = 0.0;
     double qthLongitude = 0.0;
+    bool qthPositionVisible = true;
     QString qthSource = QStringLiteral("manual");
     QString qthTileDirectory;
     QString qthOnlineProviderId = QStringLiteral("osm");

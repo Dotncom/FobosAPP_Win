@@ -12,7 +12,7 @@ if(WIN32 AND NOT DEFINED Qt5_DIR AND EXISTS "C:/Qt/5.15.2/msvc2019_64/lib/cmake/
     set(Qt5_DIR "C:/Qt/5.15.2/msvc2019_64/lib/cmake/Qt5" CACHE PATH "Qt5 CMake package directory")
 endif()
 
-find_package(Qt5 REQUIRED COMPONENTS Core Widgets Network)
+find_package(Qt5 REQUIRED COMPONENTS Core Widgets Network SerialPort)
 if(NOT WIN32)
     find_package(Qt5 COMPONENTS Multimedia QUIET)
     find_package(OpenGL REQUIRED)
@@ -187,6 +187,7 @@ target_link_libraries(FobosAPP PRIVATE
     Qt5::Core
     Qt5::Widgets
     Qt5::Network
+    Qt5::SerialPort
 )
 
 if(FOBOS_HAS_MBELIB_NEO)

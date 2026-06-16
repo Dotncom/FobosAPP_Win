@@ -33,6 +33,7 @@ $RootFiles = @(
     @{ Source = Join-Path $QtRoot "bin\Qt5Gui.dll"; Name = "Qt5Gui.dll" },
     @{ Source = Join-Path $QtRoot "bin\Qt5Widgets.dll"; Name = "Qt5Widgets.dll" },
     @{ Source = Join-Path $QtRoot "bin\Qt5Network.dll"; Name = "Qt5Network.dll" },
+    @{ Source = Join-Path $QtRoot "bin\Qt5SerialPort.dll"; Name = "Qt5SerialPort.dll" },
     @{ Source = Join-Path $VcRedistDir "MSVCP140.dll"; Name = "MSVCP140.dll" },
     @{ Source = Join-Path $VcRedistDir "MSVCP140_1.dll"; Name = "MSVCP140_1.dll" },
     @{ Source = Join-Path $VcRedistDir "VCRUNTIME140.dll"; Name = "VCRUNTIME140.dll" },

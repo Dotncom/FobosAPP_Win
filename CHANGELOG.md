@@ -12,6 +12,12 @@
 - Added the experimental GopherTrunk bridge scaffold for future virtual-source
   tests.
 - Added DMR channel-rate control and improved DMR metadata stability filtering.
+- Added live USB/serial NMEA GNSS input through Qt SerialPort, including
+  NEO-M8N-friendly COM-port controls, fix/satellite status reporting, and
+  automatic QTH/map updates when valid GGA/RMC coordinates are received.
+- Added QTH privacy controls for clearing the current real position, stopping
+  NMEA reception on request, hiding the green current-location marker, and
+  removing test/search markers from the map with right-click.
 
 ### Fixed
 
@@ -19,12 +25,18 @@
   switches the UI to Running when the reader is stuck in an idle-looking state.
 - Kept the DMR center offset workaround active so DMR decoding is not run with
   listening and RF center exactly equal on Fobos Agile.
+- Bundled `Qt5SerialPort.dll` in the Windows runtime package so serial GNSS
+  receiver support works from the release folder.
 
 ### Notes
 
 - The attempted Agile startup frequency jog was removed after field testing
   showed it could make the shifted spectrum state persistent. Startup retune
   recovery remains under investigation and should not be released as fixed yet.
+- Some Fobos/Agile receivers or host/firmware combinations may still show
+  intermittent center-frequency placement, spectrum shift, or I/Q mirroring
+  after tuning. This is documented as a known issue until more hardware can be
+  tested with the manufacturer.
 
 ## 4.3.2-beta - 2026-06-15
 
