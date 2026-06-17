@@ -26,6 +26,7 @@ constexpr int kDopplerMaxHz = 50000;
 constexpr int kDopplerStepHz = 1000;
 constexpr int kDopplerMinStepHz = 250;
 constexpr int kMaxCoherentMs = 160;
+constexpr double kToneNotchThreshold = 0.0025;
 
 struct FftwPlanScope {
     explicit FftwPlanScope(fftwf_plan plan = nullptr)
@@ -45,6 +46,11 @@ struct FftwPlanScope {
 };
 
 using FftwBuffer = std::unique_ptr<fftwf_complex, decltype(&fftwf_free)>;
+
+struct ToneNotchStats {
+    int count = 0;
+    double strongestDb = 0.0;
+};
 
 FftwBuffer makeFftwBuffer(int count) {
     return FftwBuffer(static_cast<fftwf_complex *>(fftwf_malloc(sizeof(fftwf_complex) *
@@ -200,9 +206,18 @@ bool resampleAndShift(const std::vector<float> &interleavedIq,
 
     for (int ms = 0; ms < coherentMs; ++ms) {
         const int chunkOffset = ms * kSamplesPerMs;
-        double power = 0.0;
+        std::complex<double> chunkMean(0.0, 0.0);
         for (int i = 0; i < kSamplesPerMs; ++i) {
             const std::complex<float> sample = (*out)[static_cast<std::size_t>(chunkOffset + i)];
+            chunkMean += std::complex<double>(sample.real(), sample.imag());
+        }
+        chunkMean /= static_cast<double>(kSamplesPerMs);
+
+        double power = 0.0;
+        for (int i = 0; i < kSamplesPerMs; ++i) {
+            std::complex<float> &sample = (*out)[static_cast<std::size_t>(chunkOffset + i)];
+            sample -= std::complex<float>(static_cast<float>(chunkMean.real()),
+                                          static_cast<float>(chunkMean.imag()));
             power += static_cast<double>(std::norm(sample));
         }
         const double rms = std::sqrt(power / static_cast<double>(kSamplesPerMs));
@@ -218,6 +233,79 @@ bool resampleAndShift(const std::vector<float> &interleavedIq,
         *usedInputSamples = lastInput;
     }
     return true;
+}
+
+ToneNotchStats suppressKnownGnssTones(std::vector<std::complex<float>> *samples) {
+    ToneNotchStats stats;
+    if (!samples || samples->empty()) {
+        return stats;
+    }
+
+    double totalPower = 0.0;
+    for (const std::complex<float> &sample : *samples) {
+        totalPower += static_cast<double>(std::norm(sample));
+    }
+    const double averagePower = totalPower / static_cast<double>(samples->size());
+    if (!std::isfinite(averagePower) || averagePower <= std::numeric_limits<double>::epsilon()) {
+        return stats;
+    }
+
+    // These are the stable narrow lines seen on inexpensive RTL/GNSS setups in the live IQ monitor.
+    // They are removed only when their estimated tone power is clearly above the local average.
+    constexpr std::array<double, 7> kKnownToneOffsetsHz = {
+        0.0,
+        340000.0,
+        370000.0,
+        -430000.0,
+        -1230000.0,
+        -1250000.0,
+        -1600000.0
+    };
+
+    for (const double toneHz : kKnownToneOffsetsHz) {
+        if (std::abs(toneHz) >= kAcquisitionSampleRate * 0.49) {
+            continue;
+        }
+
+        const double analysisStep = -kTwoPi * toneHz / kAcquisitionSampleRate;
+        const std::complex<double> analysisRot(std::cos(analysisStep),
+                                               std::sin(analysisStep));
+        std::complex<double> analysisOsc(1.0, 0.0);
+        std::complex<double> sum(0.0, 0.0);
+        for (const std::complex<float> &sample : *samples) {
+            sum += std::complex<double>(sample.real(), sample.imag()) * analysisOsc;
+            analysisOsc *= analysisRot;
+        }
+
+        const std::complex<double> amplitude =
+            sum / static_cast<double>(samples->size());
+        const double relativePower = std::norm(amplitude) / averagePower;
+        if (!std::isfinite(relativePower) || relativePower < kToneNotchThreshold) {
+            continue;
+        }
+
+        const double synthesisStep = kTwoPi * toneHz / kAcquisitionSampleRate;
+        const std::complex<double> synthesisRot(std::cos(synthesisStep),
+                                                std::sin(synthesisStep));
+        std::complex<double> synthesisOsc(1.0, 0.0);
+        for (std::complex<float> &sample : *samples) {
+            const std::complex<double> cleaned =
+                std::complex<double>(sample.real(), sample.imag()) -
+                amplitude * synthesisOsc;
+            sample = std::complex<float>(static_cast<float>(cleaned.real()),
+                                         static_cast<float>(cleaned.imag()));
+            synthesisOsc *= synthesisRot;
+        }
+
+        const double relativeDb =
+            10.0 * std::log10((std::max)(relativePower,
+                                         std::numeric_limits<double>::min()));
+        stats.strongestDb = stats.count == 0 ? relativeDb
+                                             : (std::max)(stats.strongestDb, relativeDb);
+        ++stats.count;
+    }
+
+    return stats;
 }
 
 void insertCandidate(QVector<GnssAcquisitionCandidate> *candidates,
@@ -324,6 +412,9 @@ GnssAcquisitionResult GnssAcquisition::acquireGpsL1Ca(const std::vector<float> &
         result.status = QStringLiteral("GNSS resample failed");
         return result;
     }
+    const ToneNotchStats notchStats = suppressKnownGnssTones(&samples);
+    result.toneNotchesApplied = notchStats.count;
+    result.strongestToneNotchDb = notchStats.strongestDb;
     result.coherentMs = coherentMs;
     if (isCancelRequested(cancelRequested)) {
         markCancelled(&result);

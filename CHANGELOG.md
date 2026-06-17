@@ -1,5 +1,55 @@
 # Changelog
 
+## 4.5.0 - 2026-06-17
+
+### Added
+
+- Added a full external serial GNSS workflow for NMEA/u-blox receivers, tested
+  with a NEO-M8N module: serial port selection, live fix status, satellite
+  table, sky view, QTH map overlay, time-zone display, and per-system/per-
+  satellite filtering for FobosAPP's own display and analysis.
+- Added UBX support for enabling NAV-PVT/NAV-SAT/NAV-DOP output, polling and
+  applying `CFG-GNSS` constellation settings, saving module configuration with
+  `CFG-CFG`, and capturing exact raw UBX/NMEA serial logs for later replay or
+  analysis.
+- Added GNSS raw serial capture alongside the existing NMEA text logging and
+  SDR IQ acquisition reports.
+- Added SDR GPS L1 C/A acquisition diagnostics improvements: per-millisecond DC
+  cleanup, GNSS tone-notch diagnostics, stronger report metadata, and clearer
+  weak/no-lock status for difficult RF conditions.
+
+### Changed
+
+- Reduced normal diagnostic-log noise from live GNSS serial and IQ-monitor
+  telemetry. Frequent NMEA/UBX/IQ detail is still available when verbose
+  logging is enabled in Settings.
+- Native RTL-SDR starts with tuner auto-gain/AGC by default, which is more
+  useful for weak GNSS experiments and avoids the previous zero-gain trap.
+- Reorganized the GNSS/QTH controls into a more compact layout so the main
+  control panel no longer grows excessively wide.
+
+### Fixed
+
+- Fixed UBX `CFG-GNSS` handling so the first button press polls and synchronizes
+  the module state instead of blindly applying unsupported constellation
+  combinations.
+- Fixed UBX configuration saves by sending `CFG-CFG` and reporting ACK/NAK in
+  the GNSS status area.
+- Fixed raw serial logging cleanup so active UBX/NMEA captures are closed when
+  the serial receiver is stopped.
+
+### Notes
+
+- Generic NMEA GNSS modules should provide most live map, QTH, sky-view and
+  satellite-table functionality. UBX configuration controls are intended for
+  u-blox-compatible modules and were field-tested on NEO-M8N.
+- SDR-only GPS L1 C/A reception remains experimental. The current tools can
+  record IQ, monitor RF quality, run acquisition and produce reports, but a real
+  position lock from SDR IQ has not been proven with the tested antenna setup.
+- DMR voice remains a laboratory feature. The mbelib/OpenDMR, DSD-neo and
+  GopherTrunk paths are included for testing and comparison, not as a finished
+  commercial-grade DMR receiver.
+
 ## 4.4.0 - 2026-06-16
 
 ### Added

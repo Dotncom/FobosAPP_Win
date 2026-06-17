@@ -49,8 +49,10 @@ $excludedNames = @(
 )
 $excludedExtensions = @(
     ".bmp",
+    ".csv",
     ".iq",
     ".log",
+    ".ubx",
     ".wav"
 )
 $excludedDirs = @(

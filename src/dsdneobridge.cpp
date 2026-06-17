@@ -19,7 +19,7 @@ constexpr qint64 PROCESS_RESTART_BACKOFF_MAX_MS = 10000;
 constexpr int DEFAULT_DSD_AUDIO_RATE = 8000;
 constexpr int APP_AUDIO_RATE = 48000;
 constexpr int UPSAMPLE_FACTOR = APP_AUDIO_RATE / DEFAULT_DSD_AUDIO_RATE;
-constexpr double DSD_INPUT_TARGET_PEAK = 0.45;
+constexpr double DSD_INPUT_TARGET_PEAK = 0.65;
 constexpr int DSD_INPUT_WARMUP_FRAMES = 3;
 
 QString defaultDsdNeoProgram() {
@@ -196,6 +196,8 @@ void DsdNeoBridge::setEnabled(bool enabled) {
     bridgeEnabled = enabled;
     if (bridgeEnabled) {
         pcmFramesForwarded = 0;
+        udpInputPacketsForwarded = 0;
+        udpOutputPacketsReceived = 0;
         inputSampleRate = 0;
         if (inputServerEnabled) {
             startInputServer();
@@ -249,6 +251,11 @@ void DsdNeoBridge::sendInputPcm(const QByteArray &pcmData, int sampleRate) {
         ++udpInputPacketsForwarded;
     }
     ++pcmFramesForwarded;
+    if (pcmFramesForwarded <= 8 || (pcmFramesForwarded % 200) == 0) {
+        emitStatus(QStringLiteral("DSD-neo input: frame %1, UDP packets %2")
+                       .arg(pcmFramesForwarded)
+                       .arg(udpInputPacketsForwarded));
+    }
 }
 
 void DsdNeoBridge::startInputServer() {
@@ -406,6 +413,11 @@ void DsdNeoBridge::readUdpOutput() {
             continue;
         }
         ++udpOutputPacketsReceived;
+        if (udpOutputPacketsReceived <= 8 || (udpOutputPacketsReceived % 100) == 0) {
+            emitStatus(QStringLiteral("DSD-neo audio: packet %1, %2 bytes")
+                           .arg(udpOutputPacketsReceived)
+                           .arg(mono8k.size()));
+        }
         if (fobosVerboseLoggingEnabled() &&
             (udpOutputPacketsReceived <= 8 || (udpOutputPacketsReceived % 100) == 0)) {
             qDebug() << "[DSD-neo] decoded UDP audio"

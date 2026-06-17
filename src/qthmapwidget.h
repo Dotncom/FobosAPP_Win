@@ -24,6 +24,23 @@ public:
         OnlineXyz = 2
     };
 
+    enum class OverlayMode {
+        None = 0,
+        QthGrid = 1,
+        GridAndSatellites = 2,
+        Satellites = 3
+    };
+
+    struct SatelliteMarker {
+        QString label;
+        QString system;
+        int elevationDeg = -1;
+        int azimuthDeg = -1;
+        int cn0DbHz = -1;
+        bool usedInFix = false;
+        bool enabled = true;
+    };
+
     explicit QthMapWidget(QWidget *parent = nullptr);
 
     void setPosition(double latitude, double longitude);
@@ -36,6 +53,8 @@ public:
     void setMapZoomRange(int minimumZoom, int maximumZoom);
     void setMapZoom(int zoom);
     void setGridPrecision(int precision);
+    void setOverlayMode(OverlayMode mode);
+    void setSatelliteMarkers(const QVector<SatelliteMarker> &markers);
     void setPositionVisible(bool visible);
     void centerOnPosition();
     void centerOn(double latitude, double longitude);
@@ -91,6 +110,7 @@ private:
     bool searchMarkerAtPosition(const QPointF &point, const QRectF &mapRect) const;
     bool currentPositionAtPosition(const QPointF &point, const QRectF &mapRect) const;
     void drawUserMarkers(QPainter &painter, const QRectF &mapRect);
+    void drawSatelliteMarkers(QPainter &painter, const QRectF &mapRect);
     void drawMarkerAndTitle(QPainter &painter, const QRectF &mapRect);
     void drawFooter(QPainter &painter, const QRectF &mapRect);
 
@@ -111,6 +131,7 @@ private:
     int minimumMapZoom = 0;
     int maximumMapZoom = 19;
     int gridPrecision = 6;
+    OverlayMode overlayMode = OverlayMode::QthGrid;
     int lastTilesDrawn = 0;
     int lastTilesMissing = 0;
     int lastTilesPending = 0;
@@ -118,6 +139,7 @@ private:
     bool draggingMap = false;
     QPointF lastDragPosition;
     QVector<qth::UserMarker> userMarkers;
+    QVector<SatelliteMarker> satelliteMarkers;
     bool hasSearchMarker = false;
     qth::UserMarker searchMarker;
 

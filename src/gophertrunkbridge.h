@@ -26,6 +26,7 @@ public:
     void resetStream();
     void sendDibitBurst(const QString &dibits,
                         quint64 sample,
+                        quint64 baseDibit,
                         int burstIndex,
                         int cadenceSymbols,
                         int colorCode);
@@ -67,8 +68,13 @@ private:
     QElapsedTimer processRestartBackoffTimer;
     qint64 processRestartBackoffMs = 0;
     quint64 dibitPacketsSent = 0;
+    quint64 virtualBaseDibit = 0;
     quint64 udpOutputPacketsReceived = 0;
     quint64 processLogLines = 0;
+    quint64 tcpOutputLines = 0;
+    bool streamPolarityKnown = false;
+    bool streamPolarityFlip = false;
+    int lastColorCode = -1;
 };
 
 #endif // GOPHERTRUNKBRIDGE_H

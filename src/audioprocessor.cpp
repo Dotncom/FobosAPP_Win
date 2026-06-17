@@ -38,6 +38,8 @@ constexpr double DMR_FOURFSK_SYMBOL_FILTER_HZ = 6200.0;
 constexpr double DMR_FOURFSK_DC_TRACK_HZ = 12.0;
 constexpr double DMR_FOURFSK_OUTER_DEVIATION_HZ = 1944.0;
 constexpr double DMR_FOURFSK_OUTPUT_OUTER_LEVEL = 0.15;
+constexpr float DMR_FOURFSK_LIMIT_INPUT = 4.0f;
+constexpr float DMR_FOURFSK_SOFT_LIMIT_DRIVE = 0.85f;
 constexpr int DMR_CHANNEL_CIC_STAGES = 4;
 
 double clampDouble(double value, double low, double high) {
@@ -794,7 +796,8 @@ void AudioProcessor::processDmrIqDemodulatorBlock(const std::vector<float>& iqBl
         if (!std::isfinite(normalizedSample)) {
             normalizedSample = 0.0f;
         }
-        normalizedSample = (std::clamp)(normalizedSample, -1.0f, 1.0f);
+        normalizedSample =
+            (std::clamp)(normalizedSample, -DMR_FOURFSK_LIMIT_INPUT, DMR_FOURFSK_LIMIT_INPUT);
 
         if (!previousOutputValid) {
             previousOutputSample = normalizedSample;
@@ -812,7 +815,8 @@ void AudioProcessor::processDmrIqDemodulatorBlock(const std::vector<float>& iqBl
             const float interpolated =
                 previousOutputSample +
                 static_cast<float>(fraction) * (normalizedSample - previousOutputSample);
-            const float clamped = (std::clamp)(interpolated, -1.0f, 1.0f);
+            const float clamped =
+                std::tanh(interpolated * DMR_FOURFSK_SOFT_LIMIT_DRIVE);
             dmrBasebandSamples.push_back(
                 static_cast<short>(std::lrint(clamped * 32767.0f)));
             resamplePhase -= 1.0;

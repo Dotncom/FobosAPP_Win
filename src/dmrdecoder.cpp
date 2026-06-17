@@ -4573,8 +4573,17 @@ void DmrDecoder::queueVoicePayloadFrames(const PendingEmb &pending,
         gopherPayload.syncDibits +
         gopherPayload.rightDibits;
     if (gopherDibits.size() == 132) {
+        const quint64 centralDibit =
+            samplesPerSymbol > 0
+                ? pending.absoluteSample / static_cast<quint64>(samplesPerSymbol)
+                : pending.absoluteSample;
+        const quint64 baseDibit =
+            centralDibit > static_cast<quint64>(DMR_SYMBOLS_BEFORE_SYNC)
+                ? centralDibit - static_cast<quint64>(DMR_SYMBOLS_BEFORE_SYNC)
+                : quint64(0);
         pendingDibitBursts.push_back({gopherDibits,
                                       pending.absoluteSample,
+                                      baseDibit,
                                       pending.burstIndex,
                                       pending.cadenceSymbols,
                                       selectedVoicePayloadColorCode});

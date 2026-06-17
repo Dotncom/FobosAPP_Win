@@ -30,6 +30,7 @@
 #include <QJsonObject>
 #include <QList>
 #include <QMenu>
+#include <QAction>
 #include <QMetaObject>
 #include <QHostAddress>
 #include <QHostInfo>
@@ -41,6 +42,7 @@
 #include <QPointer>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -58,6 +60,8 @@
 #include <QScopeGuard>
 #include <QSettings>
 #include <QSerialPort>
+#include <QSerialPortInfo>
+#include <QtMath>
 #include <QUrl>
 #if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
 #include <QAudioDeviceInfo>
@@ -138,6 +142,13 @@ struct NmeaSerialStatus {
     int fixMode = -1;
     int satellitesUsed = -1;
     int satellitesInView = -1;
+    double hdop = std::numeric_limits<double>::quiet_NaN();
+    double vdop = std::numeric_limits<double>::quiet_NaN();
+    double pdop = std::numeric_limits<double>::quiet_NaN();
+    double altitudeM = std::numeric_limits<double>::quiet_NaN();
+    double geoidSeparationM = std::numeric_limits<double>::quiet_NaN();
+    double speedKmh = std::numeric_limits<double>::quiet_NaN();
+    double courseDeg = std::numeric_limits<double>::quiet_NaN();
 };
 
 int parseNmeaIntField(const QStringList &fields, int index, int fallback = -1) {
@@ -149,11 +160,19 @@ int parseNmeaIntField(const QStringList &fields, int index, int fallback = -1) {
     return ok ? value : fallback;
 }
 
-NmeaSerialStatus parseNmeaSerialStatusSentence(const QString &line) {
-    NmeaSerialStatus status;
+double parseNmeaDoubleField(const QStringList &fields, int index, double fallback = std::numeric_limits<double>::quiet_NaN()) {
+    if (index < 0 || index >= fields.size()) {
+        return fallback;
+    }
+    bool ok = false;
+    const double value = fields.at(index).trimmed().toDouble(&ok);
+    return ok ? value : fallback;
+}
+
+QStringList nmeaBodyFields(const QString &line) {
     QString sentence = line.trimmed();
     if (sentence.isEmpty()) {
-        return status;
+        return {};
     }
     const int start = sentence.indexOf(QLatin1Char('$'));
     if (start >= 0) {
@@ -163,7 +182,229 @@ NmeaSerialStatus parseNmeaSerialStatusSentence(const QString &line) {
     }
     const int checksumPos = sentence.indexOf(QLatin1Char('*'));
     const QString body = checksumPos >= 0 ? sentence.left(checksumPos) : sentence;
-    const QStringList fields = body.split(QLatin1Char(','));
+    return body.split(QLatin1Char(','));
+}
+
+QString gnssSystemForTalker(const QString &talker, int prn = -1) {
+    const QString upper = talker.trimmed().toUpper();
+    if (upper == QStringLiteral("GP")) {
+        if (prn >= 33 && prn <= 64) {
+            return QStringLiteral("SBAS");
+        }
+        return QStringLiteral("GPS");
+    }
+    if (upper == QStringLiteral("GL")) {
+        return QStringLiteral("GLONASS");
+    }
+    if (upper == QStringLiteral("GA")) {
+        return QStringLiteral("Galileo");
+    }
+    if (upper == QStringLiteral("GB") || upper == QStringLiteral("BD")) {
+        return QStringLiteral("BeiDou");
+    }
+    if (upper == QStringLiteral("GQ")) {
+        return QStringLiteral("QZSS");
+    }
+    if (upper == QStringLiteral("GN")) {
+        return QStringLiteral("Mixed");
+    }
+    return QStringLiteral("Other");
+}
+
+QString gnssSatelliteKey(const QString &talker, int prn) {
+    return QStringLiteral("%1:%2").arg(gnssSystemForTalker(talker, prn)).arg(prn);
+}
+
+quint16 ubxU2(const QByteArray &bytes, int offset) {
+    if (offset < 0 || offset + 1 >= bytes.size()) {
+        return 0;
+    }
+    return static_cast<quint16>(static_cast<quint8>(bytes.at(offset))) |
+           static_cast<quint16>(static_cast<quint8>(bytes.at(offset + 1)) << 8);
+}
+
+quint32 ubxU4(const QByteArray &bytes, int offset) {
+    if (offset < 0 || offset + 3 >= bytes.size()) {
+        return 0;
+    }
+    return static_cast<quint32>(static_cast<quint8>(bytes.at(offset))) |
+           (static_cast<quint32>(static_cast<quint8>(bytes.at(offset + 1))) << 8) |
+           (static_cast<quint32>(static_cast<quint8>(bytes.at(offset + 2))) << 16) |
+           (static_cast<quint32>(static_cast<quint8>(bytes.at(offset + 3))) << 24);
+}
+
+void ubxPutU4(QByteArray &bytes, int offset, quint32 value) {
+    if (offset < 0 || offset + 3 >= bytes.size()) {
+        return;
+    }
+    bytes[offset] = char(value & 0xFFu);
+    bytes[offset + 1] = char((value >> 8) & 0xFFu);
+    bytes[offset + 2] = char((value >> 16) & 0xFFu);
+    bytes[offset + 3] = char((value >> 24) & 0xFFu);
+}
+
+void ubxAppendU4(QByteArray &bytes, quint32 value) {
+    bytes.append(char(value & 0xFFu));
+    bytes.append(char((value >> 8) & 0xFFu));
+    bytes.append(char((value >> 16) & 0xFFu));
+    bytes.append(char((value >> 24) & 0xFFu));
+}
+
+qint16 ubxI2(const QByteArray &bytes, int offset) {
+    return static_cast<qint16>(ubxU2(bytes, offset));
+}
+
+qint32 ubxI4(const QByteArray &bytes, int offset) {
+    return static_cast<qint32>(ubxU4(bytes, offset));
+}
+
+QByteArray makeUbxFrame(quint8 messageClass, quint8 messageId, const QByteArray &payload) {
+    QByteArray frame;
+    frame.reserve(payload.size() + 8);
+    frame.append(char(0xB5));
+    frame.append(char(0x62));
+    frame.append(char(messageClass));
+    frame.append(char(messageId));
+    frame.append(char(payload.size() & 0xFF));
+    frame.append(char((payload.size() >> 8) & 0xFF));
+    frame.append(payload);
+    quint8 ckA = 0;
+    quint8 ckB = 0;
+    for (int i = 2; i < frame.size(); ++i) {
+        ckA = static_cast<quint8>(ckA + static_cast<quint8>(frame.at(i)));
+        ckB = static_cast<quint8>(ckB + ckA);
+    }
+    frame.append(char(ckA));
+    frame.append(char(ckB));
+    return frame;
+}
+
+bool hasValidUbxChecksum(const QByteArray &frame) {
+    if (frame.size() < 8 ||
+        static_cast<quint8>(frame.at(0)) != 0xB5 ||
+        static_cast<quint8>(frame.at(1)) != 0x62) {
+        return false;
+    }
+    quint8 ckA = 0;
+    quint8 ckB = 0;
+    for (int i = 2; i < frame.size() - 2; ++i) {
+        ckA = static_cast<quint8>(ckA + static_cast<quint8>(frame.at(i)));
+        ckB = static_cast<quint8>(ckB + ckA);
+    }
+    return ckA == static_cast<quint8>(frame.at(frame.size() - 2)) &&
+           ckB == static_cast<quint8>(frame.at(frame.size() - 1));
+}
+
+QString ubxGnssSystemName(quint8 gnssId) {
+    switch (gnssId) {
+    case 0:
+        return QStringLiteral("GPS");
+    case 1:
+        return QStringLiteral("SBAS");
+    case 2:
+        return QStringLiteral("Galileo");
+    case 3:
+        return QStringLiteral("BeiDou");
+    case 5:
+        return QStringLiteral("QZSS");
+    case 6:
+        return QStringLiteral("GLONASS");
+    default:
+        return QStringLiteral("Other");
+    }
+}
+
+QString ubxGnssTalker(quint8 gnssId) {
+    switch (gnssId) {
+    case 0:
+        return QStringLiteral("GP");
+    case 1:
+        return QStringLiteral("SB");
+    case 2:
+        return QStringLiteral("GA");
+    case 3:
+        return QStringLiteral("GB");
+    case 5:
+        return QStringLiteral("GQ");
+    case 6:
+        return QStringLiteral("GL");
+    default:
+        return QStringLiteral("UX");
+    }
+}
+
+QString ubxSatelliteKey(quint8 gnssId, int svId) {
+    return QStringLiteral("UBX:%1:%2").arg(ubxGnssSystemName(gnssId)).arg(svId);
+}
+
+QString normalizedGnssPositionPolicy(QString policy) {
+    policy = policy.trimmed().toLower();
+    if (policy == QStringLiteral("ubx_preferred") ||
+        policy == QStringLiteral("nmea_only") ||
+        policy == QStringLiteral("ubx_only")) {
+        return policy;
+    }
+    return QStringLiteral("auto");
+}
+
+QString formatGnssUtcForDisplay(const QString &rawUtc, int offsetMinutes) {
+    const QString raw = rawUtc.trimmed();
+    if (raw.isEmpty()) {
+        return QStringLiteral("-");
+    }
+
+    QDateTime utcDateTime;
+    QString fraction;
+    if (raw.contains(QLatin1Char('T'))) {
+        utcDateTime = QDateTime::fromString(raw, Qt::ISODateWithMs);
+        if (!utcDateTime.isValid()) {
+            utcDateTime = QDateTime::fromString(raw, Qt::ISODate);
+        }
+        utcDateTime.setTimeSpec(Qt::UTC);
+    } else {
+        const int dot = raw.indexOf(QLatin1Char('.'));
+        const QString compact = dot >= 0 ? raw.left(dot) : raw;
+        fraction = dot >= 0 ? raw.mid(dot) : QString();
+        if (compact.size() >= 6) {
+            const int hour = compact.mid(0, 2).toInt();
+            const int minute = compact.mid(2, 2).toInt();
+            const int second = compact.mid(4, 2).toInt();
+            if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 && second >= 0 && second <= 60) {
+                utcDateTime = QDateTime(QDate::currentDate(), QTime(hour, minute, (std::min)(second, 59)), Qt::UTC);
+            }
+        }
+    }
+
+    if (!utcDateTime.isValid()) {
+        return raw;
+    }
+
+    QDateTime displayTime = utcDateTime;
+    QString zone;
+    if (offsetMinutes == 100000) {
+        displayTime = utcDateTime.toLocalTime();
+        zone = QStringLiteral("Local");
+    } else {
+        displayTime = utcDateTime.addSecs(offsetMinutes * 60);
+        const int absMinutes = std::abs(offsetMinutes);
+        zone = QStringLiteral("UTC%1%2:%3")
+                   .arg(offsetMinutes >= 0 ? QStringLiteral("+") : QStringLiteral("-"))
+                   .arg(absMinutes / 60, 2, 10, QLatin1Char('0'))
+                   .arg(absMinutes % 60, 2, 10, QLatin1Char('0'));
+    }
+
+    if (fraction.size() > 4) {
+        fraction = fraction.left(4);
+    }
+    return QStringLiteral("%1%2 %3")
+        .arg(displayTime.time().toString(QStringLiteral("HH:mm:ss")))
+        .arg(fraction)
+        .arg(zone);
+}
+
+NmeaSerialStatus parseNmeaSerialStatusSentence(const QString &line) {
+    NmeaSerialStatus status;
+    const QStringList fields = nmeaBodyFields(line);
     if (fields.isEmpty()) {
         return status;
     }
@@ -180,13 +421,24 @@ NmeaSerialStatus parseNmeaSerialStatusSentence(const QString &line) {
         status.utc = fields.size() > 1 ? fields.at(1).trimmed() : QString();
         status.fixQuality = parseNmeaIntField(fields, 6);
         status.satellitesUsed = parseNmeaIntField(fields, 7);
+        status.hdop = parseNmeaDoubleField(fields, 8);
+        status.altitudeM = parseNmeaDoubleField(fields, 9);
+        status.geoidSeparationM = parseNmeaDoubleField(fields, 11);
     } else if (status.sentence == QStringLiteral("RMC")) {
         status.recognized = true;
         status.utc = fields.size() > 1 ? fields.at(1).trimmed() : QString();
         status.fixQuality = (fields.size() > 2 && fields.at(2).trimmed().toUpper() == QStringLiteral("A")) ? 1 : 0;
+        const double speedKnots = parseNmeaDoubleField(fields, 7);
+        if (std::isfinite(speedKnots)) {
+            status.speedKmh = speedKnots * 1.852;
+        }
+        status.courseDeg = parseNmeaDoubleField(fields, 8);
     } else if (status.sentence == QStringLiteral("GSA")) {
         status.recognized = true;
         status.fixMode = parseNmeaIntField(fields, 2);
+        status.pdop = parseNmeaDoubleField(fields, 15);
+        status.hdop = parseNmeaDoubleField(fields, 16);
+        status.vdop = parseNmeaDoubleField(fields, 17);
     } else if (status.sentence == QStringLiteral("GSV")) {
         status.recognized = true;
         status.satellitesInView = parseNmeaIntField(fields, 3);
@@ -194,6 +446,10 @@ NmeaSerialStatus parseNmeaSerialStatusSentence(const QString &line) {
         status.recognized = true;
         status.utc = fields.size() > 5 ? fields.at(5).trimmed() : QString();
         status.fixQuality = (fields.size() > 6 && fields.at(6).trimmed().toUpper() == QStringLiteral("A")) ? 1 : 0;
+    } else if (status.sentence == QStringLiteral("VTG")) {
+        status.recognized = true;
+        status.courseDeg = parseNmeaDoubleField(fields, 1, parseNmeaDoubleField(fields, 3));
+        status.speedKmh = parseNmeaDoubleField(fields, 7);
     }
 
     return status;
@@ -210,7 +466,8 @@ QString defaultDsdNeoProgramPath() {
 bool isLegacyDsdNeoProgramName(const QString &program) {
     const QString trimmed = program.trimmed();
     return trimmed.compare(QStringLiteral("dsd-neo.exe"), Qt::CaseInsensitive) == 0 ||
-           trimmed.compare(QStringLiteral("dsd-neo"), Qt::CaseInsensitive) == 0;
+           trimmed.compare(QStringLiteral("dsd-neo"), Qt::CaseInsensitive) == 0 ||
+           trimmed.compare(defaultDsdNeoProgramPath(), Qt::CaseInsensitive) == 0;
 }
 
 QString defaultGopherTrunkProgramPath() {
@@ -334,6 +591,9 @@ constexpr int SPUR_CALIBRATION_OUTER_BINS = 36;
 constexpr int SPUR_MAX_MASK_ENTRIES = 16;
 constexpr double SPUR_MIN_MASK_WIDTH_HZ = 50.0;
 constexpr double SPUR_MAX_MASK_WIDTH_HZ = 20000.0;
+constexpr int GNSS_SATELLITE_TABLE_ROWS = 64;
+constexpr int GNSS_SATELLITE_TABLE_GROW_STEP = 32;
+constexpr int GNSS_SATELLITE_TABLE_MAX_ROWS = 256;
 qint64 agileRfLiveSettleMs(double sampleRate, bool sampleRateChange) {
     if (!std::isfinite(sampleRate) || sampleRate <= 0.0) {
         return sampleRateChange ? AGILE_RF_MID_RATE_SAMPLE_SETTLE_MS
@@ -2503,15 +2763,21 @@ YourClassName::YourClassName(QWidget *parent)
     qthClearButton->setToolTip(uiText(
         QStringLiteral("clear_qth_tooltip"),
         QStringLiteral("Hide the current real QTH position from the map and clear the live location state.")));
-    qthPasteNmeaButton = new QPushButton("Paste NMEA", qthBox);
-    markTranslatable(qthPasteNmeaButton, QStringLiteral("paste_nmea"), QStringLiteral("NMEA"));
-    qthPasteNmeaButton->setToolTip(uiText(
-        QStringLiteral("nmea_paste_tooltip"),
-        QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
-    gnssSerialPortEdit = new QLineEdit(qthBox);
-    gnssSerialPortEdit->setText(gnssSerialPortName);
-    gnssSerialPortEdit->setPlaceholderText(QStringLiteral("COM4"));
-    gnssSerialPortEdit->setMaximumWidth(76);
+    qthPasteNmeaButton = nullptr;
+    gnssSerialPortEdit = new QComboBox(qthBox);
+    gnssSerialPortEdit->setEditable(true);
+    gnssSerialPortEdit->setMaximumWidth(98);
+    QStringList serialPortNames;
+    for (const QSerialPortInfo &portInfo : QSerialPortInfo::availablePorts()) {
+        serialPortNames << portInfo.portName();
+    }
+    serialPortNames.removeDuplicates();
+    serialPortNames.sort(Qt::CaseInsensitive);
+    if (!serialPortNames.contains(gnssSerialPortName, Qt::CaseInsensitive)) {
+        serialPortNames.prepend(gnssSerialPortName.isEmpty() ? QStringLiteral("COM4") : gnssSerialPortName);
+    }
+    gnssSerialPortEdit->addItems(serialPortNames);
+    gnssSerialPortEdit->setCurrentText(gnssSerialPortName.isEmpty() ? QStringLiteral("COM4") : gnssSerialPortName);
     gnssSerialPortEdit->setToolTip(uiText(
         QStringLiteral("gnss_serial_port_tooltip"),
         QStringLiteral("Serial port for an external NMEA GNSS receiver, for example COM4 or /dev/ttyUSB0.")));
@@ -2528,6 +2794,70 @@ YourClassName::YourClassName(QWidget *parent)
     gnssSerialButton->setToolTip(uiText(
         QStringLiteral("gnss_serial_connect_tooltip"),
         QStringLiteral("Open the serial NMEA stream and use valid GGA/RMC fixes as the current QTH.")));
+    gnssNmeaLogButton = new QPushButton("Log", qthBox);
+    markTranslatable(gnssNmeaLogButton, QStringLiteral("nmea_log"), QStringLiteral("Log"));
+    gnssNmeaLogButton->setToolTip(uiText(
+        QStringLiteral("nmea_log_tooltip"),
+        QStringLiteral("Start or stop writing live NMEA sentences to recordings/nmea.")));
+    gnssNmeaReplayButton = new QPushButton("Replay", qthBox);
+    markTranslatable(gnssNmeaReplayButton, QStringLiteral("nmea_replay"), QStringLiteral("Replay"));
+    gnssNmeaReplayButton->setToolTip(uiText(
+        QStringLiteral("nmea_replay_tooltip"),
+        QStringLiteral("Replay a saved NMEA log through the same parser, map and satellite diagnostics.")));
+    gnssSerialRawLogButton = new QPushButton("Raw", qthBox);
+    markTranslatable(gnssSerialRawLogButton, QStringLiteral("gnss_raw_serial_log"), QStringLiteral("Raw"));
+    gnssSerialRawLogButton->setToolTip(uiText(
+        QStringLiteral("gnss_raw_serial_log_tooltip"),
+        QStringLiteral("Start or stop a raw binary UBX/NMEA serial capture in recordings/gnss_raw.")));
+    gnssUbxSystemsButton = new QPushButton("UBX sys", qthBox);
+    markTranslatable(gnssUbxSystemsButton, QStringLiteral("gnss_ubx_systems"), QStringLiteral("UBX sys"));
+    gnssUbxSystemsButton->setToolTip(uiText(
+        QStringLiteral("gnss_ubx_systems_tooltip"),
+        QStringLiteral("Apply the GPS/GLO/GAL/BDS/QZSS/SBAS checkboxes to the receiver through UBX CFG-GNSS. If needed, the module is polled first.")));
+    gnssUbxSaveButton = new QPushButton("Save cfg", qthBox);
+    markTranslatable(gnssUbxSaveButton, QStringLiteral("gnss_ubx_save_cfg"), QStringLiteral("Save cfg"));
+    gnssUbxSaveButton->setToolTip(uiText(
+        QStringLiteral("gnss_ubx_save_cfg_tooltip"),
+        QStringLiteral("Ask the u-blox module to save its current configuration to non-volatile memory.")));
+    gnssPositionPolicyCombo = new QComboBox(qthBox);
+    gnssPositionPolicyCombo->addItem(uiText(QStringLiteral("gnss_position_policy_auto"),
+                                            QStringLiteral("Auto")),
+                                     QStringLiteral("auto"));
+    gnssPositionPolicyCombo->addItem(uiText(QStringLiteral("gnss_position_policy_ubx_preferred"),
+                                            QStringLiteral("UBX preferred")),
+                                     QStringLiteral("ubx_preferred"));
+    gnssPositionPolicyCombo->addItem(uiText(QStringLiteral("gnss_position_policy_nmea_only"),
+                                            QStringLiteral("NMEA only")),
+                                     QStringLiteral("nmea_only"));
+    gnssPositionPolicyCombo->addItem(uiText(QStringLiteral("gnss_position_policy_ubx_only"),
+                                            QStringLiteral("UBX only")),
+                                     QStringLiteral("ubx_only"));
+    {
+        const int policyIndex = gnssPositionPolicyCombo->findData(normalizedGnssPositionPolicy(gnssPositionPolicy));
+        gnssPositionPolicyCombo->setCurrentIndex(policyIndex >= 0 ? policyIndex : 0);
+    }
+    gnssPositionPolicyCombo->setToolTip(uiText(
+        QStringLiteral("gnss_position_policy_tooltip"),
+        QStringLiteral("Choose which external GNSS stream is allowed to update the current QTH position.")));
+    gnssTimeZoneCombo = new QComboBox(qthBox);
+    gnssTimeZoneCombo->addItem(QStringLiteral("UTC"), 0);
+    gnssTimeZoneCombo->addItem(uiText(QStringLiteral("local_time"), QStringLiteral("Local")), 100000);
+    for (int hour = -12; hour <= 14; ++hour) {
+        if (hour == 0) {
+            continue;
+        }
+        gnssTimeZoneCombo->addItem(QStringLiteral("UTC%1%2:00")
+                                       .arg(hour > 0 ? QStringLiteral("+") : QStringLiteral("-"))
+                                       .arg(std::abs(hour), 2, 10, QLatin1Char('0')),
+                                   hour * 60);
+    }
+    {
+        const int zoneIndex = gnssTimeZoneCombo->findData(gnssTimeZoneOffsetMinutes);
+        gnssTimeZoneCombo->setCurrentIndex(zoneIndex >= 0 ? zoneIndex : 0);
+    }
+    gnssTimeZoneCombo->setToolTip(uiText(
+        QStringLiteral("gnss_timezone_tooltip"),
+        QStringLiteral("Time zone used only for displaying GNSS UTC time. Raw NMEA/UBX data remains unchanged.")));
     gnssTuneButton = new QPushButton("Tune", qthBox);
     markTranslatable(gnssTuneButton, QStringLiteral("tune_gnss_l1"), QStringLiteral("Tune"));
     gnssScanButton = new QPushButton("Scan", qthBox);
@@ -2567,8 +2897,32 @@ YourClassName::YourClassName(QWidget *parent)
     gnssMonitorCheckbox->setToolTip(uiText(
         QStringLiteral("gnss_iq_monitor_tooltip"),
         QStringLiteral("Measure live/playback IQ level, DC offset, clipping and I/Q balance before attempting GNSS acquisition.")));
-    gnssMonitorResetButton = new QPushButton("Reset", qthBox);
-    markTranslatable(gnssMonitorResetButton, QStringLiteral("reset"), QStringLiteral("Reset"));
+    gnssUseGpsCheckbox = new QCheckBox(QStringLiteral("GPS"), qthBox);
+    gnssUseGlonassCheckbox = new QCheckBox(QStringLiteral("GLO"), qthBox);
+    gnssUseGalileoCheckbox = new QCheckBox(QStringLiteral("GAL"), qthBox);
+    gnssUseBeidouCheckbox = new QCheckBox(QStringLiteral("BDS"), qthBox);
+    gnssUseQzssCheckbox = new QCheckBox(QStringLiteral("QZSS"), qthBox);
+    gnssUseSbasCheckbox = new QCheckBox(QStringLiteral("SBAS"), qthBox);
+    gnssUseOtherCheckbox = new QCheckBox(QStringLiteral("Other"), qthBox);
+    for (QCheckBox *box : {gnssUseGpsCheckbox,
+                           gnssUseGlonassCheckbox,
+                           gnssUseGalileoCheckbox,
+                           gnssUseBeidouCheckbox,
+                           gnssUseQzssCheckbox,
+                           gnssUseSbasCheckbox,
+                           gnssUseOtherCheckbox}) {
+        box->setChecked(true);
+        box->setMinimumWidth(0);
+        box->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        box->setToolTip(uiText(QStringLiteral("gnss_system_filter_tooltip"),
+                               QStringLiteral("Use this constellation in NMEA satellite diagnostics and filtered GNSS decisions.")));
+    }
+    markTranslatable(gnssUseOtherCheckbox, QStringLiteral("other"), QStringLiteral("Other"));
+    gnssMonitorResetButton = new QPushButton("IQ reset", qthBox);
+    markTranslatable(gnssMonitorResetButton, QStringLiteral("gnss_iq_reset"), QStringLiteral("IQ reset"));
+    gnssMonitorResetButton->setToolTip(uiText(
+        QStringLiteral("gnss_iq_monitor_reset_tooltip"),
+        QStringLiteral("Reset only the GNSS IQ monitor peak history and accumulated SDR statistics. It does not clear the QTH position.")));
     gnssNetworkTimeButton = new QPushButton("NTP", qthBox);
     markTranslatable(gnssNetworkTimeButton, QStringLiteral("gnss_ntp_time"), QStringLiteral("NTP"));
     gnssNetworkTimeButton->setToolTip(uiText(
@@ -2579,6 +2933,11 @@ YourClassName::YourClassName(QWidget *parent)
     gnssPlotButton->setToolTip(uiText(
         QStringLiteral("gnss_acq_plot_tooltip"),
         QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
+    gnssSatellitesButton = new QPushButton("Sats", qthBox);
+    markTranslatable(gnssSatellitesButton, QStringLiteral("gnss_satellites"), QStringLiteral("Sats"));
+    gnssSatellitesButton->setToolTip(uiText(
+        QStringLiteral("gnss_satellites_tooltip"),
+        QStringLiteral("Open the live NMEA satellite list in a separate resizable window.")));
     gnssMonitorStatusLabel = new QLabel(qthBox);
     prepareGnssStatusLabel(gnssMonitorStatusLabel);
     gnssSerialStatusLabel = new QLabel(qthBox);
@@ -2588,19 +2947,111 @@ YourClassName::YourClassName(QWidget *parent)
     gnssAcquisitionPlotDialog = new QDialog(this);
     gnssAcquisitionPlotDialog->setWindowTitle(uiText(QStringLiteral("gnss_acq_plot_title"),
                                                      QStringLiteral("GNSS acquisition diagnostics")));
-    gnssAcquisitionPlotDialog->resize(720, 300);
+    gnssAcquisitionPlotDialog->resize(760, 360);
     QVBoxLayout *gnssPlotDialogLayout = new QVBoxLayout(gnssAcquisitionPlotDialog);
     gnssAcquisitionPlotLabel = new QLabel(gnssAcquisitionPlotDialog);
-    gnssAcquisitionPlotLabel->setMinimumSize(520, 220);
+    gnssAcquisitionPlotLabel->setMinimumSize(520, 260);
     gnssAcquisitionPlotLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     gnssAcquisitionPlotLabel->setScaledContents(false);
     gnssAcquisitionPlotLabel->setAlignment(Qt::AlignCenter);
     gnssAcquisitionPlotLabel->setText(uiText(QStringLiteral("gnss_acq_plot_waiting"),
-                                             QStringLiteral("Run GPS C/A accumulation to draw correlation diagnostics.")));
+                                             QStringLiteral("Run Accum/Deep/Replay/Self-test to draw SDR correlation heatmap.")));
     gnssAcquisitionPlotLabel->setToolTip(uiText(
         QStringLiteral("gnss_acq_plot_tooltip"),
         QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
     gnssPlotDialogLayout->addWidget(gnssAcquisitionPlotLabel, 1);
+
+    gnssSatelliteDialog = new QDialog(this);
+    gnssSatelliteDialog->setWindowTitle(uiText(QStringLiteral("gnss_satellite_window_title"),
+                                               QStringLiteral("GNSS satellites")));
+    gnssSatelliteDialog->resize(720, 620);
+    QVBoxLayout *gnssSatelliteLayout = new QVBoxLayout(gnssSatelliteDialog);
+    gnssSatelliteStatusLabel = new QLabel(gnssSatelliteDialog);
+    gnssSatelliteStatusLabel->setTextFormat(Qt::RichText);
+    gnssSatelliteStatusLabel->setWordWrap(true);
+    gnssSatelliteStatusLabel->setText(uiText(QStringLiteral("gnss_satellite_status_waiting"),
+                                             QStringLiteral("Waiting for GNSS satellite data.")));
+    gnssSatelliteStatusLabel->setToolTip(uiText(
+        QStringLiteral("gnss_satellite_status_tooltip"),
+        QStringLiteral("Live GNSS fix summary from NMEA and UBX: source, fix type, satellites, DOP, altitude, speed and UTC.")));
+    gnssSatelliteLayout->addWidget(gnssSatelliteStatusLabel);
+    gnssSatelliteTableCheckbox = new QCheckBox(uiText(QStringLiteral("show_table"),
+                                                      QStringLiteral("Table")),
+                                               gnssSatelliteDialog);
+    gnssSatelliteTableCheckbox->setChecked(gnssSatelliteTableVisible);
+    gnssSatelliteTableCheckbox->setToolTip(uiText(
+        QStringLiteral("gnss_satellite_table_toggle_tooltip"),
+        QStringLiteral("Open or hide the live satellite table in a separate resizable window.")));
+    gnssSatelliteLayout->addWidget(gnssSatelliteTableCheckbox);
+    gnssSatelliteSkyLabel = new QLabel(gnssSatelliteDialog);
+    gnssSatelliteSkyLabel->setMinimumSize(520, 150);
+    gnssSatelliteSkyLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    gnssSatelliteSkyLabel->setScaledContents(false);
+    gnssSatelliteSkyLabel->setAlignment(Qt::AlignCenter);
+    gnssSatelliteSkyLabel->setText(uiText(QStringLiteral("gnss_sky_waiting"),
+                                          QStringLiteral("Waiting for live GNSS satellites.")));
+    gnssSatelliteSkyLabel->setToolTip(uiText(
+        QStringLiteral("gnss_sky_tooltip"),
+        QStringLiteral("Sky view from NMEA GSV or UBX NAV-SAT azimuth/elevation values. Color follows C/N0; white outline means the satellite is used in the module fix.")));
+    gnssSatelliteLayout->addWidget(gnssSatelliteSkyLabel, 1);
+
+    gnssSatelliteTableDialog = new QDialog(this);
+    gnssSatelliteTableDialog->setWindowTitle(uiText(QStringLiteral("gnss_satellite_table_window_title"),
+                                                    QStringLiteral("GNSS satellite table")));
+    gnssSatelliteTableDialog->resize(980, 560);
+    QVBoxLayout *gnssSatelliteTableLayout = new QVBoxLayout(gnssSatelliteTableDialog);
+    gnssSatelliteTable = new QTableWidget(GNSS_SATELLITE_TABLE_ROWS, 10, gnssSatelliteTableDialog);
+    gnssSatelliteTable->setHorizontalHeaderLabels({
+        uiText(QStringLiteral("use"), QStringLiteral("Use")),
+        uiText(QStringLiteral("source_short"), QStringLiteral("Src")),
+        uiText(QStringLiteral("system"), QStringLiteral("System")),
+        QStringLiteral("SVID"),
+        uiText(QStringLiteral("elevation_short"), QStringLiteral("El")),
+        uiText(QStringLiteral("azimuth_short"), QStringLiteral("Az")),
+        QStringLiteral("C/N0"),
+        uiText(QStringLiteral("fix"), QStringLiteral("Fix")),
+        uiText(QStringLiteral("age"), QStringLiteral("Age")),
+        uiText(QStringLiteral("quality"), QStringLiteral("Quality"))
+    });
+    gnssSatelliteTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    gnssSatelliteTable->setSelectionMode(QAbstractItemView::NoSelection);
+    gnssSatelliteTable->setAlternatingRowColors(true);
+    gnssSatelliteTable->setMinimumSize(520, 180);
+    gnssSatelliteTable->verticalHeader()->setVisible(false);
+    gnssSatelliteTable->horizontalHeader()->setStretchLastSection(false);
+    gnssSatelliteTable->horizontalHeader()->setSectionsClickable(true);
+    gnssSatelliteTable->horizontalHeader()->setSortIndicatorShown(true);
+    gnssSatelliteTable->horizontalHeader()->setSortIndicator(gnssSatelliteSortColumn,
+                                                             gnssSatelliteSortAscending ? Qt::AscendingOrder
+                                                                                        : Qt::DescendingOrder);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(6, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(7, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(8, QHeaderView::ResizeToContents);
+    gnssSatelliteTable->horizontalHeader()->setSectionResizeMode(9, QHeaderView::Stretch);
+    gnssSatelliteTable->setToolTip(uiText(
+        QStringLiteral("gnss_satellite_table_tooltip"),
+        QStringLiteral("Live GNSS satellites from NMEA GSV/GSA and UBX NAV-SAT. Click headers to sort; right-click Use for bulk selection.")));
+    for (int row = 0; row < GNSS_SATELLITE_TABLE_ROWS; ++row) {
+        for (int column = 0; column < gnssSatelliteTable->columnCount(); ++column) {
+            auto *item = new QTableWidgetItem(column == 0 ? QString() : QStringLiteral("-"));
+            item->setTextAlignment(Qt::AlignCenter);
+            item->setFlags(Qt::ItemIsEnabled);
+            if (column == 0) {
+                item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
+                item->setCheckState(Qt::Unchecked);
+            }
+            gnssSatelliteTable->setItem(row, column, item);
+        }
+        gnssSatelliteTable->setRowHidden(row, true);
+    }
+    gnssSatelliteTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    gnssSatelliteTableLayout->addWidget(gnssSatelliteTable, 1);
 
     auto prepareGnssButton = [](QPushButton *button) {
         if (!button) {
@@ -2613,7 +3064,6 @@ YourClassName::YourClassName(QWidget *parent)
     for (QPushButton *button : {
              qthMapButton,
              qthCopyButton,
-             qthPasteNmeaButton,
              gnssTuneButton,
              gnssScanButton,
              gnssRawLogButton,
@@ -2623,8 +3073,14 @@ YourClassName::YourClassName(QWidget *parent)
              gnssSelfTestButton,
              gnssPositionSelfTestButton,
              gnssSerialButton,
+             gnssNmeaLogButton,
+             gnssNmeaReplayButton,
+             gnssSerialRawLogButton,
+             gnssUbxSystemsButton,
+             gnssUbxSaveButton,
              gnssNetworkTimeButton,
              gnssPlotButton,
+             gnssSatellitesButton,
              gnssMonitorResetButton}) {
         prepareGnssButton(button);
     }
@@ -2647,6 +3103,22 @@ YourClassName::YourClassName(QWidget *parent)
     markTranslatable(qthLocatorTitleLabel, QStringLiteral("qth_locator_short"), QStringLiteral("QTH:"));
     QLabel *gnssSerialLabel = new QLabel("NMEA:", qthBox);
     markTranslatable(gnssSerialLabel, QStringLiteral("nmea_serial"), QStringLiteral("NMEA:"));
+    QLabel *gnssTimeZoneLabel = new QLabel("Time:", qthBox);
+    markTranslatable(gnssTimeZoneLabel, QStringLiteral("gnss_time_zone"), QStringLiteral("Time:"));
+    QLabel *gnssFilterLabel2 = new QLabel("Use:", qthBox);
+    markTranslatable(gnssFilterLabel2, QStringLiteral("use"), QStringLiteral("Use:"));
+    QWidget *gnssFilterWidget = new QWidget(qthBox);
+    QGridLayout *gnssFilterLayout = new QGridLayout(gnssFilterWidget);
+    gnssFilterLayout->setContentsMargins(0, 0, 0, 0);
+    gnssFilterLayout->setHorizontalSpacing(4);
+    gnssFilterLayout->setVerticalSpacing(0);
+    gnssFilterLayout->addWidget(gnssUseGpsCheckbox, 0, 0);
+    gnssFilterLayout->addWidget(gnssUseGlonassCheckbox, 0, 1);
+    gnssFilterLayout->addWidget(gnssUseGalileoCheckbox, 0, 2);
+    gnssFilterLayout->addWidget(gnssUseBeidouCheckbox, 1, 0);
+    gnssFilterLayout->addWidget(gnssUseQzssCheckbox, 1, 1);
+    gnssFilterLayout->addWidget(gnssUseSbasCheckbox, 1, 2);
+    gnssFilterLayout->addWidget(gnssUseOtherCheckbox, 2, 0, 1, 3);
 
     QGridLayout *qthLayout = new QGridLayout(qthBox);
     qthLayout->setContentsMargins(6, 8, 6, 6);
@@ -2670,29 +3142,39 @@ YourClassName::YourClassName(QWidget *parent)
     qthLayout->addWidget(qthLocatorTitleLabel, 7, 0);
     qthLayout->addWidget(qthLocatorLabel, 7, 1, 1, 2);
     qthLayout->addWidget(qthMapButton, 8, 0);
-    qthLayout->addWidget(qthCopyButton, 8, 1);
-    qthLayout->addWidget(qthClearButton, 8, 2);
-    qthLayout->addWidget(gnssSerialLabel, 9, 0);
-    qthLayout->addWidget(gnssSerialPortEdit, 9, 1);
-    qthLayout->addWidget(gnssSerialBaudSpin, 9, 2);
-    qthLayout->addWidget(gnssSerialButton, 10, 0);
-    qthLayout->addWidget(qthPasteNmeaButton, 10, 1);
-    qthLayout->addWidget(gnssSerialStatusLabel, 11, 0, 1, 3);
-    qthLayout->addWidget(gnssTuneButton, 12, 0);
-    qthLayout->addWidget(gnssScanButton, 12, 1);
-    qthLayout->addWidget(gnssSelfTestButton, 12, 2);
-    qthLayout->addWidget(gnssRawLogButton, 13, 0);
-    qthLayout->addWidget(gnssAcquireButton, 13, 1);
-    qthLayout->addWidget(gnssDeepAcquireButton, 13, 2);
-    qthLayout->addWidget(gnssNetworkTimeButton, 14, 0);
-    qthLayout->addWidget(gnssOfflineAcquireButton, 14, 1);
-    qthLayout->addWidget(gnssPositionSelfTestButton, 14, 2);
-    qthLayout->addWidget(gnssMonitorCheckbox, 15, 0);
-    qthLayout->addWidget(gnssPlotButton, 15, 1);
-    qthLayout->addWidget(gnssMonitorResetButton, 15, 2);
-    qthLayout->addWidget(gnssMonitorStatusLabel, 16, 0, 1, 3);
-    qthLayout->addWidget(gnssAcquireStatusLabel, 17, 0, 1, 3);
-    qthLayout->addWidget(qthStatusLabel, 18, 0, 1, 3);
+    qthLayout->addWidget(gnssSatellitesButton, 8, 1);
+    qthLayout->addWidget(gnssPlotButton, 8, 2);
+    qthLayout->addWidget(qthCopyButton, 9, 0);
+    qthLayout->addWidget(qthClearButton, 9, 1);
+    qthLayout->addWidget(gnssMonitorResetButton, 9, 2);
+    qthLayout->addWidget(gnssSerialLabel, 10, 0);
+    qthLayout->addWidget(gnssSerialPortEdit, 10, 1);
+    qthLayout->addWidget(gnssSerialBaudSpin, 10, 2);
+    qthLayout->addWidget(gnssSerialButton, 11, 0);
+    qthLayout->addWidget(gnssNmeaLogButton, 11, 1);
+    qthLayout->addWidget(gnssNmeaReplayButton, 11, 2);
+    qthLayout->addWidget(gnssSerialRawLogButton, 12, 0);
+    qthLayout->addWidget(gnssUbxSystemsButton, 12, 1);
+    qthLayout->addWidget(gnssUbxSaveButton, 12, 2);
+    qthLayout->addWidget(gnssSerialStatusLabel, 13, 0, 1, 3);
+    qthLayout->addWidget(gnssTuneButton, 14, 0);
+    qthLayout->addWidget(gnssScanButton, 14, 1);
+    qthLayout->addWidget(gnssSelfTestButton, 14, 2);
+    qthLayout->addWidget(gnssRawLogButton, 15, 0);
+    qthLayout->addWidget(gnssAcquireButton, 15, 1);
+    qthLayout->addWidget(gnssDeepAcquireButton, 15, 2);
+    qthLayout->addWidget(gnssNetworkTimeButton, 16, 0);
+    qthLayout->addWidget(gnssOfflineAcquireButton, 16, 1);
+    qthLayout->addWidget(gnssPositionSelfTestButton, 16, 2);
+    qthLayout->addWidget(gnssFilterLabel2, 17, 0);
+    qthLayout->addWidget(gnssFilterWidget, 17, 1, 1, 2);
+    qthLayout->addWidget(gnssMonitorCheckbox, 18, 0);
+    qthLayout->addWidget(gnssPositionPolicyCombo, 18, 1, 1, 2);
+    qthLayout->addWidget(gnssTimeZoneLabel, 19, 0);
+    qthLayout->addWidget(gnssTimeZoneCombo, 19, 1, 1, 2);
+    qthLayout->addWidget(gnssMonitorStatusLabel, 20, 0, 1, 3);
+    qthLayout->addWidget(gnssAcquireStatusLabel, 21, 0, 1, 3);
+    qthLayout->addWidget(qthStatusLabel, 22, 0, 1, 3);
 
     dmrHunterControls = new SpectrumHunterControls(
         QStringLiteral("DMR Hunter"),
@@ -3276,14 +3758,55 @@ YourClassName::YourClassName(QWidget *parent)
     connect(qthMapButton, &QPushButton::clicked, this, &YourClassName::openQthMapWindow);
     connect(qthCopyButton, &QPushButton::clicked, this, &YourClassName::copyQthLocator);
     connect(qthClearButton, &QPushButton::clicked, this, &YourClassName::clearQthPosition);
-    connect(qthPasteNmeaButton, &QPushButton::clicked, this, &YourClassName::pasteNmeaPositionFromClipboard);
     connect(gnssSerialButton, &QPushButton::clicked, this, &YourClassName::toggleGnssSerial);
-    connect(gnssSerialPortEdit, &QLineEdit::editingFinished, this, [this]() {
+    connect(gnssNmeaLogButton, &QPushButton::clicked, this, &YourClassName::toggleGnssNmeaLogging);
+    connect(gnssNmeaReplayButton, &QPushButton::clicked, this, &YourClassName::replayGnssNmeaLog);
+    connect(gnssSerialRawLogButton, &QPushButton::clicked, this, &YourClassName::toggleGnssRawSerialLogging);
+    connect(gnssUbxSystemsButton, &QPushButton::clicked, this, &YourClassName::applyGnssUbxConstellationConfig);
+    connect(gnssUbxSaveButton, &QPushButton::clicked, this, &YourClassName::saveGnssUbxConfigurationToModule);
+    connect(gnssPositionPolicyCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        gnssPositionPolicy = normalizedGnssPositionPolicy(gnssPositionPolicyCombo
+                                                              ? gnssPositionPolicyCombo->currentData().toString()
+                                                              : QString());
+        savePersistentSettings();
+        updateGnssSatelliteView(true);
+    });
+    connect(gnssSatelliteTableCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        gnssSatelliteTableVisible = checked;
+        if (gnssSatelliteTableDialog) {
+            if (checked) {
+                updateGnssSatelliteView(true);
+                gnssSatelliteTableDialog->show();
+                gnssSatelliteTableDialog->raise();
+                gnssSatelliteTableDialog->activateWindow();
+            } else {
+                gnssSatelliteTableDialog->hide();
+            }
+        }
+        savePersistentSettings();
+        updateGnssSatelliteView(checked);
+    });
+    if (gnssSatelliteTableDialog) {
+        connect(gnssSatelliteTableDialog, &QDialog::finished, this, [this](int) {
+            gnssSatelliteTableVisible = false;
+            if (gnssSatelliteTableCheckbox) {
+                QSignalBlocker blocker(gnssSatelliteTableCheckbox);
+                gnssSatelliteTableCheckbox->setChecked(false);
+            }
+            savePersistentSettings();
+        });
+    }
+    connect(gnssTimeZoneCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        gnssTimeZoneOffsetMinutes = gnssTimeZoneCombo ? gnssTimeZoneCombo->currentData().toInt() : 0;
+        savePersistentSettings();
+        updateGnssSatelliteView(true);
+    });
+    connect(gnssSerialPortEdit, &QComboBox::currentTextChanged, this, [this](const QString &text) {
         if (gnssSerialPortEdit) {
-            gnssSerialPortName = gnssSerialPortEdit->text().trimmed();
+            gnssSerialPortName = text.trimmed();
             if (gnssSerialPortName.isEmpty()) {
                 gnssSerialPortName = QStringLiteral("COM4");
-                gnssSerialPortEdit->setText(gnssSerialPortName);
+                gnssSerialPortEdit->setCurrentText(gnssSerialPortName);
             }
             savePersistentSettings();
         }
@@ -3292,6 +3815,78 @@ YourClassName::YourClassName(QWidget *parent)
         gnssSerialBaud = value;
         savePersistentSettings();
     });
+    auto connectGnssSystemFilter = [this](QCheckBox *box, bool *target) {
+        if (!box || !target) {
+            return;
+        }
+        connect(box, &QCheckBox::toggled, this, [this, target](bool checked) {
+            *target = checked;
+            updateGnssSatelliteView(true);
+            savePersistentSettings();
+        });
+    };
+    connectGnssSystemFilter(gnssUseGpsCheckbox, &gnssUseGps);
+    connectGnssSystemFilter(gnssUseGlonassCheckbox, &gnssUseGlonass);
+    connectGnssSystemFilter(gnssUseGalileoCheckbox, &gnssUseGalileo);
+    connectGnssSystemFilter(gnssUseBeidouCheckbox, &gnssUseBeidou);
+    connectGnssSystemFilter(gnssUseQzssCheckbox, &gnssUseQzss);
+    connectGnssSystemFilter(gnssUseSbasCheckbox, &gnssUseSbas);
+    connectGnssSystemFilter(gnssUseOtherCheckbox, &gnssUseOther);
+    if (gnssSatelliteTable) {
+        connect(gnssSatelliteTable, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *item) {
+            if (!item || item->column() != 0) {
+                return;
+            }
+            const QString key = item->data(Qt::UserRole).toString();
+            if (key.isEmpty()) {
+                return;
+            }
+            const bool enabled = item->checkState() == Qt::Checked;
+            gnssNmeaSatelliteEnabled.insert(key, enabled);
+            if (enabled) {
+                gnssDisabledSatelliteKeys.remove(key);
+            } else {
+                gnssDisabledSatelliteKeys.insert(key);
+            }
+            gnssSatelliteTableDirty = true;
+            updateGnssSatelliteView(true);
+            savePersistentSettings();
+        });
+        connect(gnssSatelliteTable->horizontalHeader(), &QHeaderView::sectionClicked, this, [this](int section) {
+            if (section < 0 || section >= gnssSatelliteTable->columnCount()) {
+                return;
+            }
+            if (gnssSatelliteSortColumn == section) {
+                gnssSatelliteSortAscending = !gnssSatelliteSortAscending;
+            } else {
+                gnssSatelliteSortColumn = section;
+                gnssSatelliteSortAscending = section != 6 && section != 7 && section != 8 && section != 9;
+            }
+            gnssSatelliteTable->horizontalHeader()->setSortIndicator(
+                gnssSatelliteSortColumn,
+                gnssSatelliteSortAscending ? Qt::AscendingOrder : Qt::DescendingOrder);
+            updateGnssSatelliteView(true);
+        });
+        connect(gnssSatelliteTable,
+                &QTableWidget::customContextMenuRequested,
+                this,
+                [this](const QPoint &pos) {
+                    if (!gnssSatelliteTable || gnssSatelliteTable->columnAt(pos.x()) != 0) {
+                        return;
+                    }
+                    QMenu menu(gnssSatelliteTable);
+                    QAction *selectAllAction = menu.addAction(uiText(QStringLiteral("select_all"),
+                                                                      QStringLiteral("Select all")));
+                    QAction *clearAllAction = menu.addAction(uiText(QStringLiteral("clear_all"),
+                                                                     QStringLiteral("Clear all")));
+                    QAction *chosenAction = menu.exec(gnssSatelliteTable->viewport()->mapToGlobal(pos));
+                    if (chosenAction == selectAllAction) {
+                        setGnssSatelliteRowsEnabled(true);
+                    } else if (chosenAction == clearAllAction) {
+                        setGnssSatelliteRowsEnabled(false);
+                    }
+                });
+    }
     connect(gnssTuneButton, &QPushButton::clicked, this, &YourClassName::tuneGnssL1Preset);
     connect(gnssScanButton, &QPushButton::clicked, this, &YourClassName::applyGnssScanPreset);
     connect(gnssRawLogButton, &QPushButton::clicked, this, &YourClassName::logGnssRawContext);
@@ -3308,6 +3903,19 @@ YourClassName::YourClassName(QWidget *parent)
         gnssAcquisitionPlotDialog->show();
         gnssAcquisitionPlotDialog->raise();
         gnssAcquisitionPlotDialog->activateWindow();
+    });
+    connect(gnssSatellitesButton, &QPushButton::clicked, this, [this]() {
+        if (!gnssSatelliteDialog) {
+            return;
+        }
+        updateGnssSatelliteView(true);
+        gnssSatelliteDialog->show();
+        gnssSatelliteDialog->raise();
+        gnssSatelliteDialog->activateWindow();
+        if (gnssSatelliteTableVisible && gnssSatelliteTableDialog) {
+            gnssSatelliteTableDialog->show();
+            gnssSatelliteTableDialog->raise();
+        }
     });
     connect(gnssNtpSocket, &QUdpSocket::readyRead, this, &YourClassName::handleGnssNetworkTimeResponse);
     connect(gnssMonitorCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
@@ -7454,6 +8062,16 @@ void YourClassName::updateQthControls() {
         const int index = gnssSystemCombo->findData(gnssSystemId);
         gnssSystemCombo->setCurrentIndex(index >= 0 ? index : gnssSystemCombo->findData(QStringLiteral("gps_l1_ca")));
     }
+    if (gnssPositionPolicyCombo) {
+        QSignalBlocker blocker(gnssPositionPolicyCombo);
+        const int index = gnssPositionPolicyCombo->findData(normalizedGnssPositionPolicy(gnssPositionPolicy));
+        gnssPositionPolicyCombo->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    if (gnssTimeZoneCombo) {
+        QSignalBlocker blocker(gnssTimeZoneCombo);
+        const int index = gnssTimeZoneCombo->findData(gnssTimeZoneOffsetMinutes);
+        gnssTimeZoneCombo->setCurrentIndex(index >= 0 ? index : gnssTimeZoneCombo->findData(0));
+    }
     if (qthLatitudeSpin) {
         QSignalBlocker blocker(qthLatitudeSpin);
         qthLatitudeSpin->setValue(qthLatitude);
@@ -7464,9 +8082,13 @@ void YourClassName::updateQthControls() {
     }
     if (gnssSerialPortEdit) {
         QSignalBlocker blocker(gnssSerialPortEdit);
-        gnssSerialPortEdit->setText(gnssSerialPortName.isEmpty()
-                                        ? QStringLiteral("COM4")
-                                        : gnssSerialPortName);
+        const QString portName = gnssSerialPortName.isEmpty()
+                                     ? QStringLiteral("COM4")
+                                     : gnssSerialPortName;
+        if (gnssSerialPortEdit->findText(portName, Qt::MatchFixedString) < 0) {
+            gnssSerialPortEdit->insertItem(0, portName);
+        }
+        gnssSerialPortEdit->setCurrentText(portName);
     }
     if (gnssSerialBaudSpin) {
         QSignalBlocker blocker(gnssSerialBaudSpin);
@@ -7489,6 +8111,7 @@ void YourClassName::updateQthControls() {
         QSignalBlocker blocker(gnssMonitorCheckbox);
         gnssMonitorCheckbox->setChecked(gnssMonitorEnabled);
     }
+    updateGnssSatelliteView();
     if (gnssMonitorStatusLabel && !gnssSignalMonitor.lastReport().valid) {
         gnssMonitorStatusLabel->setText(gnssMonitorEnabled
                                             ? uiText(QStringLiteral("gnss_iq_monitor_waiting"),
@@ -7512,7 +8135,9 @@ void YourClassName::updateQthControls() {
         qthMapWidget->setMapZoomRange(0, qthMaxZoom);
         qthMapWidget->setMapZoom(qthMapZoom);
         qthMapWidget->setGridPrecision(qthGridPrecision);
+        qthMapWidget->setOverlayMode(static_cast<QthMapWidget::OverlayMode>((std::clamp)(qthMapOverlayMode, 0, 3)));
         qthMapWidget->setUserMarkers(qthUserMarkers);
+        updateQthMapSatelliteOverlay();
     }
     updateQthMapControls();
     if (qthStatusLabel) {
@@ -7610,7 +8235,7 @@ void YourClassName::pasteNmeaPositionFromClipboard() {
     }
 }
 
-bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMessage) {
+bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMessage, bool persist) {
     const QString trimmed = text.trimmed();
     if (trimmed.isEmpty()) {
         if (statusMessage) {
@@ -7649,7 +8274,9 @@ bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMe
     if (qthMapWidget) {
         qthMapWidget->centerOn(qthLatitude, qthLongitude);
     }
-    savePersistentSettings();
+    if (persist) {
+        savePersistentSettings();
+    }
 
     const QString status = uiText(QStringLiteral("nmea_position_applied"),
                                   QStringLiteral("NMEA QTH: %1 %2, %3 (%4)"))
@@ -7663,12 +8290,14 @@ bool YourClassName::applyNmeaPositionText(const QString &text, QString *statusMe
     if (qthStatusLabel) {
         qthStatusLabel->setText(status);
     }
-    qDebug() << "[GNSS NMEA] position applied"
-             << "sentence" << QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence)
-             << "lat" << qthLatitude
-             << "lon" << qthLongitude
-             << "qth" << locator
-             << "utc" << parsed.utc;
+    if (fobosVerboseLoggingEnabled()) {
+        qDebug() << "[GNSS NMEA] position applied"
+                 << "sentence" << QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence)
+                 << "lat" << qthLatitude
+                 << "lon" << qthLongitude
+                 << "qth" << locator
+                 << "utc" << parsed.utc;
+    }
     return true;
 }
 
@@ -7691,7 +8320,7 @@ void YourClassName::startGnssSerial() {
     }
 
     if (gnssSerialPortEdit) {
-        gnssSerialPortName = gnssSerialPortEdit->text().trimmed();
+        gnssSerialPortName = gnssSerialPortEdit->currentText().trimmed();
     }
     if (gnssSerialPortName.isEmpty()) {
         gnssSerialPortName = QStringLiteral("COM4");
@@ -7702,7 +8331,12 @@ void YourClassName::startGnssSerial() {
     gnssSerialBaud = (std::clamp)(gnssSerialBaud, 1200, 921600);
     gnssSerialBuffer.clear();
     gnssSerialSentenceCount = 0;
+    gnssSerialUbxFrameCount = 0;
     gnssSerialFixCount = 0;
+    gnssUbxOutputEnabled = false;
+    gnssPendingCfgGnssApply = false;
+    gnssLastCfgGnssPayload.clear();
+    gnssLastUbxFixMs = 0;
     gnssSerialFixQuality = -1;
     gnssSerialFixMode = -1;
     gnssSerialSatellitesUsed = -1;
@@ -7712,6 +8346,28 @@ void YourClassName::startGnssSerial() {
     gnssSerialBeidouSatellites = -1;
     gnssSerialOtherSatellites = -1;
     gnssSerialUtc.clear();
+    gnssSerialHdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialVdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialPdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialAltitudeM = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialGeoidSeparationM = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialSpeedKmh = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialCourseDeg = std::numeric_limits<double>::quiet_NaN();
+    resetGnssNmeaSatellites();
+
+    if (gnssUbxAutoEnable &&
+        normalizedGnssPositionPolicy(gnssPositionPolicy) == QStringLiteral("nmea_only")) {
+        gnssPositionPolicy = QStringLiteral("ubx_preferred");
+        if (gnssPositionPolicyCombo) {
+            QSignalBlocker blocker(gnssPositionPolicyCombo);
+            const int policyIndex = gnssPositionPolicyCombo->findData(gnssPositionPolicy);
+            if (policyIndex >= 0) {
+                gnssPositionPolicyCombo->setCurrentIndex(policyIndex);
+            }
+        }
+        qDebug() << "[GNSS policy] auto UBX promoted position policy to"
+                 << gnssPositionPolicy;
+    }
 
     gnssSerialPort->setPortName(gnssSerialPortName);
     gnssSerialPort->setBaudRate(gnssSerialBaud);
@@ -7720,7 +8376,7 @@ void YourClassName::startGnssSerial() {
     gnssSerialPort->setStopBits(QSerialPort::OneStop);
     gnssSerialPort->setFlowControl(QSerialPort::NoFlowControl);
 
-    if (!gnssSerialPort->open(QIODevice::ReadOnly)) {
+    if (!gnssSerialPort->open(QIODevice::ReadWrite)) {
         const QString message = uiText(QStringLiteral("gnss_serial_open_failed"),
                                        QStringLiteral("NMEA serial: cannot open %1 at %2 baud (%3)."))
                                     .arg(gnssSerialPortName)
@@ -7744,6 +8400,13 @@ void YourClassName::startGnssSerial() {
     qDebug() << "[GNSS serial] open"
              << "port" << gnssSerialPortName
              << "baud" << gnssSerialBaud;
+    if (gnssUbxAutoEnable) {
+        QTimer::singleShot(50, this, [this]() {
+            if (gnssSerialPort && gnssSerialPort->isOpen()) {
+                sendGnssUbxConfiguration(true);
+            }
+        });
+    }
 }
 
 void YourClassName::stopGnssSerial() {
@@ -7751,8 +8414,21 @@ void YourClassName::stopGnssSerial() {
         qDebug() << "[GNSS serial] close" << "port" << gnssSerialPort->portName();
         gnssSerialPort->close();
     }
+    if (gnssNmeaLogFile && gnssNmeaLogFile->isOpen()) {
+        gnssNmeaLogFile->flush();
+        gnssNmeaLogFile->close();
+        gnssNmeaLogFile.reset();
+        gnssNmeaLogPath.clear();
+    }
+    if (gnssRawSerialLogFile && gnssRawSerialLogFile->isOpen()) {
+        gnssRawSerialLogFile->flush();
+        gnssRawSerialLogFile->close();
+        gnssRawSerialLogFile.reset();
+        gnssRawSerialLogPath.clear();
+    }
     gnssSerialBuffer.clear();
     gnssSerialSentenceCount = 0;
+    gnssSerialUbxFrameCount = 0;
     gnssSerialFixCount = 0;
     gnssSerialFixQuality = -1;
     gnssSerialFixMode = -1;
@@ -7763,9 +8439,22 @@ void YourClassName::stopGnssSerial() {
     gnssSerialBeidouSatellites = -1;
     gnssSerialOtherSatellites = -1;
     gnssSerialUtc.clear();
+    gnssSerialHdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialVdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialPdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialAltitudeM = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialGeoidSeparationM = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialSpeedKmh = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialCourseDeg = std::numeric_limits<double>::quiet_NaN();
+    resetGnssNmeaSatellites();
     if (gnssSerialButton) {
         gnssSerialButton->setText(uiText(QStringLiteral("connect"), QStringLiteral("Connect")));
     }
+    gnssSerialUbxFrameCount = 0;
+    gnssUbxOutputEnabled = false;
+    gnssPendingCfgGnssApply = false;
+    gnssLastCfgGnssPayload.clear();
+    gnssLastUbxFixMs = 0;
     updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_idle"),
                                   QStringLiteral("NMEA serial: disconnected")));
 }
@@ -7774,15 +8463,73 @@ void YourClassName::handleGnssSerialReadyRead() {
     if (!gnssSerialPort) {
         return;
     }
-    gnssSerialBuffer.append(gnssSerialPort->readAll());
-    if (gnssSerialBuffer.size() > 8192) {
-        gnssSerialBuffer = gnssSerialBuffer.right(4096);
+    const QByteArray bytes = gnssSerialPort->readAll();
+    if (bytes.isEmpty()) {
+        return;
+    }
+    if (gnssRawSerialLogFile && gnssRawSerialLogFile->isOpen()) {
+        gnssRawSerialLogFile->write(bytes);
+        if (((gnssSerialSentenceCount + gnssSerialUbxFrameCount) % 32) == 0) {
+            gnssRawSerialLogFile->flush();
+        }
+    }
+    gnssSerialBuffer.append(bytes);
+    if (gnssSerialBuffer.size() > 65536) {
+        gnssSerialBuffer = gnssSerialBuffer.right(32768);
     }
 
     while (true) {
+        const int nmeaIndex = gnssSerialBuffer.indexOf('$');
+        const int ubxIndex = gnssSerialBuffer.indexOf(QByteArray::fromHex("B562"));
+        int nextIndex = -1;
+        if (nmeaIndex >= 0 && ubxIndex >= 0) {
+            nextIndex = (std::min)(nmeaIndex, ubxIndex);
+        } else {
+            nextIndex = (std::max)(nmeaIndex, ubxIndex);
+        }
+        if (nextIndex < 0) {
+            if (gnssSerialBuffer.size() > 4096) {
+                gnssSerialBuffer.clear();
+            }
+            break;
+        }
+        if (nextIndex > 0) {
+            gnssSerialBuffer.remove(0, nextIndex);
+        }
+
+        if (gnssSerialBuffer.size() >= 2 &&
+            static_cast<quint8>(gnssSerialBuffer.at(0)) == 0xB5 &&
+            static_cast<quint8>(gnssSerialBuffer.at(1)) == 0x62) {
+            if (gnssSerialBuffer.size() < 6) {
+                break;
+            }
+            const int payloadLength = static_cast<int>(ubxU2(gnssSerialBuffer, 4));
+            if (payloadLength < 0 || payloadLength > 4096) {
+                gnssSerialBuffer.remove(0, 1);
+                continue;
+            }
+            const int frameLength = payloadLength + 8;
+            if (gnssSerialBuffer.size() < frameLength) {
+                break;
+            }
+            const QByteArray frame = gnssSerialBuffer.left(frameLength);
+            gnssSerialBuffer.remove(0, frameLength);
+            if (!hasValidUbxChecksum(frame)) {
+                if (fobosVerboseLoggingEnabled()) {
+                    qDebug() << "[GNSS UBX] bad checksum" << "bytes" << frameLength;
+                }
+                continue;
+            }
+            processGnssUbxFrame(static_cast<quint8>(frame.at(2)),
+                                static_cast<quint8>(frame.at(3)),
+                                frame.mid(6, payloadLength));
+            continue;
+        }
+
         int lineEnd = gnssSerialBuffer.indexOf('\n');
-        if (lineEnd < 0) {
-            lineEnd = gnssSerialBuffer.indexOf('\r');
+        const int crEnd = gnssSerialBuffer.indexOf('\r');
+        if (lineEnd < 0 || (crEnd >= 0 && crEnd < lineEnd)) {
+            lineEnd = crEnd;
         }
         if (lineEnd < 0) {
             break;
@@ -7791,105 +8538,570 @@ void YourClassName::handleGnssSerialReadyRead() {
         const QByteArray rawLine = gnssSerialBuffer.left(lineEnd);
         gnssSerialBuffer.remove(0, lineEnd + 1);
         const QString line = QString::fromLatin1(rawLine).trimmed();
-        if (line.isEmpty()) {
-            continue;
-        }
-        const bool looksLikeNmea = line.startsWith(QLatin1Char('$'));
-        if (looksLikeNmea) {
-            ++gnssSerialSentenceCount;
-        }
-
-        const NmeaSerialStatus serialStatus = parseNmeaSerialStatusSentence(line);
-        if (serialStatus.recognized) {
-            if (!serialStatus.utc.isEmpty()) {
-                gnssSerialUtc = serialStatus.utc;
-            }
-            if (serialStatus.fixQuality >= 0) {
-                gnssSerialFixQuality = serialStatus.fixQuality;
-            }
-            if (serialStatus.fixMode >= 0) {
-                gnssSerialFixMode = serialStatus.fixMode;
-            }
-            if (serialStatus.satellitesUsed >= 0) {
-                gnssSerialSatellitesUsed = serialStatus.satellitesUsed;
-            }
-            if (serialStatus.satellitesInView >= 0) {
-                if (serialStatus.talker == QStringLiteral("GP")) {
-                    gnssSerialGpsSatellites = serialStatus.satellitesInView;
-                } else if (serialStatus.talker == QStringLiteral("GL")) {
-                    gnssSerialGlonassSatellites = serialStatus.satellitesInView;
-                } else if (serialStatus.talker == QStringLiteral("GA")) {
-                    gnssSerialGalileoSatellites = serialStatus.satellitesInView;
-                } else if (serialStatus.talker == QStringLiteral("GB") ||
-                           serialStatus.talker == QStringLiteral("BD")) {
-                    gnssSerialBeidouSatellites = serialStatus.satellitesInView;
-                } else {
-                    gnssSerialOtherSatellites = serialStatus.satellitesInView;
-                }
-            }
-        }
-
-        ParsedNmeaPosition parsed;
-        if (!parseNmeaPositionSentence(line, &parsed)) {
-            if (looksLikeNmea && (gnssSerialSentenceCount <= 4 || (gnssSerialSentenceCount % 32) == 0)) {
-                QStringList parts;
-                if (gnssSerialFixQuality >= 0) {
-                    parts << QStringLiteral("fix %1").arg(gnssSerialFixQuality);
-                }
-                if (gnssSerialFixMode >= 0) {
-                    parts << QStringLiteral("mode %1").arg(gnssSerialFixMode);
-                }
-                if (gnssSerialSatellitesUsed >= 0) {
-                    parts << QStringLiteral("used %1").arg(gnssSerialSatellitesUsed);
-                }
-                QStringList viewParts;
-                if (gnssSerialGpsSatellites >= 0) {
-                    viewParts << QStringLiteral("GPS %1").arg(gnssSerialGpsSatellites);
-                }
-                if (gnssSerialGlonassSatellites >= 0) {
-                    viewParts << QStringLiteral("GLO %1").arg(gnssSerialGlonassSatellites);
-                }
-                if (gnssSerialGalileoSatellites >= 0) {
-                    viewParts << QStringLiteral("GAL %1").arg(gnssSerialGalileoSatellites);
-                }
-                if (gnssSerialBeidouSatellites >= 0) {
-                    viewParts << QStringLiteral("BDS %1").arg(gnssSerialBeidouSatellites);
-                }
-                if (gnssSerialOtherSatellites >= 0) {
-                    viewParts << QStringLiteral("other %1").arg(gnssSerialOtherSatellites);
-                }
-                if (!viewParts.isEmpty()) {
-                    parts << QStringLiteral("view %1").arg(viewParts.join(QLatin1Char('/')));
-                }
-                if (!gnssSerialUtc.isEmpty()) {
-                    parts << QStringLiteral("UTC %1").arg(gnssSerialUtc);
-                }
-                const QString detail = parts.isEmpty()
-                                           ? QStringLiteral("waiting for fix")
-                                           : parts.join(QStringLiteral(", "));
-                updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_receiving"),
-                                              QStringLiteral("NMEA serial: receiving (%1 sentences), %2"))
-                                           .arg(gnssSerialSentenceCount)
-                                           .arg(detail));
-            }
-            if (looksLikeNmea && fobosVerboseLoggingEnabled()) {
-                qDebug() << "[GNSS serial] ignored NMEA" << line.left(16);
-            }
-            continue;
-        }
-
-        QString status;
-        if (applyNmeaPositionText(line, &status)) {
-            ++gnssSerialFixCount;
-            updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_fix"),
-                                          QStringLiteral("NMEA serial: %1 fix %2, %3 (%4), #%5"))
-                                       .arg(QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence))
-                                       .arg(qthLatitude, 0, 'f', 6)
-                                       .arg(qthLongitude, 0, 'f', 6)
-                                       .arg(qth::maidenheadLocator(qthLatitude, qthLongitude, 6))
-                                       .arg(gnssSerialFixCount));
+        if (!line.isEmpty()) {
+            processGnssNmeaLine(line, false);
         }
     }
+}
+
+void YourClassName::processGnssNmeaLine(const QString &line, bool fromReplay) {
+    const QString trimmed = line.trimmed();
+    if (trimmed.isEmpty()) {
+        return;
+    }
+    const bool looksLikeNmea = trimmed.startsWith(QLatin1Char('$'));
+    if (!looksLikeNmea) {
+        return;
+    }
+
+    ++gnssSerialSentenceCount;
+    if (gnssNmeaLogFile && gnssNmeaLogFile->isOpen() && !fromReplay) {
+        gnssNmeaLogFile->write(trimmed.toLatin1());
+        gnssNmeaLogFile->write("\n");
+        if ((gnssSerialSentenceCount % 16) == 0) {
+            gnssNmeaLogFile->flush();
+        }
+    }
+    updateGnssNmeaSatellitesFromSentence(trimmed);
+
+    const NmeaSerialStatus serialStatus = parseNmeaSerialStatusSentence(trimmed);
+    if (serialStatus.recognized) {
+        if (!serialStatus.utc.isEmpty()) {
+            gnssSerialUtc = serialStatus.utc;
+        }
+        if (serialStatus.fixQuality >= 0) {
+            gnssSerialFixQuality = serialStatus.fixQuality;
+        }
+        if (serialStatus.fixMode >= 0) {
+            gnssSerialFixMode = serialStatus.fixMode;
+        }
+        if (serialStatus.satellitesUsed >= 0) {
+            gnssSerialSatellitesUsed = serialStatus.satellitesUsed;
+        }
+        if (std::isfinite(serialStatus.hdop)) {
+            gnssSerialHdop = serialStatus.hdop;
+        }
+        if (std::isfinite(serialStatus.vdop)) {
+            gnssSerialVdop = serialStatus.vdop;
+        }
+        if (std::isfinite(serialStatus.pdop)) {
+            gnssSerialPdop = serialStatus.pdop;
+        }
+        if (std::isfinite(serialStatus.altitudeM)) {
+            gnssSerialAltitudeM = serialStatus.altitudeM;
+        }
+        if (std::isfinite(serialStatus.geoidSeparationM)) {
+            gnssSerialGeoidSeparationM = serialStatus.geoidSeparationM;
+        }
+        if (std::isfinite(serialStatus.speedKmh)) {
+            gnssSerialSpeedKmh = serialStatus.speedKmh;
+        }
+        if (std::isfinite(serialStatus.courseDeg)) {
+            gnssSerialCourseDeg = serialStatus.courseDeg;
+        }
+        if (serialStatus.satellitesInView >= 0) {
+            if (serialStatus.talker == QStringLiteral("GP")) {
+                gnssSerialGpsSatellites = serialStatus.satellitesInView;
+            } else if (serialStatus.talker == QStringLiteral("GL")) {
+                gnssSerialGlonassSatellites = serialStatus.satellitesInView;
+            } else if (serialStatus.talker == QStringLiteral("GA")) {
+                gnssSerialGalileoSatellites = serialStatus.satellitesInView;
+            } else if (serialStatus.talker == QStringLiteral("GB") ||
+                       serialStatus.talker == QStringLiteral("BD")) {
+                gnssSerialBeidouSatellites = serialStatus.satellitesInView;
+            } else {
+                gnssSerialOtherSatellites = serialStatus.satellitesInView;
+            }
+        }
+    }
+
+    ParsedNmeaPosition parsed;
+    if (!parseNmeaPositionSentence(trimmed, &parsed)) {
+        if (gnssSerialSentenceCount <= 4 || (gnssSerialSentenceCount % 32) == 0) {
+            QStringList parts;
+            if (gnssSerialFixQuality >= 0) {
+                parts << QStringLiteral("fix %1").arg(gnssSerialFixQuality);
+            }
+            if (gnssSerialFixMode >= 0) {
+                parts << QStringLiteral("mode %1").arg(gnssSerialFixMode);
+            }
+            if (gnssSerialSatellitesUsed >= 0) {
+                parts << QStringLiteral("used %1").arg(gnssSerialSatellitesUsed);
+            }
+            QStringList viewParts;
+            if (gnssSerialGpsSatellites >= 0) viewParts << QStringLiteral("GPS %1").arg(gnssSerialGpsSatellites);
+            if (gnssSerialGlonassSatellites >= 0) viewParts << QStringLiteral("GLO %1").arg(gnssSerialGlonassSatellites);
+            if (gnssSerialGalileoSatellites >= 0) viewParts << QStringLiteral("GAL %1").arg(gnssSerialGalileoSatellites);
+            if (gnssSerialBeidouSatellites >= 0) viewParts << QStringLiteral("BDS %1").arg(gnssSerialBeidouSatellites);
+            if (gnssSerialOtherSatellites >= 0) viewParts << QStringLiteral("other %1").arg(gnssSerialOtherSatellites);
+            if (!viewParts.isEmpty()) {
+                parts << QStringLiteral("view %1").arg(viewParts.join(QLatin1Char('/')));
+            }
+            if (std::isfinite(gnssSerialHdop)) parts << QStringLiteral("HDOP %1").arg(gnssSerialHdop, 0, 'f', 1);
+            if (std::isfinite(gnssSerialPdop)) parts << QStringLiteral("PDOP %1").arg(gnssSerialPdop, 0, 'f', 1);
+            if (std::isfinite(gnssSerialAltitudeM)) parts << QStringLiteral("alt %1 m").arg(gnssSerialAltitudeM, 0, 'f', 1);
+            if (std::isfinite(gnssSerialSpeedKmh)) parts << QStringLiteral("speed %1 km/h").arg(gnssSerialSpeedKmh, 0, 'f', 1);
+            if (!gnssSerialUtc.isEmpty()) {
+                parts << QStringLiteral("time %1").arg(formattedGnssUtc());
+            }
+            const QString detail = parts.isEmpty()
+                                       ? QStringLiteral("waiting for fix")
+                                       : parts.join(QStringLiteral(", "));
+            updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_receiving"),
+                                          QStringLiteral("NMEA serial: receiving (%1 sentences), %2"))
+                                       .arg(gnssSerialSentenceCount)
+                                       .arg(detail));
+        }
+        if (fobosVerboseLoggingEnabled() &&
+            (gnssSerialSentenceCount <= 4 || (gnssSerialSentenceCount % 64) == 0)) {
+            qDebug() << "[GNSS serial] ignored NMEA" << trimmed.left(16);
+        }
+        return;
+    }
+
+    QString status;
+    const QString policy = normalizedGnssPositionPolicy(gnssPositionPolicy);
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (policy == QStringLiteral("ubx_only") ||
+        (policy == QStringLiteral("ubx_preferred") &&
+         gnssLastUbxFixMs > 0 &&
+         nowMs - gnssLastUbxFixMs <= 3000)) {
+        if (fobosVerboseLoggingEnabled() &&
+            (gnssSerialSentenceCount <= 4 || (gnssSerialSentenceCount % 64) == 0)) {
+            qDebug() << "[GNSS policy] NMEA fix ignored"
+                     << "policy" << policy
+                     << "lastUbxAgeMs" << (gnssLastUbxFixMs > 0 ? nowMs - gnssLastUbxFixMs : -1);
+        }
+        return;
+    }
+    if (!hasEnabledGnssNmeaFixSatellite()) {
+        updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_fix_filtered"),
+                                      QStringLiteral("NMEA serial: fix ignored by satellite filters")));
+        return;
+    }
+    if (applyNmeaPositionText(trimmed, &status, false)) {
+        ++gnssSerialFixCount;
+        QStringList extras;
+        if (std::isfinite(gnssSerialHdop)) extras << QStringLiteral("HDOP %1").arg(gnssSerialHdop, 0, 'f', 1);
+        if (std::isfinite(gnssSerialAltitudeM)) extras << QStringLiteral("alt %1 m").arg(gnssSerialAltitudeM, 0, 'f', 1);
+        if (std::isfinite(gnssSerialSpeedKmh)) extras << QStringLiteral("speed %1 km/h").arg(gnssSerialSpeedKmh, 0, 'f', 1);
+        const QString suffix = extras.isEmpty() ? QString() : QStringLiteral(", %1").arg(extras.join(QStringLiteral(", ")));
+        updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_fix"),
+                                      QStringLiteral("NMEA serial: %1 fix %2, %3 (%4), #%5"))
+                                   .arg(QStringLiteral("%1%2").arg(parsed.talker, parsed.sentence))
+                                   .arg(qthLatitude, 0, 'f', 6)
+                                   .arg(qthLongitude, 0, 'f', 6)
+                                   .arg(qth::maidenheadLocator(qthLatitude, qthLongitude, 6))
+                                   .arg(QStringLiteral("%1%2").arg(gnssSerialFixCount).arg(suffix)));
+    }
+}
+
+void YourClassName::processGnssUbxFrame(quint8 messageClass, quint8 messageId, const QByteArray &payload) {
+    ++gnssSerialUbxFrameCount;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+
+    if (messageClass == 0x05 && payload.size() >= 2) {
+        const QString ackType = messageId == 0x01 ? QStringLiteral("ACK")
+                                                  : messageId == 0x00 ? QStringLiteral("NAK")
+                                                                      : QStringLiteral("ACK?");
+        const quint8 ackClass = static_cast<quint8>(payload.at(0));
+        const quint8 ackId = static_cast<quint8>(payload.at(1));
+        qDebug() << "[GNSS UBX]" << ackType
+                 << "class" << QStringLiteral("0x%1").arg(ackClass, 2, 16, QLatin1Char('0'))
+                 << "id" << QStringLiteral("0x%1").arg(ackId, 2, 16, QLatin1Char('0'));
+        if (ackClass == 0x06 && (ackId == 0x3E || ackId == 0x09)) {
+            const QString key = ackId == 0x3E ? QStringLiteral("ubx_cfg_gnss_ack")
+                                              : QStringLiteral("ubx_cfg_save_ack");
+            const QString fallback = ackId == 0x3E
+                                         ? QStringLiteral("UBX CFG-GNSS: %1")
+                                         : QStringLiteral("UBX save config: %1");
+            updateGnssSerialStatus(uiText(key, fallback).arg(ackType));
+        }
+        return;
+    }
+
+    if (messageClass == 0x06 && messageId == 0x3E) {
+        gnssLastCfgGnssPayload = payload;
+        QStringList enabledSystems;
+        QMap<QString, bool> moduleSystemEnabled;
+        if (payload.size() >= 4) {
+            const int blockCount = static_cast<quint8>(payload.at(3));
+            for (int block = 0; block < blockCount; ++block) {
+                const int offset = 4 + block * 8;
+                if (offset + 7 >= payload.size()) {
+                    break;
+                }
+                const quint8 gnssId = static_cast<quint8>(payload.at(offset));
+                const quint32 flags = ubxU4(payload, offset + 4);
+                const QString systemName = ubxGnssSystemName(gnssId);
+                const bool enabled = (flags & 0x01u) != 0;
+                moduleSystemEnabled.insert(systemName, enabled);
+                if (enabled) {
+                    enabledSystems << systemName;
+                }
+            }
+        }
+        auto syncSystem = [&moduleSystemEnabled](const QString &system, bool *target) {
+            if (!target || !moduleSystemEnabled.contains(system)) {
+                return;
+            }
+            *target = moduleSystemEnabled.value(system);
+        };
+        syncSystem(QStringLiteral("GPS"), &gnssUseGps);
+        syncSystem(QStringLiteral("GLONASS"), &gnssUseGlonass);
+        syncSystem(QStringLiteral("Galileo"), &gnssUseGalileo);
+        syncSystem(QStringLiteral("BeiDou"), &gnssUseBeidou);
+        syncSystem(QStringLiteral("QZSS"), &gnssUseQzss);
+        syncSystem(QStringLiteral("SBAS"), &gnssUseSbas);
+        updateGnssSatelliteView(true);
+        qDebug() << "[GNSS UBX] CFG-GNSS poll"
+                 << "payload" << payload.size()
+                 << "enabled" << enabledSystems;
+        gnssPendingCfgGnssApply = false;
+        updateGnssSerialStatus(uiText(QStringLiteral("ubx_cfg_gnss_polled"),
+                                      QStringLiteral("UBX CFG-GNSS received: %1. Adjust system checkboxes and press UBX sys again to apply."))
+                                   .arg(enabledSystems.isEmpty()
+                                            ? uiText(QStringLiteral("none"), QStringLiteral("none"))
+                                            : enabledSystems.join(QStringLiteral(", "))));
+        return;
+    }
+
+    if (messageClass != 0x01) {
+        return;
+    }
+
+    if (messageId == 0x35 && payload.size() >= 8) {
+        const int satelliteCount = static_cast<quint8>(payload.at(5));
+        QMap<QString, int> constellationCounts;
+        int usedCount = 0;
+        for (int i = 0; i < satelliteCount; ++i) {
+            const int offset = 8 + i * 12;
+            if (offset + 11 >= payload.size()) {
+                break;
+            }
+            const quint8 gnssId = static_cast<quint8>(payload.at(offset));
+            const int svId = static_cast<quint8>(payload.at(offset + 1));
+            const int cn0 = static_cast<quint8>(payload.at(offset + 2));
+            const int elevation = static_cast<qint8>(payload.at(offset + 3));
+            const int azimuth = ubxI2(payload, offset + 4);
+            const quint32 flags = ubxU4(payload, offset + 8);
+            const QString system = ubxGnssSystemName(gnssId);
+            const QString key = ubxSatelliteKey(gnssId, svId);
+
+            GnssNmeaSatellite satellite = gnssNmeaSatellites.value(key);
+            satellite.key = key;
+            satellite.source = QStringLiteral("UBX");
+            satellite.system = system;
+            satellite.talker = ubxGnssTalker(gnssId);
+            satellite.prn = svId;
+            satellite.elevationDeg = elevation;
+            satellite.azimuthDeg = azimuth;
+            satellite.cn0DbHz = cn0;
+            satellite.usedInFix = (flags & 0x00000008u) != 0;
+            satellite.lastSeenMs = nowMs;
+            gnssNmeaSatellites.insert(key, satellite);
+            if (!gnssNmeaSatelliteEnabled.contains(key)) {
+                gnssNmeaSatelliteEnabled.insert(key, !gnssDisabledSatelliteKeys.contains(key));
+            }
+            constellationCounts[system] = constellationCounts.value(system) + 1;
+            if (satellite.usedInFix) {
+                ++usedCount;
+            }
+        }
+
+        gnssSerialSatellitesUsed = usedCount;
+        gnssSerialGpsSatellites = constellationCounts.value(QStringLiteral("GPS"), -1);
+        gnssSerialGlonassSatellites = constellationCounts.value(QStringLiteral("GLONASS"), -1);
+        gnssSerialGalileoSatellites = constellationCounts.value(QStringLiteral("Galileo"), -1);
+        gnssSerialBeidouSatellites = constellationCounts.value(QStringLiteral("BeiDou"), -1);
+        gnssSerialOtherSatellites =
+            constellationCounts.value(QStringLiteral("QZSS"), 0) +
+            constellationCounts.value(QStringLiteral("SBAS"), 0) +
+            constellationCounts.value(QStringLiteral("Other"), 0);
+
+        if (fobosVerboseLoggingEnabled() &&
+            (gnssSerialUbxFrameCount <= 8 || (gnssSerialUbxFrameCount % 64) == 0)) {
+            qDebug() << "[GNSS UBX] NAV-SAT"
+                     << "sats" << satelliteCount
+                     << "used" << usedCount
+                     << "gps" << gnssSerialGpsSatellites
+                     << "glo" << gnssSerialGlonassSatellites
+                     << "gal" << gnssSerialGalileoSatellites
+                     << "bds" << gnssSerialBeidouSatellites;
+        }
+
+        const qint64 staleBeforeMs = nowMs - 30000;
+        for (auto it = gnssNmeaSatellites.begin(); it != gnssNmeaSatellites.end();) {
+            if (it->lastSeenMs > 0 && it->lastSeenMs < staleBeforeMs) {
+                gnssNmeaSatelliteEnabled.remove(it.key());
+                it = gnssNmeaSatellites.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        updateGnssSatelliteView();
+        return;
+    }
+
+    if (messageId == 0x04 && payload.size() >= 18) {
+        gnssSerialPdop = static_cast<double>(ubxU2(payload, 6)) * 0.01;
+        gnssSerialVdop = static_cast<double>(ubxU2(payload, 10)) * 0.01;
+        gnssSerialHdop = static_cast<double>(ubxU2(payload, 12)) * 0.01;
+        if (fobosVerboseLoggingEnabled() &&
+            (gnssSerialUbxFrameCount <= 8 || (gnssSerialUbxFrameCount % 64) == 0)) {
+            qDebug() << "[GNSS UBX] NAV-DOP"
+                     << "hdop" << gnssSerialHdop
+                     << "vdop" << gnssSerialVdop
+                     << "pdop" << gnssSerialPdop;
+        }
+        updateGnssSatelliteView();
+        return;
+    }
+
+    if (messageId == 0x07 && payload.size() >= 92) {
+        const int year = ubxU2(payload, 4);
+        const int month = static_cast<quint8>(payload.at(6));
+        const int day = static_cast<quint8>(payload.at(7));
+        const int hour = static_cast<quint8>(payload.at(8));
+        const int minute = static_cast<quint8>(payload.at(9));
+        const int second = static_cast<quint8>(payload.at(10));
+        gnssSerialUtc = QStringLiteral("%1-%2-%3T%4:%5:%6Z")
+                            .arg(year, 4, 10, QLatin1Char('0'))
+                            .arg(month, 2, 10, QLatin1Char('0'))
+                            .arg(day, 2, 10, QLatin1Char('0'))
+                            .arg(hour, 2, 10, QLatin1Char('0'))
+                            .arg(minute, 2, 10, QLatin1Char('0'))
+                            .arg(second, 2, 10, QLatin1Char('0'));
+
+        const int fixType = static_cast<quint8>(payload.at(20));
+        const quint8 flags = static_cast<quint8>(payload.at(21));
+        const bool fixOk = (flags & 0x01u) != 0;
+        gnssSerialFixQuality = fixOk ? fixType : 0;
+        gnssSerialFixMode = fixType;
+        gnssSerialSatellitesUsed = static_cast<quint8>(payload.at(23));
+        const double lon = static_cast<double>(ubxI4(payload, 24)) * 1e-7;
+        const double lat = static_cast<double>(ubxI4(payload, 28)) * 1e-7;
+        gnssSerialAltitudeM = static_cast<double>(ubxI4(payload, 36)) / 1000.0;
+        gnssSerialSpeedKmh = static_cast<double>(ubxI4(payload, 60)) * 0.0036;
+        gnssSerialCourseDeg = static_cast<double>(ubxI4(payload, 64)) * 1e-5;
+        gnssSerialPdop = static_cast<double>(ubxU2(payload, 76)) * 0.01;
+
+        if (fixOk && fixType >= 2 && std::isfinite(lat) && std::isfinite(lon) &&
+            lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0) {
+            gnssLastUbxFixMs = nowMs;
+            if (fobosVerboseLoggingEnabled() &&
+                (gnssSerialUbxFrameCount <= 8 || (gnssSerialUbxFrameCount % 32) == 0)) {
+                qDebug() << "[GNSS UBX] NAV-PVT"
+                         << "fix" << fixType
+                         << "sv" << gnssSerialSatellitesUsed
+                         << "lat" << lat
+                         << "lon" << lon
+                         << "altM" << gnssSerialAltitudeM
+                         << "pdop" << gnssSerialPdop;
+            }
+            const QString policy = normalizedGnssPositionPolicy(gnssPositionPolicy);
+            if (policy == QStringLiteral("nmea_only")) {
+                if (fobosVerboseLoggingEnabled() &&
+                    (gnssSerialUbxFrameCount <= 8 || (gnssSerialUbxFrameCount % 64) == 0)) {
+                    qDebug() << "[GNSS policy] UBX PVT ignored"
+                             << "policy" << policy;
+                }
+                updateGnssSatelliteView();
+                return;
+            }
+            if (!hasEnabledGnssNmeaFixSatellite()) {
+                updateGnssSerialStatus(uiText(QStringLiteral("gnss_serial_fix_filtered"),
+                                              QStringLiteral("NMEA serial: fix ignored by satellite filters")));
+                return;
+            }
+            qthLatitude = lat;
+            qthLongitude = lon;
+            qthSource = QStringLiteral("nmea");
+            qthPositionVisible = true;
+            ++gnssSerialFixCount;
+            updateQthControls();
+            if (qthMapWidget) {
+                qthMapWidget->centerOn(qthLatitude, qthLongitude);
+            }
+            const QString locator = qth::maidenheadLocator(qthLatitude, qthLongitude, 6);
+            QStringList extras;
+            extras << QStringLiteral("UBX frames %1").arg(gnssSerialUbxFrameCount);
+            extras << QStringLiteral("SV %1").arg(gnssSerialSatellitesUsed);
+            if (std::isfinite(gnssSerialPdop)) extras << QStringLiteral("PDOP %1").arg(gnssSerialPdop, 0, 'f', 1);
+            if (std::isfinite(gnssSerialAltitudeM)) extras << QStringLiteral("alt %1 m").arg(gnssSerialAltitudeM, 0, 'f', 1);
+            if (std::isfinite(gnssSerialSpeedKmh)) extras << QStringLiteral("speed %1 km/h").arg(gnssSerialSpeedKmh, 0, 'f', 1);
+            updateGnssSerialStatus(uiText(QStringLiteral("ubx_fix"),
+                                          QStringLiteral("UBX PVT: fix %1, %2, %3 (%4), #%5, %6"))
+                                       .arg(fixType)
+                                       .arg(qthLatitude, 0, 'f', 6)
+                                       .arg(qthLongitude, 0, 'f', 6)
+                                       .arg(locator)
+                                       .arg(gnssSerialFixCount)
+                                       .arg(extras.join(QStringLiteral(", "))));
+            updateQthMapSatelliteOverlay();
+        } else if ((gnssSerialUbxFrameCount % 16) == 0) {
+            updateGnssSerialStatus(uiText(QStringLiteral("ubx_receiving"),
+                                          QStringLiteral("UBX: receiving %1 frames, fix %2, SV %3"))
+                                       .arg(gnssSerialUbxFrameCount)
+                                       .arg(fixType)
+                                       .arg(gnssSerialSatellitesUsed));
+        }
+        updateGnssSatelliteView();
+    }
+}
+
+void YourClassName::sendGnssUbxConfiguration(bool enabled) {
+    if (!gnssSerialPort || !gnssSerialPort->isOpen() || !gnssSerialPort->isWritable()) {
+        gnssUbxOutputEnabled = false;
+        updateGnssSerialStatus(uiText(QStringLiteral("ubx_requires_serial"),
+                                      QStringLiteral("UBX: connect the GNSS serial port first.")));
+        return;
+    }
+
+    const quint8 rate = enabled ? 1 : 0;
+    const QVector<QPair<quint8, quint8>> messages = {
+        {0x01, 0x07}, // NAV-PVT
+        {0x01, 0x35}, // NAV-SAT
+        {0x01, 0x04}, // NAV-DOP
+        {0x01, 0x03}  // NAV-STATUS
+    };
+
+    qint64 bytesWritten = 0;
+    for (const auto &message : messages) {
+        QByteArray payload;
+        payload.reserve(8);
+        payload.append(char(message.first));
+        payload.append(char(message.second));
+        payload.append(char(0));    // I2C/DDC
+        payload.append(char(rate)); // UART1
+        payload.append(char(rate)); // UART2
+        payload.append(char(rate)); // USB
+        payload.append(char(0));    // SPI
+        payload.append(char(0));
+        const QByteArray frame = makeUbxFrame(0x06, 0x01, payload);
+        bytesWritten += gnssSerialPort->write(frame);
+    }
+    gnssSerialPort->flush();
+
+    gnssUbxOutputEnabled = enabled;
+    updateGnssSerialStatus(uiText(enabled ? QStringLiteral("ubx_enabled") : QStringLiteral("ubx_disabled"),
+                                  enabled ? QStringLiteral("UBX output enabled (%1 bytes sent).")
+                                          : QStringLiteral("UBX output disabled (%1 bytes sent)."))
+                               .arg(bytesWritten));
+    qDebug() << "[GNSS UBX] CFG-MSG"
+             << "enabled" << enabled
+             << "bytes" << bytesWritten;
+}
+
+void YourClassName::applyGnssUbxConstellationConfig() {
+    if (!gnssSerialPort || !gnssSerialPort->isOpen() || !gnssSerialPort->isWritable()) {
+        updateGnssSerialStatus(uiText(QStringLiteral("ubx_requires_serial"),
+                                      QStringLiteral("UBX: connect the GNSS serial port first.")));
+        return;
+    }
+
+    auto uiEnabledForGnssId = [this](quint8 gnssId) {
+        switch (gnssId) {
+        case 0:
+            return gnssUseGps;
+        case 1:
+            return gnssUseSbas;
+        case 2:
+            return gnssUseGalileo;
+        case 3:
+            return gnssUseBeidou;
+        case 5:
+            return gnssUseQzss;
+        case 6:
+            return gnssUseGlonass;
+        default:
+            return false;
+        }
+    };
+
+    if (gnssLastCfgGnssPayload.size() < 4) {
+        gnssPendingCfgGnssApply = false;
+        const QByteArray poll = makeUbxFrame(0x06, 0x3E, QByteArray());
+        const qint64 bytes = gnssSerialPort->write(poll);
+        gnssSerialPort->flush();
+        updateGnssSerialStatus(uiText(QStringLiteral("ubx_cfg_gnss_polling"),
+                                      QStringLiteral("UBX CFG-GNSS: polling module first (%1 bytes)."))
+                                   .arg(bytes));
+        qDebug() << "[GNSS UBX] CFG-GNSS poll requested" << "bytes" << bytes;
+        return;
+    }
+
+    QByteArray payload = gnssLastCfgGnssPayload;
+    const int blockCount = static_cast<quint8>(payload.at(3));
+    QStringList enabledSystems;
+    QStringList disabledSystems;
+    int changedBlocks = 0;
+    for (int block = 0; block < blockCount; ++block) {
+        const int offset = 4 + block * 8;
+        if (offset + 7 >= payload.size()) {
+            break;
+        }
+        const quint8 gnssId = static_cast<quint8>(payload.at(offset));
+        if (ubxGnssSystemName(gnssId) == QStringLiteral("Other")) {
+            continue;
+        }
+        quint32 flags = ubxU4(payload, offset + 4);
+        const quint32 oldFlags = flags;
+        const bool enabled = uiEnabledForGnssId(gnssId);
+        if (enabled) {
+            flags |= 0x01u;
+            enabledSystems << ubxGnssSystemName(gnssId);
+        } else {
+            flags &= ~0x01u;
+            disabledSystems << ubxGnssSystemName(gnssId);
+        }
+        if (flags != oldFlags) {
+            ++changedBlocks;
+            ubxPutU4(payload, offset + 4, flags);
+        }
+    }
+
+    const QByteArray frame = makeUbxFrame(0x06, 0x3E, payload);
+    const qint64 bytes = gnssSerialPort->write(frame);
+    gnssSerialPort->flush();
+    updateGnssSerialStatus(uiText(QStringLiteral("ubx_cfg_gnss_sent"),
+                                  QStringLiteral("UBX CFG-GNSS sent: enabled %1, disabled %2 (%3 blocks changed)."))
+                               .arg(enabledSystems.isEmpty()
+                                        ? uiText(QStringLiteral("none"), QStringLiteral("none"))
+                                        : enabledSystems.join(QStringLiteral(", ")))
+                               .arg(disabledSystems.isEmpty()
+                                        ? uiText(QStringLiteral("none"), QStringLiteral("none"))
+                                        : disabledSystems.join(QStringLiteral(", ")))
+                               .arg(changedBlocks));
+    qDebug() << "[GNSS UBX] CFG-GNSS sent"
+             << "bytes" << bytes
+             << "blocks" << blockCount
+             << "changed" << changedBlocks
+             << "enabled" << enabledSystems
+             << "disabled" << disabledSystems;
+}
+
+void YourClassName::saveGnssUbxConfigurationToModule() {
+    if (!gnssSerialPort || !gnssSerialPort->isOpen() || !gnssSerialPort->isWritable()) {
+        updateGnssSerialStatus(uiText(QStringLiteral("ubx_requires_serial"),
+                                      QStringLiteral("UBX: connect the GNSS serial port first.")));
+        return;
+    }
+
+    QByteArray payload;
+    payload.reserve(13);
+    ubxAppendU4(payload, 0x00000000u); // clearMask
+    ubxAppendU4(payload, 0x0000FFFFu); // saveMask
+    ubxAppendU4(payload, 0x00000000u); // loadMask
+    payload.append(char(0x17));        // BBR, Flash, EEPROM, SPI flash when present
+
+    const QByteArray frame = makeUbxFrame(0x06, 0x09, payload);
+    const qint64 bytes = gnssSerialPort->write(frame);
+    gnssSerialPort->flush();
+    updateGnssSerialStatus(uiText(QStringLiteral("ubx_cfg_save_sent"),
+                                  QStringLiteral("UBX save config sent (%1 bytes). Watch for ACK/NAK.")).
+                               arg(bytes));
+    qDebug() << "[GNSS UBX] CFG-CFG save sent" << "bytes" << bytes;
 }
 
 void YourClassName::handleGnssSerialError(QSerialPort::SerialPortError error) {
@@ -7915,6 +9127,858 @@ void YourClassName::updateGnssSerialStatus(const QString &message) {
                                       ? uiText(QStringLiteral("disconnect"), QStringLiteral("Disconnect"))
                                       : uiText(QStringLiteral("connect"), QStringLiteral("Connect")));
     }
+    if (gnssNmeaLogButton) {
+        gnssNmeaLogButton->setText(gnssNmeaLogFile && gnssNmeaLogFile->isOpen()
+                                       ? uiText(QStringLiteral("nmea_stop_log"), QStringLiteral("Stop log"))
+                                       : uiText(QStringLiteral("nmea_log"), QStringLiteral("Log")));
+    }
+    if (gnssSerialRawLogButton) {
+        gnssSerialRawLogButton->setText(gnssRawSerialLogFile && gnssRawSerialLogFile->isOpen()
+                                            ? uiText(QStringLiteral("gnss_raw_serial_stop"), QStringLiteral("Stop raw"))
+                                            : uiText(QStringLiteral("gnss_raw_serial_log"), QStringLiteral("Raw")));
+    }
+}
+
+void YourClassName::toggleGnssNmeaLogging() {
+    if (gnssNmeaLogFile && gnssNmeaLogFile->isOpen()) {
+        gnssNmeaLogFile->flush();
+        gnssNmeaLogFile->close();
+        const QString savedPath = gnssNmeaLogPath;
+        gnssNmeaLogFile.reset();
+        gnssNmeaLogPath.clear();
+        updateGnssSerialStatus(uiText(QStringLiteral("nmea_log_saved"),
+                                      QStringLiteral("NMEA log saved: %1"))
+                                   .arg(QDir::toNativeSeparators(savedPath)));
+        return;
+    }
+
+    QDir recordingsDir(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recordings/nmea")));
+    if (!recordingsDir.exists() && !recordingsDir.mkpath(QStringLiteral("."))) {
+        updateGnssSerialStatus(uiText(QStringLiteral("nmea_log_failed"),
+                                      QStringLiteral("NMEA log failed: %1"))
+                                   .arg(QStringLiteral("cannot create recordings/nmea")));
+        return;
+    }
+
+    const QString fileName =
+        QStringLiteral("nmea_%1.log").arg(QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+    gnssNmeaLogPath = recordingsDir.filePath(fileName);
+    gnssNmeaLogFile = std::make_unique<QFile>(gnssNmeaLogPath);
+    if (!gnssNmeaLogFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
+        const QString error = gnssNmeaLogFile->errorString();
+        gnssNmeaLogFile.reset();
+        updateGnssSerialStatus(uiText(QStringLiteral("nmea_log_failed"),
+                                      QStringLiteral("NMEA log failed: %1"))
+                                   .arg(error));
+        return;
+    }
+    gnssNmeaLogFile->write("# FobosAPP NMEA log\n");
+    gnssNmeaLogFile->write(QStringLiteral("# UTC %1\n")
+                               .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate))
+                               .toLatin1());
+    updateGnssSerialStatus(uiText(QStringLiteral("nmea_log_started"),
+                                  QStringLiteral("NMEA log started: %1"))
+                               .arg(QDir::toNativeSeparators(gnssNmeaLogPath)));
+}
+
+void YourClassName::toggleGnssRawSerialLogging() {
+    if (gnssRawSerialLogFile && gnssRawSerialLogFile->isOpen()) {
+        gnssRawSerialLogFile->flush();
+        gnssRawSerialLogFile->close();
+        const QString savedPath = gnssRawSerialLogPath;
+        gnssRawSerialLogFile.reset();
+        gnssRawSerialLogPath.clear();
+        updateGnssSerialStatus(uiText(QStringLiteral("gnss_raw_serial_saved"),
+                                      QStringLiteral("Raw UBX/NMEA log saved: %1"))
+                                   .arg(QDir::toNativeSeparators(savedPath)));
+        return;
+    }
+
+    QDir recordingsDir(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recordings/gnss_raw")));
+    if (!recordingsDir.exists() && !recordingsDir.mkpath(QStringLiteral("."))) {
+        updateGnssSerialStatus(uiText(QStringLiteral("gnss_raw_serial_failed"),
+                                      QStringLiteral("Raw UBX/NMEA log failed: %1"))
+                                   .arg(QStringLiteral("cannot create recordings/gnss_raw")));
+        return;
+    }
+
+    const QString fileName =
+        QStringLiteral("gnss_raw_%1.ubx")
+            .arg(QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+    gnssRawSerialLogPath = recordingsDir.filePath(fileName);
+    gnssRawSerialLogFile = std::make_unique<QFile>(gnssRawSerialLogPath);
+    if (!gnssRawSerialLogFile->open(QIODevice::WriteOnly)) {
+        const QString error = gnssRawSerialLogFile->errorString();
+        gnssRawSerialLogFile.reset();
+        updateGnssSerialStatus(uiText(QStringLiteral("gnss_raw_serial_failed"),
+                                      QStringLiteral("Raw UBX/NMEA log failed: %1"))
+                                   .arg(error));
+        return;
+    }
+    updateGnssSerialStatus(uiText(QStringLiteral("gnss_raw_serial_started"),
+                                  QStringLiteral("Raw UBX/NMEA log started: %1"))
+                               .arg(QDir::toNativeSeparators(gnssRawSerialLogPath)));
+}
+
+void YourClassName::replayGnssNmeaLog() {
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        uiText(QStringLiteral("nmea_replay_select"), QStringLiteral("Select NMEA log")),
+        QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("recordings/nmea")),
+        uiText(QStringLiteral("nmea_log_filter"), QStringLiteral("NMEA logs (*.log *.nmea *.txt);;All files (*.*)")));
+    if (path.isEmpty()) {
+        return;
+    }
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        updateGnssSerialStatus(uiText(QStringLiteral("nmea_replay_failed"),
+                                      QStringLiteral("NMEA replay failed: %1"))
+                                   .arg(file.errorString()));
+        return;
+    }
+
+    gnssSerialBuffer.clear();
+    gnssSerialSentenceCount = 0;
+    gnssSerialFixCount = 0;
+    gnssSerialFixQuality = -1;
+    gnssSerialFixMode = -1;
+    gnssSerialSatellitesUsed = -1;
+    gnssSerialGpsSatellites = -1;
+    gnssSerialGlonassSatellites = -1;
+    gnssSerialGalileoSatellites = -1;
+    gnssSerialBeidouSatellites = -1;
+    gnssSerialOtherSatellites = -1;
+    gnssSerialUtc.clear();
+    gnssSerialHdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialVdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialPdop = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialAltitudeM = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialGeoidSeparationM = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialSpeedKmh = std::numeric_limits<double>::quiet_NaN();
+    gnssSerialCourseDeg = std::numeric_limits<double>::quiet_NaN();
+    resetGnssNmeaSatellites();
+
+    int lines = 0;
+    while (!file.atEnd()) {
+        const QString line = QString::fromLatin1(file.readLine()).trimmed();
+        if (line.startsWith(QLatin1Char('$'))) {
+            processGnssNmeaLine(line, true);
+            ++lines;
+        }
+    }
+    updateGnssSatelliteView(true);
+    updateQthControls();
+    updateGnssSerialStatus(uiText(QStringLiteral("nmea_replay_done"),
+                                  QStringLiteral("NMEA replay: %1 sentences from %2"))
+                               .arg(lines)
+                               .arg(QFileInfo(path).fileName()));
+}
+
+void YourClassName::resetGnssNmeaSatellites() {
+    gnssNmeaSatellites.clear();
+    gnssNmeaSatelliteEnabled.clear();
+    gnssAcquisitionPlotShowsAcquisition = false;
+    gnssSatelliteTableDirty = true;
+    updateGnssSatelliteView(true);
+}
+
+bool YourClassName::isGnssNmeaSystemEnabled(const QString &system) const {
+    const QString normalized = system.trimmed().toUpper();
+    if (normalized == QStringLiteral("GPS")) {
+        return gnssUseGps;
+    }
+    if (normalized == QStringLiteral("GLONASS")) {
+        return gnssUseGlonass;
+    }
+    if (normalized == QStringLiteral("GALILEO")) {
+        return gnssUseGalileo;
+    }
+    if (normalized == QStringLiteral("BEIDOU")) {
+        return gnssUseBeidou;
+    }
+    if (normalized == QStringLiteral("QZSS")) {
+        return gnssUseQzss;
+    }
+    if (normalized == QStringLiteral("SBAS")) {
+        return gnssUseSbas;
+    }
+    if (normalized == QStringLiteral("MIXED")) {
+        return gnssUseGps || gnssUseGlonass || gnssUseGalileo || gnssUseBeidou || gnssUseQzss || gnssUseSbas;
+    }
+    return gnssUseOther;
+}
+
+bool YourClassName::isGnssNmeaTalkerEnabled(const QString &talker) const {
+    return isGnssNmeaSystemEnabled(gnssSystemForTalker(talker));
+}
+
+void YourClassName::ensureGnssSatelliteTableRows(int requiredRows) {
+    if (!gnssSatelliteTable) {
+        return;
+    }
+    requiredRows = (std::clamp)(requiredRows, 0, GNSS_SATELLITE_TABLE_MAX_ROWS);
+    if (requiredRows <= gnssSatelliteTable->rowCount()) {
+        return;
+    }
+
+    int newRowCount = gnssSatelliteTable->rowCount();
+    while (newRowCount < requiredRows && newRowCount < GNSS_SATELLITE_TABLE_MAX_ROWS) {
+        newRowCount += GNSS_SATELLITE_TABLE_GROW_STEP;
+    }
+    newRowCount = (std::min)(newRowCount, GNSS_SATELLITE_TABLE_MAX_ROWS);
+    const int oldRowCount = gnssSatelliteTable->rowCount();
+    gnssSatelliteTable->setRowCount(newRowCount);
+    for (int row = oldRowCount; row < newRowCount; ++row) {
+        for (int column = 0; column < gnssSatelliteTable->columnCount(); ++column) {
+            auto *item = new QTableWidgetItem(column == 0 ? QString() : QStringLiteral("-"));
+            item->setTextAlignment(Qt::AlignCenter);
+            item->setFlags(Qt::ItemIsEnabled);
+            if (column == 0) {
+                item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
+                item->setCheckState(Qt::Unchecked);
+            }
+            gnssSatelliteTable->setItem(row, column, item);
+        }
+        gnssSatelliteTable->setRowHidden(row, true);
+    }
+}
+
+bool YourClassName::isGnssSatelliteEnabled(const QString &key) const {
+    return gnssNmeaSatelliteEnabled.value(key, !gnssDisabledSatelliteKeys.contains(key));
+}
+
+bool YourClassName::hasEnabledGnssNmeaFixSatellite() const {
+    bool sawUsedSatellite = false;
+    for (const GnssNmeaSatellite &satellite : gnssNmeaSatellites) {
+        if (!satellite.usedInFix) {
+            continue;
+        }
+        sawUsedSatellite = true;
+        if (isGnssNmeaSystemEnabled(satellite.system) &&
+            isGnssSatelliteEnabled(satellite.key)) {
+            return true;
+        }
+    }
+    return !sawUsedSatellite;
+}
+
+void YourClassName::sortGnssSatelliteRows(QVector<GnssNmeaSatellite> &satellites) const {
+    auto compareText = [](const QString &left, const QString &right) {
+        return QString::localeAwareCompare(left, right) < 0;
+    };
+
+    std::sort(satellites.begin(), satellites.end(), [this, compareText](const GnssNmeaSatellite &left,
+                                                                         const GnssNmeaSatellite &right) {
+        int result = 0;
+        switch (gnssSatelliteSortColumn) {
+        case 0:
+            result = static_cast<int>(gnssNmeaSatelliteEnabled.value(left.key, true)) -
+                     static_cast<int>(gnssNmeaSatelliteEnabled.value(right.key, true));
+            break;
+        case 1:
+            result = compareText(left.source, right.source) ? -1 : (compareText(right.source, left.source) ? 1 : 0);
+            break;
+        case 2:
+            result = compareText(left.system, right.system) ? -1 : (compareText(right.system, left.system) ? 1 : 0);
+            break;
+        case 3:
+            result = left.prn - right.prn;
+            break;
+        case 4:
+            result = left.elevationDeg - right.elevationDeg;
+            break;
+        case 5:
+            result = left.azimuthDeg - right.azimuthDeg;
+            break;
+        case 6:
+            result = left.cn0DbHz - right.cn0DbHz;
+            break;
+        case 7:
+            result = static_cast<int>(left.usedInFix) - static_cast<int>(right.usedInFix);
+            break;
+        case 8:
+            result = left.lastSeenMs < right.lastSeenMs ? -1 : (left.lastSeenMs > right.lastSeenMs ? 1 : 0);
+            break;
+        case 9:
+            result = left.cn0DbHz - right.cn0DbHz;
+            break;
+        default:
+            result = 0;
+            break;
+        }
+
+        if (result == 0) {
+            if (left.usedInFix != right.usedInFix) {
+                result = static_cast<int>(left.usedInFix) - static_cast<int>(right.usedInFix);
+            } else if (left.system != right.system) {
+                result = compareText(left.system, right.system) ? -1 : 1;
+            } else {
+                result = left.prn - right.prn;
+            }
+        }
+
+        return gnssSatelliteSortAscending ? result < 0 : result > 0;
+    });
+}
+
+void YourClassName::setGnssSatelliteRowsEnabled(bool enabled) {
+    bool changed = false;
+    for (const GnssNmeaSatellite &satellite : gnssNmeaSatellites) {
+        if (!isGnssNmeaSystemEnabled(satellite.system)) {
+            continue;
+        }
+        if (isGnssSatelliteEnabled(satellite.key) == enabled) {
+            continue;
+        }
+        gnssNmeaSatelliteEnabled.insert(satellite.key, enabled);
+        if (enabled) {
+            gnssDisabledSatelliteKeys.remove(satellite.key);
+        } else {
+            gnssDisabledSatelliteKeys.insert(satellite.key);
+        }
+        changed = true;
+    }
+    if (changed) {
+        gnssSatelliteTableDirty = true;
+        updateGnssSatelliteView(true);
+        savePersistentSettings();
+    }
+}
+
+void YourClassName::updateGnssNmeaSatellitesFromSentence(const QString &line) {
+    const QStringList fields = nmeaBodyFields(line);
+    if (fields.isEmpty()) {
+        return;
+    }
+    const QString type = fields.at(0).trimmed().toUpper();
+    if (type.size() < 5) {
+        return;
+    }
+    const QString talker = type.left(type.size() - 3);
+    const QString sentence = type.right(3);
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+
+    if (sentence == QStringLiteral("GSV")) {
+        for (int index = 4; index + 3 < fields.size(); index += 4) {
+            const int prn = parseNmeaIntField(fields, index);
+            if (prn <= 0) {
+                continue;
+            }
+            const QString key = gnssSatelliteKey(talker, prn);
+            GnssNmeaSatellite satellite = gnssNmeaSatellites.value(key);
+            satellite.key = key;
+            satellite.source = QStringLiteral("NMEA");
+            satellite.talker = talker;
+            satellite.system = gnssSystemForTalker(talker, prn);
+            satellite.prn = prn;
+            satellite.elevationDeg = parseNmeaIntField(fields, index + 1, satellite.elevationDeg);
+            satellite.azimuthDeg = parseNmeaIntField(fields, index + 2, satellite.azimuthDeg);
+            satellite.cn0DbHz = parseNmeaIntField(fields, index + 3, satellite.cn0DbHz);
+            satellite.lastSeenMs = nowMs;
+            gnssNmeaSatellites.insert(key, satellite);
+            if (!gnssNmeaSatelliteEnabled.contains(key)) {
+                gnssNmeaSatelliteEnabled.insert(key, !gnssDisabledSatelliteKeys.contains(key));
+            }
+        }
+    } else if (sentence == QStringLiteral("GSA")) {
+        const bool mixedTalker = talker == QStringLiteral("GN");
+        for (auto it = gnssNmeaSatellites.begin(); it != gnssNmeaSatellites.end(); ++it) {
+            if (mixedTalker || it->talker == talker) {
+                it->usedInFix = false;
+            }
+        }
+        for (int index = 3; index <= 14 && index < fields.size(); ++index) {
+            const int prn = parseNmeaIntField(fields, index);
+            if (prn <= 0) {
+                continue;
+            }
+            const QString key = gnssSatelliteKey(talker, prn);
+            auto directIt = gnssNmeaSatellites.find(key);
+            if (directIt != gnssNmeaSatellites.end()) {
+                directIt->usedInFix = true;
+                directIt->lastSeenMs = nowMs;
+                continue;
+            }
+            for (auto it = gnssNmeaSatellites.begin(); it != gnssNmeaSatellites.end(); ++it) {
+                if (it->prn == prn && (mixedTalker || it->talker == talker)) {
+                    it->usedInFix = true;
+                    it->lastSeenMs = nowMs;
+                }
+            }
+        }
+    } else {
+        return;
+    }
+
+    const qint64 staleBeforeMs = nowMs - 30000;
+    for (auto it = gnssNmeaSatellites.begin(); it != gnssNmeaSatellites.end();) {
+        if (it->lastSeenMs > 0 && it->lastSeenMs < staleBeforeMs) {
+            gnssNmeaSatelliteEnabled.remove(it.key());
+            it = gnssNmeaSatellites.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    updateGnssSatelliteView();
+}
+
+void YourClassName::updateGnssSatelliteView(bool forceTableRefresh) {
+    if (gnssUseGpsCheckbox) {
+        QSignalBlocker blocker(gnssUseGpsCheckbox);
+        gnssUseGpsCheckbox->setChecked(gnssUseGps);
+    }
+    if (gnssUseGlonassCheckbox) {
+        QSignalBlocker blocker(gnssUseGlonassCheckbox);
+        gnssUseGlonassCheckbox->setChecked(gnssUseGlonass);
+    }
+    if (gnssUseGalileoCheckbox) {
+        QSignalBlocker blocker(gnssUseGalileoCheckbox);
+        gnssUseGalileoCheckbox->setChecked(gnssUseGalileo);
+    }
+    if (gnssUseBeidouCheckbox) {
+        QSignalBlocker blocker(gnssUseBeidouCheckbox);
+        gnssUseBeidouCheckbox->setChecked(gnssUseBeidou);
+    }
+    if (gnssUseQzssCheckbox) {
+        QSignalBlocker blocker(gnssUseQzssCheckbox);
+        gnssUseQzssCheckbox->setChecked(gnssUseQzss);
+    }
+    if (gnssUseSbasCheckbox) {
+        QSignalBlocker blocker(gnssUseSbasCheckbox);
+        gnssUseSbasCheckbox->setChecked(gnssUseSbas);
+    }
+    if (gnssUseOtherCheckbox) {
+        QSignalBlocker blocker(gnssUseOtherCheckbox);
+        gnssUseOtherCheckbox->setChecked(gnssUseOther);
+    }
+
+    QVector<GnssNmeaSatellite> satellites;
+    satellites.reserve(gnssNmeaSatellites.size());
+    for (const GnssNmeaSatellite &satellite : gnssNmeaSatellites) {
+        if (isGnssNmeaSystemEnabled(satellite.system)) {
+            satellites.append(satellite);
+        }
+    }
+    sortGnssSatelliteRows(satellites);
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    int enabledCount = 0;
+    int usedCount = 0;
+    int cn0Sum = 0;
+    int cn0Count = 0;
+    int ubxRows = 0;
+    int nmeaRows = 0;
+    int ignoredCount = 0;
+    for (const GnssNmeaSatellite &satellite : satellites) {
+        if (satellite.source == QStringLiteral("UBX")) {
+            ++ubxRows;
+        } else if (satellite.source == QStringLiteral("NMEA")) {
+            ++nmeaRows;
+        }
+        const bool rowEnabled = isGnssSatelliteEnabled(satellite.key);
+        if (rowEnabled) {
+            ++enabledCount;
+            if (satellite.cn0DbHz >= 0) {
+                cn0Sum += satellite.cn0DbHz;
+                ++cn0Count;
+            }
+            if (satellite.usedInFix) {
+                ++usedCount;
+            }
+        } else {
+            ++ignoredCount;
+        }
+    }
+    const QString averageCn0Text = cn0Count > 0
+                                       ? QStringLiteral("%1").arg(static_cast<double>(cn0Sum) / cn0Count, 0, 'f', 1)
+                                       : QStringLiteral("-");
+    const QString policyText = normalizedGnssPositionPolicy(gnssPositionPolicy).replace(QLatin1Char('_'),
+                                                                                         QLatin1Char(' '));
+
+    auto fixText = [this](int fixQuality, int fixMode) {
+        if (fixMode > 0) {
+            return QStringLiteral("%1D").arg(fixMode);
+        }
+        if (fixQuality > 0) {
+            return uiText(QStringLiteral("fix_number"), QStringLiteral("fix %1")).arg(fixQuality);
+        }
+        return uiText(QStringLiteral("no_fix"), QStringLiteral("no fix"));
+    };
+
+    auto qualityText = [this](const GnssNmeaSatellite &satellite) {
+        if (satellite.cn0DbHz < 0) {
+            return satellite.usedInFix ? uiText(QStringLiteral("used"), QStringLiteral("used")) : QStringLiteral("-");
+        }
+        if (satellite.cn0DbHz >= 38) {
+            return satellite.usedInFix ? uiText(QStringLiteral("used_strong"), QStringLiteral("used strong"))
+                                       : uiText(QStringLiteral("strong"), QStringLiteral("strong"));
+        }
+        if (satellite.cn0DbHz >= 28) {
+            return satellite.usedInFix ? uiText(QStringLiteral("used_good"), QStringLiteral("used good"))
+                                       : uiText(QStringLiteral("good"), QStringLiteral("good"));
+        }
+        if (satellite.cn0DbHz >= 18) {
+            return satellite.usedInFix ? uiText(QStringLiteral("used_weak"), QStringLiteral("used weak"))
+                                       : uiText(QStringLiteral("weak"), QStringLiteral("weak"));
+        }
+        return satellite.usedInFix ? uiText(QStringLiteral("used_poor"), QStringLiteral("used poor"))
+                                   : uiText(QStringLiteral("poor"), QStringLiteral("poor"));
+    };
+
+    const bool satelliteDialogVisible = gnssSatelliteDialog && gnssSatelliteDialog->isVisible();
+    constexpr qint64 GNSS_SATELLITE_LIVE_REFRESH_MS = 500;
+    const bool refreshTableDue = !gnssSatelliteTableUpdateTimer.isValid() ||
+                                 gnssSatelliteTableUpdateTimer.elapsed() >= GNSS_SATELLITE_LIVE_REFRESH_MS;
+    const bool refreshLight = forceTableRefresh ||
+                              !gnssSatelliteOverlayUpdateTimer.isValid() ||
+                              gnssSatelliteOverlayUpdateTimer.elapsed() >= GNSS_SATELLITE_LIVE_REFRESH_MS;
+
+    if (gnssSatelliteStatusLabel && satelliteDialogVisible && refreshLight) {
+        auto chip = [](const QString &title, const QString &value, const QString &accent) {
+            return QStringLiteral(
+                       "<td style='padding:5px 8px;border:1px solid #3b4652;background:#202832;'>"
+                       "<div style='font-size:8pt;color:#9aa7b5;'>%1</div>"
+                       "<div style='font-size:10pt;font-weight:600;color:%3;'>%2</div>"
+                       "</td>")
+                .arg(title.toHtmlEscaped(), value.toHtmlEscaped(), accent);
+        };
+        QStringList chips;
+        chips << chip(uiText(QStringLiteral("fix"), QStringLiteral("Fix")), fixText(gnssSerialFixQuality, gnssSerialFixMode),
+                      gnssSerialFixQuality > 0 ? QStringLiteral("#8ee38e") : QStringLiteral("#f08a7a"));
+        chips << chip(uiText(QStringLiteral("policy"), QStringLiteral("Policy")), policyText, QStringLiteral("#d9e2ec"));
+        chips << chip(uiText(QStringLiteral("satellites"), QStringLiteral("Satellites")),
+                      uiText(QStringLiteral("gnss_satellite_count_summary"), QStringLiteral("%1 used / %2 visible"))
+                          .arg(gnssSerialSatellitesUsed >= 0 ? gnssSerialSatellitesUsed : usedCount)
+                          .arg(satellites.size()),
+                      QStringLiteral("#d9e2ec"));
+        chips << chip(QStringLiteral("DOP"),
+                      QStringLiteral("H %1  V %2  P %3")
+                          .arg(std::isfinite(gnssSerialHdop) ? QString::number(gnssSerialHdop, 'f', 2) : QStringLiteral("-"))
+                          .arg(std::isfinite(gnssSerialVdop) ? QString::number(gnssSerialVdop, 'f', 2) : QStringLiteral("-"))
+                          .arg(std::isfinite(gnssSerialPdop) ? QString::number(gnssSerialPdop, 'f', 2) : QStringLiteral("-")),
+                      QStringLiteral("#d9e2ec"));
+        chips << chip(uiText(QStringLiteral("signal"), QStringLiteral("Signal")),
+                      uiText(QStringLiteral("gnss_signal_summary"), QStringLiteral("%1 avg C/N0, %2 enabled, %3 ignored"))
+                          .arg(averageCn0Text)
+                          .arg(enabledCount)
+                          .arg(ignoredCount),
+                      QStringLiteral("#d9e2ec"));
+        chips << chip(uiText(QStringLiteral("source"), QStringLiteral("Source")),
+                      QStringLiteral("UBX %1 / NMEA %2").arg(ubxRows).arg(nmeaRows),
+                      QStringLiteral("#d9e2ec"));
+        chips << chip(uiText(QStringLiteral("position"), QStringLiteral("Position")),
+                      QStringLiteral("%1 m").arg(std::isfinite(gnssSerialAltitudeM)
+                                                     ? QString::number(gnssSerialAltitudeM, 'f', 1)
+                                                     : QStringLiteral("-")),
+                      QStringLiteral("#d9e2ec"));
+        chips << chip(uiText(QStringLiteral("motion"), QStringLiteral("Motion")),
+                      QStringLiteral("%1 km/h  %2 deg")
+                          .arg(std::isfinite(gnssSerialSpeedKmh) ? QString::number(gnssSerialSpeedKmh, 'f', 1) : QStringLiteral("-"))
+                          .arg(std::isfinite(gnssSerialCourseDeg) ? QString::number(gnssSerialCourseDeg, 'f', 1) : QStringLiteral("-")),
+                      QStringLiteral("#d9e2ec"));
+        chips << chip(uiText(QStringLiteral("time"), QStringLiteral("Time")), formattedGnssUtc(), QStringLiteral("#d9e2ec"));
+        gnssSatelliteStatusLabel->setText(QStringLiteral(
+            "<table cellspacing='3' cellpadding='0'><tr>%1</tr></table>").arg(chips.join(QString())));
+    }
+
+    bool refreshTable = forceTableRefresh;
+    if (satelliteDialogVisible && !refreshTable) {
+        refreshTable = gnssSatelliteTableDirty && refreshTableDue;
+    }
+    if (!satelliteDialogVisible && !forceTableRefresh) {
+        refreshTable = false;
+        gnssSatelliteTableDirty = true;
+    }
+    if (!gnssSatelliteTableVisible) {
+        refreshTable = false;
+        if (gnssSatelliteTable && gnssSatelliteTable->isVisible()) {
+            gnssSatelliteTable->setVisible(false);
+        }
+    }
+
+    if (gnssSatelliteTable && refreshTable) {
+        if (!gnssSatelliteTable->isVisible()) {
+            gnssSatelliteTable->setVisible(true);
+        }
+        QSignalBlocker blocker(gnssSatelliteTable);
+        gnssSatelliteTable->setUpdatesEnabled(false);
+        ensureGnssSatelliteTableRows(satellites.size());
+        const int tableRows = gnssSatelliteTable->rowCount();
+        const int rowsToShow = (std::min)(satellites.size(), tableRows);
+        auto setText = [this](int row, int column, const QString &text) {
+            if (QTableWidgetItem *item = gnssSatelliteTable->item(row, column)) {
+                if (item->text() != text) {
+                    item->setText(text);
+                }
+            }
+        };
+        for (int row = 0; row < tableRows; ++row) {
+            if (row >= rowsToShow) {
+                gnssSatelliteTable->setRowHidden(row, true);
+                continue;
+            }
+            const GnssNmeaSatellite &satellite = satellites.at(row);
+            gnssSatelliteTable->setRowHidden(row, false);
+            const bool rowEnabled = isGnssSatelliteEnabled(satellite.key);
+            if (QTableWidgetItem *useItem = gnssSatelliteTable->item(row, 0)) {
+                useItem->setData(Qt::UserRole, satellite.key);
+                const Qt::CheckState state = rowEnabled ? Qt::Checked : Qt::Unchecked;
+                if (useItem->checkState() != state) {
+                    useItem->setCheckState(state);
+                }
+            }
+            setText(row, 1, satellite.source.isEmpty() ? QStringLiteral("-") : satellite.source);
+            setText(row, 2, satellite.system);
+            setText(row, 3, satellite.prn >= 0 ? QString::number(satellite.prn) : QStringLiteral("-"));
+            setText(row, 4, satellite.elevationDeg >= 0 ? QString::number(satellite.elevationDeg) : QStringLiteral("-"));
+            setText(row, 5, satellite.azimuthDeg >= 0 ? QString::number(satellite.azimuthDeg) : QStringLiteral("-"));
+            setText(row, 6, satellite.cn0DbHz >= 0 ? QString::number(satellite.cn0DbHz) : QStringLiteral("-"));
+            setText(row, 7, satellite.usedInFix ? QStringLiteral("yes") : QStringLiteral("-"));
+            const qint64 ageMs = satellite.lastSeenMs > 0 ? nowMs - satellite.lastSeenMs : -1;
+            setText(row, 8, ageMs >= 0 ? QStringLiteral("%1s").arg(ageMs / 1000) : QStringLiteral("-"));
+            setText(row, 9, qualityText(satellite));
+        }
+        gnssSatelliteTable->setUpdatesEnabled(true);
+        gnssSatelliteTableUpdateTimer.restart();
+        gnssSatelliteTableDirty = false;
+    } else if (gnssSatelliteTable) {
+        gnssSatelliteTableDirty = true;
+    }
+    if (refreshLight) {
+        if (satelliteDialogVisible) {
+            updateGnssNmeaSkyPlot();
+        }
+        updateQthMapSatelliteOverlay();
+        gnssSatelliteOverlayUpdateTimer.restart();
+    }
+
+    if (gnssSerialStatusLabel && (gnssSerialPort && gnssSerialPort->isOpen())) {
+        QStringList parts;
+        parts << QStringLiteral("%1 sentences").arg(gnssSerialSentenceCount);
+        if (gnssSerialUbxFrameCount > 0) {
+            parts << QStringLiteral("%1 UBX").arg(gnssSerialUbxFrameCount);
+        }
+        if (gnssSerialFixQuality >= 0) {
+            parts << QStringLiteral("fix %1").arg(gnssSerialFixQuality);
+        }
+        if (gnssSerialSatellitesUsed >= 0) {
+            parts << QStringLiteral("used %1").arg(gnssSerialSatellitesUsed);
+        }
+        if (std::isfinite(gnssSerialHdop)) {
+            parts << QStringLiteral("HDOP %1").arg(gnssSerialHdop, 0, 'f', 1);
+        }
+        if (std::isfinite(gnssSerialPdop)) {
+            parts << QStringLiteral("PDOP %1").arg(gnssSerialPdop, 0, 'f', 1);
+        }
+        if (std::isfinite(gnssSerialVdop)) {
+            parts << QStringLiteral("VDOP %1").arg(gnssSerialVdop, 0, 'f', 1);
+        }
+        if (std::isfinite(gnssSerialAltitudeM)) {
+            parts << QStringLiteral("alt %1 m").arg(gnssSerialAltitudeM, 0, 'f', 1);
+        }
+        if (std::isfinite(gnssSerialGeoidSeparationM)) {
+            parts << QStringLiteral("geoid %1 m").arg(gnssSerialGeoidSeparationM, 0, 'f', 1);
+        }
+        if (std::isfinite(gnssSerialSpeedKmh)) {
+            parts << QStringLiteral("speed %1 km/h").arg(gnssSerialSpeedKmh, 0, 'f', 1);
+        }
+        if (std::isfinite(gnssSerialCourseDeg)) {
+            parts << QStringLiteral("course %1 deg").arg(gnssSerialCourseDeg, 0, 'f', 1);
+        }
+        if (!satellites.isEmpty()) {
+            const QString cn0Text = cn0Count > 0
+                                        ? QStringLiteral(", avg C/N0 %1").arg(static_cast<double>(cn0Sum) / cn0Count, 0, 'f', 1)
+                                        : QString();
+            parts << QStringLiteral("filtered sats %1/%2, fix rows %3%4")
+                         .arg(enabledCount)
+                         .arg(satellites.size())
+                         .arg(usedCount)
+                         .arg(cn0Text);
+        }
+        if (!gnssSerialUtc.isEmpty()) {
+            parts << QStringLiteral("time %1").arg(formattedGnssUtc());
+        }
+        gnssSerialStatusLabel->setText(uiText(QStringLiteral("gnss_serial_live_summary"),
+                                              QStringLiteral("NMEA serial: %1"))
+                                           .arg(parts.join(QStringLiteral(", "))));
+    }
+}
+
+void YourClassName::updateGnssNmeaSkyPlot() {
+    if (!gnssSatelliteSkyLabel) {
+        return;
+    }
+
+    QVector<GnssNmeaSatellite> satellites;
+    satellites.reserve(gnssNmeaSatellites.size());
+    for (const GnssNmeaSatellite &satellite : gnssNmeaSatellites) {
+        if (isGnssNmeaSystemEnabled(satellite.system)) {
+            satellites.append(satellite);
+        }
+    }
+    std::sort(satellites.begin(), satellites.end(), [](const GnssNmeaSatellite &left,
+                                                       const GnssNmeaSatellite &right) {
+        if (left.usedInFix != right.usedInFix) {
+            return left.usedInFix > right.usedInFix;
+        }
+        if (left.cn0DbHz != right.cn0DbHz) {
+            return left.cn0DbHz > right.cn0DbHz;
+        }
+        if (left.system != right.system) {
+            return left.system < right.system;
+        }
+        return left.prn < right.prn;
+    });
+
+    const int width = (std::max)(520, gnssSatelliteSkyLabel->width());
+    const int height = (std::max)(240, gnssSatelliteSkyLabel->height());
+    QPixmap pixmap(width, height);
+    pixmap.fill(QColor(18, 22, 27));
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setFont(QFont(QStringLiteral("Segoe UI"), 8));
+    painter.setPen(QColor(220, 226, 232));
+    painter.drawText(12, 16, uiText(QStringLiteral("gnss_sky_title"),
+                                    QStringLiteral("GNSS sky view / C/N0")));
+
+    const int skySize = (std::min)(height - 42, width / 2 - 28);
+    const QPoint center(28 + skySize / 2, 30 + skySize / 2);
+    const int radius = skySize / 2;
+    painter.setPen(QPen(QColor(80, 92, 104), 1));
+    painter.drawEllipse(center, radius, radius);
+    painter.drawEllipse(center, radius * 2 / 3, radius * 2 / 3);
+    painter.drawEllipse(center, radius / 3, radius / 3);
+    painter.drawLine(center.x() - radius, center.y(), center.x() + radius, center.y());
+    painter.drawLine(center.x(), center.y() - radius, center.x(), center.y() + radius);
+    painter.setPen(QColor(140, 150, 160));
+    painter.drawText(center.x() - 4, center.y() - radius - 4, QStringLiteral("N"));
+    painter.drawText(center.x() + radius + 4, center.y() + 4, QStringLiteral("E"));
+    painter.drawText(center.x() - 4, center.y() + radius + 12, QStringLiteral("S"));
+    painter.drawText(center.x() - radius - 12, center.y() + 4, QStringLiteral("W"));
+
+    auto colorForCn0 = [](int cn0) {
+        if (cn0 < 0) {
+            return QColor(125, 135, 145);
+        }
+        if (cn0 < 20) {
+            return QColor(230, 95, 80);
+        }
+        if (cn0 < 35) {
+            return QColor(235, 190, 70);
+        }
+        return QColor(105, 215, 125);
+    };
+    auto systemShort = [](const QString &system) {
+        if (system == QStringLiteral("GLONASS")) return QStringLiteral("R");
+        if (system == QStringLiteral("Galileo")) return QStringLiteral("E");
+        if (system == QStringLiteral("BeiDou")) return QStringLiteral("C");
+        if (system == QStringLiteral("QZSS")) return QStringLiteral("Q");
+        if (system == QStringLiteral("SBAS")) return QStringLiteral("S");
+        if (system == QStringLiteral("GPS")) return QStringLiteral("G");
+        return QStringLiteral("?");
+    };
+
+    for (const GnssNmeaSatellite &satellite : satellites) {
+        if (satellite.elevationDeg < 0 || satellite.azimuthDeg < 0) {
+            continue;
+        }
+        const double az = qDegreesToRadians(static_cast<double>(satellite.azimuthDeg));
+        const double normalizedRadius =
+            (std::clamp)(90.0 - static_cast<double>(satellite.elevationDeg), 0.0, 90.0) / 90.0;
+        const int r = static_cast<int>(normalizedRadius * radius);
+        const QPoint point(center.x() + static_cast<int>(std::sin(az) * r),
+                           center.y() - static_cast<int>(std::cos(az) * r));
+        QColor color = colorForCn0(satellite.cn0DbHz);
+        const bool rowEnabled = isGnssSatelliteEnabled(satellite.key);
+        if (!rowEnabled) {
+            color = color.darker(220);
+        }
+        painter.setBrush(color);
+        painter.setPen(QPen(satellite.usedInFix ? QColor(255, 255, 255) : QColor(20, 24, 28),
+                            satellite.usedInFix ? 2 : 1));
+        painter.drawEllipse(point, 7, 7);
+        painter.setPen(rowEnabled ? QColor(235, 240, 245) : QColor(135, 145, 155));
+        painter.drawText(point + QPoint(9, 4),
+                         QStringLiteral("%1%2").arg(systemShort(satellite.system)).arg(satellite.prn));
+    }
+
+    const QRect barRect(width / 2 + 20, 32, width / 2 - 42, height - 54);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(QColor(130, 142, 154));
+    painter.drawRect(barRect);
+    if (satellites.isEmpty()) {
+        painter.setPen(QColor(150, 160, 170));
+        painter.drawText(barRect.adjusted(8, 8, -8, -8),
+                         Qt::AlignCenter,
+                         uiText(QStringLiteral("gnss_no_live_satellites"),
+                                QStringLiteral("No live GNSS satellites yet.")));
+    } else {
+        const int rows = (std::min)(satellites.size(), 14);
+        const int rowHeight = (std::max)(12, barRect.height() / (std::max)(1, rows));
+        for (int i = 0; i < rows; ++i) {
+            const GnssNmeaSatellite &satellite = satellites.at(i);
+            const int y = barRect.top() + i * rowHeight + 2;
+            const int cn0 = satellite.cn0DbHz >= 0 ? satellite.cn0DbHz : 0;
+            const int barWidth = static_cast<int>((std::clamp)(cn0, 0, 55) / 55.0 * (barRect.width() - 96));
+            const bool rowEnabled = isGnssSatelliteEnabled(satellite.key);
+            painter.setPen(rowEnabled ? QColor(205, 214, 222) : QColor(120, 130, 140));
+            painter.drawText(barRect.left() + 6,
+                             y + rowHeight - 4,
+                             QStringLiteral("%1%2").arg(systemShort(satellite.system)).arg(satellite.prn, 2));
+            QColor barColor = colorForCn0(satellite.cn0DbHz);
+            if (!rowEnabled) {
+                barColor = barColor.darker(220);
+            }
+            painter.fillRect(QRect(barRect.left() + 48, y + 2, barWidth, rowHeight - 5), barColor);
+            painter.setPen(rowEnabled ? QColor(190, 200, 210) : QColor(115, 125, 135));
+            painter.drawText(barRect.right() - 38,
+                             y + rowHeight - 4,
+                             satellite.cn0DbHz >= 0 ? QString::number(satellite.cn0DbHz) : QStringLiteral("-"));
+        }
+    }
+
+    gnssSatelliteSkyLabel->setPixmap(pixmap);
+}
+
+void YourClassName::updateQthMapSatelliteOverlay() {
+    if (!qthMapWidget) {
+        return;
+    }
+
+    auto systemShort = [](const QString &system) {
+        if (system == QStringLiteral("GLONASS")) return QStringLiteral("R");
+        if (system == QStringLiteral("Galileo")) return QStringLiteral("E");
+        if (system == QStringLiteral("BeiDou")) return QStringLiteral("C");
+        if (system == QStringLiteral("QZSS")) return QStringLiteral("Q");
+        if (system == QStringLiteral("SBAS")) return QStringLiteral("S");
+        if (system == QStringLiteral("GPS")) return QStringLiteral("G");
+        return QStringLiteral("?");
+    };
+
+    QVector<QthMapWidget::SatelliteMarker> markers;
+    markers.reserve(gnssNmeaSatellites.size());
+    for (const GnssNmeaSatellite &satellite : gnssNmeaSatellites) {
+        if (!isGnssNmeaSystemEnabled(satellite.system) ||
+            satellite.elevationDeg < 0 ||
+            satellite.azimuthDeg < 0) {
+            continue;
+        }
+        QthMapWidget::SatelliteMarker marker;
+        marker.system = satellite.system;
+        marker.label = QStringLiteral("%1%2").arg(systemShort(satellite.system)).arg(satellite.prn);
+        marker.elevationDeg = satellite.elevationDeg;
+        marker.azimuthDeg = satellite.azimuthDeg;
+        marker.cn0DbHz = satellite.cn0DbHz;
+        marker.usedInFix = satellite.usedInFix;
+        marker.enabled = isGnssSatelliteEnabled(satellite.key);
+        markers.append(marker);
+    }
+    qthMapWidget->setSatelliteMarkers(markers);
+}
+
+QString YourClassName::formattedGnssUtc() const {
+    return formatGnssUtcForDisplay(gnssSerialUtc, gnssTimeZoneOffsetMinutes);
 }
 
 void YourClassName::updateQthMapControls() {
@@ -7943,6 +10007,11 @@ void YourClassName::updateQthMapControls() {
         QSignalBlocker blocker(qthGridPrecisionCombo);
         const int index = qthGridPrecisionCombo->findData(qthGridPrecision);
         qthGridPrecisionCombo->setCurrentIndex(index >= 0 ? index : qthGridPrecisionCombo->findData(6));
+    }
+    if (qthMapOverlayCombo) {
+        QSignalBlocker blocker(qthMapOverlayCombo);
+        const int index = qthMapOverlayCombo->findData(qthMapOverlayMode);
+        qthMapOverlayCombo->setCurrentIndex(index >= 0 ? index : qthMapOverlayCombo->findData(1));
     }
     if (qthTileDirectoryEdit) {
         QSignalBlocker blocker(qthTileDirectoryEdit);
@@ -8061,6 +10130,27 @@ void YourClassName::openQthMapWindow() {
         qthMapLayerCombo->addItem(uiText(QStringLiteral("online_xyz_tiles"),
                                          QStringLiteral("Online XYZ tiles")),
                                   2);
+        QLabel *overlayLabel = new QLabel(uiText(QStringLiteral("map_overlay"),
+                                                 QStringLiteral("Overlay:")),
+                                          qthMapDialog);
+        qthMapOverlayCombo = new QComboBox(qthMapDialog);
+        qthMapOverlayCombo->addItem(uiText(QStringLiteral("map_overlay_none"),
+                                           QStringLiteral("None")),
+                                    static_cast<int>(QthMapWidget::OverlayMode::None));
+        qthMapOverlayCombo->addItem(uiText(QStringLiteral("map_overlay_grid"),
+                                           QStringLiteral("QTH grid")),
+                                    static_cast<int>(QthMapWidget::OverlayMode::QthGrid));
+        qthMapOverlayCombo->addItem(uiText(QStringLiteral("map_overlay_grid_satellites"),
+                                           QStringLiteral("Grid + satellites")),
+                                    static_cast<int>(QthMapWidget::OverlayMode::GridAndSatellites));
+        qthMapOverlayCombo->addItem(uiText(QStringLiteral("map_overlay_satellites"),
+                                           QStringLiteral("Satellites")),
+                                    static_cast<int>(QthMapWidget::OverlayMode::Satellites));
+        qthMapOverlayCombo->setToolTip(uiText(
+            QStringLiteral("map_overlay_tooltip"),
+            QStringLiteral("Choose QTH grid and a local scaled live NMEA satellite sky overlay drawn over the map.")));
+        qthMapOverlayCombo->setMinimumContentsLength(8);
+        qthMapOverlayCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         QLabel *providerLabel = new QLabel(uiText(QStringLiteral("provider"),
                                                   QStringLiteral("Provider:")),
                                            qthMapDialog);
@@ -8075,6 +10165,7 @@ void YourClassName::openQthMapWindow() {
         qthMapZoomSpin = new QSpinBox(qthMapDialog);
         qthMapZoomSpin->setRange(0, 19);
         qthMapZoomSpin->setValue(qthMapZoom);
+        qthMapZoomSpin->setMaximumWidth(64);
 
         QLabel *gridLabel = new QLabel(uiText(QStringLiteral("qth_grid"),
                                               QStringLiteral("QTH grid:")),
@@ -8140,28 +10231,30 @@ void YourClassName::openQthMapWindow() {
 
         mapControlLayout->addWidget(layerLabel, 0, 0);
         mapControlLayout->addWidget(qthMapLayerCombo, 0, 1);
-        mapControlLayout->addWidget(zoomLabel, 0, 2);
-        mapControlLayout->addWidget(qthMapZoomSpin, 0, 3);
-        mapControlLayout->addWidget(gridLabel, 0, 4);
-        mapControlLayout->addWidget(qthGridPrecisionCombo, 0, 5);
+        mapControlLayout->addWidget(overlayLabel, 0, 2);
+        mapControlLayout->addWidget(qthMapOverlayCombo, 0, 3);
+        mapControlLayout->addWidget(zoomLabel, 0, 4);
+        mapControlLayout->addWidget(qthMapZoomSpin, 0, 5);
+        mapControlLayout->addWidget(gridLabel, 0, 6);
+        mapControlLayout->addWidget(qthGridPrecisionCombo, 0, 7);
         mapControlLayout->addWidget(tilesLabel, 1, 0);
-        mapControlLayout->addWidget(qthTileDirectoryEdit, 1, 1, 1, 3);
-        mapControlLayout->addWidget(qthSelectTilesButton, 1, 4);
-        mapControlLayout->addWidget(qthOpenTilesButton, 1, 5);
+        mapControlLayout->addWidget(qthTileDirectoryEdit, 1, 1, 1, 4);
+        mapControlLayout->addWidget(qthSelectTilesButton, 1, 5);
+        mapControlLayout->addWidget(qthOpenTilesButton, 1, 6, 1, 2);
         mapControlLayout->addWidget(providerLabel, 2, 0);
         mapControlLayout->addWidget(qthOnlineProviderCombo, 2, 1);
         mapControlLayout->addWidget(apiKeyLabel, 2, 2);
         mapControlLayout->addWidget(qthOnlineApiKeyEdit, 2, 3);
         mapControlLayout->addWidget(qthOnlineNoDiskCacheCheckbox, 2, 4);
-        mapControlLayout->addWidget(qthUseOsmButton, 2, 5);
+        mapControlLayout->addWidget(qthUseOsmButton, 2, 5, 1, 3);
         mapControlLayout->addWidget(onlineUrlLabel, 3, 0);
-        mapControlLayout->addWidget(qthOnlineTileUrlEdit, 3, 1, 1, 4);
-        mapControlLayout->addWidget(qthCenterMapButton, 3, 5);
+        mapControlLayout->addWidget(qthOnlineTileUrlEdit, 3, 1, 1, 6);
+        mapControlLayout->addWidget(qthCenterMapButton, 3, 7);
         mapControlLayout->addWidget(onlineAttributionLabel, 4, 0);
-        mapControlLayout->addWidget(qthOnlineAttributionEdit, 4, 1, 1, 5);
+        mapControlLayout->addWidget(qthOnlineAttributionEdit, 4, 1, 1, 7);
         mapControlLayout->addWidget(searchLabel, 5, 0);
-        mapControlLayout->addWidget(qthMapSearchEdit, 5, 1, 1, 4);
-        mapControlLayout->addWidget(qthMapSearchButton, 5, 5);
+        mapControlLayout->addWidget(qthMapSearchEdit, 5, 1, 1, 6);
+        mapControlLayout->addWidget(qthMapSearchButton, 5, 7);
         rootLayout->addLayout(mapControlLayout);
         rootLayout->addWidget(qthMapStatusLabel);
 
@@ -8180,7 +10273,9 @@ void YourClassName::openQthMapWindow() {
         qthMapWidget->setOnlineDiskCacheEnabled(!qthOnlineNoDiskCache);
         qthMapWidget->setMapZoom(qthMapZoom);
         qthMapWidget->setGridPrecision(qthGridPrecision);
+        qthMapWidget->setOverlayMode(static_cast<QthMapWidget::OverlayMode>(qthMapOverlayMode));
         qthMapWidget->setUserMarkers(qthUserMarkers);
+        updateQthMapSatelliteOverlay();
         rootLayout->addWidget(qthMapWidget, 1);
 
         QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Close, qthMapDialog);
@@ -8226,6 +10321,15 @@ void YourClassName::openQthMapWindow() {
             qthGridPrecision = qthGridPrecisionCombo ? qthGridPrecisionCombo->currentData().toInt() : 6;
             if (qthMapWidget) {
                 qthMapWidget->setGridPrecision(qthGridPrecision);
+            }
+            updateQthMapControls();
+            savePersistentSettings();
+        });
+        connect(qthMapOverlayCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), qthMapDialog, [this](int) {
+            qthMapOverlayMode = qthMapOverlayCombo ? qthMapOverlayCombo->currentData().toInt() : 1;
+            qthMapOverlayMode = (std::clamp)(qthMapOverlayMode, 0, 3);
+            if (qthMapWidget) {
+                qthMapWidget->setOverlayMode(static_cast<QthMapWidget::OverlayMode>(qthMapOverlayMode));
             }
             updateQthMapControls();
             savePersistentSettings();
@@ -8341,6 +10445,7 @@ void YourClassName::openQthMapWindow() {
             qthMapDialog = nullptr;
             qthMapWidget = nullptr;
             qthMapLayerCombo = nullptr;
+            qthMapOverlayCombo = nullptr;
             qthMapZoomSpin = nullptr;
             qthGridPrecisionCombo = nullptr;
             qthTileDirectoryEdit = nullptr;
@@ -8934,8 +11039,9 @@ void YourClassName::updateGnssMonitorStatus(const GnssSignalReport &report, bool
     }
 
     if (forceLog ||
-        !gnssMonitorLogTimer.isValid() ||
-        gnssMonitorLogTimer.elapsed() >= 3000) {
+        (fobosVerboseLoggingEnabled() &&
+         (!gnssMonitorLogTimer.isValid() ||
+          gnssMonitorLogTimer.elapsed() >= 3000))) {
         gnssMonitorLogTimer.restart();
         qDebug() << "[GNSS IQ]"
                  << "source" << (report.fromSnapshot ? "snapshot" : "frame")
@@ -9086,6 +11192,7 @@ void YourClassName::updateGnssAcquisitionPlot(const GnssAcquisitionResult &resul
     if (!gnssAcquisitionPlotLabel) {
         return;
     }
+    gnssAcquisitionPlotShowsAcquisition = true;
 
     const int width = (std::max)(520, gnssAcquisitionPlotLabel->width());
     const int height = 220;
@@ -10074,6 +12181,8 @@ void YourClassName::saveGnssAcquisitionArtifacts(const GnssAcquisitionResult &re
     report.insert(QStringLiteral("channelFilterCutoffHz"), finiteJson(result.channelFilterCutoffHz));
     report.insert(QStringLiteral("channelizerTaps"), result.channelizerTaps);
     report.insert(QStringLiteral("millisecondAgc"), result.millisecondAgc);
+    report.insert(QStringLiteral("toneNotchesApplied"), result.toneNotchesApplied);
+    report.insert(QStringLiteral("strongestToneNotchDb"), finiteJson(result.strongestToneNotchDb));
 
     QJsonObject qthObject;
     qthObject.insert(QStringLiteral("latitude"), finiteJson(qthLatitude));
@@ -10227,6 +12336,8 @@ void YourClassName::updateGnssAcquisitionStatus(const GnssAcquisitionResult &res
              << "channelFilterCutoffHz" << result.channelFilterCutoffHz
              << "channelizerTaps" << result.channelizerTaps
              << "millisecondAgc" << result.millisecondAgc
+             << "toneNotches" << result.toneNotchesApplied
+             << "strongestToneNotchDb" << result.strongestToneNotchDb
              << "processingMs" << result.processingElapsedMs
              << "centerHz" << result.centerFrequency
              << "targetHz" << result.targetFrequency
@@ -10386,6 +12497,12 @@ void YourClassName::openApplicationSettings() {
     QCheckBox *generalBandMarkersOption = new QCheckBox(uiText(QStringLiteral("general_band_markers"), QStringLiteral("Band markers")), quickOptionsBox);
     QCheckBox *amateurBandMarkersOption = new QCheckBox(uiText(QStringLiteral("amateur_band_markers"), QStringLiteral("HAM bands")), quickOptionsBox);
     QCheckBox *compactBandMarkersOption = new QCheckBox(uiText(QStringLiteral("compact_band_markers"), QStringLiteral("Collapsed bands")), quickOptionsBox);
+    QCheckBox *gnssUbxAutoEnableOption = new QCheckBox(uiText(QStringLiteral("gnss_ubx_auto_enable"),
+                                                              QStringLiteral("Auto-enable UBX")),
+                                                       quickOptionsBox);
+    gnssUbxAutoEnableOption->setToolTip(uiText(
+        QStringLiteral("gnss_ubx_auto_enable_tooltip"),
+        QStringLiteral("After opening a GNSS serial port, automatically request u-blox NAV-PVT, NAV-SAT and NAV-DOP output.")));
     QCheckBox *loggingOption = new QCheckBox(uiText(QStringLiteral("logging"), QString::fromUtf8("Логування")), quickOptionsBox);
     loggingOption->setToolTip(uiText(QStringLiteral("logging_tooltip"),
                                      QStringLiteral("Write detailed diagnostic logs and DMR dumps")));
@@ -10398,6 +12515,7 @@ void YourClassName::openApplicationSettings() {
     generalBandMarkersOption->setChecked(showGeneralBandMarkers);
     amateurBandMarkersOption->setChecked(showAmateurBandMarkers);
     compactBandMarkersOption->setChecked(compactBandMarkers);
+    gnssUbxAutoEnableOption->setChecked(gnssUbxAutoEnable);
     loggingOption->setChecked(diagnosticVerboseLogging);
     quickOptionsLayout->addWidget(audioOption, 0, 0);
     quickOptionsLayout->addWidget(syncOption, 0, 1);
@@ -10406,7 +12524,8 @@ void YourClassName::openApplicationSettings() {
     quickOptionsLayout->addWidget(generalBandMarkersOption, 2, 0);
     quickOptionsLayout->addWidget(amateurBandMarkersOption, 2, 1);
     quickOptionsLayout->addWidget(compactBandMarkersOption, 2, 2);
-    quickOptionsLayout->addWidget(loggingOption, 3, 0);
+    quickOptionsLayout->addWidget(gnssUbxAutoEnableOption, 3, 0);
+    quickOptionsLayout->addWidget(loggingOption, 3, 1);
     rootLayout->addWidget(quickOptionsBox);
 
     auto applyLanguage = [this, languageCombo]() {
@@ -10508,6 +12627,10 @@ void YourClassName::openApplicationSettings() {
     connect(compactBandMarkersOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
         compactBandMarkers = checked;
         updateGraphBandMarkers();
+        savePersistentSettings();
+    });
+    connect(gnssUbxAutoEnableOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
+        gnssUbxAutoEnable = checked;
         savePersistentSettings();
     });
     connect(loggingOption, &QCheckBox::toggled, &dialog, [this](bool checked) {
@@ -11525,13 +13648,20 @@ void YourClassName::refreshSettingsFromUi() {
         }
     }
     if (gnssSerialPortEdit) {
-        gnssSerialPortName = gnssSerialPortEdit->text().trimmed();
+        gnssSerialPortName = gnssSerialPortEdit->currentText().trimmed();
         if (gnssSerialPortName.isEmpty()) {
             gnssSerialPortName = QStringLiteral("COM4");
         }
     }
     if (gnssSerialBaudSpin) {
         gnssSerialBaud = (std::clamp)(gnssSerialBaudSpin->value(), 1200, 921600);
+    }
+    if (gnssPositionPolicyCombo) {
+        gnssPositionPolicy =
+            normalizedGnssPositionPolicy(gnssPositionPolicyCombo->currentData().toString());
+    }
+    if (gnssTimeZoneCombo) {
+        gnssTimeZoneOffsetMinutes = gnssTimeZoneCombo->currentData().toInt();
     }
     if (gnssSystemCombo) {
         gnssSystemId = gnssSystemCombo->currentData().toString().trimmed();
@@ -11542,6 +13672,27 @@ void YourClassName::refreshSettingsFromUi() {
     }
     if (gnssMonitorCheckbox) {
         gnssMonitorEnabled = gnssMonitorCheckbox->isChecked();
+    }
+    if (gnssUseGpsCheckbox) {
+        gnssUseGps = gnssUseGpsCheckbox->isChecked();
+    }
+    if (gnssUseGlonassCheckbox) {
+        gnssUseGlonass = gnssUseGlonassCheckbox->isChecked();
+    }
+    if (gnssUseGalileoCheckbox) {
+        gnssUseGalileo = gnssUseGalileoCheckbox->isChecked();
+    }
+    if (gnssUseBeidouCheckbox) {
+        gnssUseBeidou = gnssUseBeidouCheckbox->isChecked();
+    }
+    if (gnssUseQzssCheckbox) {
+        gnssUseQzss = gnssUseQzssCheckbox->isChecked();
+    }
+    if (gnssUseSbasCheckbox) {
+        gnssUseSbas = gnssUseSbasCheckbox->isChecked();
+    }
+    if (gnssUseOtherCheckbox) {
+        gnssUseOther = gnssUseOtherCheckbox->isChecked();
     }
     if (qthMapLayerCombo) {
         qthMapLayer = qthMapLayerCombo->currentData().toInt();
@@ -11557,6 +13708,9 @@ void YourClassName::refreshSettingsFromUi() {
     }
     if (qthGridPrecisionCombo) {
         qthGridPrecision = qthGridPrecisionCombo->currentData().toInt();
+    }
+    if (qthMapOverlayCombo) {
+        qthMapOverlayMode = (std::clamp)(qthMapOverlayCombo->currentData().toInt(), 0, 3);
     }
     if (qthTileDirectoryEdit) {
         qthTileDirectory = QDir::fromNativeSeparators(qthTileDirectoryEdit->text().trimmed());
@@ -12075,16 +14229,16 @@ void YourClassName::handleDataProcessorFailure(int errorCode, bool stoppedByRequ
     const bool startupFailure =
         streamStartElapsedTimer.isValid() &&
         streamStartElapsedTimer.elapsed() < 2500 &&
-        !externalBackendFailure &&
         streamStartupRetryCount < 1;
     if (startupFailure) {
         ++streamStartupRetryCount;
         restartAfterStartupWatchdog = true;
         qDebug() << "[FobosLifecycle] reader startup failure will retry once"
                  << "retryCount" << streamStartupRetryCount
-                 << "error" << errorCode;
+                 << "error" << errorCode
+                 << "externalBackend" << externalBackendFailure;
     } else if (externalBackendFailure) {
-        qDebug() << "[FobosLifecycle] external receiver startup failure: automatic retry disabled"
+        qDebug() << "[FobosLifecycle] external receiver startup failure retry already used"
                  << "error" << errorCode;
     }
 
@@ -12633,10 +14787,15 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["qthSource"] = qthSource;
     settings["gnssSerialPortName"] = gnssSerialPortName;
     settings["gnssSerialBaud"] = gnssSerialBaud;
+    settings["gnssPositionPolicy"] = normalizedGnssPositionPolicy(gnssPositionPolicy);
+    settings["gnssUbxAutoEnable"] = gnssUbxAutoEnable;
+    settings["gnssTimeZoneOffsetMinutes"] = gnssTimeZoneOffsetMinutes;
+    settings["gnssSatelliteTableVisible"] = gnssSatelliteTableVisible;
     settings["qthTileDirectory"] = qthTileDirectory;
     settings["qthMapLayer"] = qthMapLayer;
     settings["qthMapZoom"] = qthMapZoom;
     settings["qthGridPrecision"] = qthGridPrecision;
+    settings["qthMapOverlayMode"] = qthMapOverlayMode;
     settings["qthOnlineProviderId"] = qthOnlineProviderId;
     settings["qthOnlineTileUrlTemplate"] = qthOnlineTileUrlTemplate;
     settings["qthOnlineAttribution"] = qthOnlineAttribution;
@@ -12644,6 +14803,22 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["qthOnlineNoDiskCache"] = qthOnlineNoDiskCache;
     settings["gnssSystemId"] = gnssSystemId;
     settings["gnssMonitorEnabled"] = gnssMonitorEnabled;
+    settings["gnssUseGps"] = gnssUseGps;
+    settings["gnssUseGlonass"] = gnssUseGlonass;
+    settings["gnssUseGalileo"] = gnssUseGalileo;
+    settings["gnssUseBeidou"] = gnssUseBeidou;
+    settings["gnssUseQzss"] = gnssUseQzss;
+    settings["gnssUseSbas"] = gnssUseSbas;
+    settings["gnssUseOther"] = gnssUseOther;
+    QJsonArray gnssDisabledSatellites;
+    QStringList disabledSatelliteKeys = gnssDisabledSatelliteKeys.values();
+    disabledSatelliteKeys.sort();
+    for (const QString &key : disabledSatelliteKeys) {
+        if (!key.trimmed().isEmpty()) {
+            gnssDisabledSatellites.append(key);
+        }
+    }
+    settings["gnssDisabledSatellites"] = gnssDisabledSatellites;
     settings["gnssAcquisitionIntegrationMs"] = gnssAcquisitionIntegrationMs;
     settings["gnssChannelFilterCutoffHz"] = gnssChannelFilterCutoffHz;
     settings["gnssDopplerSpanHz"] = gnssDopplerSpanHz;
@@ -12879,6 +15054,13 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool 
         gnssSerialPortName = QStringLiteral("COM4");
     }
     gnssSerialBaud = (std::clamp)(readInt("gnssSerialBaud", gnssSerialBaud), 1200, 921600);
+    gnssPositionPolicy =
+        normalizedGnssPositionPolicy(settingsJson.value("gnssPositionPolicy").toString(gnssPositionPolicy));
+    gnssUbxAutoEnable = readBool("gnssUbxAutoEnable", gnssUbxAutoEnable);
+    gnssTimeZoneOffsetMinutes = (std::clamp)(readInt("gnssTimeZoneOffsetMinutes", gnssTimeZoneOffsetMinutes),
+                                             -12 * 60,
+                                             100000);
+    gnssSatelliteTableVisible = readBool("gnssSatelliteTableVisible", gnssSatelliteTableVisible);
     qthTileDirectory = settingsJson.value("qthTileDirectory").toString(qthTileDirectory).trimmed();
     qthMapLayer = (std::clamp)(readInt("qthMapLayer", qthMapLayer), 0, 2);
     qthMapZoom = (std::clamp)(readInt("qthMapZoom", qthMapZoom), 0, 19);
@@ -12897,6 +15079,26 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool 
     gnssSystemId =
         gnssSystemPreset(settingsJson.value("gnssSystemId").toString(gnssSystemId).trimmed()).id;
     gnssMonitorEnabled = readBool("gnssMonitorEnabled", gnssMonitorEnabled);
+    gnssUseGps = readBool("gnssUseGps", gnssUseGps);
+    gnssUseGlonass = readBool("gnssUseGlonass", gnssUseGlonass);
+    gnssUseGalileo = readBool("gnssUseGalileo", gnssUseGalileo);
+    gnssUseBeidou = readBool("gnssUseBeidou", gnssUseBeidou);
+    gnssUseQzss = readBool("gnssUseQzss", gnssUseQzss);
+    gnssUseSbas = readBool("gnssUseSbas", gnssUseSbas);
+    gnssUseOther = readBool("gnssUseOther", gnssUseOther);
+    if (settingsJson.contains(QStringLiteral("gnssDisabledSatellites"))) {
+        gnssDisabledSatelliteKeys.clear();
+        const QJsonArray disabledSatellites = settingsJson.value(QStringLiteral("gnssDisabledSatellites")).toArray();
+        for (const QJsonValue &value : disabledSatellites) {
+            const QString key = value.toString().trimmed();
+            if (!key.isEmpty()) {
+                gnssDisabledSatelliteKeys.insert(key);
+            }
+        }
+        for (auto it = gnssNmeaSatelliteEnabled.begin(); it != gnssNmeaSatelliteEnabled.end(); ++it) {
+            it.value() = !gnssDisabledSatelliteKeys.contains(it.key());
+        }
+    }
     gnssAcquisitionIntegrationMs =
         (std::clamp)(readInt("gnssAcquisitionIntegrationMs", gnssAcquisitionIntegrationMs),
                      GNSS_ACQUISITION_MIN_INTEGRATION_MS,
@@ -12917,6 +15119,7 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool 
     } else {
         qthGridPrecision = 6;
     }
+    qthMapOverlayMode = (std::clamp)(readInt("qthMapOverlayMode", qthMapOverlayMode), 0, 3);
     if (settingsJson.contains(QStringLiteral("qthMarkers"))) {
         QVector<qth::UserMarker> nextMarkers;
         QVector<int> usedNumbers;
@@ -13147,11 +15350,41 @@ void YourClassName::loadUiTranslations() {
         {"nmea_gps", "NMEA GPS"},
         {"os_location", "OS location"},
         {"gps_source_future_tooltip", "OS location input is planned; manual coordinates are used for now."},
-        {"paste_nmea", "NMEA"},
+        {"paste_nmea", "Paste"},
         {"nmea_paste_tooltip", "Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH."},
         {"nmea_parse_failed", "NMEA: no valid GGA/RMC position found in clipboard."},
         {"nmea_position_applied", "NMEA QTH: %1 %2, %3 (%4)"},
         {"nmea_serial", "NMEA:"},
+        {"nmea_log", "Log"},
+        {"nmea_stop_log", "Stop log"},
+        {"nmea_replay", "Replay"},
+        {"nmea_log_tooltip", "Start or stop writing live NMEA sentences to recordings/nmea."},
+        {"nmea_replay_tooltip", "Replay a saved NMEA log through the same parser, map and satellite diagnostics."},
+        {"nmea_log_started", "NMEA log started: %1"},
+        {"nmea_log_saved", "NMEA log saved: %1"},
+        {"nmea_log_failed", "NMEA log failed: %1"},
+        {"nmea_replay_select", "Select NMEA log"},
+        {"nmea_log_filter", "NMEA logs (*.log *.nmea *.txt);;All files (*.*)"},
+        {"nmea_replay_failed", "NMEA replay failed: %1"},
+        {"nmea_replay_done", "NMEA replay: %1 sentences from %2"},
+        {"gnss_position_policy_auto", "Auto"},
+        {"gnss_position_policy_ubx_preferred", "UBX preferred"},
+        {"gnss_position_policy_nmea_only", "NMEA only"},
+        {"gnss_position_policy_ubx_only", "UBX only"},
+        {"gnss_position_policy_tooltip", "Choose which external GNSS stream is allowed to update the current QTH position."},
+        {"gnss_time_zone", "Time:"},
+        {"gnss_timezone_tooltip", "Time zone used only for displaying GNSS UTC time. Raw NMEA/UBX data remains unchanged."},
+        {"local_time", "Local"},
+        {"gnss_ubx_auto_enable", "Auto-enable UBX"},
+        {"gnss_ubx_auto_enable_tooltip", "After opening a GNSS serial port, automatically request u-blox NAV-PVT, NAV-SAT and NAV-DOP output."},
+        {"ubx_on", "UBX on"},
+        {"ubx_off", "UBX off"},
+        {"ubx_enable_tooltip", "Enable or disable u-blox UBX NAV-PVT, NAV-SAT and NAV-DOP messages on the connected GNSS module."},
+        {"ubx_requires_serial", "UBX: connect the GNSS serial port first."},
+        {"ubx_enabled", "UBX output enabled (%1 bytes sent)."},
+        {"ubx_disabled", "UBX output disabled (%1 bytes sent)."},
+        {"ubx_receiving", "UBX: receiving %1 frames, fix %2, SV %3"},
+        {"ubx_fix", "UBX PVT: fix %1, %2, %3 (%4), #%5, %6"},
         {"connect", "Connect"},
         {"disconnect", "Disconnect"},
         {"gnss_serial_port_tooltip", "Serial port for an external NMEA GNSS receiver, for example COM4 or /dev/ttyUSB0."},
@@ -13161,12 +15394,15 @@ void YourClassName::loadUiTranslations() {
         {"gnss_serial_open_failed", "NMEA serial: cannot open %1 at %2 baud (%3)."},
         {"gnss_serial_waiting", "NMEA serial: %1 open at %2 baud, waiting for fix..."},
         {"gnss_serial_receiving", "NMEA serial: receiving (%1 sentences), %2"},
+        {"gnss_serial_live_summary", "NMEA serial: %1"},
         {"gnss_serial_idle", "NMEA serial: disconnected"},
         {"gnss_serial_fix", "NMEA serial: %1 fix %2, %3 (%4), #%5"},
+        {"gnss_serial_fix_filtered", "NMEA serial: fix ignored by satellite filters"},
         {"gnss_serial_error", "NMEA serial error: %1"},
         {"source", "Source:"},
         {"gnss_system", "System:"},
         {"gnss_system_tooltip", "Select which GNSS signal family the tune, scan and acquisition controls should target."},
+        {"gnss_system_filter_tooltip", "Use this constellation in NMEA satellite diagnostics and filtered GNSS decisions."},
         {"gnss_acq_integration", "Accum:"},
         {"gnss_acq_integration_tooltip", "How many milliseconds of GPS C/A code to accumulate from the current IQ snapshot."},
         {"gnss_channel_lpf", "GPS LPF:"},
@@ -13225,7 +15461,45 @@ void YourClassName::loadUiTranslations() {
         {"gnss_acq_plot", "Plot"},
         {"gnss_acq_plot_title", "GNSS acquisition diagnostics"},
         {"gnss_acq_plot_tooltip", "GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history."},
-        {"gnss_acq_plot_waiting", "Run GPS C/A accumulation to draw correlation diagnostics."},
+        {"gnss_acq_plot_waiting", "Run Accum/Deep/Replay/Self-test to draw SDR correlation heatmap."},
+        {"gnss_satellites", "Sats"},
+        {"gnss_satellites_tooltip", "Open the live GNSS satellite list and sky view in a separate resizable window."},
+        {"gnss_satellite_window_title", "GNSS satellites"},
+        {"gnss_satellite_status_waiting", "Waiting for GNSS satellite data."},
+        {"gnss_satellite_status_tooltip", "Live GNSS fix summary from NMEA and UBX: source, fix type, satellites, DOP, altitude, speed and time."},
+        {"gnss_satellite_table_tooltip", "Live GNSS satellites from NMEA GSV/GSA and UBX NAV-SAT. Click headers to sort; right-click Use for bulk selection."},
+        {"gnss_satellite_table_window_title", "GNSS satellite table"},
+        {"gnss_sky_waiting", "Waiting for live GNSS satellites."},
+        {"gnss_sky_tooltip", "Sky view from NMEA GSV or UBX NAV-SAT azimuth/elevation values. Color follows C/N0; white outline means the satellite is used in the module fix."},
+        {"gnss_sky_title", "GNSS sky view / C/N0"},
+        {"gnss_no_live_satellites", "No live GNSS satellites yet."},
+        {"source_short", "Src"},
+        {"elevation_short", "El"},
+        {"azimuth_short", "Az"},
+        {"fix", "Fix"},
+        {"age", "Age"},
+        {"quality", "Quality"},
+        {"used", "used"},
+        {"strong", "strong"},
+        {"good", "good"},
+        {"weak", "weak"},
+        {"poor", "poor"},
+        {"used_strong", "used strong"},
+        {"used_good", "used good"},
+        {"used_weak", "used weak"},
+        {"used_poor", "used poor"},
+        {"no_fix", "no fix"},
+        {"fix_number", "fix %1"},
+        {"policy", "Policy"},
+        {"satellites", "Satellites"},
+        {"signal", "Signal"},
+        {"position", "Position"},
+        {"motion", "Motion"},
+        {"time", "Time"},
+        {"gnss_satellite_count_summary", "%1 used / %2 visible"},
+        {"gnss_signal_summary", "%1 avg C/N0, %2 enabled, %3 ignored"},
+        {"show_table", "Table"},
+        {"gnss_satellite_table_toggle_tooltip", "Open or hide the live satellite table in a separate resizable window."},
         {"gps_ca_scan_running", "GPS C/A accumulation: running"},
         {"gps_ca_scan_no_iq", "GPS C/A accumulation: no IQ snapshot yet"},
         {"gps_ca_scan_no_candidate", "GPS C/A accumulation: no candidates"},
@@ -13679,6 +15953,36 @@ void YourClassName::applyUiLanguage() {
                      QStringLiteral("os"),
                      QStringLiteral("os_location"),
                      QStringLiteral("OS location"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("auto"),
+                     QStringLiteral("gnss_position_policy_auto"),
+                     QStringLiteral("Auto"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("ubx_preferred"),
+                     QStringLiteral("gnss_position_policy_ubx_preferred"),
+                     QStringLiteral("UBX preferred"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("nmea_only"),
+                     QStringLiteral("gnss_position_policy_nmea_only"),
+                     QStringLiteral("NMEA only"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("ubx_only"),
+                     QStringLiteral("gnss_position_policy_ubx_only"),
+                     QStringLiteral("UBX only"));
+    if (gnssPositionPolicyCombo) {
+        gnssPositionPolicyCombo->setToolTip(uiText(
+            QStringLiteral("gnss_position_policy_tooltip"),
+            QStringLiteral("Choose which external GNSS stream is allowed to update the current QTH position.")));
+    }
+    setComboItemText(gnssTimeZoneCombo,
+                     100000,
+                     QStringLiteral("local_time"),
+                     QStringLiteral("Local"));
+    if (gnssTimeZoneCombo) {
+        gnssTimeZoneCombo->setToolTip(uiText(
+            QStringLiteral("gnss_timezone_tooltip"),
+            QStringLiteral("Time zone used only for displaying GNSS UTC time. Raw NMEA/UBX data remains unchanged.")));
+    }
     if (qthSourceCombo) {
         qthSourceCombo->setItemData(1,
                                     uiText(QStringLiteral("nmea_paste_tooltip"),
@@ -13699,6 +16003,11 @@ void YourClassName::applyUiLanguage() {
             QStringLiteral("clear_qth_tooltip"),
             QStringLiteral("Hide the current real QTH position from the map and clear the live location state.")));
     }
+    if (gnssMonitorResetButton) {
+        gnssMonitorResetButton->setToolTip(uiText(
+            QStringLiteral("gnss_iq_monitor_reset_tooltip"),
+            QStringLiteral("Reset only the GNSS IQ monitor peak history and accumulated SDR statistics. It does not clear the QTH position.")));
+    }
     if (gnssSerialPortEdit) {
         gnssSerialPortEdit->setToolTip(uiText(
             QStringLiteral("gnss_serial_port_tooltip"),
@@ -13714,6 +16023,16 @@ void YourClassName::applyUiLanguage() {
             QStringLiteral("gnss_serial_connect_tooltip"),
             QStringLiteral("Open the serial NMEA stream and use valid GGA/RMC fixes as the current QTH.")));
     }
+    if (gnssNmeaLogButton) {
+        gnssNmeaLogButton->setToolTip(uiText(
+            QStringLiteral("nmea_log_tooltip"),
+            QStringLiteral("Start or stop writing live NMEA sentences to recordings/nmea.")));
+    }
+    if (gnssNmeaReplayButton) {
+        gnssNmeaReplayButton->setToolTip(uiText(
+            QStringLiteral("nmea_replay_tooltip"),
+            QStringLiteral("Replay a saved NMEA log through the same parser, map and satellite diagnostics.")));
+    }
     if (gnssAcquisitionPlotDialog) {
         gnssAcquisitionPlotDialog->setWindowTitle(uiText(
             QStringLiteral("gnss_acq_plot_title"),
@@ -13723,6 +16042,56 @@ void YourClassName::applyUiLanguage() {
         gnssPlotButton->setToolTip(uiText(
             QStringLiteral("gnss_acq_plot_tooltip"),
             QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
+    }
+    if (gnssSatelliteDialog) {
+        gnssSatelliteDialog->setWindowTitle(uiText(
+            QStringLiteral("gnss_satellite_window_title"),
+            QStringLiteral("GNSS satellites")));
+    }
+    if (gnssSatelliteTableDialog) {
+        gnssSatelliteTableDialog->setWindowTitle(uiText(
+            QStringLiteral("gnss_satellite_table_window_title"),
+            QStringLiteral("GNSS satellite table")));
+    }
+    if (gnssSatellitesButton) {
+        gnssSatellitesButton->setToolTip(uiText(
+            QStringLiteral("gnss_satellites_tooltip"),
+            QStringLiteral("Open the live GNSS satellite list and sky view in a separate resizable window.")));
+    }
+    if (gnssSatelliteTable) {
+        gnssSatelliteTable->setHorizontalHeaderLabels({
+            uiText(QStringLiteral("use"), QStringLiteral("Use")),
+            uiText(QStringLiteral("source_short"), QStringLiteral("Src")),
+            uiText(QStringLiteral("system"), QStringLiteral("System")),
+            QStringLiteral("SVID"),
+            uiText(QStringLiteral("elevation_short"), QStringLiteral("El")),
+            uiText(QStringLiteral("azimuth_short"), QStringLiteral("Az")),
+            QStringLiteral("C/N0"),
+            uiText(QStringLiteral("fix"), QStringLiteral("Fix")),
+            uiText(QStringLiteral("age"), QStringLiteral("Age")),
+            uiText(QStringLiteral("quality"), QStringLiteral("Quality"))
+        });
+        gnssSatelliteTable->setToolTip(uiText(
+            QStringLiteral("gnss_satellite_table_tooltip"),
+            QStringLiteral("Live GNSS satellites from NMEA GSV/GSA and UBX NAV-SAT. Click headers to sort; right-click Use for bulk selection.")));
+    }
+    if (gnssSatelliteStatusLabel) {
+        gnssSatelliteStatusLabel->setToolTip(uiText(
+            QStringLiteral("gnss_satellite_status_tooltip"),
+            QStringLiteral("Live GNSS fix summary from NMEA and UBX: source, fix type, satellites, DOP, altitude, speed and UTC.")));
+    }
+    if (gnssSatelliteTableCheckbox) {
+        QSignalBlocker blocker(gnssSatelliteTableCheckbox);
+        gnssSatelliteTableCheckbox->setText(uiText(QStringLiteral("show_table"), QStringLiteral("Table")));
+        gnssSatelliteTableCheckbox->setChecked(gnssSatelliteTableVisible);
+        gnssSatelliteTableCheckbox->setToolTip(uiText(
+            QStringLiteral("gnss_satellite_table_toggle_tooltip"),
+            QStringLiteral("Open or hide the live satellite table in a separate resizable window.")));
+    }
+    if (gnssSatelliteSkyLabel) {
+        gnssSatelliteSkyLabel->setToolTip(uiText(
+            QStringLiteral("gnss_sky_tooltip"),
+            QStringLiteral("Sky view from NMEA GSV or UBX NAV-SAT azimuth/elevation values. Color follows C/N0; white outline means the satellite is used in the module fix.")));
     }
     if (gnssDopplerSpanSpin) {
         gnssDopplerSpanSpin->setToolTip(uiText(
@@ -14386,6 +16755,16 @@ void YourClassName::loadPersistentSettings() {
         (std::clamp)(settings.value("gpsQth/nmeaSerialBaud", gnssSerialBaud).toInt(),
                      1200,
                      921600);
+    gnssPositionPolicy =
+        normalizedGnssPositionPolicy(settings.value("gpsQth/positionPolicy", gnssPositionPolicy).toString());
+    gnssUbxAutoEnable =
+        settings.value("gpsQth/ubxAutoEnable", gnssUbxAutoEnable).toBool();
+    gnssTimeZoneOffsetMinutes =
+        (std::clamp)(settings.value("gpsQth/timeZoneOffsetMinutes", gnssTimeZoneOffsetMinutes).toInt(),
+                     -12 * 60,
+                     100000);
+    gnssSatelliteTableVisible =
+        settings.value("gpsQth/satelliteTableVisible", gnssSatelliteTableVisible).toBool();
     qthTileDirectory = settings.value("gpsQth/tileDirectory", qthTileDirectory).toString().trimmed();
     qthMapLayer = (std::clamp)(settings.value("gpsQth/mapLayer", qthMapLayer).toInt(), 0, 2);
     qthMapZoom = (std::clamp)(settings.value("gpsQth/mapZoom", qthMapZoom).toInt(), 0, 19);
@@ -14406,6 +16785,22 @@ void YourClassName::loadPersistentSettings() {
         gnssSystemPreset(settings.value("gpsQth/gnssSystemId", gnssSystemId).toString().trimmed()).id;
     gnssMonitorEnabled =
         settings.value("gpsQth/gnssMonitorEnabled", gnssMonitorEnabled).toBool();
+    gnssUseGps = settings.value("gpsQth/gnssUseGps", gnssUseGps).toBool();
+    gnssUseGlonass = settings.value("gpsQth/gnssUseGlonass", gnssUseGlonass).toBool();
+    gnssUseGalileo = settings.value("gpsQth/gnssUseGalileo", gnssUseGalileo).toBool();
+    gnssUseBeidou = settings.value("gpsQth/gnssUseBeidou", gnssUseBeidou).toBool();
+    gnssUseQzss = settings.value("gpsQth/gnssUseQzss", gnssUseQzss).toBool();
+    gnssUseSbas = settings.value("gpsQth/gnssUseSbas", gnssUseSbas).toBool();
+    gnssUseOther = settings.value("gpsQth/gnssUseOther", gnssUseOther).toBool();
+    gnssDisabledSatelliteKeys.clear();
+    const QStringList disabledSatelliteKeys =
+        settings.value("gpsQth/gnssDisabledSatellites").toStringList();
+    for (const QString &key : disabledSatelliteKeys) {
+        const QString normalized = key.trimmed();
+        if (!normalized.isEmpty()) {
+            gnssDisabledSatelliteKeys.insert(normalized);
+        }
+    }
     gnssAcquisitionIntegrationMs =
         (std::clamp)(settings.value("gpsQth/gnssAcquisitionIntegrationMs",
                                     gnssAcquisitionIntegrationMs).toInt(),
@@ -14432,6 +16827,7 @@ void YourClassName::loadPersistentSettings() {
     } else {
         qthGridPrecision = 6;
     }
+    qthMapOverlayMode = (std::clamp)(settings.value("gpsQth/mapOverlayMode", qthMapOverlayMode).toInt(), 0, 3);
     qthUserMarkers.clear();
     QVector<int> qthMarkerNumbers;
     const int qthMarkerCount = settings.beginReadArray(QStringLiteral("gpsQth/markers"));
@@ -15057,10 +17453,15 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("gpsQth/source", qthSource);
     settings.setValue("gpsQth/nmeaSerialPort", gnssSerialPortName);
     settings.setValue("gpsQth/nmeaSerialBaud", gnssSerialBaud);
+    settings.setValue("gpsQth/positionPolicy", normalizedGnssPositionPolicy(gnssPositionPolicy));
+    settings.setValue("gpsQth/ubxAutoEnable", gnssUbxAutoEnable);
+    settings.setValue("gpsQth/timeZoneOffsetMinutes", gnssTimeZoneOffsetMinutes);
+    settings.setValue("gpsQth/satelliteTableVisible", gnssSatelliteTableVisible);
     settings.setValue("gpsQth/tileDirectory", qthTileDirectory);
     settings.setValue("gpsQth/mapLayer", qthMapLayer);
     settings.setValue("gpsQth/mapZoom", qthMapZoom);
     settings.setValue("gpsQth/gridPrecision", qthGridPrecision);
+    settings.setValue("gpsQth/mapOverlayMode", qthMapOverlayMode);
     settings.setValue("gpsQth/onlineProviderId", qthOnlineProviderId);
     settings.setValue("gpsQth/onlineTileUrlTemplate", qthOnlineTileUrlTemplate);
     settings.setValue("gpsQth/onlineAttribution", qthOnlineAttribution);
@@ -15068,6 +17469,16 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("gpsQth/onlineNoDiskCache", qthOnlineNoDiskCache);
     settings.setValue("gpsQth/gnssSystemId", gnssSystemId);
     settings.setValue("gpsQth/gnssMonitorEnabled", gnssMonitorEnabled);
+    settings.setValue("gpsQth/gnssUseGps", gnssUseGps);
+    settings.setValue("gpsQth/gnssUseGlonass", gnssUseGlonass);
+    settings.setValue("gpsQth/gnssUseGalileo", gnssUseGalileo);
+    settings.setValue("gpsQth/gnssUseBeidou", gnssUseBeidou);
+    settings.setValue("gpsQth/gnssUseQzss", gnssUseQzss);
+    settings.setValue("gpsQth/gnssUseSbas", gnssUseSbas);
+    settings.setValue("gpsQth/gnssUseOther", gnssUseOther);
+    QStringList disabledSatelliteKeys = gnssDisabledSatelliteKeys.values();
+    disabledSatelliteKeys.sort();
+    settings.setValue("gpsQth/gnssDisabledSatellites", disabledSatelliteKeys);
     settings.setValue("gpsQth/gnssAcquisitionIntegrationMs", gnssAcquisitionIntegrationMs);
     settings.setValue("gpsQth/gnssChannelFilterCutoffHz", gnssChannelFilterCutoffHz);
     settings.setValue("gpsQth/gnssDopplerSpanHz", gnssDopplerSpanHz);
@@ -16511,6 +18922,7 @@ QStringList YourClassName::dsdNeoProcessArguments() const {
         QString::number(sampleRate),
         QStringLiteral("-o"),
         QStringLiteral("udp:127.0.0.1:%1").arg(outputPort),
+        QStringLiteral("-mc"),
         QStringLiteral("-nm")
     };
 }
@@ -16521,7 +18933,7 @@ void YourClassName::updateDsdNeoBridgeSettings() {
     }
 
     const bool enabled = selectedDmrBackend() == DMR_BACKEND_DSD_NEO;
-    const bool autoStart = dsdNeoAutoStartCheckbox && dsdNeoAutoStartCheckbox->isChecked();
+    bool autoStart = dsdNeoAutoStartCheckbox && dsdNeoAutoStartCheckbox->isChecked();
     const quint16 inputPort =
         dsdNeoInputPortSpin ? static_cast<quint16>(dsdNeoInputPortSpin->value()) : quint16(7355);
     const quint16 outputPort =
@@ -16537,6 +18949,11 @@ void YourClassName::updateDsdNeoBridgeSettings() {
         if (dsdNeoProgramEdit && dsdNeoProgramEdit->text().trimmed() != defaultDsdNeoProgramPath()) {
             const QSignalBlocker blocker(dsdNeoProgramEdit);
             dsdNeoProgramEdit->setText(defaultDsdNeoProgramPath());
+        }
+        if (enabled && !autoStart && dsdNeoAutoStartCheckbox) {
+            const QSignalBlocker blocker(dsdNeoAutoStartCheckbox);
+            dsdNeoAutoStartCheckbox->setChecked(true);
+            autoStart = true;
         }
     }
     QFileInfo programInfo(program);
@@ -16562,7 +18979,7 @@ void YourClassName::updateDsdNeoBridgeSettings() {
     }
 
     dsdNeoBridge->configureInputServer(true, inputPort);
-    dsdNeoBridge->configureUdpOutput(true, outputPort, 1);
+    dsdNeoBridge->configureUdpOutput(true, outputPort, 2);
     dsdNeoBridge->configureProcess(autoStart, program, dsdNeoProcessArguments(), workingDirectory);
     dsdNeoBridge->setEnabled(enabled);
 
@@ -20795,8 +23212,8 @@ ReceiverStreamDescriptor YourClassName::makeRtlSdrNativeStreamDescriptor(bool qu
     stream.sampleRateHz = pendingSettings.sampleRate;
     stream.centerFrequencyHz = pendingSettings.centerFrequency;
     stream.rtlSdrNativeDeviceIndex = selectedRtlSdrNativeIndex();
-    stream.rtlTcpAgc = false;
-    stream.rtlTcpTunerGainTenthsDb = 0;
+    stream.rtlTcpAgc = true;
+    stream.rtlTcpTunerGainTenthsDb = -1;
     stream.syncReader = false;
     stream.queueAudioBlocks = queueAudioBlocks;
     stream.publishIqSnapshot = publishIqSnapshot;
@@ -21555,15 +23972,16 @@ void YourClassName::checkStreamStartup() {
 
     const bool directSamplingStartup = pendingSettings.inputMode != INPUT_RF;
     const bool externalBackend = isExternalReceiverBackendSelected();
-    if (!externalBackend && streamStartupRetryCount < 1) {
+    if (streamStartupRetryCount < 1) {
         ++streamStartupRetryCount;
         restartAfterStartupWatchdog = true;
         qDebug() << "[FobosLifecycle] stream startup watchdog will retry once"
                  << "retryCount" << streamStartupRetryCount
-                 << "directSampling" << directSamplingStartup;
+                 << "directSampling" << directSamplingStartup
+                 << "externalBackend" << externalBackend;
     } else if (externalBackend) {
         restartAfterStartupWatchdog = false;
-        qDebug() << "[FobosLifecycle] external receiver stream startup watchdog: automatic retry disabled";
+        qDebug() << "[FobosLifecycle] external receiver stream startup watchdog retry already used";
     } else {
         restartAfterStartupWatchdog = false;
         qDebug() << "[FobosLifecycle] stream startup watchdog retry already used; leaving receiver stopped";

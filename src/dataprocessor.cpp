@@ -892,14 +892,19 @@ void DataProcessor::runRtlSdrNativeReader(const ReceiverStreamDescriptor &stream
     ret = setRtlSdrSampleRateSafely(rtlDevice, sampleRateHz);
     qDebug() << "[RTL-SDR] set sample rate" << sampleRateHz << "result" << ret;
     configured = configured && ret == 0;
-    ret = setRtlSdrTunerGainModeSafely(rtlDevice, 1);
-    qDebug() << "[RTL-SDR] set manual gain mode result" << ret;
+    const bool useManualGain = stream.rtlTcpTunerGainTenthsDb >= 0;
+    ret = setRtlSdrTunerGainModeSafely(rtlDevice, useManualGain ? 1 : 0);
+    qDebug() << "[RTL-SDR] set tuner gain mode"
+             << (useManualGain ? QStringLiteral("manual") : QStringLiteral("auto"))
+             << "result" << ret;
     configured = configured && ret == 0;
-    ret = setRtlSdrTunerGainSafely(rtlDevice, (std::max)(0, stream.rtlTcpTunerGainTenthsDb));
-    qDebug() << "[RTL-SDR] set tuner gain" << (std::max)(0, stream.rtlTcpTunerGainTenthsDb) << "result" << ret;
-    configured = configured && ret == 0;
-    ret = setRtlSdrAgcModeSafely(rtlDevice, stream.rtlTcpAgc ? 1 : 0);
-    qDebug() << "[RTL-SDR] set agc" << stream.rtlTcpAgc << "result" << ret;
+    if (useManualGain) {
+        ret = setRtlSdrTunerGainSafely(rtlDevice, stream.rtlTcpTunerGainTenthsDb);
+        qDebug() << "[RTL-SDR] set tuner gain" << stream.rtlTcpTunerGainTenthsDb << "result" << ret;
+        configured = configured && ret == 0;
+    }
+    ret = setRtlSdrAgcModeSafely(rtlDevice, (stream.rtlTcpAgc || !useManualGain) ? 1 : 0);
+    qDebug() << "[RTL-SDR] set agc" << (stream.rtlTcpAgc || !useManualGain) << "result" << ret;
     configured = configured && ret == 0;
     ret = setRtlSdrFrequencyCorrectionSafely(rtlDevice, 0);
     qDebug() << "[RTL-SDR] set frequency correction best-effort result" << ret;

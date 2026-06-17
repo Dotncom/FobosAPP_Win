@@ -2,12 +2,13 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android USB/network client support work. Version 4.2.2 keeps the stable
+and Android USB/network client support work. Version 4.5.0 keeps the stable
 real-device, network, and video/image work from the 2.x/3.x line, expands the
 receiver backend layer, adds native RTL-SDR/rtl_tcp and optional SoapySDR
-backends, improves scan/measurement tooling, keeps the GNSS/QTH laboratory
-workflow available, and keeps the desktop, Raspberry Pi, and Android tuning
-controls current.
+backends, improves scan/measurement tooling, adds practical external
+NMEA/u-blox GNSS receiver support, keeps SDR GNSS acquisition diagnostics
+available, and keeps the desktop, Raspberry Pi, and Android tuning controls
+current.
 
 ## Windows Release Package
 
@@ -24,14 +25,35 @@ for map providers, and UI settings. The desktop app also provides
 `Settings... -> Settings backup -> Export settings... / Import settings...` for
 making a separate backup file.
 
-DMR voice in 4.2.2 is experimental. Windows packages may include optional
+DMR voice in 4.5.0 is experimental. Windows packages may include optional
 `dmr_voice_backends/fobos_dmr_voice_*.dll` GPL backend modules. See
 `THIRD_PARTY_LICENSES.txt` and `licenses/dmr_voice_backend/` before
 redistributing AMBE-capable binaries.
 
-GNSS/QTH work in 4.2.2 is a laboratory workflow, not a finished
-navigation receiver. See `docs/gnss_preflight_4.1.md` for the recommended test
-order, RF notes, and the generated acquisition report files.
+GNSS/QTH work in 4.5.0 has two paths:
+
+- External serial GNSS receivers are the practical path. Standard NMEA modules
+  provide live coordinates, time, satellite diagnostics, sky view, QTH map
+  updates and raw text logging. u-blox-compatible modules, tested with
+  NEO-M8N, can additionally use UBX NAV output, constellation configuration,
+  raw UBX/NMEA capture, and module configuration save.
+- SDR-only GPS L1 C/A acquisition remains a laboratory workflow. See
+  `docs/gnss_preflight_4.1.md` for the recommended test order, RF notes, and
+  the generated acquisition report files.
+
+## External GNSS Receiver Quick Start
+
+1. Connect a serial GNSS module such as NEO-M8N and select its COM/tty port in
+   the GNSS/QTH section. Most NEO-M8N boards use 9600 baud by default.
+2. Press `Connect`. Valid NMEA GGA/RMC fixes update the green current-position
+   marker, QTH locator and satellite diagnostics.
+3. Press `Raw` only when you want an exact UBX/NMEA binary capture under
+   `recordings/gnss_raw/`. These files may contain location data and are not
+   included in release packages.
+4. For u-blox modules, `UBX sys` first polls `CFG-GNSS` and synchronizes the
+   system checkboxes. Adjust GPS/GLO/GAL/BDS/QZSS/SBAS checkboxes and press it
+   again to apply. `Save cfg` writes the current module configuration to
+   non-volatile memory when supported by the module.
 
 ## Optional DMR Voice Backends
 

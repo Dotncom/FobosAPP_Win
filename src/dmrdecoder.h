@@ -18,6 +18,7 @@ public:
     struct DibitBurst {
         QString dibits;
         quint64 sample = 0;
+        quint64 baseDibit = 0;
         int burstIndex = 0;
         int cadenceSymbols = 0;
         int colorCode = -1;

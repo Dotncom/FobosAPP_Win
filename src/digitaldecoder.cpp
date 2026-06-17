@@ -1166,6 +1166,7 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
         for (const DmrDecoder::DibitBurst &burst : result.dibitBursts) {
             emit dmrDibitBurstReady(burst.dibits,
                                     burst.sample,
+                                    burst.baseDibit,
                                     burst.burstIndex,
                                     burst.cadenceSymbols,
                                     burst.colorCode);
@@ -1463,8 +1464,13 @@ void DigitalDecoder::processPcmFrame(const QByteArray &pcmData, const RadioSetti
 
             maybeSelectCandidate(payloadCandidate, false);
             maybeSelectCandidate(rawCandidate, false);
-            if (dmrAudioLooksLikeArtifact(selectedCandidate)) {
-                maybeSelectCandidate(canonicalCandidate, true);
+            const bool selectedIsNotUseful =
+                !selectedCandidate.valid() ||
+                dmrAudioLooksLikeArtifact(selectedCandidate) ||
+                (selectedCandidate.decodedFrames < expectedAudioFrames &&
+                 selectedCandidate.stats.rms < DMR_AUDIO_NEAR_SILENCE_RMS);
+            if (selectedIsNotUseful) {
+                maybeSelectCandidate(canonicalCandidate, false);
             }
             if (selectedCandidate.source != audioSource) {
                 audioSource = selectedCandidate.source;

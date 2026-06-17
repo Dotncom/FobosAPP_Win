@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcessEnvironment>
+#include <QStringList>
 #include <QTimer>
 
 #include <algorithm>
@@ -21,6 +22,70 @@ constexpr int UPSAMPLE_FACTOR = APP_AUDIO_RATE / DEFAULT_GOPHER_AUDIO_RATE;
 constexpr double GOPHER_OUTPUT_TARGET_PEAK = 0.55;
 constexpr double GOPHER_OUTPUT_MAX_GAIN = 16.0;
 
+QString rotateDibitPolarity(const QString &dibits) {
+    QString out;
+    out.reserve(dibits.size());
+    for (QChar ch : dibits) {
+        const int value = ch.unicode() - QLatin1Char('0').unicode();
+        if (value < 0 || value > 3) {
+            out.append(ch);
+            continue;
+        }
+        out.append(QLatin1Char(static_cast<char>('0' + ((value + 2) & 3))));
+    }
+    return out;
+}
+
+int syncDistance(const QString &center, const QString &pattern) {
+    if (center.size() != pattern.size()) {
+        return 1000;
+    }
+    int distance = 0;
+    for (int i = 0; i < center.size(); ++i) {
+        if (center.at(i) != pattern.at(i)) {
+            ++distance;
+        }
+    }
+    return distance;
+}
+
+int bestVoiceSyncDistance(const QString &center) {
+    static const QStringList kVoiceSyncs = {
+        QStringLiteral("131111333113313313113313"), // BS voice
+        QStringLiteral("133313311131311113313331"), // MS voice
+        QStringLiteral("113111131333131311133333"), // DM voice TS1
+        QStringLiteral("133133333111331111311133")  // DM voice TS2
+    };
+    int best = 1000;
+    for (const QString &pattern : kVoiceSyncs) {
+        best = std::min(best, syncDistance(center, pattern));
+    }
+    return best;
+}
+
+bool detectDmrVoicePolarityFlip(const QString &dibits, bool *flipped) {
+    if (dibits.size() != 132) {
+        return false;
+    }
+
+    const QString center = dibits.mid(54, 24);
+    const int normalDistance = bestVoiceSyncDistance(center);
+    const int rotatedDistance = bestVoiceSyncDistance(rotateDibitPolarity(center));
+    const int bestDistance = qMin(normalDistance, rotatedDistance);
+    if (bestDistance > 2) {
+        return false;
+    }
+
+    if (flipped) {
+        *flipped = rotatedDistance < normalDistance;
+    }
+    return true;
+}
+
+QString applyDmrVoicePolarityForGopher(const QString &dibits, bool flip) {
+    return flip ? rotateDibitPolarity(dibits) : dibits;
+}
+
 qint16 readLe16(const char *data) {
     const auto lo = static_cast<quint8>(data[0]);
     const auto hi = static_cast<quint8>(data[1]);
@@ -32,6 +97,49 @@ void appendLe16(QByteArray &target, qint16 value) {
     const quint16 raw = static_cast<quint16>(value);
     target.append(static_cast<char>(raw & 0xff));
     target.append(static_cast<char>((raw >> 8) & 0xff));
+}
+
+QString compactGopherSummary(const QString &line) {
+    const QJsonDocument doc = QJsonDocument::fromJson(line.toUtf8());
+    if (!doc.isObject()) {
+        return line.left(160);
+    }
+
+    const QJsonObject obj = doc.object();
+    const QString type = obj.value(QStringLiteral("type")).toString(QStringLiteral("output"));
+    if (type == QLatin1String("reset")) {
+        return QStringLiteral("reset");
+    }
+
+    QStringList parts;
+    parts << type;
+    if (obj.contains(QStringLiteral("startDibit"))) {
+        parts << QStringLiteral("base=%1").arg(obj.value(QStringLiteral("startDibit")).toInt());
+    }
+    if (obj.contains(QStringLiteral("phase"))) {
+        parts << QStringLiteral("phase=%1").arg(obj.value(QStringLiteral("phase")).toInt());
+    }
+    const QString sync = obj.value(QStringLiteral("sync")).toString();
+    if (!sync.isEmpty()) {
+        parts << QStringLiteral("sync=%1").arg(sync);
+    }
+    if (obj.contains(QStringLiteral("frames"))) {
+        parts << QStringLiteral("frames=%1").arg(obj.value(QStringLiteral("frames")).toInt());
+    }
+    if (obj.contains(QStringLiteral("badFrames"))) {
+        parts << QStringLiteral("bad=%1").arg(obj.value(QStringLiteral("badFrames")).toInt());
+    }
+    if (obj.contains(QStringLiteral("audioFrames"))) {
+        parts << QStringLiteral("audio=%1").arg(obj.value(QStringLiteral("audioFrames")).toInt());
+    }
+
+    const QJsonObject lc = obj.value(QStringLiteral("lc")).toObject();
+    if (!lc.isEmpty()) {
+        parts << QStringLiteral("src=%1").arg(lc.value(QStringLiteral("src")).toInt());
+        parts << QStringLiteral("dst=%1").arg(lc.value(QStringLiteral("dst")).toInt());
+    }
+
+    return parts.join(QLatin1Char(' ')).left(220);
 }
 } // namespace
 
@@ -130,6 +238,7 @@ void GopherTrunkBridge::configure(bool autoStart,
     processArguments = QStringList()
                        << QStringLiteral("-listen")
                        << QStringLiteral("127.0.0.1:%1").arg(tcpPort)
+                       << QStringLiteral("-interleaved=false")
                        << QStringLiteral("-audio-udp")
                        << QStringLiteral("127.0.0.1:%1").arg(audioUdpPort);
     processWorkingDirectory = workingDirectory;
@@ -158,6 +267,12 @@ void GopherTrunkBridge::setEnabled(bool enabled) {
     bridgeEnabled = enabled;
     if (bridgeEnabled) {
         dibitPacketsSent = 0;
+        virtualBaseDibit = 0;
+        tcpOutputLines = 0;
+        udpOutputPacketsReceived = 0;
+        streamPolarityKnown = false;
+        streamPolarityFlip = false;
+        lastColorCode = -1;
         startUdpOutput();
         if (processAutoStart) {
             startProcessIfNeeded();
@@ -173,6 +288,10 @@ void GopherTrunkBridge::setEnabled(bool enabled) {
 }
 
 void GopherTrunkBridge::resetStream() {
+    virtualBaseDibit = 0;
+    lastColorCode = -1;
+    streamPolarityKnown = false;
+    streamPolarityFlip = false;
     if (!bridgeEnabled || tcpSocket->state() != QAbstractSocket::ConnectedState) {
         return;
     }
@@ -181,6 +300,7 @@ void GopherTrunkBridge::resetStream() {
 
 void GopherTrunkBridge::sendDibitBurst(const QString &dibits,
                                        quint64 sample,
+                                       quint64 baseDibit,
                                        int burstIndex,
                                        int cadenceSymbols,
                                        int colorCode) {
@@ -195,25 +315,72 @@ void GopherTrunkBridge::sendDibitBurst(const QString &dibits,
         return;
     }
 
+    if (colorCode >= 0 && lastColorCode >= 0 && colorCode != lastColorCode) {
+        emitStatus(QStringLiteral("GopherTrunk reset: color code changed %1 -> %2")
+                       .arg(lastColorCode)
+                       .arg(colorCode));
+        resetStream();
+    }
+    if (colorCode >= 0) {
+        lastColorCode = colorCode;
+    }
+
+    bool detectedPolarityFlip = false;
+    bool resetForPolarity = false;
+    if (detectDmrVoicePolarityFlip(dibits, &detectedPolarityFlip)) {
+        if (!streamPolarityKnown || streamPolarityFlip != detectedPolarityFlip) {
+            streamPolarityKnown = true;
+            streamPolarityFlip = detectedPolarityFlip;
+            resetForPolarity = true;
+            if (fobosVerboseLoggingEnabled()) {
+                qDebug() << "[GopherTrunk] stream dibit polarity"
+                         << "flip" << streamPolarityFlip
+                         << "sample" << static_cast<qulonglong>(sample)
+                         << "burst" << burstIndex
+                         << "cc" << colorCode;
+            }
+        }
+    }
+    if (!streamPolarityKnown) {
+        return;
+    }
+    if (resetForPolarity) {
+        virtualBaseDibit = 0;
+        tcpSocket->write(QByteArrayLiteral("{\"reset\":true}\n"));
+    }
+
+    const bool polarityFlipped = streamPolarityFlip;
+    const QString normalizedDibits =
+        applyDmrVoicePolarityForGopher(dibits, polarityFlipped);
+    const quint64 packetBaseDibit = virtualBaseDibit;
     QJsonObject packet;
-    packet.insert(QStringLiteral("dibits"), dibits);
+    packet.insert(QStringLiteral("baseIdx"), static_cast<double>(packetBaseDibit));
+    packet.insert(QStringLiteral("dibits"), normalizedDibits);
     packet.insert(QStringLiteral("sample"), QString::number(sample));
+    packet.insert(QStringLiteral("rfBaseIdx"), QString::number(baseDibit));
     packet.insert(QStringLiteral("burst"), burstIndex);
     packet.insert(QStringLiteral("cadenceSymbols"), cadenceSymbols);
+    packet.insert(QStringLiteral("polarityKnown"), streamPolarityKnown);
+    packet.insert(QStringLiteral("polarityNormalized"), polarityFlipped);
     if (colorCode >= 0) {
         packet.insert(QStringLiteral("colorCode"), colorCode);
     }
     QByteArray line = QJsonDocument(packet).toJson(QJsonDocument::Compact);
     line.append('\n');
     tcpSocket->write(line);
+    virtualBaseDibit += static_cast<quint64>(dibits.size());
     ++dibitPacketsSent;
     if (fobosVerboseLoggingEnabled() &&
         (dibitPacketsSent <= 8 || (dibitPacketsSent % 100) == 0)) {
         qDebug() << "[GopherTrunk] sent dibit burst"
                  << "packet" << dibitPacketsSent
                  << "sample" << static_cast<qulonglong>(sample)
+                 << "baseIdx" << static_cast<qulonglong>(packetBaseDibit)
+                 << "rfBaseIdx" << static_cast<qulonglong>(baseDibit)
                  << "burst" << burstIndex
-                 << "cc" << colorCode;
+                 << "cc" << colorCode
+                 << "polarityKnown" << streamPolarityKnown
+                 << "polarityFlip" << polarityFlipped;
     }
 }
 
@@ -304,7 +471,10 @@ void GopherTrunkBridge::readTcpOutput() {
         if (line.isEmpty()) {
             continue;
         }
-        if (fobosVerboseLoggingEnabled()) {
+        ++tcpOutputLines;
+        if (tcpOutputLines <= 16 || (tcpOutputLines % 40) == 0) {
+            emitStatus(QStringLiteral("GopherTrunk decoded: %1").arg(compactGopherSummary(line)));
+        } else if (fobosVerboseLoggingEnabled()) {
             qDebug() << "[GopherTrunk output]" << line.left(240);
         }
     }
@@ -338,6 +508,11 @@ void GopherTrunkBridge::readUdpOutput() {
             continue;
         }
         ++udpOutputPacketsReceived;
+        if (udpOutputPacketsReceived <= 8 || (udpOutputPacketsReceived % 100) == 0) {
+            emitStatus(QStringLiteral("GopherTrunk audio: packet %1, %2 bytes")
+                           .arg(udpOutputPacketsReceived)
+                           .arg(mono8k.size()));
+        }
         const QByteArray normalized = normalizeOutputPcmForPlayback(mono8k, udpOutputPacketsReceived);
         emit decodedPcmReady(upsample8kMonoTo48k(normalized));
     }

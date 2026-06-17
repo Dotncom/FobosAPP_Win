@@ -30,6 +30,8 @@ struct GnssAcquisitionResult {
     double channelFilterCutoffHz = 0.0;
     int channelizerTaps = 0;
     bool millisecondAgc = false;
+    int toneNotchesApplied = 0;
+    double strongestToneNotchDb = 0.0;
     int inputSamples = 0;
     int usedInputSamples = 0;
     int coherentMs = 0;

@@ -36,6 +36,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
+#include <QSet>
 #include <QStringList>
 #include <QVector>
 #include <QApplication>
@@ -105,12 +106,28 @@ extern float contrast;
 class FFTResult;
 class FineTuneScaleWidget;
 class QDialog;
+class QFile;
 class QStackedWidget;
 class QToolButton;
+class QTableWidget;
+class QTableWidgetItem;
 class QthMapWidget;
 class DsdNeoBridge;
 class GopherTrunkBridge;
 extern int deviceID;
+
+struct GnssNmeaSatellite {
+    QString key;
+    QString source;
+    QString system;
+    QString talker;
+    int prn = -1;
+    int elevationDeg = -1;
+    int azimuthDeg = -1;
+    int cn0DbHz = -1;
+    bool usedInFix = false;
+    qint64 lastSeenMs = 0;
+};
 
 class YourClassName : public QMainWindow {
     Q_OBJECT
@@ -324,13 +341,34 @@ private:
     void applyQthPositionFromUi();
     void clearQthPosition();
     void pasteNmeaPositionFromClipboard();
-    bool applyNmeaPositionText(const QString &text, QString *statusMessage = nullptr);
+    bool applyNmeaPositionText(const QString &text, QString *statusMessage = nullptr, bool persist = true);
     void toggleGnssSerial();
     void startGnssSerial();
     void stopGnssSerial();
     void handleGnssSerialReadyRead();
+    void processGnssNmeaLine(const QString &line, bool fromReplay = false);
+    void processGnssUbxFrame(quint8 messageClass, quint8 messageId, const QByteArray &payload);
+    void sendGnssUbxConfiguration(bool enabled);
+    void applyGnssUbxConstellationConfig();
+    void saveGnssUbxConfigurationToModule();
     void handleGnssSerialError(QSerialPort::SerialPortError error);
     void updateGnssSerialStatus(const QString &message);
+    void toggleGnssNmeaLogging();
+    void toggleGnssRawSerialLogging();
+    void replayGnssNmeaLog();
+    void resetGnssNmeaSatellites();
+    void updateGnssNmeaSatellitesFromSentence(const QString &line);
+    void updateGnssSatelliteView(bool forceTableRefresh = false);
+    void updateGnssNmeaSkyPlot();
+    void updateQthMapSatelliteOverlay();
+    QString formattedGnssUtc() const;
+    void ensureGnssSatelliteTableRows(int requiredRows);
+    void sortGnssSatelliteRows(QVector<GnssNmeaSatellite> &satellites) const;
+    void setGnssSatelliteRowsEnabled(bool enabled);
+    bool isGnssSatelliteEnabled(const QString &key) const;
+    bool hasEnabledGnssNmeaFixSatellite() const;
+    bool isGnssNmeaSystemEnabled(const QString &system) const;
+    bool isGnssNmeaTalkerEnabled(const QString &talker) const;
     void openQthMapWindow();
     void copyQthLocator();
     void updateGnssSystemSelection();
@@ -506,6 +544,8 @@ private:
     QLineEdit *dsdNeoProgramEdit = nullptr;
     QComboBox *qthSourceCombo = nullptr;
     QComboBox *gnssSystemCombo = nullptr;
+    QComboBox *gnssPositionPolicyCombo = nullptr;
+    QComboBox *gnssTimeZoneCombo = nullptr;
     QCheckBox *dmrManualTimingCheckbox = nullptr;
     QSpinBox *dmrTimingOffsetSpin = nullptr;
     QDoubleSpinBox *dmrSlicerRatioSpin = nullptr;
@@ -535,6 +575,11 @@ private:
     QPushButton *qthClearButton = nullptr;
     QPushButton *qthPasteNmeaButton = nullptr;
     QPushButton *gnssSerialButton = nullptr;
+    QPushButton *gnssNmeaLogButton = nullptr;
+    QPushButton *gnssNmeaReplayButton = nullptr;
+    QPushButton *gnssSerialRawLogButton = nullptr;
+    QPushButton *gnssUbxSystemsButton = nullptr;
+    QPushButton *gnssUbxSaveButton = nullptr;
     QPushButton *gnssTuneButton = nullptr;
     QPushButton *gnssScanButton = nullptr;
     QPushButton *gnssRawLogButton = nullptr;
@@ -545,6 +590,7 @@ private:
     QPushButton *gnssPositionSelfTestButton = nullptr;
     QPushButton *gnssNetworkTimeButton = nullptr;
     QPushButton *gnssPlotButton = nullptr;
+    QPushButton *gnssSatellitesButton = nullptr;
     QPushButton *gnssMonitorResetButton = nullptr;
     
     QCheckBox *spectrumCheckbox = nullptr;
@@ -567,6 +613,13 @@ private:
     QCheckBox *scanMeasurementCheckbox = nullptr;
     QCheckBox *spurSuppressionCheckbox = nullptr;
     QCheckBox *gnssMonitorCheckbox = nullptr;
+    QCheckBox *gnssUseGpsCheckbox = nullptr;
+    QCheckBox *gnssUseGlonassCheckbox = nullptr;
+    QCheckBox *gnssUseGalileoCheckbox = nullptr;
+    QCheckBox *gnssUseBeidouCheckbox = nullptr;
+    QCheckBox *gnssUseQzssCheckbox = nullptr;
+    QCheckBox *gnssUseSbasCheckbox = nullptr;
+    QCheckBox *gnssUseOtherCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
@@ -633,7 +686,7 @@ private:
     QLineEdit *qthOnlineAttributionEdit = nullptr;
     QLineEdit *qthOnlineApiKeyEdit = nullptr;
     QLineEdit *qthMapSearchEdit = nullptr;
-    QLineEdit *gnssSerialPortEdit = nullptr;
+    QComboBox *gnssSerialPortEdit = nullptr;
     QDoubleSpinBox *agileScanStepSpin = nullptr;
     QCheckBox *agileScanAutoStepCheckbox = nullptr;
     QDoubleSpinBox *qthLatitudeSpin = nullptr;
@@ -673,6 +726,7 @@ private:
     QComboBox *qthMapLayerCombo = nullptr;
     QComboBox *qthOnlineProviderCombo = nullptr;
     QComboBox *qthGridPrecisionCombo = nullptr;
+    QComboBox *qthMapOverlayCombo = nullptr;
     QCheckBox *qthOnlineNoDiskCacheCheckbox = nullptr;
     QSpinBox *qthMapZoomSpin = nullptr;
     QLabel *fpvHunterHistoryLabel = nullptr;
@@ -688,6 +742,11 @@ private:
     QLabel *gnssMonitorStatusLabel = nullptr;
     QLabel *gnssAcquireStatusLabel = nullptr;
     QLabel *gnssAcquisitionPlotLabel = nullptr;
+    QLabel *gnssSatelliteSkyLabel = nullptr;
+    QLabel *gnssSatelliteStatusLabel = nullptr;
+    QCheckBox *gnssSatelliteTableCheckbox = nullptr;
+    QDialog *gnssSatelliteTableDialog = nullptr;
+    QTableWidget *gnssSatelliteTable = nullptr;
     QLabel *dsdNeoStatusLabel = nullptr;
 
     FrequencyControl *frequencyControl = nullptr;
@@ -727,6 +786,7 @@ private:
     QDockWidget *videoDock = nullptr;
     QDialog *qthMapDialog = nullptr;
     QthMapWidget *qthMapWidget = nullptr;
+    QDialog *gnssSatelliteDialog = nullptr;
     QPlainTextEdit *digitalTextEdit = nullptr;
     VideoWidget *videoWidget = nullptr;
     
@@ -951,9 +1011,16 @@ private:
     QString gnssAcquisitionSource = QStringLiteral("live");
     QString gnssSerialPortName = QStringLiteral("COM4");
     int gnssSerialBaud = 9600;
+    QString gnssPositionPolicy = QStringLiteral("auto");
+    bool gnssUbxAutoEnable = false;
     QByteArray gnssSerialBuffer;
     quint64 gnssSerialSentenceCount = 0;
+    quint64 gnssSerialUbxFrameCount = 0;
     quint64 gnssSerialFixCount = 0;
+    bool gnssUbxOutputEnabled = false;
+    bool gnssPendingCfgGnssApply = false;
+    QByteArray gnssLastCfgGnssPayload;
+    qint64 gnssLastUbxFixMs = 0;
     int gnssSerialFixQuality = -1;
     int gnssSerialFixMode = -1;
     int gnssSerialSatellitesUsed = -1;
@@ -963,6 +1030,35 @@ private:
     int gnssSerialBeidouSatellites = -1;
     int gnssSerialOtherSatellites = -1;
     QString gnssSerialUtc;
+    int gnssTimeZoneOffsetMinutes = 0;
+    double gnssSerialHdop = std::numeric_limits<double>::quiet_NaN();
+    double gnssSerialVdop = std::numeric_limits<double>::quiet_NaN();
+    double gnssSerialPdop = std::numeric_limits<double>::quiet_NaN();
+    double gnssSerialAltitudeM = std::numeric_limits<double>::quiet_NaN();
+    double gnssSerialGeoidSeparationM = std::numeric_limits<double>::quiet_NaN();
+    double gnssSerialSpeedKmh = std::numeric_limits<double>::quiet_NaN();
+    double gnssSerialCourseDeg = std::numeric_limits<double>::quiet_NaN();
+    std::unique_ptr<QFile> gnssNmeaLogFile;
+    QString gnssNmeaLogPath;
+    std::unique_ptr<QFile> gnssRawSerialLogFile;
+    QString gnssRawSerialLogPath;
+    QMap<QString, GnssNmeaSatellite> gnssNmeaSatellites;
+    QMap<QString, bool> gnssNmeaSatelliteEnabled;
+    QSet<QString> gnssDisabledSatelliteKeys;
+    QElapsedTimer gnssSatelliteTableUpdateTimer;
+    QElapsedTimer gnssSatelliteOverlayUpdateTimer;
+    bool gnssSatelliteTableDirty = false;
+    bool gnssSatelliteTableVisible = false;
+    int gnssSatelliteSortColumn = 6;
+    bool gnssSatelliteSortAscending = false;
+    bool gnssAcquisitionPlotShowsAcquisition = false;
+    bool gnssUseGps = true;
+    bool gnssUseGlonass = true;
+    bool gnssUseGalileo = true;
+    bool gnssUseBeidou = true;
+    bool gnssUseQzss = true;
+    bool gnssUseSbas = true;
+    bool gnssUseOther = true;
     int gnssAcquisitionIntegrationMs = 24;
     double gnssChannelFilterCutoffHz = 1800000.0;
     int gnssDopplerSpanHz = 25000;
@@ -987,6 +1083,7 @@ private:
     int qthMapLayer = 0;
     int qthMapZoom = 12;
     int qthGridPrecision = 6;
+    int qthMapOverlayMode = 1;
     QVector<qth::UserMarker> qthUserMarkers;
     std::atomic_bool videoIqFramePending{false};
     bool momentaryRecordingActive = false;

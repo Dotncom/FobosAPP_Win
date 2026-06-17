@@ -37,6 +37,8 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kMercatorMaxLatitude = 85.05112878;
 constexpr int kTileSize = 256;
+constexpr double kEarthRadiusKm = 6371.0;
+constexpr double kSatelliteSkyOverlayHorizonKm = 1800.0;
 
 double wrapLongitude(double longitude) {
     if (!std::isfinite(longitude)) {
@@ -88,6 +90,41 @@ QString markerDisplayLabel(const qth::UserMarker &marker) {
         label = QStringLiteral("%1 %2").arg(marker.number).arg(label);
     }
     return label;
+}
+
+bool approximateSatelliteSkyPoint(double observerLatitude,
+                                  double observerLongitude,
+                                  const QthMapWidget::SatelliteMarker &satellite,
+                                  QPointF *geo) {
+    if (!geo ||
+        !std::isfinite(observerLatitude) ||
+        !std::isfinite(observerLongitude) ||
+        satellite.elevationDeg < 0 ||
+        satellite.azimuthDeg < 0) {
+        return false;
+    }
+
+    const double lat = observerLatitude * kPi / 180.0;
+    const double lon = observerLongitude * kPi / 180.0;
+    const double az = satellite.azimuthDeg * kPi / 180.0;
+    const double elevationFactor =
+        (std::clamp)(90.0 - static_cast<double>(satellite.elevationDeg), 0.0, 90.0) / 90.0;
+    const double angularDistance = (kSatelliteSkyOverlayHorizonKm * elevationFactor) / kEarthRadiusKm;
+
+    const double sinLat = std::sin(lat);
+    const double cosLat = std::cos(lat);
+    const double sinDistance = std::sin(angularDistance);
+    const double cosDistance = std::cos(angularDistance);
+
+    const double targetLat = std::asin(sinLat * cosDistance +
+                                       cosLat * sinDistance * std::cos(az));
+    const double targetLon =
+        lon + std::atan2(std::sin(az) * sinDistance * cosLat,
+                         cosDistance - sinLat * std::sin(targetLat));
+
+    *geo = QPointF((std::clamp)(targetLat * 180.0 / kPi, -90.0, 90.0),
+                   wrapLongitude(targetLon * 180.0 / kPi));
+    return true;
 }
 
 #ifdef _WIN32
@@ -340,6 +377,32 @@ void QthMapWidget::setGridPrecision(int precision) {
         return;
     }
     gridPrecision = precision;
+    update();
+}
+
+void QthMapWidget::setOverlayMode(OverlayMode mode) {
+    if (overlayMode == mode) {
+        return;
+    }
+    overlayMode = mode;
+    update();
+}
+
+void QthMapWidget::setSatelliteMarkers(const QVector<SatelliteMarker> &markers) {
+    satelliteMarkers.clear();
+    satelliteMarkers.reserve(markers.size());
+    for (SatelliteMarker marker : markers) {
+        if (marker.elevationDeg < 0 || marker.azimuthDeg < 0) {
+            continue;
+        }
+        marker.elevationDeg = (std::clamp)(marker.elevationDeg, 0, 90);
+        marker.azimuthDeg = (std::clamp)(marker.azimuthDeg, 0, 359);
+        marker.label = marker.label.trimmed().left(16);
+        if (marker.label.isEmpty()) {
+            marker.label = QStringLiteral("SAT");
+        }
+        satelliteMarkers.append(marker);
+    }
     update();
 }
 
@@ -1049,6 +1112,72 @@ void QthMapWidget::drawUserMarkers(QPainter &painter, const QRectF &mapRect) {
     }
 }
 
+void QthMapWidget::drawSatelliteMarkers(QPainter &painter, const QRectF &mapRect) {
+    if (!positionVisible || satelliteMarkers.isEmpty()) {
+        return;
+    }
+
+    const QPointF qthPoint = geoToPoint(latitude, longitude, mapRect);
+    const bool qthVisible = mapRect.adjusted(-24, -24, 24, 24).contains(qthPoint);
+
+    auto colorForCn0 = [](int cn0) {
+        if (cn0 < 0) {
+            return QColor(125, 135, 145);
+        }
+        if (cn0 < 20) {
+            return QColor(230, 95, 80);
+        }
+        if (cn0 < 35) {
+            return QColor(235, 190, 70);
+        }
+        return QColor(105, 215, 125);
+    };
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setClipRect(mapRect);
+
+    QFont labelFont = painter.font();
+    labelFont.setBold(true);
+    labelFont.setPointSize((std::max)(8, labelFont.pointSize() - 1));
+    painter.setFont(labelFont);
+
+    for (const SatelliteMarker &satellite : satelliteMarkers) {
+        QPointF satelliteGeo;
+        if (!approximateSatelliteSkyPoint(latitude, longitude, satellite, &satelliteGeo)) {
+            continue;
+        }
+
+        const QPointF point = geoToPoint(satelliteGeo.x(), satelliteGeo.y(), mapRect);
+        if (!mapRect.adjusted(-18, -18, 18, 18).contains(point)) {
+            continue;
+        }
+
+        QColor color = colorForCn0(satellite.cn0DbHz);
+        if (!satellite.enabled) {
+            color = color.darker(220);
+        }
+
+        if (qthVisible) {
+            painter.setPen(QPen(QColor(20, 24, 28, satellite.enabled ? 150 : 85), 3));
+            painter.drawLine(qthPoint, point);
+            painter.setPen(QPen(QColor(245, 248, 252, satellite.enabled ? 90 : 45), 1, Qt::DashLine));
+            painter.drawLine(qthPoint, point);
+        }
+
+        painter.setBrush(color);
+        painter.setPen(QPen(satellite.usedInFix ? QColor(255, 255, 255) : QColor(20, 24, 28),
+                            satellite.usedInFix ? 2 : 1));
+        painter.drawEllipse(point, 7.0, 7.0);
+
+        painter.setPen(satellite.enabled ? QColor(245, 248, 252) : QColor(135, 145, 155));
+        const QString label = QStringLiteral("%1 %2°").arg(satellite.label).arg(satellite.elevationDeg);
+        painter.drawText(point + QPointF(10.0, 4.0), label);
+    }
+
+    painter.restore();
+}
+
 void QthMapWidget::drawMarkerAndTitle(QPainter &painter, const QRectF &mapRect) {
     if (!positionVisible) {
         const bool ukrainian = uiLanguage.startsWith(QStringLiteral("uk"));
@@ -1197,11 +1326,21 @@ void QthMapWidget::paintEvent(QPaintEvent *event) {
         painter.fillRect(mapRect, QColor(0, 0, 0, 28));
     }
 
-    drawMaidenheadGrid(painter, mapRect);
-    if (positionVisible) {
+    const bool drawGrid = overlayMode == OverlayMode::QthGrid ||
+                          overlayMode == OverlayMode::GridAndSatellites;
+    const bool drawSatellites = overlayMode == OverlayMode::GridAndSatellites ||
+                                overlayMode == OverlayMode::Satellites;
+
+    if (drawGrid) {
+        drawMaidenheadGrid(painter, mapRect);
+    }
+    if (positionVisible && drawGrid) {
         drawCurrentLocator(painter, mapRect);
     }
     drawUserMarkers(painter, mapRect);
+    if (drawSatellites) {
+        drawSatelliteMarkers(painter, mapRect);
+    }
     drawMarkerAndTitle(painter, mapRect);
     drawFooter(painter, mapRect);
 }

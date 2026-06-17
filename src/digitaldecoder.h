@@ -37,6 +37,7 @@ signals:
                              int flco);
     void dmrDibitBurstReady(const QString &dibits,
                             quint64 sample,
+                            quint64 baseDibit,
                             int burstIndex,
                             int cadenceSymbols,
                             int colorCode);
