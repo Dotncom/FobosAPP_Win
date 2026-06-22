@@ -405,6 +405,30 @@ final class UsbSandbox {
         preferredReceiverTarget = target;
     }
 
+    int activeReceiverTarget() {
+        if (activeReceiverKind == ActiveUsbReceiverKind.FOBOS) {
+            return USB_TARGET_FOBOS;
+        }
+        if (activeReceiverKind == ActiveUsbReceiverKind.RTL_SDR) {
+            return USB_TARGET_RTL_SDR;
+        }
+        return USB_TARGET_AUTO;
+    }
+
+    int detectedReceiverTarget() {
+        HashMap<String, UsbDevice> deviceList = usbManager.getDeviceList();
+        boolean rtlVisible = false;
+        for (UsbDevice device : deviceList.values()) {
+            if (isFobosCandidate(device)) {
+                return USB_TARGET_FOBOS;
+            }
+            if (isRtlSdrCandidate(device)) {
+                rtlVisible = true;
+            }
+        }
+        return rtlVisible ? USB_TARGET_RTL_SDR : USB_TARGET_AUTO;
+    }
+
     String requestPermissionForBestDevice() {
         UsbDevice device = bestDevice();
         if (device == null) {

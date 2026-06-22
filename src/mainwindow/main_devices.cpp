@@ -20,6 +20,26 @@ void YourClassName::buildLocalReceiverDeviceChoices(QStringList &labels, QVector
         labels << availableFobosDevices.at(i).label;
         values << i;
     }
+    if (hasActiveFobosDevice()) {
+        const int activeLogicalIndex = openedDeviceIndex >= 0
+                                           ? openedDeviceIndex
+                                           : pendingSettings.deviceIndex;
+        bool activeAlreadyListed = false;
+        for (int value : values) {
+            if (value == activeLogicalIndex) {
+                activeAlreadyListed = true;
+                break;
+            }
+        }
+        if (!activeAlreadyListed) {
+            labels << QStringLiteral("[%1] active device #%2")
+                          .arg(fobosApiDisplayName(activeFobosApiKind))
+                          .arg(openedNativeDeviceIndex >= 0
+                                   ? openedNativeDeviceIndex
+                                   : std::max(0, activeLogicalIndex));
+            values << activeLogicalIndex;
+        }
+    }
 
     const QVector<RtlSdrDeviceInfo> rtlDevices = enumerateRtlSdrDevices();
     if (rtlDevices.isEmpty()) {
@@ -64,8 +84,11 @@ void YourClassName::rebuildReceiverDeviceCombo() {
     QStringList labels;
     QVector<int> values;
     if (isNetworkClientMode() && remoteReceiverDeviceListValid) {
-        labels = remoteReceiverDeviceLabels;
-        values = remoteReceiverDeviceValues;
+        const int count = std::min(remoteReceiverDeviceLabels.size(), remoteReceiverDeviceValues.size());
+        for (int i = 0; i < count; ++i) {
+            labels << QStringLiteral("[Server] %1").arg(remoteReceiverDeviceLabels.at(i));
+            values << remoteReceiverComboValue(remoteReceiverDeviceValues.at(i));
+        }
     } else {
         if (!isNetworkClientMode() &&
             !deviceOpened &&
@@ -94,7 +117,11 @@ void YourClassName::rebuildReceiverDeviceCombo() {
         comboBox->addItem(labels.at(i), values.at(i));
     }
 
-    int selectedIndex = comboBox->findData(pendingSettings.deviceIndex);
+    const int selectedComboValue =
+        isNetworkClientMode() && remoteReceiverDeviceListValid
+            ? remoteReceiverComboValue(pendingSettings.deviceIndex)
+            : pendingSettings.deviceIndex;
+    int selectedIndex = comboBox->findData(selectedComboValue);
     if (selectedIndex < 0 &&
         pendingSettings.deviceIndex >= 0 &&
         pendingSettings.deviceIndex < comboBox->count()) {
@@ -108,7 +135,7 @@ void YourClassName::rebuildReceiverDeviceCombo() {
         bool ok = false;
         const int selectedDevice = comboBox->itemData(selectedIndex).toInt(&ok);
         if (ok) {
-            pendingSettings.deviceIndex = selectedDevice;
+            pendingSettings.deviceIndex = receiverDeviceIndexFromComboValue(selectedDevice);
         }
     }
 }
@@ -116,7 +143,40 @@ void YourClassName::rebuildReceiverDeviceCombo() {
 QJsonArray YourClassName::receiverDeviceListToJson() const {
     QStringList labels;
     QVector<int> values;
-    buildLocalReceiverDeviceChoices(labels, values);
+
+    for (int i = 0; i < availableFobosDevices.size(); ++i) {
+        labels << availableFobosDevices.at(i).label;
+        values << i;
+    }
+    if (hasActiveFobosDevice()) {
+        const int activeLogicalIndex = openedDeviceIndex >= 0
+                                           ? openedDeviceIndex
+                                           : pendingSettings.deviceIndex;
+        bool activeAlreadyListed = false;
+        for (int value : values) {
+            if (value == activeLogicalIndex) {
+                activeAlreadyListed = true;
+                break;
+            }
+        }
+        if (!activeAlreadyListed) {
+            labels << QStringLiteral("[%1] active device #%2")
+                          .arg(fobosApiDisplayName(activeFobosApiKind))
+                          .arg(openedNativeDeviceIndex >= 0
+                                   ? openedNativeDeviceIndex
+                                   : std::max(0, activeLogicalIndex));
+            values << activeLogicalIndex;
+        }
+    }
+
+    labels << QStringLiteral("RTL-SDR native auto (server)");
+    values << rtlSdrNativeComboValue(0);
+    labels << QStringLiteral("RTL-SDR via rtl_tcp (server 127.0.0.1:1234)");
+    values << RTL_TCP_DEVICE_INDEX;
+    labels << QStringLiteral("bladeRF native auto (server)");
+    values << bladeRfNativeComboValue(0);
+    labels << QStringLiteral("SoapySDR auto (server)");
+    values << SOAPY_SDR_DEVICE_INDEX;
 
     QJsonArray array;
     const int count = std::min(labels.size(), values.size());
@@ -368,7 +428,7 @@ YourClassName::FobosDeviceInfo YourClassName::selectedFobosDeviceInfo() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     if (selected >= 0 && selected < availableFobosDevices.size()) {
@@ -388,7 +448,7 @@ bool YourClassName::isRtlTcpSelected() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     return selected == RTL_TCP_DEVICE_INDEX;
@@ -400,7 +460,7 @@ bool YourClassName::isRtlSdrNativeSelected() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     return isRtlSdrNativeComboValue(selected);
@@ -412,7 +472,7 @@ bool YourClassName::isSoapySdrSelected() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     return selected == SOAPY_SDR_DEVICE_INDEX;
@@ -424,7 +484,7 @@ bool YourClassName::isBladeRfNativeSelected() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     return isBladeRfNativeComboValue(selected);
@@ -436,7 +496,7 @@ int YourClassName::selectedRtlSdrNativeIndex() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     return isRtlSdrNativeComboValue(selected) ? rtlSdrNativeIndexFromComboValue(selected) : 0;
@@ -448,7 +508,7 @@ int YourClassName::selectedBladeRfNativeIndex() const {
         bool ok = false;
         const int value = comboBox->currentData().toInt(&ok);
         if (ok) {
-            selected = value;
+            selected = receiverDeviceIndexFromComboValue(value);
         }
     }
     return isBladeRfNativeComboValue(selected) ? bladeRfNativeIndexFromComboValue(selected) : 0;

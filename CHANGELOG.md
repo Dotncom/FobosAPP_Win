@@ -1,5 +1,23 @@
 # Changelog
 
+## 4.5.2 - 2026-06-22
+
+### Changed
+
+- Reworked network receiver selection so the client uses the server's receiver
+  list instead of sending a local device index to the server.
+- Updated the Android USB/network client with RTL/Fobos target auto-sync,
+  corrected sample-rate option switching, and spectrum half-swap handling.
+- Reduced network-server USB probing during client handshakes by using cached
+  server receiver state for remote device lists.
+
+### Fixed
+
+- Fixed network-client audio playback/HTTP relay when attaching to an already
+  running server.
+- Fixed network-client window close hanging while waiting for a local SDR
+  reader that does not exist in client-only mode.
+
 ## 4.5.1 - 2026-06-22
 
 ### Changed

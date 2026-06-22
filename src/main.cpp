@@ -2637,14 +2637,15 @@ YourClassName::YourClassName(QWidget *parent)
     connect(clkBox, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &YourClassName::onClkChanged);
     connect(refreshButton, &QPushButton::clicked, [this]() {
         if (isNetworkClientMode()) {
-            sendRemoteControlCommand(QStringLiteral("refreshDevices"));
+            sendRemoteControlCommand(QStringLiteral("requestServerState"));
             return;
         }
 
         refreshFobosDeviceList(true);
         rebuildReceiverDeviceCombo();
         if (!availableFobosDevices.isEmpty() && comboBox) {
-            pendingSettings.deviceIndex = comboBox->currentData().toInt();
+            pendingSettings.deviceIndex =
+                receiverDeviceIndexFromComboValue(comboBox->currentData().toInt());
             if (!isRtlBackendSelected() && isKnownRtlSampleRate(pendingSettings.sampleRate)) {
                 pendingSettings.sampleRate = FOBOS_DEFAULT_SAMPLE_RATE;
             }
@@ -2660,7 +2661,7 @@ YourClassName::YourClassName(QWidget *parent)
         }
         bool ok = false;
         const int selectedIndex = comboBox->currentData().toInt(&ok);
-        pendingSettings.deviceIndex = ok ? selectedIndex : index;
+        pendingSettings.deviceIndex = ok ? receiverDeviceIndexFromComboValue(selectedIndex) : index;
         if (isRtlBackendSelected()) {
             if (!isKnownRtlSampleRate(pendingSettings.sampleRate)) {
                 pendingSettings.sampleRate = RTL_TCP_SAFE_SAMPLE_RATE;
@@ -4174,6 +4175,20 @@ void YourClassName::closeEvent(QCloseEvent *event) {
         event->ignore();
         if (runState != RadioRunState::Stopping) {
             stopFobosProcessing();
+            if (isNetworkClientMode() &&
+                !(processor && processor->isRunning()) &&
+                !deviceOpened) {
+                closeShutdownFinalized = false;
+                QTimer::singleShot(0, this, [this]() {
+                    if (closeShutdownInProgress &&
+                        !closeShutdownFinalized &&
+                        !(processor && processor->isRunning()) &&
+                        !deviceOpened) {
+                        closeShutdownInProgress = false;
+                        close();
+                    }
+                });
+            }
         } else if (stopPollTimer && !stopPollTimer->isActive()) {
             stopElapsedTimer.restart();
             stopCancelRetryCount = 0;
@@ -4470,7 +4485,8 @@ void YourClassName::refreshSettingsFromUi() {
     if (comboBox) {
         bool ok = false;
         const int selectedIndex = comboBox->currentData().toInt(&ok);
-        pendingSettings.deviceIndex = ok ? selectedIndex : std::max(0, comboBox->currentIndex());
+        pendingSettings.deviceIndex =
+            ok ? receiverDeviceIndexFromComboValue(selectedIndex) : std::max(0, comboBox->currentIndex());
     }
     if (clkBox) {
         pendingSettings.clockSource = clkBox->currentData().toInt();
@@ -5348,7 +5364,11 @@ void YourClassName::updateUiForRunState() {
             processorRunning;
         stopButton->setEnabled(canStop && (clientCanControl || isNetworkClientMode()));
     }
-    if (comboBox) comboBox->setEnabled(idle && clientCanControl);
+    if (comboBox) {
+        const bool receiverListReady =
+            !isNetworkClientMode() || remoteReceiverDeviceListValid;
+        comboBox->setEnabled(idle && clientCanControl && receiverListReady);
+    }
     if (refreshButton) refreshButton->setEnabled(idle && clientCanControl);
     if (fobosButton) fobosButton->setEnabled(idle);
     if (modeBox) modeBox->setEnabled(true);

@@ -13,4 +13,9 @@ int bladeRfNativeComboValue(int nativeIndex);
 bool isBladeRfNativeComboValue(int value);
 int bladeRfNativeIndexFromComboValue(int value);
 
+int remoteReceiverComboValue(int serverDeviceIndex);
+bool isRemoteReceiverComboValue(int value);
+int remoteReceiverDeviceIndexFromComboValue(int value);
+int receiverDeviceIndexFromComboValue(int value);
+
 #endif // RECEIVERDEVICEUTILS_H

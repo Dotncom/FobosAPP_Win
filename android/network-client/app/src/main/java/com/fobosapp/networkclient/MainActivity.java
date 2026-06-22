@@ -185,6 +185,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             @Override
             public void onUsbLog(String message) {
                 appendUsbLog(message);
+                runOnMain(() -> syncUsbReceiverTargetFromActiveSession());
             }
 
             @Override
@@ -363,7 +364,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         receiverModeButton.setOnClickListener(v -> toggleReceiverMode());
         connectButton.setOnClickListener(v -> {
             if (isOtgMode()) {
-                requestUsbPermission();
+                openUsbOtgSession();
             } else {
                 toggleConnection();
             }
@@ -696,6 +697,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return;
         }
         appendUsbLog(usbSandbox.requestPermissionForBestDevice());
+        syncUsbReceiverTargetFromActiveSession();
     }
 
     private void openUsbOtgSession() {
@@ -705,6 +707,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return;
         }
         appendUsbLog(usbSandbox.openReceiverSession());
+        syncUsbReceiverTargetFromActiveSession();
     }
 
     private void readUsbOtgProbe() {
@@ -714,6 +717,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return;
         }
         appendUsbLog(usbSandbox.readReceiverProbe());
+        syncUsbReceiverTargetFromActiveSession();
     }
 
     private void readUsbOtgInfo() {
@@ -723,6 +727,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return;
         }
         appendUsbLog(usbSandbox.readReceiverInfo());
+        syncUsbReceiverTargetFromActiveSession();
     }
 
     private void closeUsbOtgSession() {
@@ -732,6 +737,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return;
         }
         appendUsbLog(usbSandbox.closeReceiverSession());
+        applyUsbReceiverTarget();
     }
 
     private void runUsbOtgSampleTest() {
@@ -785,6 +791,35 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         updateReceiverTargetControls();
     }
 
+    private void syncUsbReceiverTargetFromActiveSession() {
+        if (usbSandbox == null) {
+            return;
+        }
+        int activeTarget = usbSandbox.activeReceiverTarget();
+        if (activeTarget != UsbSandbox.USB_TARGET_FOBOS &&
+                activeTarget != UsbSandbox.USB_TARGET_RTL_SDR) {
+            return;
+        }
+        boolean rtlTarget = activeTarget == UsbSandbox.USB_TARGET_RTL_SDR;
+        boolean targetChanged = usbReceiverTarget != activeTarget;
+        if (!targetChanged && sampleRateOptionsAreRtl == rtlTarget) {
+            return;
+        }
+        if (targetChanged) {
+            usbReceiverTarget = activeTarget;
+            if (usbTargetButton != null) {
+                usbTargetButton.setText("USB " + usbReceiverTargetLabel());
+            }
+        }
+        normalizeSettingsForReceiverTarget();
+        refreshSampleRateOptions(true);
+        updateReceiverTargetControls();
+        setFrequencyTextsFromSettings(true);
+        if (targetChanged) {
+            savePrefs();
+        }
+    }
+
     private String usbReceiverTargetLabel() {
         if (usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR) {
             return "RTL";
@@ -796,7 +831,26 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private boolean isRtlUsbTarget() {
-        return usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR;
+        return effectiveUsbReceiverTarget() == UsbSandbox.USB_TARGET_RTL_SDR;
+    }
+
+    private int effectiveUsbReceiverTarget() {
+        if (!isOtgMode()) {
+            return UsbSandbox.USB_TARGET_FOBOS;
+        }
+        if (usbSandbox != null) {
+            int activeTarget = usbSandbox.activeReceiverTarget();
+            if (activeTarget == UsbSandbox.USB_TARGET_FOBOS ||
+                    activeTarget == UsbSandbox.USB_TARGET_RTL_SDR) {
+                return activeTarget;
+            }
+            int detectedTarget = usbSandbox.detectedReceiverTarget();
+            if (detectedTarget == UsbSandbox.USB_TARGET_FOBOS ||
+                    detectedTarget == UsbSandbox.USB_TARGET_RTL_SDR) {
+                return detectedTarget;
+            }
+        }
+        return usbReceiverTarget;
     }
 
     private void normalizeSettingsForReceiverTarget() {
@@ -867,6 +921,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 settings.lnaGain,
                 settings.vgaGain,
                 settings.fftLength));
+        syncUsbReceiverTargetFromActiveSession();
     }
 
     private void stopUsbOtgPreview() {
@@ -1175,8 +1230,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
 
     private void updateControlsFromSettings(boolean force) {
         normalizeSettingsForCurrentInput();
-        refreshSampleRateOptions(false);
         normalizeSettingsForReceiverTarget();
+        refreshSampleRateOptions(false);
         enforceListeningCenterBinding();
         suppressUiCallbacks = true;
         setTextIfNotFocused(centerEdit, formatMhz(settings.centerFrequency), force);
@@ -1872,14 +1927,14 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     }
 
     private double[] activeSampleRates() {
-        return usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR ? rtlSampleRates : fobosSampleRates;
+        return effectiveUsbReceiverTarget() == UsbSandbox.USB_TARGET_RTL_SDR ? rtlSampleRates : fobosSampleRates;
     }
 
     private void refreshSampleRateOptions(boolean force) {
         if (sampleRateSpinner == null) {
             return;
         }
-        boolean rtlOptions = usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR;
+        boolean rtlOptions = effectiveUsbReceiverTarget() == UsbSandbox.USB_TARGET_RTL_SDR;
         if (!force && sampleRateOptionsAreRtl == rtlOptions &&
                 sampleRateSpinner.getAdapter() != null) {
             return;
@@ -1904,9 +1959,9 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             return value;
         }
         if (!isFinite(value) || value <= 0.0) {
-            return usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR ? 2_400_000.0 : rates[0];
+            return effectiveUsbReceiverTarget() == UsbSandbox.USB_TARGET_RTL_SDR ? 2_400_000.0 : rates[0];
         }
-        if (usbReceiverTarget == UsbSandbox.USB_TARGET_RTL_SDR && value > 3_200_000.0) {
+        if (effectiveUsbReceiverTarget() == UsbSandbox.USB_TARGET_RTL_SDR && value > 3_200_000.0) {
             return 2_400_000.0;
         }
         return rates[indexOfSampleRate(value)];

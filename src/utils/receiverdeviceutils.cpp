@@ -51,3 +51,22 @@ bool isBladeRfNativeComboValue(int value) {
 int bladeRfNativeIndexFromComboValue(int value) {
     return BLADERF_NATIVE_DEVICE_INDEX_BASE - value;
 }
+
+int remoteReceiverComboValue(int serverDeviceIndex) {
+    return NETWORK_REMOTE_RECEIVER_DEVICE_INDEX_BASE + serverDeviceIndex;
+}
+
+bool isRemoteReceiverComboValue(int value) {
+    return value >= NETWORK_REMOTE_RECEIVER_DEVICE_INDEX_MIN &&
+           value <= NETWORK_REMOTE_RECEIVER_DEVICE_INDEX_MAX;
+}
+
+int remoteReceiverDeviceIndexFromComboValue(int value) {
+    return value - NETWORK_REMOTE_RECEIVER_DEVICE_INDEX_BASE;
+}
+
+int receiverDeviceIndexFromComboValue(int value) {
+    return isRemoteReceiverComboValue(value)
+               ? remoteReceiverDeviceIndexFromComboValue(value)
+               : value;
+}

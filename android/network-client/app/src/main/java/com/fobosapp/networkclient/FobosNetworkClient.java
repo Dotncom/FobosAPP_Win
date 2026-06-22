@@ -322,6 +322,7 @@ final class FobosNetworkClient {
             frequencies[i] = frequencyArray.optDouble(i, 0.0);
             magnitudes[i] = (float) magnitudeArray.optDouble(i, -160.0);
         }
+        swapSpectrumHalves(magnitudes);
         return new SpectrumFrame(
                 frequencies,
                 magnitudes,
@@ -367,6 +368,7 @@ final class FobosNetworkClient {
             float value = buffer.getFloat();
             magnitudes[i] = Float.isFinite(value) ? value : -160.0f;
         }
+        swapSpectrumHalves(magnitudes);
 
         return new SpectrumFrame(
                 frequencies,
@@ -379,6 +381,19 @@ final class FobosNetworkClient {
                 command.optDouble("bandwidth", 0.0),
                 command.optInt("modulationType", RadioSettings.MOD_AM),
                 command.has("inputMode") ? command.optInt("inputMode", -1) : -1);
+    }
+
+    private static void swapSpectrumHalves(float[] magnitudes) {
+        int count = magnitudes != null ? magnitudes.length : 0;
+        if (count < 2 || (count & 1) != 0) {
+            return;
+        }
+        int half = count / 2;
+        for (int i = 0; i < half; ++i) {
+            float left = magnitudes[i];
+            magnitudes[i] = magnitudes[i + half];
+            magnitudes[i + half] = left;
+        }
     }
 
     private static double optionalDouble(JSONObject command, String key) {

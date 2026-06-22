@@ -106,6 +106,30 @@ QJsonObject YourClassName::networkSettingsPatch(const QJsonObject &settings) con
     return patch;
 }
 
+bool YourClassName::isRemoteReceiverDeviceValue(int deviceIndex) const {
+    return remoteReceiverDeviceListValid && remoteReceiverDeviceValues.contains(deviceIndex);
+}
+
+QJsonObject YourClassName::networkClientSettingsForCommand(const QJsonObject &settings,
+                                                           const QString &action) const {
+    QJsonObject sanitized = settings;
+    if (!isNetworkClientMode()) {
+        return sanitized;
+    }
+
+    const bool maySendReceiverChoice =
+        remoteReceiverDeviceListValid &&
+        isRemoteReceiverDeviceValue(pendingSettings.deviceIndex);
+    if (!maySendReceiverChoice) {
+        sanitized.remove(QStringLiteral("deviceIndex"));
+        qDebug() << "[Network] client settings omit receiver device until server device list is known"
+                 << "action" << action
+                 << "remoteListValid" << remoteReceiverDeviceListValid
+                 << "deviceIndex" << pendingSettings.deviceIndex;
+    }
+    return sanitized;
+}
+
 void YourClassName::applyAuthoritativeNetworkState(const QJsonObject &command) {
     const RadioSettings previousSettings = pendingSettings;
     const int previousFftLength = pendingSettings.fftLength;
@@ -207,10 +231,6 @@ void YourClassName::handleNetworkSettingsAckTimeout() {
 void YourClassName::sendServerStateToClients() {
     if (networkMode != NetworkMode::Server || !networkController || !networkController->isControlReady()) {
         return;
-    }
-    if (!isRunningOrTransitioning() && !(processor && processor->isRunning())) {
-        refreshFobosDeviceList();
-        rebuildReceiverDeviceCombo();
     }
 
     QJsonObject state;
@@ -345,7 +365,7 @@ bool YourClassName::sendRemoteControlCommand(const QString &action, const QJsonO
     QJsonObject currentSettings;
     if (carriesSettings) {
         refreshSettingsFromUi();
-        currentSettings = settingsToJson();
+        currentSettings = networkClientSettingsForCommand(settingsToJson(), action);
     }
 
     QJsonObject command;
@@ -634,8 +654,7 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
     }
 
     if (action == QStringLiteral("refreshDevices")) {
-        refreshFobosDeviceList(true);
-        rebuildReceiverDeviceCombo();
+        qDebug() << "[Network] remote refreshDevices returns cached server receiver list";
         sendServerStateToClients();
         return;
     }
@@ -663,6 +682,29 @@ void YourClassName::onNetworkControlCommandReceived(const QJsonObject &command) 
         const QString previousListeningScanTargetsMhz = listeningScanTargetsMhz;
         const int previousListeningScanDwellMs = listeningScanDwellMs;
         const int previousListeningScanSettleMs = listeningScanSettleMs;
+        if (settingsJson.contains(QStringLiteral("deviceIndex"))) {
+            QVector<int> serverReceiverValues;
+            const QJsonArray serverReceivers = receiverDeviceListToJson();
+            for (const QJsonValue &value : serverReceivers) {
+                serverReceiverValues.append(value.toObject().value(QStringLiteral("deviceIndex")).toInt());
+            }
+            const int requestedDeviceIndex =
+                settingsJson.value(QStringLiteral("deviceIndex")).toInt(pendingSettings.deviceIndex);
+            if (!serverReceiverValues.contains(requestedDeviceIndex)) {
+                const QString reason =
+                    QStringLiteral("Requested receiver is not available on the server");
+                qDebug() << "[Network] rejecting unknown remote receiver choice"
+                         << "peer" << peerLabel
+                         << "requestedDeviceIndex" << requestedDeviceIndex
+                         << "serverValues" << serverReceiverValues;
+                sendSettingsAckToPeer(peerId,
+                                      false,
+                                      command.value(QStringLiteral("requestId")).toString(),
+                                      reason);
+                sendServerStateToClients();
+                return;
+            }
+        }
         applySettingsFromJson(settingsJson);
         publishSettingsToGlobals();
         updateUiFromPendingSettings();

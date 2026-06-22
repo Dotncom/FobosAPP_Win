@@ -416,6 +416,9 @@ private:
     void appendNetworkState(QJsonObject &command) const;
     void applyNetworkStateFromCommand(const QJsonObject &command);
     QJsonObject networkSettingsPatch(const QJsonObject &settings) const;
+    bool isRemoteReceiverDeviceValue(int deviceIndex) const;
+    QJsonObject networkClientSettingsForCommand(const QJsonObject &settings,
+                                                const QString &action) const;
     void applyAuthoritativeNetworkState(const QJsonObject &command);
     void sendSettingsAckToPeer(const QString &peerId,
                                bool ok,

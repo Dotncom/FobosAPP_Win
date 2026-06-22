@@ -48,13 +48,21 @@ void YourClassName::sendNetworkAudioFrame(const QByteArray &pcmData) {
     frame["sampleFormat"] = "pcm_s16le";
     frame["pcm"] = QString::fromLatin1(pcmData.toBase64());
     networkController->sendControlCommand(frame);
+
+    static quint64 sentAudioFrames = 0;
+    ++sentAudioFrames;
+    if (fobosVerboseLoggingEnabled() && sentAudioFrames % 200 == 1) {
+        qDebug() << "[NetworkAudio] sent PCM frame"
+                 << "frames" << static_cast<qulonglong>(sentAudioFrames)
+                 << "bytes" << pcmData.size();
+    }
 }
 
 void YourClassName::playNetworkAudioFrame(const QJsonObject &frame) {
     if (networkMode != NetworkMode::Client || !remoteAudioPlayer) {
         return;
     }
-    if (runState != RadioRunState::Running) {
+    if (!networkController || !networkController->isControlReady()) {
         return;
     }
 
@@ -73,6 +81,14 @@ void YourClassName::playNetworkAudioFrame(const QJsonObject &frame) {
     sendAudioRelayFrame(pcmData);
     sendAudioHttpFrame(pcmData);
     remoteAudioPlayer->playPcmFrame(pcmData);
+
+    static quint64 receivedAudioFrames = 0;
+    ++receivedAudioFrames;
+    if (fobosVerboseLoggingEnabled() && receivedAudioFrames % 200 == 1) {
+        qDebug() << "[NetworkAudio] received PCM frame"
+                 << "frames" << static_cast<qulonglong>(receivedAudioFrames)
+                 << "bytes" << pcmData.size();
+    }
 }
 
 void YourClassName::updateAudioRelaySocket() {

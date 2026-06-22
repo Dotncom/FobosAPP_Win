@@ -29,7 +29,11 @@ extern bool colorf;
 void YourClassName::updateUiFromPendingSettings() {
     if (comboBox) {
         comboBox->blockSignals(true);
-        int deviceComboIndex = comboBox->findData(pendingSettings.deviceIndex);
+        const int deviceComboValue =
+            isNetworkClientMode() && remoteReceiverDeviceListValid
+                ? remoteReceiverComboValue(pendingSettings.deviceIndex)
+                : pendingSettings.deviceIndex;
+        int deviceComboIndex = comboBox->findData(deviceComboValue);
         if (deviceComboIndex < 0 &&
             pendingSettings.deviceIndex >= 0 &&
             pendingSettings.deviceIndex < comboBox->count()) {
@@ -40,7 +44,7 @@ void YourClassName::updateUiFromPendingSettings() {
             bool ok = false;
             const int selectedDevice = comboBox->itemData(deviceComboIndex).toInt(&ok);
             if (ok) {
-                pendingSettings.deviceIndex = selectedDevice;
+                pendingSettings.deviceIndex = receiverDeviceIndexFromComboValue(selectedDevice);
             }
         }
         comboBox->blockSignals(false);
