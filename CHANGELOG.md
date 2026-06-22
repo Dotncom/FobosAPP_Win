@@ -1,5 +1,31 @@
 # Changelog
 
+## 4.5.1 - 2026-06-22
+
+### Changed
+
+- Restored the legacy waterfall palette/contrast behavior while keeping the
+  lower-copy optimized waterfall row path.
+- Cleaned the live roadmap so it now contains only current release, stability,
+  GNSS, DMR, backend, Android/network and future transceiver priorities.
+- Tightened Windows and Raspberry package filtering for nested `recordings`
+  folders and local capture formats.
+
+### Fixed
+
+- Omitted exact latitude/longitude from automatic GNSS IQ sidecar metadata and
+  acquisition reports. Reports keep QTH locator context plus an explicit privacy
+  note.
+- Avoided exact UBX NAV-PVT latitude/longitude in verbose diagnostic logs.
+- Added extra git ignore rules for local settings, captures, screenshots and
+  scratch notes that must not be committed.
+
+### Notes
+
+- This is a privacy/stability/visual-performance patch over 4.5.0.
+- Android was not rebuilt for this patch because the changes are desktop/source
+  packaging focused.
+
 ## 4.5.0 - 2026-06-17
 
 ### Added

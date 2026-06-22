@@ -1,0 +1,538 @@
+#include "main.h"
+
+#include "appconstants.h"
+#include "dmrprivacyutils.h"
+#include "gnssserialutils.h"
+#include "receiverdeviceutils.h"
+#include "scanvisualutils.h"
+#include "tuningutils.h"
+
+#include <QFile>
+#include <QJsonDocument>
+#include <QSignalBlocker>
+#include <QTableWidget>
+
+QString YourClassName::normalizedUiLanguage(const QString &language) const {
+    const QString code = language.trimmed();
+    if (!code.isEmpty() && uiTranslations.value(code).isObject()) {
+        return code;
+    }
+    if (uiTranslations.value(QStringLiteral("en")).isObject()) {
+        return QStringLiteral("en");
+    }
+    for (const QString &fallbackCode : uiLanguageOrder) {
+        if (uiTranslations.value(fallbackCode).isObject()) {
+            return fallbackCode;
+        }
+    }
+    return QStringLiteral("en");
+}
+
+void YourClassName::populateLanguageCombo(QComboBox *combo) const {
+    if (!combo) {
+        return;
+    }
+    const QSignalBlocker blocker(combo);
+    combo->clear();
+    for (const QString &code : uiLanguageOrder) {
+        combo->addItem(uiLanguageNames.value(code, code.toUpper()), code);
+    }
+    if (combo->count() == 0) {
+        combo->addItem(QStringLiteral("English"), QStringLiteral("en"));
+    }
+}
+
+QString YourClassName::uiText(const QString &key, const QString &fallback) const {
+    const QJsonObject language = uiTranslations.value(normalizedUiLanguage(uiLanguage)).toObject();
+    const QString translated = language.value(key).toString();
+    if (!translated.isEmpty()) {
+        return translated;
+    }
+    const QString english = uiTranslations.value(QStringLiteral("en")).toObject().value(key).toString();
+    return english.isEmpty() ? fallback : english;
+}
+
+QString YourClassName::localizedStatusText(const QString &status) const {
+    const auto prefixStatus = [this, &status](const QString &prefix,
+                                             const QString &key,
+                                             const QString &fallback,
+                                             const QString &separator) -> QString {
+        if (!status.startsWith(prefix)) {
+            return QString();
+        }
+        const QString base = uiText(key, fallback);
+        const QString suffix = status.mid(prefix.size());
+        return suffix.isEmpty() ? base : QStringLiteral("%1%2%3").arg(base, separator, suffix);
+    };
+
+    if (status == QStringLiteral("Recording: idle")) {
+        return uiText(QStringLiteral("recording_idle"), status);
+    }
+    if (status == QStringLiteral("Playback: idle")) {
+        return uiText(QStringLiteral("playback_idle"), status);
+    }
+    if (status == QStringLiteral("Recording blocked: Channel IQ cannot run during Full IQ streaming")) {
+        return uiText(QStringLiteral("recording_blocked_channel_iq_full_iq"), status);
+    }
+    if (status == QStringLiteral("Recording stopped: Channel IQ cannot run during Full IQ streaming")) {
+        return uiText(QStringLiteral("recording_stopped_channel_iq_full_iq"), status);
+    }
+    if (status == QStringLiteral("Recording stopped: no data")) {
+        return uiText(QStringLiteral("recording_stopped_no_data"), status);
+    }
+    if (status == QStringLiteral("Playback blocked: stop receiver first")) {
+        return uiText(QStringLiteral("playback_blocked_stop_receiver"), status);
+    }
+    if (status == QStringLiteral("Playback blocked: stop recording first")) {
+        return uiText(QStringLiteral("playback_blocked_stop_recording"), status);
+    }
+    if (status == QStringLiteral("Playback: no file selected")) {
+        return uiText(QStringLiteral("playback_no_file_selected"), status);
+    }
+    if (status == QStringLiteral("Playback failed: audio WAV must be mono 48 kHz")) {
+        return uiText(QStringLiteral("playback_audio_wav_mono"), status);
+    }
+    if (status == QStringLiteral("Playback: stopped")) {
+        return uiText(QStringLiteral("playback_stopped"), status);
+    }
+
+    const QStringList prefixTranslations = {
+        prefixStatus(QStringLiteral("Recording failed: "), QStringLiteral("recording_failed"), QStringLiteral("Recording failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Recording audio: "), QStringLiteral("recording_audio"), QStringLiteral("Recording audio"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Recording channel IQ: waiting for IQ frames"),
+                     QStringLiteral("recording_channel_iq_waiting"),
+                     QStringLiteral("Recording channel IQ: waiting for IQ frames"),
+                     QString()),
+        prefixStatus(QStringLiteral("Recording channel IQ: "), QStringLiteral("recording_channel_iq"), QStringLiteral("Recording channel IQ"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("IQ recording failed: "), QStringLiteral("iq_recording_failed"), QStringLiteral("IQ recording failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Recording saved: "), QStringLiteral("recording_saved"), QStringLiteral("Recording saved"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Playback failed: "), QStringLiteral("playback_failed"), QStringLiteral("Playback failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Playback: "), QStringLiteral("playback"), QStringLiteral("Playback"), QStringLiteral(": "))
+    };
+
+    for (const QString &translated : prefixTranslations) {
+        if (!translated.isEmpty()) {
+            return translated;
+        }
+    }
+    return status;
+}
+
+void YourClassName::markTranslatable(QWidget *widget, const QString &key, const QString &fallback) {
+    if (!widget) {
+        return;
+    }
+    widget->setProperty("i18nKey", key);
+    widget->setProperty("i18nFallback", fallback);
+    const QString text = uiText(key, fallback);
+    if (auto *label = qobject_cast<QLabel*>(widget)) {
+        label->setText(text);
+    } else if (auto *button = qobject_cast<QAbstractButton*>(widget)) {
+        button->setText(text);
+    } else if (auto *group = qobject_cast<QGroupBox*>(widget)) {
+        group->setTitle(text);
+    } else if (auto *dock = qobject_cast<QDockWidget*>(widget)) {
+        dock->setWindowTitle(text);
+    }
+}
+
+void YourClassName::setComboItemText(QComboBox *combo,
+                                     const QVariant &data,
+                                     const QString &key,
+                                     const QString &fallback) {
+    if (!combo) {
+        return;
+    }
+    const int index = combo->findData(data);
+    if (index >= 0) {
+        combo->setItemText(index, uiText(key, fallback));
+    }
+}
+
+void YourClassName::applyUiLanguage() {
+    const auto widgets = findChildren<QWidget*>();
+    for (QWidget *widget : widgets) {
+        const QString key = widget->property("i18nKey").toString();
+        if (key.isEmpty()) {
+            continue;
+        }
+        markTranslatable(widget, key, widget->property("i18nFallback").toString());
+    }
+
+    if (languageComboBox) {
+        QSignalBlocker blocker(languageComboBox);
+        const int index = languageComboBox->findData(uiLanguage);
+        if (index >= 0) {
+            languageComboBox->setCurrentIndex(index);
+        }
+    }
+
+    setComboItemText(clkBox, 0, QStringLiteral("internal"), QStringLiteral("Internal"));
+    setComboItemText(clkBox, 1, QStringLiteral("external"), QStringLiteral("External"));
+    setComboItemText(modeBox, static_cast<int>(INPUT_HF_NOISE_CANCEL),
+                     QStringLiteral("hf_cancel_lab"),
+                     QStringLiteral("HF1 - HF2 cancel lab"));
+    setComboItemText(dmrLabCallTypeCombo,
+                     QStringLiteral("group"),
+                     QStringLiteral("dmr_group"),
+                     QStringLiteral("Group"));
+    setComboItemText(dmrLabCallTypeCombo,
+                     QStringLiteral("private"),
+                     QStringLiteral("dmr_private"),
+                     QStringLiteral("Private"));
+    setComboItemText(dmrLabCallTypeCombo,
+                     QStringLiteral("all_call"),
+                     QStringLiteral("dmr_all"),
+                     QStringLiteral("All"));
+    setComboItemText(dmrAmbeLayoutCombo,
+                     DMR_AMBE_LAYOUT_AUTO,
+                     QStringLiteral("auto"),
+                     QStringLiteral("Auto"));
+    setComboItemText(dmrBackendCombo,
+                     DMR_BACKEND_FOBOS_MBELIB,
+                     QStringLiteral("dmr_backend_fobos_mbelib"),
+                     QStringLiteral("FobosAPP + mbelib"));
+    setComboItemText(dmrBackendCombo,
+                     DMR_BACKEND_FOBOS_OPENDMR,
+                     QStringLiteral("dmr_backend_fobos_opendmr"),
+                     QStringLiteral("FobosAPP + OpenDMR/OP25"));
+    setComboItemText(dmrBackendCombo,
+                     DMR_BACKEND_GOPHERTRUNK,
+                     QStringLiteral("dmr_backend_gopher_future"),
+                     QStringLiteral("GopherTrunk bridge"));
+    setComboItemText(dmrPrivacyModeCombo,
+                     DMR_PRIVACY_NONE,
+                     QStringLiteral("dmr_privacy_none"),
+                     QStringLiteral("No privacy"));
+    if (dmrBackendCombo) {
+        dmrBackendCombo->setToolTip(uiText(
+            QStringLiteral("dmr_backend_tooltip"),
+            QStringLiteral("Choose which DMR decoder path receives the selected channel.")));
+    }
+    setComboItemText(recordingModeCombo,
+                     static_cast<int>(RecordingManager::Mode::AudioWav),
+                     QStringLiteral("audio_wav"),
+                     QStringLiteral("Audio WAV"));
+    setComboItemText(recordingModeCombo,
+                     static_cast<int>(RecordingManager::Mode::ChannelIqWav),
+                     QStringLiteral("channel_iq_wav"),
+                     QStringLiteral("Channel IQ WAV"));
+    setComboItemText(scanVisualModeCombo,
+                     static_cast<int>(ScanVisualMode::CompressedMosaic),
+                     QStringLiteral("scan_visual_compressed"),
+                     QStringLiteral("Compressed/Mosaic"));
+    setComboItemText(scanVisualModeCombo,
+                     static_cast<int>(ScanVisualMode::FloatingTrueAxis),
+                     QStringLiteral("scan_visual_true_axis"),
+                     QStringLiteral("Floating/True axis"));
+    setComboItemText(scanVisualModeCombo,
+                     static_cast<int>(ScanVisualMode::PassComposite),
+                     QStringLiteral("scan_visual_pass_composite"),
+                     QStringLiteral("Pass composite"));
+    if (scanVisualModeCombo) {
+        scanVisualModeCombo->setToolTip(uiText(
+            QStringLiteral("scan_visual_mode_tooltip"),
+            QStringLiteral("Choose how scan centers are stitched on the spectrum and waterfall.")));
+    }
+    setComboItemText(qthSourceCombo,
+                     QStringLiteral("manual"),
+                     QStringLiteral("manual"),
+                     QStringLiteral("Manual"));
+    setComboItemText(qthSourceCombo,
+                     QStringLiteral("nmea"),
+                     QStringLiteral("nmea_gps"),
+                     QStringLiteral("NMEA GPS"));
+    setComboItemText(qthSourceCombo,
+                     QStringLiteral("os"),
+                     QStringLiteral("os_location"),
+                     QStringLiteral("OS location"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("auto"),
+                     QStringLiteral("gnss_position_policy_auto"),
+                     QStringLiteral("Auto"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("ubx_preferred"),
+                     QStringLiteral("gnss_position_policy_ubx_preferred"),
+                     QStringLiteral("UBX preferred"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("nmea_only"),
+                     QStringLiteral("gnss_position_policy_nmea_only"),
+                     QStringLiteral("NMEA only"));
+    setComboItemText(gnssPositionPolicyCombo,
+                     QStringLiteral("ubx_only"),
+                     QStringLiteral("gnss_position_policy_ubx_only"),
+                     QStringLiteral("UBX only"));
+    if (gnssPositionPolicyCombo) {
+        gnssPositionPolicyCombo->setToolTip(uiText(
+            QStringLiteral("gnss_position_policy_tooltip"),
+            QStringLiteral("Choose which external GNSS stream is allowed to update the current QTH position.")));
+    }
+    setComboItemText(gnssTimeZoneCombo,
+                     100000,
+                     QStringLiteral("local_time"),
+                     QStringLiteral("Local"));
+    if (gnssTimeZoneCombo) {
+        gnssTimeZoneCombo->setToolTip(uiText(
+            QStringLiteral("gnss_timezone_tooltip"),
+            QStringLiteral("Time zone used only for displaying GNSS UTC time. Raw NMEA/UBX data remains unchanged.")));
+    }
+    if (qthSourceCombo) {
+        qthSourceCombo->setItemData(1,
+                                    uiText(QStringLiteral("nmea_paste_tooltip"),
+                                           QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")),
+                                    Qt::ToolTipRole);
+        qthSourceCombo->setItemData(2,
+                                    uiText(QStringLiteral("gps_source_future_tooltip"),
+                                           QStringLiteral("OS location input is planned; manual coordinates are used for now.")),
+                                    Qt::ToolTipRole);
+    }
+    if (qthPasteNmeaButton) {
+        qthPasteNmeaButton->setToolTip(uiText(
+            QStringLiteral("nmea_paste_tooltip"),
+            QStringLiteral("Paste NMEA GGA/RMC text from the clipboard and use it as the current QTH.")));
+    }
+    if (qthCopyButton) {
+        qthCopyButton->setToolTip(uiText(
+            QStringLiteral("qth_position_tooltip"),
+            QStringLiteral("Show the last valid QTH position on the map and copy its Maidenhead locator.")));
+    }
+    if (qthClearButton) {
+        qthClearButton->setToolTip(uiText(
+            QStringLiteral("clear_qth_tooltip"),
+            QStringLiteral("Hide the current real QTH position from the map and clear the live location state.")));
+    }
+    if (gnssMonitorResetButton) {
+        gnssMonitorResetButton->setToolTip(uiText(
+            QStringLiteral("gnss_iq_monitor_reset_tooltip"),
+            QStringLiteral("Reset only the GNSS IQ monitor peak history and accumulated SDR statistics. It does not clear the QTH position.")));
+    }
+    if (gnssSerialPortEdit) {
+        gnssSerialPortEdit->setToolTip(uiText(
+            QStringLiteral("gnss_serial_port_tooltip"),
+            QStringLiteral("Serial port for an external NMEA GNSS receiver, for example COM4 or /dev/ttyUSB0.")));
+    }
+    if (gnssSerialBaudSpin) {
+        gnssSerialBaudSpin->setToolTip(uiText(
+            QStringLiteral("gnss_serial_baud_tooltip"),
+            QStringLiteral("NMEA serial baud rate. Most NEO-M8N modules use 9600 by default.")));
+    }
+    if (gnssSerialButton) {
+        gnssSerialButton->setToolTip(uiText(
+            QStringLiteral("gnss_serial_connect_tooltip"),
+            QStringLiteral("Open the serial NMEA stream and use valid GGA/RMC fixes as the current QTH.")));
+    }
+    if (gnssNmeaLogButton) {
+        gnssNmeaLogButton->setToolTip(uiText(
+            QStringLiteral("nmea_log_tooltip"),
+            QStringLiteral("Start or stop writing live NMEA sentences to recordings/nmea.")));
+    }
+    if (gnssNmeaReplayButton) {
+        gnssNmeaReplayButton->setToolTip(uiText(
+            QStringLiteral("nmea_replay_tooltip"),
+            QStringLiteral("Replay a saved NMEA log through the same parser, map and satellite diagnostics.")));
+    }
+    if (gnssAcquisitionPlotDialog) {
+        gnssAcquisitionPlotDialog->setWindowTitle(uiText(
+            QStringLiteral("gnss_acq_plot_title"),
+            QStringLiteral("GNSS acquisition diagnostics")));
+    }
+    if (gnssPlotButton) {
+        gnssPlotButton->setToolTip(uiText(
+            QStringLiteral("gnss_acq_plot_tooltip"),
+            QStringLiteral("GPS acquisition diagnostics: PRN/Doppler heatmap, best code-phase correlation and peak history.")));
+    }
+    if (gnssSatelliteDialog) {
+        gnssSatelliteDialog->setWindowTitle(uiText(
+            QStringLiteral("gnss_satellite_window_title"),
+            QStringLiteral("GNSS satellites")));
+    }
+    if (gnssSatelliteTableDialog) {
+        gnssSatelliteTableDialog->setWindowTitle(uiText(
+            QStringLiteral("gnss_satellite_table_window_title"),
+            QStringLiteral("GNSS satellite table")));
+    }
+    if (gnssSatellitesButton) {
+        gnssSatellitesButton->setToolTip(uiText(
+            QStringLiteral("gnss_satellites_tooltip"),
+            QStringLiteral("Open the live GNSS satellite list and sky view in a separate resizable window.")));
+    }
+    if (gnssSatelliteTable) {
+        gnssSatelliteTable->setHorizontalHeaderLabels({
+            uiText(QStringLiteral("use"), QStringLiteral("Use")),
+            uiText(QStringLiteral("source_short"), QStringLiteral("Src")),
+            uiText(QStringLiteral("system"), QStringLiteral("System")),
+            QStringLiteral("SVID"),
+            uiText(QStringLiteral("elevation_short"), QStringLiteral("El")),
+            uiText(QStringLiteral("azimuth_short"), QStringLiteral("Az")),
+            QStringLiteral("C/N0"),
+            uiText(QStringLiteral("fix"), QStringLiteral("Fix")),
+            uiText(QStringLiteral("age"), QStringLiteral("Age")),
+            uiText(QStringLiteral("quality"), QStringLiteral("Quality"))
+        });
+        gnssSatelliteTable->setToolTip(uiText(
+            QStringLiteral("gnss_satellite_table_tooltip"),
+            QStringLiteral("Live GNSS satellites from NMEA GSV/GSA and UBX NAV-SAT. Click headers to sort; right-click Use for bulk selection.")));
+    }
+    if (gnssSatelliteStatusLabel) {
+        gnssSatelliteStatusLabel->setToolTip(uiText(
+            QStringLiteral("gnss_satellite_status_tooltip"),
+            QStringLiteral("Live GNSS fix summary from NMEA and UBX: source, fix type, satellites, DOP, altitude, speed and UTC.")));
+    }
+    if (gnssSatelliteTableCheckbox) {
+        QSignalBlocker blocker(gnssSatelliteTableCheckbox);
+        gnssSatelliteTableCheckbox->setText(uiText(QStringLiteral("show_table"), QStringLiteral("Table")));
+        gnssSatelliteTableCheckbox->setChecked(gnssSatelliteTableVisible);
+        gnssSatelliteTableCheckbox->setToolTip(uiText(
+            QStringLiteral("gnss_satellite_table_toggle_tooltip"),
+            QStringLiteral("Open or hide the live satellite table in a separate resizable window.")));
+    }
+    if (gnssSatelliteSkyLabel) {
+        gnssSatelliteSkyLabel->setToolTip(uiText(
+            QStringLiteral("gnss_sky_tooltip"),
+            QStringLiteral("Sky view from NMEA GSV or UBX NAV-SAT azimuth/elevation values. Color follows C/N0; white outline means the satellite is used in the module fix.")));
+    }
+    if (gnssDopplerSpanSpin) {
+        gnssDopplerSpanSpin->setToolTip(uiText(
+            QStringLiteral("gnss_doppler_span_tooltip"),
+            QStringLiteral("GPS C/A acquisition Doppler search half-span. Lower values are faster; wider values tolerate larger clock/frequency error.")));
+    }
+    if (gnssDopplerStepSpin) {
+        gnssDopplerStepSpin->setToolTip(uiText(
+            QStringLiteral("gnss_doppler_step_tooltip"),
+            QStringLiteral("GPS C/A acquisition Doppler bin spacing. Smaller values are slower but can refine weak candidates.")));
+    }
+    if (gnssOfflineAcquireButton) {
+        gnssOfflineAcquireButton->setToolTip(uiText(
+            QStringLiteral("gps_ca_replay_scan_tooltip"),
+            QStringLiteral("Run GPS L1 C/A acquisition directly on the selected Channel IQ WAV recording.")));
+    }
+    if (gnssPositionSelfTestButton) {
+        gnssPositionSelfTestButton->setToolTip(uiText(
+            QStringLiteral("gnss_position_self_test_tooltip"),
+            QStringLiteral("Solve a synthetic multi-satellite pseudorange fix and show the result on the QTH map.")));
+    }
+    if (playbackFileCombo &&
+        playbackFileCombo->count() == 1 &&
+        playbackFileCombo->itemData(0).toString().isEmpty()) {
+        playbackFileCombo->setItemText(0,
+                                       uiText(QStringLiteral("no_wav_recordings_found"),
+                                              QStringLiteral("No WAV recordings found")));
+    }
+
+    if (volumeLabel) {
+        volumeLabel->setText(QStringLiteral("%1: %2%").arg(uiText(QStringLiteral("volume"), QStringLiteral("Volume"))).arg(volumePercent));
+    }
+    if (lnaGainLabel) {
+        lnaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("lna_gain"), QStringLiteral("LNA Gain"))).arg(pendingSettings.lnaGain));
+    }
+    if (vgaGainLabel) {
+        vgaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("vga_gain"), QStringLiteral("VGA Gain"))).arg(pendingSettings.vgaGain));
+    }
+    if (rtlAgcCheckbox) {
+        rtlAgcCheckbox->blockSignals(true);
+        rtlAgcCheckbox->setChecked(pendingSettings.rtlAgc);
+        rtlAgcCheckbox->blockSignals(false);
+    }
+    if (rtlGainSlider) {
+        rtlGainSlider->blockSignals(true);
+        rtlGainSlider->setValue((std::clamp)(pendingSettings.rtlTunerGainTenthsDb, 0, 496));
+        rtlGainSlider->blockSignals(false);
+    }
+    if (rtlGainLabel) {
+        rtlGainLabel->setText(QStringLiteral("%1: %2 dB")
+                                  .arg(uiText(QStringLiteral("rtl_gain"), QStringLiteral("RTL gain")))
+                                  .arg(pendingSettings.rtlTunerGainTenthsDb / 10.0, 0, 'f', 1));
+    }
+    if (scaleLabel) {
+        scaleLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("scale"), QStringLiteral("Scale")),
+                                                        formatScalePercent(currentScale)));
+    }
+    if (contrastLabel) {
+        contrastLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("contrast"), QStringLiteral("Contrast"))).arg(contrast));
+    }
+    if (sensitivityLabel) {
+        sensitivityLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("sensitivity"), QStringLiteral("Sensitivity"))).arg(sensitivity));
+    }
+    if (levelMinLabel) {
+        levelMinLabel->setText(levelLabelText(uiText(QStringLiteral("min"), QStringLiteral("Min")), displayLevelMin));
+    }
+    if (levelMaxLabel) {
+        levelMaxLabel->setText(levelLabelText(uiText(QStringLiteral("max"), QStringLiteral("Max")), displayLevelMax));
+    }
+    updateFineTuneLabel();
+    if (scanMeasurementBaselineButton) {
+        scanMeasurementBaselineButton->setText(scanMeasurementBaselineRecording
+                                                   ? uiText(QStringLiteral("stop_bg"), QStringLiteral("Stop BG"))
+                                                   : uiText(QStringLiteral("bg_rec"), QStringLiteral("BG Rec")));
+    }
+    if (recordingStatusLabel) {
+        const QString rawStatus = recordingStatusLabel->property("statusRawText").toString();
+        recordingStatusLabel->setText(localizedStatusText(rawStatus.isEmpty()
+                                                              ? QStringLiteral("Recording: idle")
+                                                              : rawStatus));
+    }
+    if (playbackStatusLabel) {
+        const QString rawStatus = playbackStatusLabel->property("statusRawText").toString();
+        playbackStatusLabel->setText(localizedStatusText(rawStatus.isEmpty()
+                                                             ? QStringLiteral("Playback: idle")
+                                                             : rawStatus));
+    }
+
+    updateAudioFilterLabels();
+    updateHfNoiseCancelControls();
+    updateQthControls();
+    applySpectrumHunterTranslations();
+    updateAgileScanControls();
+    updateScanMeasurementStatus();
+    updateSpurSuppressionStatus();
+    updateVideoProcessorMode();
+    updateNetworkButtonText();
+}
+
+void YourClassName::applySpectrumHunterTranslations() {
+    auto applyHunter = [this](SpectrumHunterControls *controls,
+                              const QString &titleKey,
+                              const QString &titleFallback,
+                              const QString &tooltipKey,
+                              const QString &tooltipFallback) {
+        if (!controls) {
+            return;
+        }
+        controls->setUiText(
+            uiText(titleKey, titleFallback),
+            uiText(tooltipKey, tooltipFallback),
+            uiText(QStringLiteral("detect"), QStringLiteral("Detect")),
+            uiText(QStringLiteral("use_scan"), QStringLiteral("Use scan")),
+            uiText(QStringLiteral("use_scan_tooltip"),
+                   QStringLiteral("Copy this preset into Agile scan ranges and step")),
+            uiText(QStringLiteral("tune"), QStringLiteral("Tune")),
+            uiText(QStringLiteral("tune_candidate_tooltip"),
+                   QStringLiteral("Tune to the best detected candidate center")),
+            uiText(QStringLiteral("follow"), QStringLiteral("Follow")),
+            uiText(QStringLiteral("follow_candidate_tooltip"),
+                   QStringLiteral("Keep tuning to the selected detected candidate as the scan updates")),
+            uiText(QStringLiteral("previous_candidate_tooltip"),
+                   QStringLiteral("Tune to previous detected candidate")),
+            uiText(QStringLiteral("next_candidate_tooltip"),
+                   QStringLiteral("Tune to next detected candidate")),
+            uiText(QStringLiteral("min_width_short"), QStringLiteral("Min W:")),
+            uiText(QStringLiteral("max_width_short"), QStringLiteral("Max W:")),
+            uiText(QStringLiteral("threshold_short"), QStringLiteral("Thr:")));
+    };
+
+    applyHunter(dmrHunterControls,
+                QStringLiteral("dmr_hunter"),
+                QStringLiteral("DMR Hunter"),
+                QStringLiteral("dmr_hunter_tooltip"),
+                QStringLiteral("Detect DMR-like TDMA bursts in the current spectrum"));
+    applyHunter(fpvHunterControls,
+                QStringLiteral("fpv_hunter"),
+                QStringLiteral("FPV Hunter"),
+                QStringLiteral("fpv_hunter_tooltip"),
+                QStringLiteral("Detect wide FPV-like video carriers in the current spectrum"));
+    applyHunter(digitalVideoHunterControls,
+                QStringLiteral("digital_video_hunter"),
+                QStringLiteral("Digital Video Hunter"),
+                QStringLiteral("digital_video_hunter_tooltip"),
+                QStringLiteral("Detect wide digital video / OFDM-like carriers in the current spectrum"));
+}

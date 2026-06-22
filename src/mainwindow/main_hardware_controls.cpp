@@ -1,0 +1,224 @@
+#include "main.h"
+#include "appconstants.h"
+#include "tuningutils.h"
+
+#include <QCheckBox>
+#include <QDebug>
+#include <QSignalBlocker>
+
+#include <algorithm>
+#include <cmath>
+
+extern double globalFrequency;
+extern double globalSampleRate;
+extern double globalBandwidth;
+extern int globalModulationType;
+extern int globalMode;
+extern double currentScale;
+extern double minFrequency;
+extern double maxFrequency;
+void YourClassName::onDirectSamplingChanged(int index) {
+    Q_UNUSED(index);
+
+    if (!modeBox) {
+        return;
+    }
+
+    const int value = modeBox->currentData().toInt();
+
+    if (pendingSettings.inputMode == value) {
+        return;
+    }
+
+    const int previousInputMode = pendingSettings.inputMode;
+    pendingSettings.inputMode = value;
+
+    if (value != INPUT_RF) {
+        pendingSettings.centerFrequency = 0;
+        if (previousInputMode == INPUT_RF ||
+            !std::isfinite(pendingSettings.listeningFrequency)) {
+            pendingSettings.listeningFrequency = value == INPUT_HF_COMBINED ? 0 : 1250000;
+        }
+    } else {
+        if (!std::isfinite(pendingSettings.listeningFrequency) ||
+            pendingSettings.listeningFrequency < RF_MIN_LISTENING_FREQUENCY) {
+            pendingSettings.listeningFrequency = 100000000;
+        }
+        if (!std::isfinite(pendingSettings.centerFrequency) ||
+            pendingSettings.centerFrequency < RF_MIN_CENTER_FREQUENCY) {
+            pendingSettings.centerFrequency = pendingSettings.listeningFrequency;
+        }
+    }
+
+    normalizeTuning(pendingSettings);
+
+    if (frequencyControl) {
+        QSignalBlocker blocker(frequencyControl);
+        frequencyControl->setValueHz(pendingSettings.centerFrequency);
+    }
+
+    if (listeningFrequencyControl) {
+        QSignalBlocker blocker(listeningFrequencyControl);
+        listeningFrequencyControl->setValueHz(pendingSettings.listeningFrequency);
+    }
+
+    publishSettingsToGlobals();
+    settingRange();
+    updateHfNoiseCancelControls();
+
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+        return;
+    }
+
+    if (!isIdle()) {
+        restartStreamForHardwareChange();
+        return;
+    }
+
+    qDebug() << "Input mode will be applied on the next start.";
+}
+void YourClassName::settingRange() {
+    if (!scaleWidget || globalSampleRate <= 0.0) {
+        return;
+    }
+    double newRange = globalSampleRate * (currentScale / 100.0);
+    double overallMin = directMinFrequencyForMode(globalMode, globalSampleRate);
+    double overallMax = directMaxFrequency(globalSampleRate);
+
+    if (offlineIqPlaybackActive && !offlineIqPlaybackHasMetadata) {
+        overallMin = globalFrequency - globalSampleRate / 2.0;
+        overallMax = globalFrequency + globalSampleRate / 2.0;
+    } else if (globalMode == INPUT_RF) {
+        overallMin = (std::max)(RF_MIN_LISTENING_FREQUENCY,
+                                globalFrequency - globalSampleRate / 2.0);
+        overallMax = (std::max)(overallMin,
+                                globalFrequency + globalSampleRate / 2.0);
+    }
+
+    if (listeningFrequencyControl) {
+        const double controlMin = globalMode == INPUT_RF ? RF_MIN_LISTENING_FREQUENCY : overallMin;
+        const double controlMax = globalMode == INPUT_RF ? RF_EXPERIMENTAL_MAX_FREQUENCY : overallMax;
+        QSignalBlocker blocker(listeningFrequencyControl);
+        listeningFrequencyControl->setRangeHz(controlMin, controlMax);
+        listeningFrequencyControl->setValueHz((std::clamp)(pendingSettings.listeningFrequency, controlMin, controlMax));
+    }
+
+    const double availableRange = (std::max)(1.0, overallMax - overallMin);
+    newRange = (std::clamp)(newRange, 1.0, availableRange);
+
+    const double displayAnchorListening = (std::clamp)(pendingSettings.listeningFrequency, overallMin, overallMax);
+	double newMin = displayAnchorListening - newRange / 2.0;
+    newMin = (std::clamp)(newMin, overallMin, overallMax - newRange);
+    double newMax = newMin + newRange;
+    minFrequency = newMin;
+    maxFrequency = newMax;
+    scaleWidget->setTuning(pendingSettings.listeningFrequency, globalFrequency, globalBandwidth, globalModulationType);
+    scaleWidget->setRange(minFrequency, maxFrequency);
+    updateFineTuneLabel();
+}
+
+void YourClassName::onCheckboxStateChanged(int state) {
+    QCheckBox *senderCheckbox = qobject_cast<QCheckBox*>(sender());
+    if (senderCheckbox) {
+        const uint8_t value = currentGpoValue();
+        pendingSettings.gpoValue = value;
+        qDebug() << "Checkbox state changed. New GPO value:" << value;
+        if (hasActiveFobosDevice() && !isIdle() && hardwareSettingsApplied) {
+            const int result = setActiveGpoSafely(pendingSettings.gpoValue);
+            qDebug() << "[Live] GPO apply result" << result;
+            if (result == FOBOS_ERR_OK) {
+                appliedHardwareSettings.gpoValue = pendingSettings.gpoValue;
+            }
+        } else {
+            qDebug() << "GPO state will be applied on the next start.";
+        }
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand();
+        }
+    }
+}
+
+void YourClassName::onLnaGainChanged(int value) {
+    pendingSettings.lnaGain = value;
+    lnaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("lna_gain"), QStringLiteral("LNA Gain"))).arg(value));
+
+    if (hasActiveFobosDevice() && !isIdle() && hardwareSettingsApplied) {
+        const int result = setActiveLnaGainSafely(static_cast<unsigned int>(value));
+        qDebug() << "[Live] LNA gain apply result" << result;
+
+        if (result == FOBOS_ERR_OK) {
+            appliedHardwareSettings.lnaGain = value;
+        }
+    }
+
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+}
+
+void YourClassName::onVgaGainChanged(int value) {
+    pendingSettings.vgaGain = value;
+    vgaGainLabel->setText(QStringLiteral("%1: %2").arg(uiText(QStringLiteral("vga_gain"), QStringLiteral("VGA Gain"))).arg(value));
+
+    if (hasActiveFobosDevice() && !isIdle() && hardwareSettingsApplied) {
+        const int result = setActiveVgaGainSafely(static_cast<unsigned int>(value));
+        qDebug() << "[Live] VGA gain apply result" << result;
+
+        if (result == FOBOS_ERR_OK) {
+            appliedHardwareSettings.vgaGain = value;
+        }
+    }
+
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+}
+
+void YourClassName::onRtlAgcChanged(int state) {
+    pendingSettings.rtlAgc = state == Qt::Checked;
+    if (rtlGainSlider) {
+        rtlGainSlider->setEnabled(isRtlBackendSelected() && !pendingSettings.rtlAgc &&
+                                  (isIdle() || runState == RadioRunState::Running));
+    }
+
+    if (processor && processor->isRunning() && isRtlSdrNativeSelected()) {
+        processor->applyRtlGainSettings(pendingSettings.rtlAgc,
+                                        (std::clamp)(pendingSettings.rtlTunerGainTenthsDb, 0, 496));
+    }
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+    savePersistentSettings();
+}
+
+void YourClassName::onRtlGainChanged(int value) {
+    pendingSettings.rtlTunerGainTenthsDb = (std::clamp)(value, 0, 496);
+    if (rtlGainLabel) {
+        rtlGainLabel->setText(QStringLiteral("%1: %2 dB")
+                                  .arg(uiText(QStringLiteral("rtl_gain"), QStringLiteral("RTL gain")))
+                                  .arg(pendingSettings.rtlTunerGainTenthsDb / 10.0, 0, 'f', 1));
+    }
+
+    if (!pendingSettings.rtlAgc && processor && processor->isRunning() && isRtlSdrNativeSelected()) {
+        processor->applyRtlGainSettings(false, pendingSettings.rtlTunerGainTenthsDb);
+    }
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+    savePersistentSettings();
+}
+
+void YourClassName::onClkChanged(int index) {
+    if (!isIdle()) {
+        qDebug() << "Stop processing before changing clock source.";
+        revertHardwareControlsToSettings();
+        return;
+    }
+
+    pendingSettings.clockSource = clkBox->currentData().toInt();
+    qDebug() << "Clock source will be applied on the next start.";
+    if (isNetworkClientMode()) {
+        scheduleRemoteSettingsCommand();
+    }
+}

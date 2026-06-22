@@ -52,6 +52,8 @@ $excludedExtensions = @(
     ".csv",
     ".iq",
     ".log",
+    ".nmea",
+    ".raw",
     ".ubx",
     ".wav"
 )
@@ -63,7 +65,7 @@ $runtimeRoot = $RuntimePath.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [S
 Get-ChildItem -LiteralPath $RuntimePath -Recurse -Force | ForEach-Object {
     $relative = $_.FullName.Substring($runtimeRoot.Length).TrimStart("\", "/")
     $parts = $relative -split "[\\/]"
-    if ($parts.Count -gt 0 -and ($excludedDirs -contains $parts[0])) {
+    if ($parts | Where-Object { $excludedDirs -contains $_ }) {
         return
     }
 

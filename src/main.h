@@ -22,9 +22,7 @@
 #include <QMainWindow>
 #include <QDockWidget>
 #include <QPlainTextEdit>
-//#include <QAudioOutput>
-//#include <QAudioDeviceInfo>
-//#include <QAudio>
+#include <QVector>
 #include <QWheelEvent>
 #include <QObject>
 #include <QThread>
@@ -58,6 +56,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #endif
+#include "appconstants.h"
 #include "fft.h"
 #include "dataprocessor.h"
 #include "digitaldecoder.h"
@@ -70,6 +69,7 @@
 #include "videoprocessor.h"
 #include "videowidget.h"
 #include "dmrhunterdetector.h"
+#include "dmrprivacyutils.h"
 #include "fpvhunterdetector.h"
 #include "digitalvideohunterdetector.h"
 #include "spectrumhuntercontrols.h"
@@ -83,9 +83,7 @@
 #include "scalewidget.h"
 #include "MyGraphWidget.h"
 #include "MyWaterfallWidget.h"
-//#include <fobos.h>
 #include <fftw3.h>
-//#include <libusb.h>
 
 extern fobos_dev_t *device;
 extern float* dataq;
@@ -104,6 +102,7 @@ extern double maxFrequency;
 extern float sensitivity;
 extern float contrast;
 class FFTResult;
+class SpectrumFftWorker;
 class FineTuneScaleWidget;
 class QDialog;
 class QFile;
@@ -136,12 +135,15 @@ public:
    explicit YourClassName(QWidget *parent = nullptr);
     ~YourClassName();
      std::unique_ptr<FFTResult> fftResult;
+     std::unique_ptr<SpectrumFftWorker> spectrumFftWorker;
     void onFrequencyEntered();
     void onListeningFrequencyEntered();
     void onScaleChanged(int value);
     void updateSpectrum();
     void onLnaGainChanged(int value);
     void onVgaGainChanged(int value);
+    void onRtlAgcChanged(int state);
+    void onRtlGainChanged(int value);
     void onSensitivityChanged(int value);
     void onContrastChanged(int value);
     void onLevelMinChanged(int value);
@@ -196,16 +198,6 @@ protected:
 	void onWaterfallScaleChanged(int delta);
     void wheelEvent(QWheelEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
-        //void closeEvent(QCloseEvent *event) override {
-        //int reply = QMessageBox::question(this, "Acception", 
-        //                                  "Close this program?",
-        //                                  QMessageBox::Yes | QMessageBox::No);
-        //if (reply == QMessageBox::Yes) { 
-        //    event->accept();
-        //} else {
-        //    event->ignore();
-        //}
-		//};
 
 private:
     struct FobosDeviceInfo {
@@ -246,13 +238,12 @@ private:
                                                                bool publishIqSnapshot,
                                                                bool emitIqFrames) const;
     bool restartStreamForHardwareChange();
-    bool restartAgileReaderForCenterRetune(double previousFrequency,
-                                           double requestedFrequency,
-                                           const QString &reason);
     void abandonFobosSessionWithoutClose(const char *reason);
     bool openFobosSession();
     bool closeFobosSession(bool clearIq = true);
+    bool prepareFobosSessionFromSettings(const QString &reason);
     bool applyFobosSettings(bool forceFrequencyApply = false);
+    bool applyAgileStartupFrequencyKick(const QString &reason);
     bool applyAgileScanSettings(bool forceStop = false);
     bool applyStandardScanSettings(bool forceStop = false);
     QVector<double> agileScanFrequencyList(QString *error = nullptr) const;
@@ -387,6 +378,10 @@ private:
     void runGnssOfflineReplayTest();
     void runGnssSyntheticSelfTest();
     void runGnssPositionSelfTest();
+    void setGnssContinuousAcquisitionEnabled(bool enabled);
+    void stopGnssSdrAcquisition(const QString &reason, bool persistSettings = false);
+    void scheduleGnssContinuousAcquisition(int delayMs = -1);
+    void handleGnssContinuousAcquisitionTick();
     void updateGnssAcquisitionStatus(const GnssAcquisitionResult &result);
     void updateGnssAcquisitionPlot(const GnssAcquisitionResult &result);
     void saveGnssAcquisitionArtifacts(const GnssAcquisitionResult &result, const QString &sourceLabel);
@@ -498,6 +493,10 @@ private:
     QStringList dsdNeoProcessArguments() const;
     void updateDsdNeoBridgeSettings();
     void updateGopherTrunkBridgeSettings();
+    void showDmrPrivacyKeyDialog();
+    int selectedDmrPrivacyKeyId() const;
+    void refreshDmrPrivacyKeyIdCombo();
+    bool applyDmrPrivacyKeySelection();
     bool isVideoDecodeActive() const;
     void processVideoIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount);
     void processVideoSnapshotFrame();
@@ -541,6 +540,10 @@ private:
     QComboBox *dmrChannelRateCombo = nullptr;
     QComboBox *dmrAmbeLayoutCombo = nullptr;
     QComboBox *dmrBackendCombo = nullptr;
+    QComboBox *dmrPrivacyModeCombo = nullptr;
+    QComboBox *dmrPrivacyFrameOffsetCombo = nullptr;
+    QComboBox *dmrPrivacyDropCombo = nullptr;
+    QComboBox *dmrPrivacyBitLayoutCombo = nullptr;
     QLineEdit *dsdNeoProgramEdit = nullptr;
     QComboBox *qthSourceCombo = nullptr;
     QComboBox *gnssSystemCombo = nullptr;
@@ -548,10 +551,12 @@ private:
     QComboBox *gnssTimeZoneCombo = nullptr;
     QCheckBox *dmrManualTimingCheckbox = nullptr;
     QSpinBox *dmrTimingOffsetSpin = nullptr;
+    QComboBox *dmrPrivacyKeyIdCombo = nullptr;
     QDoubleSpinBox *dmrSlicerRatioSpin = nullptr;
     QSpinBox *gnssDopplerSpanSpin = nullptr;
     QSpinBox *gnssDopplerStepSpin = nullptr;
     QCheckBox *dmrAdaptiveSlicerCheckbox = nullptr;
+    QCheckBox *dmrPrivacyForwardCheckbox = nullptr;
     QCheckBox *dsdNeoAutoStartCheckbox = nullptr;
     QSpinBox *dsdNeoInputPortSpin = nullptr;
     QSpinBox *dsdNeoUdpOutputPortSpin = nullptr;
@@ -565,6 +570,7 @@ private:
     QPushButton *controlsToggleButton = nullptr;
     QPushButton *digitalToggleButton = nullptr;
     QPushButton *videoToggleButton = nullptr;
+    QPushButton *dmrPrivacyKeysButton = nullptr;
     QPushButton *recordButton = nullptr;
     QPushButton *playbackRefreshButton = nullptr;
     QPushButton *playbackButton = nullptr;
@@ -620,11 +626,13 @@ private:
     QCheckBox *gnssUseQzssCheckbox = nullptr;
     QCheckBox *gnssUseSbasCheckbox = nullptr;
     QCheckBox *gnssUseOtherCheckbox = nullptr;
+    QCheckBox *rtlAgcCheckbox = nullptr;
     QCheckBox *checkBoxes[8] = {};
     
     QSlider *scaleSlider = nullptr;
     QSlider *lnaGainSlider = nullptr;
     QSlider *vgaGainSlider = nullptr;
+    QSlider *rtlGainSlider = nullptr;
     QSlider *contrastSlider = nullptr;
     QSlider *sensitivitySlider = nullptr;
     QSlider *levelMinSlider = nullptr;
@@ -652,6 +660,7 @@ private:
     QLabel *hfNoiseCancelRefDelayLabel = nullptr;
     QLabel *hfNoiseCancelRefTiltLabel = nullptr;
     QLabel *lnaGainLabel = nullptr;
+    QLabel *rtlGainLabel = nullptr;
     QLabel *centralFrequencyLabel = nullptr;
     QLabel *listeningFrequencyLabel = nullptr;
     QLabel *fftLabel = nullptr;
@@ -676,6 +685,7 @@ private:
     QLineEdit *dmrLabTargetIdEdit = nullptr;
     QLineEdit *dmrLabRadioEdit = nullptr;
     QLineEdit *dmrLabNotesEdit = nullptr;
+    QVector<DmrPrivacyKeyEntry> dmrPrivacyKeys;
     QLineEdit *agileScanRangesEdit = nullptr;
     QLineEdit *standardScanCentersEdit = nullptr;
     QLineEdit *listeningScanTargetsEdit = nullptr;
@@ -804,6 +814,7 @@ private:
     bool automaticStreamRestart = false;
     bool pendingAudioStartAfterStreamReady = false;
     bool clearSpectrumAfterStop = false;
+    bool closeFobosSessionAfterStop = false;
     bool pendingNetworkAudioStartAfterIqPrebuffer = false;
     bool sampleRateReopenRequired = false;
     bool fobosCloseKnownUnsafe = false;
@@ -832,6 +843,7 @@ private:
     int scanVisualDebugFramesRemaining = 0;
     uint64_t scanVisualDebugSequence = 0;
     RadioRunState runState = RadioRunState::Idle;
+    bool closeShutdownFinalized = false;
     NetworkMode networkMode = NetworkMode::Disabled;
     NetworkProcessingMode networkProcessingMode = NetworkProcessingMode::ServerSide;
     QString networkServerAddress = "127.0.0.1";
@@ -881,9 +893,14 @@ private:
     QStringList listeningScanPresetOrder;
     int spectrumUpdateIntervalMs = 0;
     int waterfallRowsPerFrame = 1;
+    bool experimentalGpuWaterfall = false;
+    std::vector<float> spectrumFrequencyScratch;
+    std::vector<float> spectrumMagnitudeScratch;
+    std::vector<float> spectrumReferenceScratch;
     bool scanMeasurementEnabled = true;
     bool scanMeasurementBaselineRecording = false;
     double scanMeasurementBinMhz = 0.1;
+    int scanMeasurementUpdateIntervalMs = SCAN_MEASUREMENT_DEFAULT_UPDATE_MS;
     DmrHunterSettings dmrHunterSettings;
     DmrHunterResult dmrHunterLastResult;
     std::vector<DmrHunterCandidate> dmrHunterCandidates;
@@ -955,6 +972,14 @@ private:
     };
     QMap<qint64, ScanMeasurementBin> scanMeasurementBins;
     uint64_t scanMeasurementSequence = 0;
+    QElapsedTimer scanMeasurementUpdateClock;
+    QElapsedTimer scanMeasurementStatusClock;
+    mutable QElapsedTimer scanMeasurementOverlayClock;
+    mutable std::vector<float> scanMeasurementOverlayCache;
+    mutable uint64_t scanMeasurementOverlayCacheSequence = 0;
+    mutable int scanMeasurementOverlayCacheCount = 0;
+    mutable double scanMeasurementOverlayCacheFirstHz = std::numeric_limits<double>::quiet_NaN();
+    mutable double scanMeasurementOverlayCacheLastHz = std::numeric_limits<double>::quiet_NaN();
 
     struct SpurMaskEntry {
         double offsetHz = 0.0;
@@ -1005,11 +1030,24 @@ private:
     bool diagnosticVerboseLogging = false;
     bool gnssMonitorEnabled = false;
     bool gnssAcquisitionRunning = false;
+    bool gnssContinuousAcquisitionEnabled = false;
+    bool gnssContinuousAcquisitionTickActive = false;
+    int gnssContinuousAcquisitionIntervalMs = 2500;
+    std::uint64_t gnssLastContinuousAcquisitionSequence = 0;
     std::shared_ptr<std::atomic_bool> gnssAcquisitionCancelFlag;
     QVector<double> gnssPeakToSecondHistoryDb;
+    QMap<QString, QVector<int>> gnssGpsLnavBitHistory;
+    QMap<QString, QVector<int>> gnssGpsLnavSegmentHistory;
+    QMap<QString, int> gnssGpsLnavNextSegmentId;
+    QMap<QString, std::uint64_t> gnssGpsLnavLastSequence;
+    QMap<QString, qint64> gnssGpsLnavLastUpdateMs;
+    int gnssGpsFocusedPrn = 0;
+    double gnssGpsFocusedDopplerHz = 0.0;
+    int gnssGpsFocusedWeakCount = 0;
+    int gnssGpsFocusedStableCount = 0;
     QString gnssSystemId = QStringLiteral("gps_l1_ca");
     QString gnssAcquisitionSource = QStringLiteral("live");
-    QString gnssSerialPortName = QStringLiteral("COM4");
+    QString gnssSerialPortName;
     int gnssSerialBaud = 9600;
     QString gnssPositionPolicy = QStringLiteral("auto");
     bool gnssUbxAutoEnable = false;
@@ -1020,6 +1058,7 @@ private:
     bool gnssUbxOutputEnabled = false;
     bool gnssPendingCfgGnssApply = false;
     QByteArray gnssLastCfgGnssPayload;
+    qint64 gnssLastContinuousArtifactSaveMs = 0;
     qint64 gnssLastUbxFixMs = 0;
     int gnssSerialFixQuality = -1;
     int gnssSerialFixMode = -1;
@@ -1070,6 +1109,7 @@ private:
     QElapsedTimer gnssSpurWatchTimer;
     QElapsedTimer gnssSpurLogTimer;
     QDialog *gnssAcquisitionPlotDialog = nullptr;
+    QTimer *gnssContinuousAcquireTimer = nullptr;
     double qthLatitude = 0.0;
     double qthLongitude = 0.0;
     bool qthPositionVisible = true;

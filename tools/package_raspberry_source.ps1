@@ -24,11 +24,12 @@ if (Test-Path -LiteralPath $Stage) {
 }
 New-Item -ItemType Directory -Path $Stage | Out-Null
 
-$files = git -C $Workspace ls-files --cached --others --exclude-standard
+$files = git -C $Workspace -c core.quotepath=false ls-files --cached --others --exclude-standard
 $excludePrefixes = @(
     "android/",
     "release/",
     "build/",
+    "src.Fobos.example/",
     "third_party/patched/libfobos/showimg/",
     "third_party/patched/libfobos-sdr-agile/showimg/",
     "sandbox/",
@@ -38,6 +39,9 @@ $excludePrefixes = @(
 $excludeExactPaths = @(
     "third_party/mbelib-neo",
     "third_party/softdmr",
+    "token.txt",
+    "aqtinstall.log",
+    "Новий текстовий документ.txt",
     "tools/analyze_retune_raw_dump.py",
     "tools/dmr_lab_replay.cpp",
     "docs/dmr_lab_replay.md",
@@ -52,6 +56,12 @@ $excludeExactPaths = @(
 foreach ($file in $files) {
     $normalized = $file -replace "\\", "/"
     $normalizedExact = $normalized.TrimEnd("/")
+    if (-not $normalized.Contains("/") -and
+        $normalized.EndsWith(".txt", [System.StringComparison]::OrdinalIgnoreCase) -and
+        $normalized -ne "CMakeLists.txt" -and
+        $normalized -ne "THIRD_PARTY_LICENSES.txt") {
+        continue
+    }
     if ($excludeExactPaths -contains $normalizedExact) {
         continue
     }

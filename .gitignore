@@ -35,11 +35,16 @@ Makefile
 
 # Logs
 *.log
+*.csv
+*.nmea
+*.ubx
+FobosAPP.ini
 
 # Local context screenshots/photos kept in the workspace root
 /*.jpg
 /*.jpeg
 /*.png
+/*.txt
 
 # IDE
 .idea/
@@ -77,6 +82,7 @@ local.properties
 *.aab
 
 # Local SDR captures / decoder dumps
+*.wav
 *.iq.wav
 *.iq
 *.cu8
@@ -103,6 +109,7 @@ src/udp_sender.cpp
 src/udp_sender.h
 src/ringbuffer.cpp
 src/ringbuffer.h
+src.Fobos.example/
 
 # unused folders
 /shaders/

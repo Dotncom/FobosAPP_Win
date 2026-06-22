@@ -2,7 +2,7 @@
 
 FobosAPP is an SDR receiver application for RigExpert Fobos SDR hardware.
 The current packaged release is Windows-first, with active Linux/Raspberry Pi
-and Android USB/network client support work. Version 4.5.0 keeps the stable
+and Android USB/network client support work. Version 4.5.1 keeps the stable
 real-device, network, and video/image work from the 2.x/3.x line, expands the
 receiver backend layer, adds native RTL-SDR/rtl_tcp and optional SoapySDR
 backends, improves scan/measurement tooling, adds practical external
@@ -25,12 +25,12 @@ for map providers, and UI settings. The desktop app also provides
 `Settings... -> Settings backup -> Export settings... / Import settings...` for
 making a separate backup file.
 
-DMR voice in 4.5.0 is experimental. Windows packages may include optional
+DMR voice in 4.5.x is experimental. Windows packages may include optional
 `dmr_voice_backends/fobos_dmr_voice_*.dll` GPL backend modules. See
 `THIRD_PARTY_LICENSES.txt` and `licenses/dmr_voice_backend/` before
 redistributing AMBE-capable binaries.
 
-GNSS/QTH work in 4.5.0 has two paths:
+GNSS/QTH work in 4.5.x has two paths:
 
 - External serial GNSS receivers are the practical path. Standard NMEA modules
   provide live coordinates, time, satellite diagnostics, sky view, QTH map
@@ -175,7 +175,7 @@ now uses cache paths instead of hard-coded include/link directives:
 - `FFTW_ROOT`
 
 On the existing Windows development machine those default to the local SDK
-folders above. On Linux, install Qt5 Core/Widgets/Network/Multimedia, FFTW
+folders above. On Linux, install Qt5 Core/Widgets/Network/SerialPort/Multimedia, FFTW
 single-precision libraries, libusb, and Linux builds of the standard/agile Fobos
 libraries, or point the three cache paths at local builds.
 
