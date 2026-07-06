@@ -4,6 +4,7 @@
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QPushButton>
+#include <QSizePolicy>
 #include <QSignalBlocker>
 #include <QVBoxLayout>
 
@@ -51,43 +52,47 @@ FrequencyControl::FrequencyControl(QWidget *parent)
     valueSpin->setKeyboardTracking(false);
     valueSpin->setButtonSymbols(QAbstractSpinBox::NoButtons);
     valueSpin->setAlignment(Qt::AlignRight);
-    valueSpin->setMinimumWidth(92);
+    valueSpin->setMinimumWidth(76);
+    valueSpin->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
     unitCombo = new QComboBox(this);
     for (const UnitInfo &unit : UNITS) {
         unitCombo->addItem(unit.label, unit.factor);
     }
-    unitCombo->setMaximumWidth(62);
+    unitCombo->setMaximumWidth(56);
+    unitCombo->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
 
     stepCombo = new QComboBox(this);
     setStepPresets(defaultSteps());
-    stepCombo->setMinimumContentsLength(7);
+    stepCombo->setMinimumContentsLength(5);
     stepCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    stepCombo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
     presetCombo = new QComboBox(this);
     presetCombo->addItem("Preset", QVariant());
     presetCombo->setEnabled(false);
-    presetCombo->setMinimumContentsLength(7);
+    presetCombo->setMinimumContentsLength(5);
     presetCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    presetCombo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
     minusButton = new QPushButton("-", this);
     plusButton = new QPushButton("+", this);
-    minusButton->setFixedWidth(28);
-    plusButton->setFixedWidth(28);
+    minusButton->setFixedWidth(24);
+    plusButton->setFixedWidth(24);
 
     QVBoxLayout *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(2);
     QHBoxLayout *valueLayout = new QHBoxLayout();
     valueLayout->setContentsMargins(0, 0, 0, 0);
-    valueLayout->setSpacing(4);
+    valueLayout->setSpacing(3);
     valueLayout->addWidget(minusButton);
     valueLayout->addWidget(valueSpin, 1);
     valueLayout->addWidget(unitCombo);
     valueLayout->addWidget(plusButton);
     QHBoxLayout *presetLayout = new QHBoxLayout();
     presetLayout->setContentsMargins(0, 0, 0, 0);
-    presetLayout->setSpacing(4);
+    presetLayout->setSpacing(3);
     presetLayout->addWidget(stepCombo, 1);
     presetLayout->addWidget(presetCombo, 1);
     layout->addLayout(valueLayout);

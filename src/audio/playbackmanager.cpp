@@ -11,7 +11,7 @@
 namespace {
 
 constexpr int AUDIO_FRAME_SAMPLES = 4800;
-constexpr int IQ_FRAME_SAMPLES = 16384;
+constexpr int IQ_FRAME_SAMPLES = 4096;
 
 quint16 readLe16(const QByteArray &data, int offset) {
     const auto *ptr = reinterpret_cast<const uchar *>(data.constData() + offset);

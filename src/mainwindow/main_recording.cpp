@@ -1,13 +1,17 @@
 #include "main.h"
 #include "appconstants.h"
 #include "iqbuffer.h"
+#include "spectrumframereplaydialog.h"
 #include "spectrumfftworker.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFileInfoList>
+#include <QMessageBox>
 #include <QMetaObject>
 #include <QSignalBlocker>
 
@@ -104,6 +108,15 @@ bool YourClassName::isChannelIqRecordingActive() const {
            recordingManager->mode() == RecordingManager::Mode::ChannelIqWav;
 }
 
+bool YourClassName::spectrumEventIqProducerNeeded() const {
+    return spectrumEventCaptureMode > 0 &&
+           (spectrumFrameBufferEnabled || spectrumFrameRecorder.isRecording());
+}
+
+bool YourClassName::spectrumEventIqChannelized() const {
+    return spectrumEventCaptureMode == 1;
+}
+
 void YourClassName::updateIqFrameProducerSettings() {
     if (!processor) {
         return;
@@ -113,15 +126,278 @@ void YourClassName::updateIqFrameProducerSettings() {
     const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
     const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
     const bool channelIqRecording = isChannelIqRecordingActive();
+    const bool eventIq = spectrumEventIqProducerNeeded();
+    const bool eventFullIq = eventIq && spectrumEventCaptureMode == 2;
+    const bool eventChannelIq = eventIq && spectrumEventIqChannelized();
     processor->configureNetworkIqStreaming(pendingSettings,
-                                           serverIqStreaming || channelIqRecording,
-                                           serverChannelIqStreaming || channelIqRecording);
+                                           serverIqStreaming || channelIqRecording || eventIq,
+                                           !serverFullIqStreaming &&
+                                               !eventFullIq &&
+                                               (serverChannelIqStreaming || channelIqRecording || eventChannelIq));
 }
 
 void YourClassName::updateRecordingStatus(const QString &status) {
     if (recordingStatusLabel) {
         recordingStatusLabel->setProperty("statusRawText", status);
-        recordingStatusLabel->setText(localizedStatusText(status));
+        const QString localized = localizedStatusText(status);
+        recordingStatusLabel->setText(localized);
+        recordingStatusLabel->setToolTip(localized);
+    }
+}
+
+void YourClassName::updateSpectrumFrameRecordingStatus(const QString &status) {
+    if (spectrumFrameRecordingStatusLabel) {
+        spectrumFrameRecordingStatusLabel->setProperty("statusRawText", status);
+        const QString localized = localizedStatusText(status);
+        spectrumFrameRecordingStatusLabel->setText(localized);
+        spectrumFrameRecordingStatusLabel->setToolTip(localized);
+    }
+}
+
+void YourClassName::startSpectrumFrameRecording() {
+    if (spectrumFrameRecorder.isRecording()) {
+        return;
+    }
+
+    QString errorMessage;
+    const int bins = spectrumFrameBinsCombo ? spectrumFrameBinsCombo->currentData().toInt() : 4096;
+    const bool wantEventIq = spectrumEventCaptureMode > 0;
+    const bool wantChannelized = spectrumEventIqChannelized();
+    const qint64 firstSpectrumUtcMs = (!spectrumFramePrebuffer.empty() && spectrumFrameBufferEnabled)
+                                          ? spectrumFramePrebuffer.front().utcMs
+                                          : 0;
+    qint64 firstIqUtcMs = 0;
+    if (wantEventIq && spectrumFrameBufferEnabled) {
+        for (const SpectrumEventIqFrame &frame : spectrumIqPrebuffer) {
+            if (frame.channelized == wantChannelized) {
+                firstIqUtcMs = frame.utcMs;
+                break;
+            }
+        }
+    }
+
+    qint64 firstUtcMs = firstSpectrumUtcMs;
+    if (wantEventIq && spectrumFrameBufferEnabled) {
+        if (firstSpectrumUtcMs > 0 && firstIqUtcMs > 0) {
+            firstUtcMs = (std::max)(firstSpectrumUtcMs, firstIqUtcMs);
+        } else if (firstIqUtcMs > 0) {
+            firstUtcMs = firstIqUtcMs;
+        } else {
+            firstUtcMs = 0;
+        }
+    }
+    if (!spectrumFrameRecorder.start(pendingSettings, currentScale, bins, firstUtcMs, &errorMessage)) {
+        updateSpectrumFrameRecordingStatus(QStringLiteral("Spectrum recording failed: %1").arg(errorMessage));
+        if (spectrumFrameRecordButton) {
+            QSignalBlocker blocker(spectrumFrameRecordButton);
+            spectrumFrameRecordButton->setChecked(false);
+        }
+        return;
+    }
+
+    spectrumEventBasePath = spectrumFrameRecorder.currentFilePath();
+    if (spectrumEventBasePath.endsWith(QStringLiteral("_spectrum.fbspec"))) {
+        spectrumEventBasePath.chop(QStringLiteral("_spectrum.fbspec").size());
+    }
+
+    if (spectrumFrameBufferEnabled && firstUtcMs > 0 && !spectrumFramePrebuffer.empty()) {
+        for (const SpectrumFrameRecord &frame : spectrumFramePrebuffer) {
+            if (frame.utcMs < firstUtcMs) {
+                continue;
+            }
+            if (!spectrumFrameRecorder.appendFrameRecord(frame)) {
+                spectrumFrameRecorder.stop();
+                updateSpectrumFrameRecordingStatus(QStringLiteral("Spectrum recording failed: pre-buffer write error"));
+                if (spectrumFrameRecordButton) {
+                    QSignalBlocker blocker(spectrumFrameRecordButton);
+                    spectrumFrameRecordButton->setChecked(false);
+                }
+                return;
+            }
+        }
+    }
+
+    if (spectrumEventCaptureMode > 0 && !spectrumIqPrebuffer.empty()) {
+        auto firstIqIt = std::find_if(spectrumIqPrebuffer.begin(),
+                                      spectrumIqPrebuffer.end(),
+                                      [wantChannelized, firstUtcMs](const SpectrumEventIqFrame &frame) {
+                                          return frame.channelized == wantChannelized &&
+                                                 (firstUtcMs <= 0 || frame.utcMs >= firstUtcMs);
+                                      });
+        if (firstIqIt != spectrumIqPrebuffer.end()) {
+            const SpectrumEventIqFrame &firstIq = *firstIqIt;
+            const SpectrumIqEventRecorder::Mode iqMode =
+                wantChannelized
+                    ? SpectrumIqEventRecorder::Mode::ChannelIqS16
+                    : SpectrumIqEventRecorder::Mode::FullIqS8;
+            if (!spectrumIqEventRecorder.start(spectrumEventBasePath,
+                                               iqMode,
+                                               pendingSettings,
+                                               firstIq.sampleRate,
+                                               firstIq.utcMs,
+                                               spectrumFrameRecorder.firstFrameUtcMs(),
+                                               &errorMessage)) {
+                qDebug() << "[SpectrumEventIQ] failed to start prebuffer IQ recorder" << errorMessage;
+            } else {
+                for (auto it = firstIqIt; it != spectrumIqPrebuffer.end(); ++it) {
+                    const SpectrumEventIqFrame &frame = *it;
+                    if (frame.channelized == wantChannelized) {
+                        spectrumIqEventRecorder.appendFrame(frame.data, frame.sampleRate, frame.sampleCount, frame.utcMs);
+                    }
+                }
+            }
+        }
+    }
+
+    if (spectrumFrameBinsCombo) {
+        spectrumFrameBinsCombo->setEnabled(false);
+    }
+    if (spectrumFramePrebufferSpin) {
+        spectrumFramePrebufferSpin->setEnabled(false);
+    }
+    if (spectrumFrameRecordButton) {
+        QSignalBlocker blocker(spectrumFrameRecordButton);
+        spectrumFrameRecordButton->setChecked(true);
+        spectrumFrameRecordButton->setText(uiText(QStringLiteral("stop_rec"), QStringLiteral("Stop Rec")));
+    }
+    updateSpectrumFrameRecordingStatus(
+        QStringLiteral("Spectrum recording: %1 (%2 pre)")
+            .arg(QFileInfo(spectrumFrameRecorder.currentFilePath()).fileName())
+            .arg(spectrumFrameRecorder.frameCount()));
+    qDebug() << "[SpectrumRecorder] started"
+             << spectrumFrameRecorder.currentFilePath()
+             << "bins" << spectrumFrameRecorder.targetBins()
+             << "eventMode" << spectrumEventCaptureMode
+             << "spectrumFirstUtc" << firstSpectrumUtcMs
+             << "iqFirstUtc" << firstIqUtcMs
+             << "commonFirstUtc" << spectrumFrameRecorder.firstFrameUtcMs();
+    updateIqFrameProducerSettings();
+}
+
+void YourClassName::stopSpectrumFrameRecording() {
+    if (!spectrumFrameRecorder.isRecording()) {
+        if (spectrumFrameRecordButton && spectrumFrameRecordButton->isChecked()) {
+            QSignalBlocker blocker(spectrumFrameRecordButton);
+            spectrumFrameRecordButton->setChecked(false);
+            spectrumFrameRecordButton->setText(uiText(QStringLiteral("spectrum_rec"), QStringLiteral("Spectrum Rec")));
+        }
+        return;
+    }
+
+    const QString finishedFile = spectrumFrameRecorder.currentFilePath();
+    const quint64 frames = spectrumFrameRecorder.frameCount();
+    const quint64 iqBytes = spectrumIqEventRecorder.bytesWritten();
+    if (spectrumIqEventRecorder.isRecording()) {
+        spectrumIqEventRecorder.stop();
+    }
+    spectrumFrameRecorder.stop();
+    if (spectrumFrameBinsCombo) {
+        spectrumFrameBinsCombo->setEnabled(true);
+    }
+    if (spectrumFramePrebufferSpin) {
+        spectrumFramePrebufferSpin->setEnabled(true);
+    }
+    if (spectrumFrameRecordButton) {
+        QSignalBlocker blocker(spectrumFrameRecordButton);
+        spectrumFrameRecordButton->setChecked(false);
+        spectrumFrameRecordButton->setText(uiText(QStringLiteral("spectrum_rec"), QStringLiteral("Spectrum Rec")));
+    }
+    updateSpectrumFrameRecordingStatus(
+        frames > 0
+            ? QStringLiteral("Spectrum saved: %1 (%2 frames, IQ %3 MB)")
+                  .arg(QFileInfo(finishedFile).fileName())
+                  .arg(frames)
+                  .arg(static_cast<double>(iqBytes) / (1024.0 * 1024.0), 0, 'f', 1)
+            : QStringLiteral("Spectrum recording stopped: no frames"));
+    qDebug() << "[SpectrumRecorder] stopped"
+             << finishedFile
+             << "frames" << static_cast<qulonglong>(frames)
+             << "iqBytes" << static_cast<qulonglong>(iqBytes);
+    updateIqFrameProducerSettings();
+}
+
+void YourClassName::openSpectrumFrameReplay() {
+    const QString startDir = QDir(QCoreApplication::applicationDirPath())
+                                 .filePath(QStringLiteral("recordings/spectrum"));
+    const QString path =
+        QFileDialog::getOpenFileName(this,
+                                     uiText(QStringLiteral("spectrum_replay"), QStringLiteral("Spectrum replay")),
+                                     startDir,
+                                     QStringLiteral("Fobos spectrum frames (*.fbspec);;All files (*.*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+
+    QString errorMessage;
+    auto *dialog = new SpectrumFrameReplayDialog(this);
+    if (!dialog->loadRecording(path, &errorMessage)) {
+        dialog->deleteLater();
+        QMessageBox::warning(this,
+                             uiText(QStringLiteral("spectrum_replay"), QStringLiteral("Spectrum replay")),
+                             QStringLiteral("Could not open spectrum recording:\n%1").arg(errorMessage));
+        return;
+    }
+    dialog->setAttribute(Qt::WA_DeleteOnClose, true);
+    dialog->show();
+}
+
+void YourClassName::handleSpectrumEventIqFrame(const QByteArray &iqData,
+                                               double sampleRate,
+                                               int sampleCount,
+                                               bool channelized) {
+    if (iqData.isEmpty() || sampleRate <= 0.0 || sampleCount <= 0 || spectrumEventCaptureMode <= 0) {
+        return;
+    }
+    const bool wantChannelized = spectrumEventIqChannelized();
+    if (channelized != wantChannelized) {
+        return;
+    }
+
+    SpectrumEventIqFrame frame;
+    frame.data = iqData;
+    frame.sampleRate = sampleRate;
+    frame.sampleCount = sampleCount;
+    frame.channelized = channelized;
+    frame.utcMs = QDateTime::currentMSecsSinceEpoch();
+
+    if (spectrumFrameBufferEnabled) {
+        spectrumIqPrebuffer.push_back(frame);
+        const qint64 keepMs = static_cast<qint64>((std::max)(1, spectrumFramePrebufferSeconds)) * 1000;
+        while (!spectrumIqPrebuffer.empty() &&
+               frame.utcMs - spectrumIqPrebuffer.front().utcMs > keepMs) {
+            spectrumIqPrebuffer.pop_front();
+        }
+    }
+
+    if (!spectrumFrameRecorder.isRecording()) {
+        return;
+    }
+
+    if (!spectrumIqEventRecorder.isRecording()) {
+        QString errorMessage;
+        if (spectrumEventBasePath.isEmpty()) {
+            spectrumEventBasePath = spectrumFrameRecorder.currentFilePath();
+            if (spectrumEventBasePath.endsWith(QStringLiteral("_spectrum.fbspec"))) {
+                spectrumEventBasePath.chop(QStringLiteral("_spectrum.fbspec").size());
+            }
+        }
+        const SpectrumIqEventRecorder::Mode iqMode =
+            channelized
+                ? SpectrumIqEventRecorder::Mode::ChannelIqS16
+                : SpectrumIqEventRecorder::Mode::FullIqS8;
+        if (!spectrumIqEventRecorder.start(spectrumEventBasePath,
+                                           iqMode,
+                                           pendingSettings,
+                                           sampleRate,
+                                           frame.utcMs,
+                                           spectrumFrameRecorder.firstFrameUtcMs(),
+                                           &errorMessage)) {
+            qDebug() << "[SpectrumEventIQ] failed to start IQ event recorder" << errorMessage;
+            return;
+        }
+    }
+    if (!spectrumIqEventRecorder.appendFrame(iqData, sampleRate, sampleCount, frame.utcMs)) {
+        qDebug() << "[SpectrumEventIQ] IQ write failed";
     }
 }
 
@@ -489,7 +765,9 @@ void YourClassName::onPlaybackStopped() {
 void YourClassName::onPlaybackStatusChanged(const QString &status) {
     if (playbackStatusLabel) {
         playbackStatusLabel->setProperty("statusRawText", status);
-        playbackStatusLabel->setText(localizedStatusText(status));
+        const QString localized = localizedStatusText(status);
+        playbackStatusLabel->setText(localized);
+        playbackStatusLabel->setToolTip(localized);
     }
 }
 

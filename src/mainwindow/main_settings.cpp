@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 extern bool secondGraph;
 extern bool syncWariable;
@@ -70,6 +71,11 @@ void YourClassName::loadPersistentSettings() {
     pendingSettings.hfNoiseCancelRefTiltDb =
         clampHfNoiseCancelRefTiltDb(settings.value("hfNoiseCancel/refTiltDb", pendingSettings.hfNoiseCancelRefTiltDb).toDouble());
     pendingSettings.hfNoiseCancelFreeze = settings.value("hfNoiseCancel/freeze", pendingSettings.hfNoiseCancelFreeze).toBool();
+    hfInterferenceBaselineEnabled = settings.value("hfInterference/baselineEnabled", hfInterferenceBaselineEnabled).toBool();
+    hfInterferenceBaselineDepth =
+        (std::clamp)(settings.value("hfInterference/baselineDepth", hfInterferenceBaselineDepth).toDouble(), 0.0, 2.0);
+    hfInterferenceBaselineSmoothBins =
+        (std::clamp)(settings.value("hfInterference/baselineSmoothBins", hfInterferenceBaselineSmoothBins).toInt(), 1, 301) | 1;
     pendingSettings.audioEnabled = settings.value("receiver/audioEnabled", pendingSettings.audioEnabled).toBool();
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>((std::clamp)(settings.value("receiver/gpoValue", static_cast<int>(pendingSettings.gpoValue)).toInt(), 0, 255));
@@ -577,6 +583,37 @@ void YourClassName::loadPersistentSettings() {
                      AGILE_LIVE_RETUNE_MIN_COMMAND_INTERVAL_MS,
                      AGILE_LIVE_RETUNE_MAX_COMMAND_INTERVAL_MS);
     fineTuneScaleHoldMode = settings.value("ui/fineTuneScaleHoldMode", fineTuneScaleHoldMode).toBool();
+    spectrumFrameBufferEnabled =
+        settings.value("spectrumFrames/bufferEnabled", spectrumFrameBufferEnabled).toBool();
+    spectrumFramePrebufferSeconds =
+        (std::clamp)(settings.value("spectrumFrames/prebufferSeconds",
+                                    spectrumFramePrebufferSeconds).toInt(),
+                     1,
+                     120);
+    spectrumEventCaptureMode =
+        (std::clamp)(settings.value("spectrumFrames/eventCaptureMode",
+                                    spectrumEventCaptureMode).toInt(),
+                     0,
+                     2);
+    if (spectrumFrameBinsCombo) {
+        const int requestedBins =
+            (std::clamp)(settings.value("spectrumFrames/bins",
+                                        spectrumFrameBinsCombo->currentData().toInt()).toInt(),
+                         256,
+                         2097152);
+        int bestIndex = 0;
+        int bestDistance = std::numeric_limits<int>::max();
+        for (int i = 0; i < spectrumFrameBinsCombo->count(); ++i) {
+            const int bins = spectrumFrameBinsCombo->itemData(i).toInt();
+            const int distance = std::abs(bins - requestedBins);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+        }
+        QSignalBlocker blocker(spectrumFrameBinsCombo);
+        spectrumFrameBinsCombo->setCurrentIndex(bestIndex);
+    }
 
     networkMode = NetworkMode::Disabled;
     const int processingModeValue = (std::clamp)(settings.value("network/processingMode", static_cast<int>(networkProcessingMode)).toInt(),
@@ -1166,6 +1203,12 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("ui/experimentalGpuWaterfall", experimentalGpuWaterfall);
     settings.setValue("ui/agileLiveRetuneIntervalMs", agileLiveRetuneCommandIntervalMs);
     settings.setValue("ui/fineTuneScaleHoldMode", fineTuneScaleHoldMode);
+    settings.setValue("spectrumFrames/bufferEnabled", spectrumFrameBufferEnabled);
+    settings.setValue("spectrumFrames/prebufferSeconds", spectrumFramePrebufferSeconds);
+    settings.setValue("spectrumFrames/eventCaptureMode", spectrumEventCaptureMode);
+    if (spectrumFrameBinsCombo) {
+        settings.setValue("spectrumFrames/bins", spectrumFrameBinsCombo->currentData().toInt());
+    }
     settings.setValue("audio/lowPassHz", pendingSettings.audioLowPassHz);
     settings.setValue("audio/highPassHz", pendingSettings.audioHighPassHz);
     settings.setValue("hfNoiseCancel/depth", pendingSettings.hfNoiseCancelDepth);
@@ -1173,6 +1216,9 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("hfNoiseCancel/refDelayNs", pendingSettings.hfNoiseCancelRefDelayNs);
     settings.setValue("hfNoiseCancel/refTiltDb", pendingSettings.hfNoiseCancelRefTiltDb);
     settings.setValue("hfNoiseCancel/freeze", pendingSettings.hfNoiseCancelFreeze);
+    settings.setValue("hfInterference/baselineEnabled", hfInterferenceBaselineEnabled);
+    settings.setValue("hfInterference/baselineDepth", hfInterferenceBaselineDepth);
+    settings.setValue("hfInterference/baselineSmoothBins", hfInterferenceBaselineSmoothBins);
 
     settings.setValue("network/serverAddress", networkServerAddress);
     settings.setValue("network/bindAddress", networkBindAddress);

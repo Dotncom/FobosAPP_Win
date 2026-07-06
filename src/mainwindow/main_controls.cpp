@@ -583,6 +583,62 @@ void YourClassName::updateAudioFilterLabels() {
 
 void YourClassName::updateHfNoiseCancelControls() {
     const bool enabled = pendingSettings.inputMode == INPUT_HF_NOISE_CANCEL;
+    const bool hfVisualEnabled = isDirectInputMode(pendingSettings.inputMode);
+
+    if (hfInterferenceBaselineCheckbox) {
+        hfInterferenceBaselineCheckbox->setEnabled(hfVisualEnabled);
+        hfInterferenceBaselineCheckbox->setToolTip(
+            uiText(QStringLiteral("hf_baseline_tooltip"),
+                   QStringLiteral("Subtract a learned HF noise-floor curve from the visual spectrum and waterfall only.")));
+    }
+    if (hfInterferenceBaselineLearnButton) {
+        hfInterferenceBaselineLearnButton->setEnabled(hfVisualEnabled && !spectrumFrequencyScratch.empty());
+        hfInterferenceBaselineLearnButton->setToolTip(
+            uiText(QStringLiteral("hf_baseline_learn_tooltip"),
+                   QStringLiteral("Capture the current visible spectrum as the HF interference baseline.")));
+    }
+    if (hfInterferenceBaselineClearButton) {
+        hfInterferenceBaselineClearButton->setEnabled(!hfInterferenceBaselineFrequencies.empty());
+        hfInterferenceBaselineClearButton->setToolTip(
+            uiText(QStringLiteral("hf_baseline_clear_tooltip"),
+                   QStringLiteral("Clear the learned HF interference baseline.")));
+    }
+    if (hfInterferenceBaselineDepthLabel) {
+        hfInterferenceBaselineDepthLabel->setText(
+            QStringLiteral("%1: %2%")
+                .arg(uiText(QStringLiteral("hf_baseline_depth"), QStringLiteral("Baseline depth")))
+                .arg(static_cast<int>(std::lround(hfInterferenceBaselineDepth * 100.0))));
+        hfInterferenceBaselineDepthLabel->setEnabled(hfVisualEnabled);
+    }
+    if (hfInterferenceBaselineDepthSlider) {
+        hfInterferenceBaselineDepthSlider->setEnabled(hfVisualEnabled);
+    }
+    if (hfInterferenceBaselineSmoothLabel) {
+        hfInterferenceBaselineSmoothLabel->setText(
+            QStringLiteral("%1: %2")
+                .arg(uiText(QStringLiteral("hf_baseline_smooth"), QStringLiteral("Smooth")))
+                .arg(hfInterferenceBaselineSmoothBins));
+        hfInterferenceBaselineSmoothLabel->setEnabled(hfVisualEnabled);
+    }
+    if (hfInterferenceBaselineSmoothSlider) {
+        hfInterferenceBaselineSmoothSlider->setEnabled(hfVisualEnabled);
+    }
+    if (hfInterferenceBaselineStatusLabel) {
+        QString status;
+        if (hfInterferenceBaselineFrequencies.empty()) {
+            status = uiText(QStringLiteral("hf_baseline_empty"), QStringLiteral("Baseline: empty"));
+        } else {
+            status = QStringLiteral("%1: %2 %3")
+                         .arg(uiText(QStringLiteral("hf_baseline_ready"), QStringLiteral("Baseline ready")))
+                         .arg(hfInterferenceBaselineFrequencies.size())
+                         .arg(uiText(QStringLiteral("bins"), QStringLiteral("bins")));
+        }
+        if (hfInterferenceBaselineEnabled && !hfInterferenceBaselineFrequencies.empty()) {
+            status += QStringLiteral(" / %1").arg(uiText(QStringLiteral("enabled"), QStringLiteral("enabled")));
+        }
+        hfInterferenceBaselineStatusLabel->setText(status);
+        hfInterferenceBaselineStatusLabel->setEnabled(hfVisualEnabled);
+    }
 
     if (hfNoiseCancelDepthLabel) {
         hfNoiseCancelDepthLabel->setText(QStringLiteral("%1: %2%").arg(uiText(QStringLiteral("hf_cancel"), QStringLiteral("HF cancel")))

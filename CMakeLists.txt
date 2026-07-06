@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(FobosAPP VERSION 4.5.2)
+project(FobosAPP VERSION 4.6.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -116,6 +116,10 @@ set(SOURCES
     src/utils/appruntimeutils.h
     src/core/appdiagnostics.cpp
     src/core/appdiagnostics.h
+    src/core/channelizerutils.cpp
+    src/core/channelizerutils.h
+    src/core/iqchannelizer.cpp
+    src/core/iqchannelizer.h
     src/utils/appconstants.h
     src/utils/appsettingsutils.cpp
     src/utils/appsettingsutils.h
@@ -164,6 +168,12 @@ set(SOURCES
     src/core/iqbuffer.h
     src/network/networkcontroller.cpp
     src/network/networkcontroller.h
+    src/research/spectrumframerecorder.cpp
+    src/research/spectrumframerecorder.h
+    src/research/spectrumframereplaydialog.cpp
+    src/research/spectrumframereplaydialog.h
+    src/research/spectrumiqeventrecorder.cpp
+    src/research/spectrumiqeventrecorder.h
     src/audio/playbackmanager.cpp
     src/audio/playbackmanager.h
     src/presets/presethelpers.cpp
@@ -234,6 +244,7 @@ target_include_directories(FobosAPP PRIVATE
     ${CMAKE_SOURCE_DIR}/src/mainwindow
     ${CMAKE_SOURCE_DIR}/src/network
     ${CMAKE_SOURCE_DIR}/src/presets
+    ${CMAKE_SOURCE_DIR}/src/research
     ${CMAKE_SOURCE_DIR}/src/scan
     ${CMAKE_SOURCE_DIR}/src/ui
     ${CMAKE_SOURCE_DIR}/src/utils

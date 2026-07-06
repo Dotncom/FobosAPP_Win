@@ -71,6 +71,15 @@ QString YourClassName::localizedStatusText(const QString &status) const {
     if (status == QStringLiteral("Playback: idle")) {
         return uiText(QStringLiteral("playback_idle"), status);
     }
+    if (status == QStringLiteral("Spectrum frames: idle")) {
+        return uiText(QStringLiteral("spectrum_frames_idle"), status);
+    }
+    if (status == QStringLiteral("Spectrum frames: buffer off")) {
+        return uiText(QStringLiteral("spectrum_frames_buffer_off"), status);
+    }
+    if (status == QStringLiteral("Spectrum recording stopped: no frames")) {
+        return uiText(QStringLiteral("spectrum_recording_stopped_no_frames"), status);
+    }
     if (status == QStringLiteral("Recording blocked: Channel IQ cannot run during Full IQ streaming")) {
         return uiText(QStringLiteral("recording_blocked_channel_iq_full_iq"), status);
     }
@@ -106,6 +115,9 @@ QString YourClassName::localizedStatusText(const QString &status) const {
         prefixStatus(QStringLiteral("Recording channel IQ: "), QStringLiteral("recording_channel_iq"), QStringLiteral("Recording channel IQ"), QStringLiteral(": ")),
         prefixStatus(QStringLiteral("IQ recording failed: "), QStringLiteral("iq_recording_failed"), QStringLiteral("IQ recording failed"), QStringLiteral(": ")),
         prefixStatus(QStringLiteral("Recording saved: "), QStringLiteral("recording_saved"), QStringLiteral("Recording saved"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Spectrum recording failed: "), QStringLiteral("spectrum_recording_failed"), QStringLiteral("Spectrum recording failed"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Spectrum recording: "), QStringLiteral("spectrum_recording"), QStringLiteral("Spectrum recording"), QStringLiteral(": ")),
+        prefixStatus(QStringLiteral("Spectrum saved: "), QStringLiteral("spectrum_saved"), QStringLiteral("Spectrum saved"), QStringLiteral(": ")),
         prefixStatus(QStringLiteral("Playback failed: "), QStringLiteral("playback_failed"), QStringLiteral("Playback failed"), QStringLiteral(": ")),
         prefixStatus(QStringLiteral("Playback: "), QStringLiteral("playback"), QStringLiteral("Playback"), QStringLiteral(": "))
     };
@@ -171,7 +183,7 @@ void YourClassName::applyUiLanguage() {
     setComboItemText(clkBox, 1, QStringLiteral("external"), QStringLiteral("External"));
     setComboItemText(modeBox, static_cast<int>(INPUT_HF_NOISE_CANCEL),
                      QStringLiteral("hf_cancel_lab"),
-                     QStringLiteral("HF1 - HF2 cancel lab"));
+                     QStringLiteral("HF interference lab"));
     setComboItemText(dmrLabCallTypeCombo,
                      QStringLiteral("group"),
                      QStringLiteral("dmr_group"),
@@ -217,6 +229,48 @@ void YourClassName::applyUiLanguage() {
                      static_cast<int>(RecordingManager::Mode::ChannelIqWav),
                      QStringLiteral("channel_iq_wav"),
                      QStringLiteral("Channel IQ WAV"));
+    setComboItemText(spectrumEventModeCombo,
+                     0,
+                     QStringLiteral("spectrum_event_spectrum_only"),
+                     QStringLiteral("Spectrum only"));
+    setComboItemText(spectrumEventModeCombo,
+                     1,
+                     QStringLiteral("spectrum_event_channel_iq"),
+                     QStringLiteral("Spectrum + Channel IQ"));
+    setComboItemText(spectrumEventModeCombo,
+                     2,
+                     QStringLiteral("spectrum_event_full_iq"),
+                     QStringLiteral("Spectrum + Full IQ short"));
+    if (spectrumFrameRecordButton) {
+        spectrumFrameRecordButton->setToolTip(uiText(
+            QStringLiteral("spectrum_rec_tooltip"),
+            QStringLiteral("Record compact FFT spectrum frames for event replay and measurement.")));
+    }
+    if (spectrumFrameReplayButton) {
+        spectrumFrameReplayButton->setToolTip(uiText(
+            QStringLiteral("spectrum_replay_tooltip"),
+            QStringLiteral("Open a spectrum-frame recording and inspect the waterfall timeline.")));
+    }
+    if (spectrumEventModeCombo) {
+        spectrumEventModeCombo->setToolTip(uiText(
+            QStringLiteral("spectrum_event_mode_tooltip"),
+            QStringLiteral("Choose what is saved when the spectrum event trigger is pressed.")));
+    }
+    if (spectrumFrameBufferCheckbox) {
+        spectrumFrameBufferCheckbox->setToolTip(uiText(
+            QStringLiteral("spectrum_buffer_tooltip"),
+            QStringLiteral("Keep a rolling pre-trigger spectrum buffer in RAM.")));
+    }
+    if (spectrumFrameBinsCombo) {
+        spectrumFrameBinsCombo->setToolTip(uiText(
+            QStringLiteral("spectrum_bins_tooltip"),
+            QStringLiteral("Maximum bins stored per spectrum frame. Higher values preserve detail but increase file size.")));
+    }
+    if (spectrumFramePrebufferSpin) {
+        spectrumFramePrebufferSpin->setToolTip(uiText(
+            QStringLiteral("spectrum_prebuffer_tooltip"),
+            QStringLiteral("Seconds of spectrum frames kept before the hotkey trigger.")));
+    }
     setComboItemText(scanVisualModeCombo,
                      static_cast<int>(ScanVisualMode::CompressedMosaic),
                      QStringLiteral("scan_visual_compressed"),
@@ -467,15 +521,27 @@ void YourClassName::applyUiLanguage() {
     }
     if (recordingStatusLabel) {
         const QString rawStatus = recordingStatusLabel->property("statusRawText").toString();
-        recordingStatusLabel->setText(localizedStatusText(rawStatus.isEmpty()
-                                                              ? QStringLiteral("Recording: idle")
-                                                              : rawStatus));
+        const QString localized = localizedStatusText(rawStatus.isEmpty()
+                                                          ? QStringLiteral("Recording: idle")
+                                                          : rawStatus);
+        recordingStatusLabel->setText(localized);
+        recordingStatusLabel->setToolTip(localized);
+    }
+    if (spectrumFrameRecordingStatusLabel) {
+        const QString rawStatus = spectrumFrameRecordingStatusLabel->property("statusRawText").toString();
+        const QString localized = localizedStatusText(rawStatus.isEmpty()
+                                                          ? QStringLiteral("Spectrum frames: idle")
+                                                          : rawStatus);
+        spectrumFrameRecordingStatusLabel->setText(localized);
+        spectrumFrameRecordingStatusLabel->setToolTip(localized);
     }
     if (playbackStatusLabel) {
         const QString rawStatus = playbackStatusLabel->property("statusRawText").toString();
-        playbackStatusLabel->setText(localizedStatusText(rawStatus.isEmpty()
-                                                             ? QStringLiteral("Playback: idle")
-                                                             : rawStatus));
+        const QString localized = localizedStatusText(rawStatus.isEmpty()
+                                                          ? QStringLiteral("Playback: idle")
+                                                          : rawStatus);
+        playbackStatusLabel->setText(localized);
+        playbackStatusLabel->setToolTip(localized);
     }
 
     updateAudioFilterLabels();

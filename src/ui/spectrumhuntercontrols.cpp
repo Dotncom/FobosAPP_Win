@@ -94,23 +94,24 @@ SpectrumHunterControls::SpectrumHunterControls(const QString &title,
     maxWidthLabel = new QLabel(QStringLiteral("Max W:"), this);
     thresholdLabel = new QLabel(QStringLiteral("Thr:"), this);
 
+    tuningLayout->setHorizontalSpacing(4);
+    tuningLayout->setVerticalSpacing(3);
     tuningLayout->addWidget(minWidthLabel, 0, 0);
     tuningLayout->addWidget(minWidthSpin, 0, 1);
     tuningLayout->addWidget(maxWidthLabel, 0, 2);
     tuningLayout->addWidget(maxWidthSpin, 0, 3);
-    tuningLayout->addWidget(thresholdLabel, 0, 4);
-    tuningLayout->addWidget(thresholdSpin, 0, 5);
+    tuningLayout->addWidget(thresholdLabel, 1, 0);
+    tuningLayout->addWidget(thresholdSpin, 1, 1);
     candidateLayout->addWidget(previousCandidateButton);
     candidateLayout->addWidget(candidateIndexLabel);
     candidateLayout->addWidget(nextCandidateButton);
-    candidateLayout->addSpacing(8);
+    candidateLayout->addSpacing(4);
     candidateLayout->addWidget(followCheckbox);
     candidateLayout->addWidget(tuneButton);
     candidateLayout->addStretch(1);
-    tuningLayout->addLayout(candidateLayout, 1, 0, 1, 6);
+    tuningLayout->addLayout(candidateLayout, 1, 2, 1, 2);
     tuningLayout->setColumnStretch(1, 1);
     tuningLayout->setColumnStretch(3, 1);
-    tuningLayout->setColumnStretch(5, 1);
 
     mainLayout->addLayout(presetLayout);
     mainLayout->addLayout(tuningLayout);

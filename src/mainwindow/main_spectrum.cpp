@@ -9,6 +9,7 @@
 #include "tuningutils.h"
 
 #include <QDebug>
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QSignalBlocker>
 
@@ -230,6 +231,159 @@ void YourClassName::populateSampleRates() {
             closeFobosDeviceSafely(static_cast<fobos_dev_t*>(sampleRateDevice));
         }
     }
+}
+
+void YourClassName::learnHfInterferenceBaseline() {
+    const std::vector<float> &sourceFrequencies =
+        !hfInterferenceLastFrequencies.empty() ? hfInterferenceLastFrequencies : spectrumFrequencyScratch;
+    const std::vector<float> &sourceMagnitudes =
+        !hfInterferenceLastMagnitudes.empty() ? hfInterferenceLastMagnitudes : spectrumMagnitudeScratch;
+    if (sourceFrequencies.size() != sourceMagnitudes.size() ||
+        sourceFrequencies.size() < 2) {
+        qDebug() << "[HF interference] baseline learn skipped: no visible spectrum frame";
+        updateHfNoiseCancelControls();
+        return;
+    }
+
+    struct BaselinePoint {
+        float frequency = 0.0f;
+        float magnitude = 0.0f;
+    };
+    std::vector<BaselinePoint> points;
+    points.reserve(sourceFrequencies.size());
+    for (std::size_t i = 0; i < sourceFrequencies.size(); ++i) {
+        const float frequency = sourceFrequencies[i];
+        const float magnitude = sourceMagnitudes[i];
+        if (std::isfinite(frequency) && std::isfinite(magnitude)) {
+            points.push_back({frequency, magnitude});
+        }
+    }
+    if (points.size() < 2) {
+        qDebug() << "[HF interference] baseline learn skipped: spectrum frame has no finite bins";
+        updateHfNoiseCancelControls();
+        return;
+    }
+
+    std::sort(points.begin(), points.end(), [](const BaselinePoint &a, const BaselinePoint &b) {
+        return a.frequency < b.frequency;
+    });
+
+    const int smoothBins = (std::max)(1, hfInterferenceBaselineSmoothBins | 1);
+    const int radius = smoothBins / 2;
+    std::vector<double> prefix(points.size() + 1, 0.0);
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        prefix[i + 1] = prefix[i] + points[i].magnitude;
+    }
+
+    hfInterferenceBaselineFrequencies.resize(points.size());
+    hfInterferenceBaselineMagnitudes.resize(points.size());
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        const std::size_t begin = static_cast<std::size_t>((std::max)(0, static_cast<int>(i) - radius));
+        const std::size_t end = (std::min)(points.size(), i + static_cast<std::size_t>(radius) + 1);
+        const double count = static_cast<double>((std::max)(std::size_t(1), end - begin));
+        hfInterferenceBaselineFrequencies[i] = points[i].frequency;
+        hfInterferenceBaselineMagnitudes[i] = static_cast<float>((prefix[end] - prefix[begin]) / count);
+    }
+    hfInterferenceBaselineEnabled = true;
+    if (hfInterferenceBaselineCheckbox) {
+        QSignalBlocker blocker(hfInterferenceBaselineCheckbox);
+        hfInterferenceBaselineCheckbox->setChecked(true);
+    }
+    updateHfNoiseCancelControls();
+    savePersistentSettings();
+    qDebug() << "[HF interference] baseline learned"
+             << "bins" << hfInterferenceBaselineFrequencies.size()
+             << "smoothBins" << smoothBins
+             << "depth" << hfInterferenceBaselineDepth;
+}
+
+void YourClassName::clearHfInterferenceBaseline() {
+    hfInterferenceBaselineFrequencies.clear();
+    hfInterferenceBaselineMagnitudes.clear();
+    hfInterferenceVisualMagnitudes.clear();
+    hfInterferenceBaselineEnabled = false;
+    if (hfInterferenceBaselineCheckbox) {
+        QSignalBlocker blocker(hfInterferenceBaselineCheckbox);
+        hfInterferenceBaselineCheckbox->setChecked(false);
+    }
+    updateHfNoiseCancelControls();
+    savePersistentSettings();
+    qDebug() << "[HF interference] baseline cleared";
+}
+
+bool YourClassName::buildHfInterferenceBaselineVisual(const std::vector<float> &frequencies,
+                                                      const std::vector<float> &magnitudes,
+                                                      std::vector<float> &outputMagnitudes) {
+    if (!hfInterferenceBaselineEnabled ||
+        hfInterferenceBaselineFrequencies.size() < 2 ||
+        hfInterferenceBaselineFrequencies.size() != hfInterferenceBaselineMagnitudes.size() ||
+        frequencies.size() != magnitudes.size() ||
+        frequencies.empty()) {
+        return false;
+    }
+
+    outputMagnitudes.resize(magnitudes.size());
+    const float floorDb = displayLevelMin;
+    const float ceilingDb = displayLevelMax;
+    const float depth = static_cast<float>((std::clamp)(hfInterferenceBaselineDepth, 0.0, 2.0));
+    const auto baselineBegin = hfInterferenceBaselineFrequencies.begin();
+    const auto baselineEnd = hfInterferenceBaselineFrequencies.end();
+    const bool ascendingFrequencies = frequencies.size() < 2 || frequencies.back() >= frequencies.front();
+    std::size_t rollingBaselineIndex = 1;
+    for (std::size_t i = 0; i < magnitudes.size(); ++i) {
+        const float frequency = frequencies[i];
+        const float magnitude = magnitudes[i];
+        if (!std::isfinite(frequency) || !std::isfinite(magnitude)) {
+            outputMagnitudes[i] = floorDb;
+            continue;
+        }
+
+        float baseline = hfInterferenceBaselineMagnitudes.front();
+        if (ascendingFrequencies) {
+            while (rollingBaselineIndex < hfInterferenceBaselineFrequencies.size() &&
+                   hfInterferenceBaselineFrequencies[rollingBaselineIndex] < frequency) {
+                ++rollingBaselineIndex;
+            }
+            if (rollingBaselineIndex == 0 || frequency <= hfInterferenceBaselineFrequencies.front()) {
+                baseline = hfInterferenceBaselineMagnitudes.front();
+            } else if (rollingBaselineIndex >= hfInterferenceBaselineFrequencies.size()) {
+                baseline = hfInterferenceBaselineMagnitudes.back();
+            } else {
+                const std::size_t upperIndex = rollingBaselineIndex;
+                const std::size_t lowerIndex = upperIndex - 1;
+                const float f0 = hfInterferenceBaselineFrequencies[lowerIndex];
+                const float f1 = hfInterferenceBaselineFrequencies[upperIndex];
+                const float m0 = hfInterferenceBaselineMagnitudes[lowerIndex];
+                const float m1 = hfInterferenceBaselineMagnitudes[upperIndex];
+                const float span = f1 - f0;
+                const float ratio = span > 0.0f ? (frequency - f0) / span : 0.0f;
+                baseline = m0 + (m1 - m0) * (std::clamp)(ratio, 0.0f, 1.0f);
+            }
+        } else {
+            const auto it = std::lower_bound(baselineBegin, baselineEnd, frequency);
+            if (it == baselineBegin) {
+                baseline = hfInterferenceBaselineMagnitudes.front();
+            } else if (it == baselineEnd) {
+                baseline = hfInterferenceBaselineMagnitudes.back();
+            } else {
+                const std::size_t upperIndex = static_cast<std::size_t>(std::distance(baselineBegin, it));
+                const std::size_t lowerIndex = upperIndex - 1;
+                const float f0 = hfInterferenceBaselineFrequencies[lowerIndex];
+                const float f1 = hfInterferenceBaselineFrequencies[upperIndex];
+                const float m0 = hfInterferenceBaselineMagnitudes[lowerIndex];
+                const float m1 = hfInterferenceBaselineMagnitudes[upperIndex];
+                const float span = f1 - f0;
+                const float ratio = span > 0.0f ? (frequency - f0) / span : 0.0f;
+                baseline = m0 + (m1 - m0) * (std::clamp)(ratio, 0.0f, 1.0f);
+            }
+        }
+
+        const float excess = magnitude - baseline;
+        outputMagnitudes[i] = excess <= 0.0f
+                                  ? floorDb
+                                  : (std::clamp)(floorDb + excess * depth, floorDb, ceilingDb);
+    }
+    return true;
 }
 
 void YourClassName::updateSpectrum() {
@@ -676,6 +830,52 @@ void YourClassName::updateSpectrum() {
     updateFpvHunter(fpvHunterFrequencies, fpvHunterMagnitudes);
     updateDigitalVideoHunter(digitalVideoHunterFrequencies, digitalVideoHunterMagnitudes);
 
+    const std::vector<float> *visualMagnitudesPtr = &displayMagnitudes;
+    if (isDirectInputMode(spectrumSettings.inputMode) &&
+        buildHfInterferenceBaselineVisual(displayFrequencies,
+                                          displayMagnitudes,
+                                          hfInterferenceVisualMagnitudes)) {
+        visualMagnitudesPtr = &hfInterferenceVisualMagnitudes;
+    }
+    const std::vector<float> &visualMagnitudes = *visualMagnitudesPtr;
+    if ((spectrumFrameBufferEnabled || spectrumFrameRecorder.isRecording()) &&
+        updateWaterfallFrame &&
+        !displayFrequencies.empty() &&
+        displayFrequencies.size() == visualMagnitudes.size()) {
+        const int bins = spectrumFrameBinsCombo ? spectrumFrameBinsCombo->currentData().toInt() : 4096;
+        SpectrumFrameRecord frame =
+            SpectrumFrameRecorder::makeFrame(displayFrequencies,
+                                             visualMagnitudes,
+                                             displayCenterFrequency,
+                                             displayMinFrequency,
+                                             displayMaxFrequency,
+                                             displayFftLength,
+                                             bins,
+                                             QDateTime::currentMSecsSinceEpoch());
+        if (!frame.magnitudes.empty()) {
+            if (spectrumFrameBufferEnabled) {
+                spectrumFramePrebuffer.push_back(frame);
+                const qint64 keepMs = static_cast<qint64>((std::max)(1, spectrumFramePrebufferSeconds)) * 1000;
+                while (!spectrumFramePrebuffer.empty() &&
+                       frame.utcMs - spectrumFramePrebuffer.front().utcMs > keepMs) {
+                    spectrumFramePrebuffer.pop_front();
+                }
+            }
+            if (spectrumFrameRecorder.isRecording()) {
+                if (!spectrumFrameRecorder.appendFrameRecord(frame)) {
+                    stopSpectrumFrameRecording();
+                    updateSpectrumFrameRecordingStatus(QStringLiteral("Spectrum recording failed: write error"));
+                } else if ((spectrumFrameRecorder.frameCount() % 100) == 0) {
+                    updateSpectrumFrameRecordingStatus(
+                        QStringLiteral("Spectrum recording: %1 frames").arg(spectrumFrameRecorder.frameCount()));
+                }
+            } else if (spectrumFrameBufferEnabled && (spectrumFramePrebuffer.size() % 100) == 0) {
+                updateSpectrumFrameRecordingStatus(
+                    QStringLiteral("Spectrum frames: buffering %1 frames").arg(spectrumFramePrebuffer.size()));
+            }
+        }
+    }
+
     if (spectrumTuningDebugFramesRemaining > 0 &&
         displayFrequencies.size() == displayMagnitudes.size() &&
         !displayFrequencies.empty()) {
@@ -782,7 +982,7 @@ void YourClassName::updateSpectrum() {
         graphWidget->setScanSegments(displayScanSegments);
         graphWidget->setScanSegmentMarkersVisible(displayScanSegmentMarkers);
         graphWidget->setData(displayFrequencies,
-                             displayMagnitudes,
+                             visualMagnitudes,
                              displayMinFrequency,
                              displayMaxFrequency,
                              displayFftLength,
@@ -802,7 +1002,7 @@ void YourClassName::updateSpectrum() {
         }
         if (updateWaterfallFrame) {
             waterfallWidget->setData(displayFrequencies,
-                                     displayMagnitudes,
+                                     visualMagnitudes,
                                      displayMinFrequency,
                                      displayMaxFrequency,
                                      displayFftLength,

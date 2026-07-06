@@ -43,6 +43,7 @@
 #include <cmath>
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <limits>
 #include <QRadioButton>
 #include <QButtonGroup>
@@ -65,6 +66,8 @@
 #include "playbackmanager.h"
 #include "recordingmanager.h"
 #include "remoteaudioplayer.h"
+#include "spectrumframerecorder.h"
+#include "spectrumiqeventrecorder.h"
 #include "radiosettings.h"
 #include "videoprocessor.h"
 #include "videowidget.h"
@@ -128,6 +131,14 @@ struct GnssNmeaSatellite {
     qint64 lastSeenMs = 0;
 };
 
+struct SpectrumEventIqFrame {
+    QByteArray data;
+    double sampleRate = 0.0;
+    int sampleCount = 0;
+    bool channelized = true;
+    qint64 utcMs = 0;
+};
+
 class YourClassName : public QMainWindow {
     Q_OBJECT
 
@@ -186,6 +197,13 @@ private slots:
                                int flco);
     void startRecording(bool momentary);
     void stopRecording(bool momentaryRelease);
+    void startSpectrumFrameRecording();
+    void stopSpectrumFrameRecording();
+    void openSpectrumFrameReplay();
+    void updateSpectrumFrameRecordingStatus(const QString &status);
+    bool spectrumEventIqProducerNeeded() const;
+    bool spectrumEventIqChannelized() const;
+    void handleSpectrumEventIqFrame(const QByteArray &iqData, double sampleRate, int sampleCount, bool channelized);
     void startPlayback();
     void stopPlayback();
     void refreshPlaybackFiles();
@@ -450,6 +468,11 @@ private:
     void updateNetworkButtonText();
     void updateAudioFilterLabels();
     void updateHfNoiseCancelControls();
+    void learnHfInterferenceBaseline();
+    void clearHfInterferenceBaseline();
+    bool buildHfInterferenceBaselineVisual(const std::vector<float> &frequencies,
+                                           const std::vector<float> &magnitudes,
+                                           std::vector<float> &outputMagnitudes);
     void applyLiveRemoteSettings(const RadioSettings &previousSettings);
     void handleDataProcessorFailure(int errorCode, bool stoppedByRequest);
     void clearLiveSpectrumSnapshot(bool clearVisualHistory = false, uint64_t iqEpoch = 0);
@@ -547,6 +570,7 @@ private:
     QComboBox *dmrPrivacyFrameOffsetCombo = nullptr;
     QComboBox *dmrPrivacyDropCombo = nullptr;
     QComboBox *dmrPrivacyBitLayoutCombo = nullptr;
+    QComboBox *spectrumEventModeCombo = nullptr;
     QLineEdit *dsdNeoProgramEdit = nullptr;
     QComboBox *qthSourceCombo = nullptr;
     QComboBox *gnssSystemCombo = nullptr;
@@ -575,6 +599,8 @@ private:
     QPushButton *videoToggleButton = nullptr;
     QPushButton *dmrPrivacyKeysButton = nullptr;
     QPushButton *recordButton = nullptr;
+    QPushButton *spectrumFrameRecordButton = nullptr;
+    QPushButton *spectrumFrameReplayButton = nullptr;
     QPushButton *playbackRefreshButton = nullptr;
     QPushButton *playbackButton = nullptr;
     QPushButton *startButton = nullptr;
@@ -601,6 +627,8 @@ private:
     QPushButton *gnssPlotButton = nullptr;
     QPushButton *gnssSatellitesButton = nullptr;
     QPushButton *gnssMonitorResetButton = nullptr;
+    QPushButton *hfInterferenceBaselineLearnButton = nullptr;
+    QPushButton *hfInterferenceBaselineClearButton = nullptr;
     
     QCheckBox *spectrumCheckbox = nullptr;
     QCheckBox *audioCheckbox = nullptr;
@@ -615,6 +643,8 @@ private:
     QCheckBox *videoVSyncCheckbox = nullptr;
     QCheckBox *videoTestPatternCheckbox = nullptr;
     QCheckBox *hfNoiseCancelFreezeCheckbox = nullptr;
+    QCheckBox *hfInterferenceBaselineCheckbox = nullptr;
+    QCheckBox *spectrumFrameBufferCheckbox = nullptr;
     QCheckBox *agileScanCheckbox = nullptr;
     QCheckBox *standardScanCheckbox = nullptr;
     QCheckBox *listeningScanCheckbox = nullptr;
@@ -651,6 +681,8 @@ private:
     QSlider *hfNoiseCancelRefGainSlider = nullptr;
     QSlider *hfNoiseCancelRefDelaySlider = nullptr;
     QSlider *hfNoiseCancelRefTiltSlider = nullptr;
+    QSlider *hfInterferenceBaselineDepthSlider = nullptr;
+    QSlider *hfInterferenceBaselineSmoothSlider = nullptr;
     SpectrumHunterControls *dmrHunterControls = nullptr;
     SpectrumHunterControls *fpvHunterControls = nullptr;
     SpectrumHunterControls *digitalVideoHunterControls = nullptr;
@@ -662,6 +694,9 @@ private:
     QLabel *hfNoiseCancelRefGainLabel = nullptr;
     QLabel *hfNoiseCancelRefDelayLabel = nullptr;
     QLabel *hfNoiseCancelRefTiltLabel = nullptr;
+    QLabel *hfInterferenceBaselineDepthLabel = nullptr;
+    QLabel *hfInterferenceBaselineSmoothLabel = nullptr;
+    QLabel *hfInterferenceBaselineStatusLabel = nullptr;
     QLabel *lnaGainLabel = nullptr;
     QLabel *rtlGainLabel = nullptr;
     QLabel *centralFrequencyLabel = nullptr;
@@ -677,6 +712,7 @@ private:
     QLabel *digitalStatusLabel = nullptr;
     QLabel *videoStatusLabel = nullptr;
     QLabel *recordingStatusLabel = nullptr;
+    QLabel *spectrumFrameRecordingStatusLabel = nullptr;
     QLabel *playbackStatusLabel = nullptr;
 
     QJsonObject uiTranslations;
@@ -711,6 +747,8 @@ private:
     QSpinBox *listeningScanSettleSpin = nullptr;
     QSpinBox *gnssIntegrationSpin = nullptr;
     QSpinBox *gnssSerialBaudSpin = nullptr;
+    QComboBox *spectrumFrameBinsCombo = nullptr;
+    QSpinBox *spectrumFramePrebufferSpin = nullptr;
     QDoubleSpinBox *scanMeasurementBinSpin = nullptr;
     QPushButton *agileScanSavePresetButton = nullptr;
     QPushButton *agileScanDeletePresetButton = nullptr;
@@ -897,9 +935,25 @@ private:
     int spectrumUpdateIntervalMs = 0;
     int waterfallRowsPerFrame = 1;
     bool experimentalGpuWaterfall = false;
+    SpectrumFrameRecorder spectrumFrameRecorder;
+    SpectrumIqEventRecorder spectrumIqEventRecorder;
+    bool spectrumFrameBufferEnabled = false;
+    int spectrumFramePrebufferSeconds = 10;
+    int spectrumEventCaptureMode = 0;
+    std::deque<SpectrumFrameRecord> spectrumFramePrebuffer;
+    std::deque<SpectrumEventIqFrame> spectrumIqPrebuffer;
+    QString spectrumEventBasePath;
+    bool hfInterferenceBaselineEnabled = false;
+    double hfInterferenceBaselineDepth = 1.0;
+    int hfInterferenceBaselineSmoothBins = 121;
     std::vector<float> spectrumFrequencyScratch;
     std::vector<float> spectrumMagnitudeScratch;
     std::vector<float> spectrumReferenceScratch;
+    std::vector<float> hfInterferenceLastFrequencies;
+    std::vector<float> hfInterferenceLastMagnitudes;
+    std::vector<float> hfInterferenceBaselineFrequencies;
+    std::vector<float> hfInterferenceBaselineMagnitudes;
+    std::vector<float> hfInterferenceVisualMagnitudes;
     bool scanMeasurementEnabled = true;
     bool scanMeasurementBaselineRecording = false;
     double scanMeasurementBinMhz = 0.1;

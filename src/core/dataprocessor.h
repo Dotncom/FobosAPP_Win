@@ -21,6 +21,7 @@
 #include <complex>
 #include <cstdint>
 #include "radiosettings.h"
+#include "iqchannelizer.h"
 #include "receiverbackend.h"
 
 
@@ -110,6 +111,8 @@ private:
     std::array<std::complex<float>, 4> networkIqCicSums = {};
     int networkIqCicIndex = 0;
     int networkIqCicLength = 0;
+    IqChannelizer networkIqChannelizer;
+    std::vector<float> networkIqChannelizerOutput;
     int networkIqLastLoggedDmrOutputRate = 0;
     int networkIqLastLoggedDmrDecimationFactor = 0;
     float networkIqAgcLevel = 0.01f;

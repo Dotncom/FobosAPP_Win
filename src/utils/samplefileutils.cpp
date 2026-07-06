@@ -29,6 +29,35 @@ qint16 readLeI16(const char *data) {
                                (static_cast<quint16>(bytes[1]) << 8));
 }
 
+void appendIqS16LeToFloat(const QByteArray &iqData, int sampleCount, std::vector<float> &output) {
+    constexpr int bytesPerIq = 2 * static_cast<int>(sizeof(qint16));
+    if (iqData.size() < bytesPerIq) {
+        return;
+    }
+    const int iqCount = sampleCount > 0 ? sampleCount : iqData.size() / bytesPerIq;
+    output.reserve(output.size() + static_cast<std::size_t>(iqCount) * 2U);
+    for (int offset = 0, n = 0; offset + bytesPerIq - 1 < iqData.size() && n < iqCount;
+         offset += bytesPerIq, ++n) {
+        const qint16 iSample = readLeI16(iqData.constData() + offset);
+        const qint16 qSample = readLeI16(iqData.constData() + offset + 2);
+        output.push_back(iSample / 32768.0f);
+        output.push_back(qSample / 32768.0f);
+    }
+}
+
+void appendIqS8ToFloat(const QByteArray &iqData, int sampleCount, std::vector<float> &output) {
+    if (iqData.size() < 2) {
+        return;
+    }
+    const int iqCount = sampleCount > 0 ? sampleCount : iqData.size() / 2;
+    output.reserve(output.size() + static_cast<std::size_t>(iqCount) * 2U);
+    const auto *src = reinterpret_cast<const qint8 *>(iqData.constData());
+    for (int offset = 0, n = 0; offset + 1 < iqData.size() && n < iqCount; offset += 2, ++n) {
+        output.push_back(src[offset] / 128.0f);
+        output.push_back(src[offset + 1] / 128.0f);
+    }
+}
+
 QByteArray streamingWavHeader() {
     constexpr quint32 streamDataBytes = 0x7fffffffU;
     constexpr quint16 channels = 1;

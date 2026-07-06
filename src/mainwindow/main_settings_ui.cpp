@@ -274,6 +274,33 @@ void YourClassName::updateUiFromPendingSettings() {
         hfNoiseCancelFreezeCheckbox->setChecked(pendingSettings.hfNoiseCancelFreeze);
         hfNoiseCancelFreezeCheckbox->blockSignals(false);
     }
+    if (spectrumFrameBufferCheckbox) {
+        QSignalBlocker blocker(spectrumFrameBufferCheckbox);
+        spectrumFrameBufferCheckbox->setChecked(spectrumFrameBufferEnabled);
+    }
+    if (spectrumFramePrebufferSpin) {
+        QSignalBlocker blocker(spectrumFramePrebufferSpin);
+        spectrumFramePrebufferSpin->setValue(spectrumFramePrebufferSeconds);
+    }
+    if (spectrumEventModeCombo) {
+        QSignalBlocker blocker(spectrumEventModeCombo);
+        const int index = spectrumEventModeCombo->findData(spectrumEventCaptureMode);
+        if (index >= 0) {
+            spectrumEventModeCombo->setCurrentIndex(index);
+        }
+    }
+    if (hfInterferenceBaselineCheckbox) {
+        QSignalBlocker blocker(hfInterferenceBaselineCheckbox);
+        hfInterferenceBaselineCheckbox->setChecked(hfInterferenceBaselineEnabled);
+    }
+    if (hfInterferenceBaselineDepthSlider) {
+        QSignalBlocker blocker(hfInterferenceBaselineDepthSlider);
+        hfInterferenceBaselineDepthSlider->setValue(static_cast<int>(std::lround(hfInterferenceBaselineDepth * 100.0)));
+    }
+    if (hfInterferenceBaselineSmoothSlider) {
+        QSignalBlocker blocker(hfInterferenceBaselineSmoothSlider);
+        hfInterferenceBaselineSmoothSlider->setValue(hfInterferenceBaselineSmoothBins);
+    }
     if (agileScanCheckbox) {
         QSignalBlocker blocker(agileScanCheckbox);
         agileScanCheckbox->setChecked(agileScanEnabled);

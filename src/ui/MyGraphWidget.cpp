@@ -106,6 +106,12 @@ void MyGraphWidget::setScanSegmentMarkersVisible(bool visible) {
     update();
 }
 
+void MyGraphWidget::setTuningMarker(double frequencyHz, bool visible) {
+    tuningMarkerFrequencyHz = frequencyHz;
+    tuningMarkerVisible = visible && std::isfinite(frequencyHz);
+    update();
+}
+
 void MyGraphWidget::clearData() {
     xData.clear();
     yData.clear();
@@ -289,6 +295,7 @@ void MyGraphWidget::paintGL() {
     drawScanSegments(painter);
     drawBandMarkers(painter);
     drawYAxis(painter);
+    drawTuningMarker(painter);
     drawBandwidthMeasurement(painter);
     drawHoverCursor(painter);
 }
@@ -1004,4 +1011,37 @@ void MyGraphWidget::drawYAxis(QPainter &painter) const {
 
     painter.setPen(QColor(185, 210, 195));
     painter.drawText(4, height() - 4, "dBFS");
+}
+
+void MyGraphWidget::drawTuningMarker(QPainter &painter) const {
+    if (!tuningMarkerVisible ||
+        !std::isfinite(tuningMarkerFrequencyHz) ||
+        width() <= 0 ||
+        height() <= 0 ||
+        qFuzzyCompare(xMin, xMax)) {
+        return;
+    }
+
+    const int plotLeft = GRAPH_LEFT_MARGIN;
+    const int plotRight = (std::max)(plotLeft + 1, width() - GRAPH_RIGHT_MARGIN);
+    const int plotTop = GRAPH_TOP_MARGIN;
+    const int plotBottom = (std::max)(plotTop + 1, height() - bottomMargin());
+    const int x = (std::clamp)(xForFrequency(tuningMarkerFrequencyHz), plotLeft, plotRight);
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(QPen(QColor(255, 72, 72, 230), 2));
+    painter.drawLine(x, plotTop, x, plotBottom);
+    painter.setPen(QColor(255, 220, 220, 240));
+    const QString label = formatFrequencyLabel(tuningMarkerFrequencyHz);
+    const QFontMetrics metrics = painter.fontMetrics();
+    const int labelWidth = metrics.horizontalAdvance(label) + 10;
+    const QRect labelRect((std::clamp)(x + 5, plotLeft + 2, (std::max)(plotLeft + 2, plotRight - labelWidth - 2)),
+                          plotTop + 4,
+                          labelWidth,
+                          metrics.height() + 5);
+    painter.fillRect(labelRect, QColor(30, 0, 0, 190));
+    painter.drawRect(labelRect);
+    painter.drawText(labelRect.adjusted(5, 0, -5, 0), Qt::AlignVCenter | Qt::AlignLeft, label);
+    painter.restore();
 }

@@ -35,6 +35,7 @@ public:
     void setBandMarkers(const QVector<GraphBandMarker> &markers);
     void setScanSegments(const QVector<ScanVisualSegment> &segments);
     void setScanSegmentMarkersVisible(bool visible);
+    void setTuningMarker(double frequencyHz, bool visible);
     void clearData();
 
 signals:
@@ -66,6 +67,7 @@ private:
     void drawBandMarkers(QPainter &painter) const;
     void drawScanSegments(QPainter &painter) const;
     void drawYAxis(QPainter &painter) const;
+    void drawTuningMarker(QPainter &painter) const;
     void drawBandwidthMeasurement(QPainter &painter) const;
     void drawHoverCursor(QPainter &painter) const;
     float normalizedLevel(float value) const;
@@ -102,6 +104,8 @@ private:
     QVector<GraphBandMarker> bandMarkers;
     QVector<ScanVisualSegment> scanSegments;
     bool scanSegmentMarkersVisible = true;
+    bool tuningMarkerVisible = false;
+    double tuningMarkerFrequencyHz = 0.0;
     QColor valueToColor(float value);
 };
 

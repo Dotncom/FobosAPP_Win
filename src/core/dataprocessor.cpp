@@ -1,5 +1,6 @@
 #include "dataprocessor.h"
 #include "iqbuffer.h"
+#include "channelizerutils.h"
 #include "diagnosticlogging.h"
 #include "bladerfbackend.h"
 #include "fobosbackend.h"
@@ -36,7 +37,7 @@ constexpr uint32_t MAX_SYNC_BLOCK_SAMPLES = 4000000;
 constexpr uint32_t MIN_ASYNC_BLOCK_SAMPLES = 32768;
 constexpr uint32_t MAX_ASYNC_BLOCK_SAMPLES = 262144;
 constexpr int NETWORK_CHANNEL_FRAME_SAMPLES = 8192;
-constexpr float NETWORK_IQ_QUANTIZE_GAIN = 1.0f;
+constexpr float NETWORK_IQ_QUANTIZE_GAIN = 16.0f;
 constexpr float NETWORK_CHANNEL_IQ_TARGET_LEVEL = 0.45f;
 constexpr float HF_NOISE_CANCEL_MAX_COEFF = 2.5f;
 constexpr double SAMPLE_RATE_DIAGNOSTIC_RELATIVE_WARN = 0.03;
@@ -75,10 +76,6 @@ bool writeRtlTcpCommand(QTcpSocket &socket, quint8 command, quint32 parameter) {
     return socket.waitForBytesWritten(1000);
 }
 
-double clampDouble(double value, double low, double high) {
-    return (std::max)(low, (std::min)(value, high));
-}
-
 bool shouldReportMeasuredSampleRate(double configuredRate, double measuredRate, int reportCount) {
     if (!std::isfinite(configuredRate) || configuredRate <= 0.0 ||
         !std::isfinite(measuredRate) || measuredRate <= 0.0) {
@@ -105,79 +102,6 @@ QString safeFileToken(QString value) {
         value.replace(QStringLiteral("__"), QStringLiteral("_"));
     }
     return value;
-}
-
-double networkChannelTargetRate(const RadioSettings &settings) {
-    switch (settings.modulationType) {
-    case MOD_ATV:
-        return clampDouble((std::max)(2400000.0, settings.bandwidth * 1.4), 2400000.0, 8000000.0);
-    case MOD_WFM:
-        return clampDouble((std::max)(384000.0, settings.bandwidth * 3.0), 384000.0, 768000.0);
-    case MOD_NFM:
-    case MOD_RTTY:
-    case MOD_FSK:
-        return clampDouble((std::max)(240000.0, settings.bandwidth * 4.0), 240000.0, 384000.0);
-    case MOD_DMR:
-        return (std::max)(192000.0,
-                          static_cast<double>(
-                              normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate)));
-    case MOD_CW:
-    case MOD_USB:
-    case MOD_LSB:
-    case MOD_FT8:
-    case MOD_PSK:
-    case MOD_AM:
-    case MOD_SAM:
-    case MOD_DSB:
-    default:
-        return 192000.0;
-    }
-}
-
-double networkChannelCutoff(const RadioSettings &settings, double outputRate) {
-    double requestedCutoff = settings.bandwidth * 0.6;
-    switch (settings.modulationType) {
-    case MOD_ATV:
-        requestedCutoff = (std::max)(1000000.0, settings.bandwidth * 0.9);
-        break;
-    case MOD_WFM:
-        requestedCutoff = (std::max)(120000.0, settings.bandwidth * 0.6);
-        break;
-    case MOD_NFM:
-    case MOD_RTTY:
-    case MOD_FSK:
-        requestedCutoff = (std::max)(12000.0, settings.bandwidth * 0.6);
-        break;
-    case MOD_DMR:
-        requestedCutoff = (std::min)(9500.0, (std::max)(6000.0, settings.bandwidth * 0.75));
-        break;
-    case MOD_USB:
-    case MOD_LSB:
-    case MOD_FT8:
-    case MOD_PSK:
-        requestedCutoff = (std::max)(3600.0, settings.bandwidth);
-        break;
-    case MOD_CW:
-        requestedCutoff = (std::max)(1200.0, settings.bandwidth);
-        break;
-    case MOD_AM:
-    case MOD_SAM:
-    case MOD_DSB:
-    default:
-        requestedCutoff = (std::max)(10000.0, settings.bandwidth * 0.6);
-        break;
-    }
-    return (std::min)(requestedCutoff, outputRate * 0.45);
-}
-
-int networkChannelFrameSamplesForRate(double outputRate) {
-    if (outputRate >= 4000000.0) {
-        return NETWORK_CHANNEL_FRAME_SAMPLES * 32;
-    }
-    if (outputRate >= 1000000.0) {
-        return NETWORK_CHANNEL_FRAME_SAMPLES * 16;
-    }
-    return NETWORK_CHANNEL_FRAME_SAMPLES;
 }
 
 char quantizeIqSample(float sample) {
@@ -1680,6 +1604,8 @@ void DataProcessor::resetNetworkIqState() {
     networkIqCicSums.fill(std::complex<float>(0.0f, 0.0f));
     networkIqCicIndex = 0;
     networkIqCicLength = 0;
+    networkIqChannelizer.reset();
+    networkIqChannelizerOutput.clear();
     networkIqLastLoggedDmrOutputRate = 0;
     networkIqLastLoggedDmrDecimationFactor = 0;
     networkIqAgcLevel = 0.01f;
@@ -1732,18 +1658,49 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
         return;
     }
 
+    const bool dmrChannelMode = settings.modulationType == MOD_DMR;
+    const bool adaptiveNoiseCancel = settings.inputMode == INPUT_HF_NOISE_CANCEL;
+    if (!dmrChannelMode && !adaptiveNoiseCancel) {
+        const IqChannelizer::Result result =
+            networkIqChannelizer.processFloatIq(samples,
+                                                floatCount,
+                                                settings,
+                                                networkIqChannelizerOutput);
+        if (!result.valid || result.outputRate <= 0.0) {
+            return;
+        }
+        if (std::abs(networkIqFrameSampleRate - result.outputRate) > 0.5) {
+            networkIqFrameBuffer.clear();
+            networkIqFrameSampleRate = result.outputRate;
+        }
+        const int frameSamples =
+            channelizerFrameSamplesForRate(result.outputRate, NETWORK_CHANNEL_FRAME_SAMPLES);
+        for (std::size_t i = 0; i + 1 < networkIqChannelizerOutput.size(); i += 2U) {
+            appendInt16Le(networkIqFrameBuffer, networkIqChannelizerOutput[i]);
+            appendInt16Le(networkIqFrameBuffer, networkIqChannelizerOutput[i + 1U]);
+            if (networkIqFrameBuffer.size() >=
+                frameSamples * FLOATS_PER_IQ_SAMPLE * static_cast<int>(sizeof(qint16))) {
+                emit iqFrameReady(networkIqFrameBuffer,
+                                  result.outputRate,
+                                  networkIqFrameBuffer.size() /
+                                      (FLOATS_PER_IQ_SAMPLE * static_cast<int>(sizeof(qint16))));
+                networkIqFrameBuffer.clear();
+            }
+        }
+        return;
+    }
+
     const std::size_t iqSamples = floatCount / FLOATS_PER_IQ_SAMPLE;
-    const double targetRate = networkChannelTargetRate(settings);
+    const double targetRate = channelizerTargetRate(settings);
     const int decimationFactor = (std::max)(1, static_cast<int>(std::floor(inputRate / targetRate)));
     const double outputRate = inputRate / static_cast<double>(decimationFactor);
-    const double cutoff = networkChannelCutoff(settings, outputRate);
-    const int frameSamples = networkChannelFrameSamplesForRate(outputRate);
+    const double cutoff = channelizerCutoff(settings, outputRate);
+    const int frameSamples = channelizerFrameSamplesForRate(outputRate, NETWORK_CHANNEL_FRAME_SAMPLES);
     const float lowPassAlpha = static_cast<float>((std::clamp)(
         1.0 - std::exp(-TWO_PI * cutoff / outputRate),
         0.000001,
         1.0
         ));
-    const bool dmrChannelMode = settings.modulationType == MOD_DMR;
     if (dmrChannelMode &&
         (networkIqLastLoggedDmrOutputRate != static_cast<int>(std::lround(outputRate)) ||
          networkIqLastLoggedDmrDecimationFactor != decimationFactor)) {
@@ -1803,7 +1760,6 @@ void DataProcessor::emitChannelIqFrame(const float *samples,
     int decimationCount = networkIqDecimationCount;
     std::complex<float> lowPass = networkIqLowPassState;
     std::array<std::complex<float>, 3> preLowPassStates = networkIqPreLowPassStates;
-    const bool adaptiveNoiseCancel = settings.inputMode == INPUT_HF_NOISE_CANCEL;
     std::complex<float> refDecimationSum = networkHfNoiseCancelRefDecimationSum;
     std::complex<float> adaptiveCoeff = networkHfNoiseCancelCoeff;
     if (!adaptiveNoiseCancel) {

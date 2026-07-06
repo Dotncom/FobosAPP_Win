@@ -136,13 +136,17 @@ YourClassName::YourClassName(QWidget *parent)
     controlsScrollArea->setWidgetResizable(true);
     controlsScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     controlsScrollArea->setWidget(controlsWidget);
+    controlsWidget->setMinimumWidth(0);
+    controlsWidget->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    controlsScrollArea->setMinimumWidth(0);
+    controlsScrollArea->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     controlsDock = new QDockWidget("Controls", this);
     controlsDock->setObjectName("controlsDock");
     markTranslatable(controlsDock, QStringLiteral("controls"), QStringLiteral("Controls"));
     controlsDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
     controlsDock->setFeatures(QDockWidget::DockWidgetMovable |
                               QDockWidget::DockWidgetFloatable);
-    controlsDock->setMinimumWidth(260);
+    controlsDock->setMinimumWidth(220);
     controlsDock->setWidget(controlsScrollArea);
     addDockWidget(Qt::LeftDockWidgetArea, controlsDock);
 
@@ -588,6 +592,31 @@ YourClassName::YourClassName(QWidget *parent)
     markTranslatable(hfNoiseCancelFreezeCheckbox, QStringLiteral("freeze"), QStringLiteral("Freeze"));
     hfNoiseCancelFreezeCheckbox->setToolTip("Hold the small adaptive trim added on top of the manual HF2 reference");
 
+    hfInterferenceBaselineCheckbox = new QCheckBox("Baseline", this);
+    markTranslatable(hfInterferenceBaselineCheckbox, QStringLiteral("hf_baseline"), QStringLiteral("Baseline"));
+    hfInterferenceBaselineCheckbox->setChecked(hfInterferenceBaselineEnabled);
+    hfInterferenceBaselineCheckbox->setToolTip("Apply a learned HF noise-floor curve to the visual spectrum/waterfall only.");
+
+    hfInterferenceBaselineLearnButton = new QPushButton("Learn", this);
+    markTranslatable(hfInterferenceBaselineLearnButton, QStringLiteral("hf_baseline_learn"), QStringLiteral("Learn"));
+    hfInterferenceBaselineLearnButton->setToolTip("Capture the current visible spectrum as a smoothed HF interference baseline.");
+
+    hfInterferenceBaselineClearButton = new QPushButton("Clear", this);
+    markTranslatable(hfInterferenceBaselineClearButton, QStringLiteral("clear"), QStringLiteral("Clear"));
+    hfInterferenceBaselineClearButton->setToolTip("Remove the learned HF interference baseline.");
+
+    hfInterferenceBaselineDepthSlider = new QSlider(Qt::Horizontal, this);
+    hfInterferenceBaselineDepthSlider->setRange(0, 200);
+    hfInterferenceBaselineDepthSlider->setSingleStep(5);
+    hfInterferenceBaselineDepthSlider->setPageStep(25);
+    hfInterferenceBaselineDepthSlider->setValue(static_cast<int>(std::lround(hfInterferenceBaselineDepth * 100.0)));
+
+    hfInterferenceBaselineSmoothSlider = new QSlider(Qt::Horizontal, this);
+    hfInterferenceBaselineSmoothSlider->setRange(1, 301);
+    hfInterferenceBaselineSmoothSlider->setSingleStep(10);
+    hfInterferenceBaselineSmoothSlider->setPageStep(40);
+    hfInterferenceBaselineSmoothSlider->setValue(hfInterferenceBaselineSmoothBins);
+
     volumeLabel = new QLabel("Volume: 100%", this);
     audioLowPassLabel = new QLabel("Audio LPF: Auto", this);
     audioHighPassLabel = new QLabel("Audio HPF: Off", this);
@@ -595,6 +624,9 @@ YourClassName::YourClassName(QWidget *parent)
     hfNoiseCancelRefGainLabel = new QLabel(hfNoiseCancelRefGainLabelText(pendingSettings.hfNoiseCancelRefGainDb), this);
     hfNoiseCancelRefDelayLabel = new QLabel(hfNoiseCancelRefDelayLabelText(pendingSettings.hfNoiseCancelRefDelayNs), this);
     hfNoiseCancelRefTiltLabel = new QLabel(hfNoiseCancelRefTiltLabelText(pendingSettings.hfNoiseCancelRefTiltDb), this);
+    hfInterferenceBaselineDepthLabel = new QLabel("Baseline depth: 100%", this);
+    hfInterferenceBaselineSmoothLabel = new QLabel("Smooth: 121 bins", this);
+    hfInterferenceBaselineStatusLabel = new QLabel("Baseline: empty", this);
     lnaGainLabel = new QLabel("LNA Gain: 1", this);
     vgaGainLabel = new QLabel("VGA Gain: 3", this);
     rtlGainLabel = new QLabel("RTL gain: 16.6 dB", this);
@@ -638,7 +670,7 @@ YourClassName::YourClassName(QWidget *parent)
     modeBox->addItem("HF1 + HF2", INPUT_HF_COMBINED);
     modeBox->addItem("HF1", INPUT_HF1);
     modeBox->addItem("HF2", INPUT_HF2);
-    modeBox->addItem("HF1 - HF2 cancel lab", INPUT_HF_NOISE_CANCEL);
+    modeBox->addItem("HF interference lab", INPUT_HF_NOISE_CANCEL);
     
     clkBox->addItem("Internal", 0);
     clkBox->addItem("External", 1);
@@ -735,10 +767,77 @@ YourClassName::YourClassName(QWidget *parent)
     markTranslatable(recordButton, QStringLiteral("record"), QStringLiteral("Record"));
     recordButton->setCheckable(true);
     recordButton->setToolTip("Start/stop recording. Hold F9 for momentary recording.");
+    spectrumFrameRecordButton = new QPushButton("Spectrum Rec", this);
+    markTranslatable(spectrumFrameRecordButton, QStringLiteral("spectrum_rec"), QStringLiteral("Spectrum Rec"));
+    spectrumFrameRecordButton->setCheckable(true);
+    spectrumFrameRecordButton->setToolTip(uiText(
+        QStringLiteral("spectrum_rec_tooltip"),
+        QStringLiteral("Record compact FFT spectrum frames for event replay and measurement.")));
+    spectrumFrameReplayButton = new QPushButton("Replay", this);
+    markTranslatable(spectrumFrameReplayButton, QStringLiteral("spectrum_replay"), QStringLiteral("Replay"));
+    spectrumFrameReplayButton->setToolTip(uiText(
+        QStringLiteral("spectrum_replay_tooltip"),
+        QStringLiteral("Open a spectrum-frame recording and inspect the waterfall timeline.")));
+    spectrumEventModeCombo = new QComboBox(this);
+    spectrumEventModeCombo->addItem(uiText(QStringLiteral("spectrum_event_spectrum_only"),
+                                           QStringLiteral("Spectrum only")),
+                                    0);
+    spectrumEventModeCombo->addItem(uiText(QStringLiteral("spectrum_event_channel_iq"),
+                                           QStringLiteral("Spectrum + Channel IQ")),
+                                    1);
+    spectrumEventModeCombo->addItem(uiText(QStringLiteral("spectrum_event_full_iq"),
+                                           QStringLiteral("Spectrum + Full IQ short")),
+                                    2);
+    spectrumEventModeCombo->setToolTip(uiText(
+        QStringLiteral("spectrum_event_mode_tooltip"),
+        QStringLiteral("Choose what is saved when the spectrum event trigger is pressed.")));
+    spectrumFrameBufferCheckbox = new QCheckBox("Buffer", this);
+    markTranslatable(spectrumFrameBufferCheckbox, QStringLiteral("spectrum_buffer"), QStringLiteral("Buffer"));
+    spectrumFrameBufferCheckbox->setChecked(spectrumFrameBufferEnabled);
+    spectrumFrameBufferCheckbox->setToolTip(uiText(
+        QStringLiteral("spectrum_buffer_tooltip"),
+        QStringLiteral("Keep a rolling pre-trigger spectrum buffer in RAM.")));
+    spectrumFrameBinsCombo = new QComboBox(this);
+    const QVector<int> spectrumFrameBinOptions = {
+        256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+        65536, 131072, 262144, 524288, 1048576, 2097152
+    };
+    for (int bins : spectrumFrameBinOptions) {
+        spectrumFrameBinsCombo->addItem(QString::number(bins), bins);
+    }
+    spectrumFrameBinsCombo->setCurrentText(QStringLiteral("4096"));
+    spectrumFrameBinsCombo->setToolTip(uiText(
+        QStringLiteral("spectrum_bins_tooltip"),
+        QStringLiteral("Maximum bins stored per spectrum frame. Higher values preserve detail but increase file size.")));
+    spectrumFramePrebufferSpin = new QSpinBox(this);
+    spectrumFramePrebufferSpin->setRange(1, 120);
+    spectrumFramePrebufferSpin->setValue(spectrumFramePrebufferSeconds);
+    spectrumFramePrebufferSpin->setSuffix(QStringLiteral(" s"));
+    spectrumFramePrebufferSpin->setToolTip(uiText(
+        QStringLiteral("spectrum_prebuffer_tooltip"),
+        QStringLiteral("Seconds of spectrum frames kept before the hotkey trigger.")));
     recordingStatusLabel = new QLabel(localizedStatusText(QStringLiteral("Recording: idle")), this);
     recordingStatusLabel->setProperty("statusRawText", QStringLiteral("Recording: idle"));
+    spectrumFrameRecordingStatusLabel = new QLabel(localizedStatusText(QStringLiteral("Spectrum frames: idle")), this);
+    spectrumFrameRecordingStatusLabel->setProperty("statusRawText", QStringLiteral("Spectrum frames: idle"));
     playbackStatusLabel = new QLabel(localizedStatusText(QStringLiteral("Playback: idle")), this);
     playbackStatusLabel->setProperty("statusRawText", QStringLiteral("Playback: idle"));
+    auto prepareCompactStatusLabel = [](QLabel *label) {
+        if (!label) {
+            return;
+        }
+        label->setMinimumWidth(0);
+        label->setMaximumWidth(260);
+        label->setWordWrap(false);
+        label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    };
+    prepareCompactStatusLabel(recordingStatusLabel);
+    prepareCompactStatusLabel(spectrumFrameRecordingStatusLabel);
+    prepareCompactStatusLabel(playbackStatusLabel);
+    recordingStatusLabel->setToolTip(recordingStatusLabel->text());
+    spectrumFrameRecordingStatusLabel->setToolTip(spectrumFrameRecordingStatusLabel->text());
+    playbackStatusLabel->setToolTip(playbackStatusLabel->text());
     playbackFileCombo = new QComboBox(this);
     playbackFileCombo->setMinimumContentsLength(24);
     playbackRefreshButton = new QPushButton("Refresh Playback", this);
@@ -2039,19 +2138,50 @@ YourClassName::YourClassName(QWidget *parent)
     rtlGainLayout->addWidget(rtlGainSlider, 1);
 
     QGridLayout *hfNoiseCancelLayout = new QGridLayout();
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthLabel, 0, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthSlider, 0, 1);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelFreezeCheckbox, 0, 2);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainLabel, 1, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainSlider, 1, 1, 1, 2);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelayLabel, 2, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelaySlider, 2, 1, 1, 2);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltLabel, 3, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltSlider, 3, 1, 1, 2);
+    hfNoiseCancelLayout->setColumnStretch(1, 1);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineCheckbox, 0, 0);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineLearnButton, 0, 1);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineClearButton, 0, 2);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineStatusLabel, 1, 0, 1, 3);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineDepthLabel, 2, 0);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineDepthSlider, 2, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineSmoothLabel, 3, 0);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineSmoothSlider, 3, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthLabel, 4, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthSlider, 4, 1);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelFreezeCheckbox, 4, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainLabel, 5, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainSlider, 5, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelayLabel, 6, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelaySlider, 6, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltLabel, 7, 0);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltSlider, 7, 1, 1, 2);
 
     QHBoxLayout *recordingLayout = new QHBoxLayout();
     recordingLayout->addWidget(recordingModeCombo);
     recordingLayout->addWidget(recordButton);
+
+    QVBoxLayout *spectrumFrameRecordingLayout = new QVBoxLayout();
+    QHBoxLayout *spectrumFrameRecordingModeLayout = new QHBoxLayout();
+    spectrumFrameRecordingModeLayout->setContentsMargins(0, 0, 0, 0);
+    spectrumFrameRecordingModeLayout->setSpacing(4);
+    spectrumFrameRecordingModeLayout->addWidget(spectrumFrameBufferCheckbox);
+    spectrumFrameRecordingModeLayout->addWidget(spectrumEventModeCombo, 1);
+    QHBoxLayout *spectrumFrameRecordingActionLayout = new QHBoxLayout();
+    spectrumFrameRecordingActionLayout->setContentsMargins(0, 0, 0, 0);
+    spectrumFrameRecordingActionLayout->setSpacing(4);
+    spectrumFrameRecordingActionLayout->addWidget(spectrumFrameRecordButton);
+    spectrumFrameRecordingActionLayout->addWidget(spectrumFrameReplayButton);
+    QLabel *spectrumFramePreLabel = new QLabel(QStringLiteral("Pre:"), this);
+    markTranslatable(spectrumFramePreLabel, QStringLiteral("prebuffer_short"), QStringLiteral("Pre:"));
+    spectrumFrameRecordingActionLayout->addWidget(spectrumFramePreLabel);
+    spectrumFrameRecordingActionLayout->addWidget(spectrumFramePrebufferSpin);
+    QLabel *spectrumFrameBinsLabel = new QLabel(QStringLiteral("Bins:"), this);
+    markTranslatable(spectrumFrameBinsLabel, QStringLiteral("bins_short"), QStringLiteral("Bins:"));
+    spectrumFrameRecordingActionLayout->addWidget(spectrumFrameBinsLabel);
+    spectrumFrameRecordingActionLayout->addWidget(spectrumFrameBinsCombo);
+    spectrumFrameRecordingLayout->addLayout(spectrumFrameRecordingModeLayout);
+    spectrumFrameRecordingLayout->addLayout(spectrumFrameRecordingActionLayout);
 
     QHBoxLayout *playbackButtonLayout = new QHBoxLayout();
     playbackButtonLayout->addWidget(playbackRefreshButton);
@@ -2182,7 +2312,7 @@ YourClassName::YourClassName(QWidget *parent)
     receiverSection.contentLayout->addLayout(rtlGainLayout);
     receiverSection.contentLayout->addLayout(startStopLayout);
 
-    CollapsibleSection hfCancelSection = createCollapsibleSection(QStringLiteral("hf_cancel_lab_section"), QStringLiteral("HF cancel lab"), false);
+    CollapsibleSection hfCancelSection = createCollapsibleSection(QStringLiteral("hf_interference_lab_section"), QStringLiteral("HF interference lab"), false);
     hfCancelSection.contentLayout->addLayout(hfNoiseCancelLayout);
 
     CollapsibleSection scanSection = createCollapsibleSection(QStringLiteral("scan"), QStringLiteral("Scan"), false);
@@ -2240,6 +2370,8 @@ YourClassName::YourClassName(QWidget *parent)
     CollapsibleSection recordingSection = createCollapsibleSection(QStringLiteral("recording_playback"), QStringLiteral("Recording / playback"), false);
     recordingSection.contentLayout->addWidget(recordingStatusLabel);
     recordingSection.contentLayout->addLayout(recordingLayout);
+    recordingSection.contentLayout->addWidget(spectrumFrameRecordingStatusLabel);
+    recordingSection.contentLayout->addLayout(spectrumFrameRecordingLayout);
     recordingSection.contentLayout->addWidget(playbackStatusLabel);
     recordingSection.contentLayout->addWidget(playbackFileCombo);
     recordingSection.contentLayout->addLayout(playbackButtonLayout);
@@ -2420,6 +2552,31 @@ YourClassName::YourClassName(QWidget *parent)
     connect(hfNoiseCancelRefDelaySlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfNoiseCancelRefTiltSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfNoiseCancelFreezeCheckbox, &QCheckBox::toggled, this, applyHfNoiseCancelControls);
+    connect(hfInterferenceBaselineCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        hfInterferenceBaselineEnabled = checked;
+        updateHfNoiseCancelControls();
+        savePersistentSettings();
+    });
+    connect(hfInterferenceBaselineDepthSlider, &QSlider::valueChanged, this, [this](int value) {
+        hfInterferenceBaselineDepth = (std::clamp)(value / 100.0, 0.0, 2.0);
+        updateHfNoiseCancelControls();
+        savePersistentSettings();
+    });
+    connect(hfInterferenceBaselineSmoothSlider, &QSlider::valueChanged, this, [this](int value) {
+        hfInterferenceBaselineSmoothBins = (std::max)(1, value | 1);
+        if (hfInterferenceBaselineSmoothSlider && hfInterferenceBaselineSmoothSlider->value() != hfInterferenceBaselineSmoothBins) {
+            QSignalBlocker blocker(hfInterferenceBaselineSmoothSlider);
+            hfInterferenceBaselineSmoothSlider->setValue(hfInterferenceBaselineSmoothBins);
+        }
+        updateHfNoiseCancelControls();
+        savePersistentSettings();
+    });
+    connect(hfInterferenceBaselineLearnButton, &QPushButton::clicked, this, [this]() {
+        learnHfInterferenceBaseline();
+    });
+    connect(hfInterferenceBaselineClearButton, &QPushButton::clicked, this, [this]() {
+        clearHfInterferenceBaseline();
+    });
     connect(qthSourceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         qthSource = qthSourceCombo ? qthSourceCombo->currentData().toString() : QStringLiteral("manual");
         updateQthControls();
@@ -3187,6 +3344,43 @@ YourClassName::YourClassName(QWidget *parent)
         } else {
             stopRecording(false);
         }
+    });
+    connect(spectrumFrameRecordButton, &QPushButton::toggled, this, [this](bool checked) {
+        if (checked) {
+            startSpectrumFrameRecording();
+        } else {
+            stopSpectrumFrameRecording();
+        }
+    });
+    connect(spectrumFrameReplayButton, &QPushButton::clicked, this, &YourClassName::openSpectrumFrameReplay);
+    connect(spectrumEventModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        spectrumEventCaptureMode = spectrumEventModeCombo ? spectrumEventModeCombo->currentData().toInt() : 0;
+        spectrumIqPrebuffer.clear();
+        updateIqFrameProducerSettings();
+        savePersistentSettings();
+    });
+    connect(spectrumFrameBufferCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        spectrumFrameBufferEnabled = checked;
+        if (!checked) {
+            spectrumFramePrebuffer.clear();
+            spectrumIqPrebuffer.clear();
+            if (!spectrumFrameRecorder.isRecording()) {
+                updateSpectrumFrameRecordingStatus(QStringLiteral("Spectrum frames: buffer off"));
+            }
+        } else if (!spectrumFrameRecorder.isRecording()) {
+            updateSpectrumFrameRecordingStatus(
+                QStringLiteral("Spectrum frames: buffering %1 s").arg(spectrumFramePrebufferSeconds));
+        }
+        updateIqFrameProducerSettings();
+        savePersistentSettings();
+    });
+    connect(spectrumFramePrebufferSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        spectrumFramePrebufferSeconds = (std::clamp)(value, 1, 120);
+        savePersistentSettings();
+    });
+    connect(spectrumFrameBinsCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        spectrumFramePrebuffer.clear();
+        savePersistentSettings();
     });
     connect(playbackRefreshButton, &QPushButton::clicked, this, &YourClassName::refreshPlaybackFiles);
     connect(playbackButton, &QPushButton::toggled, this, [this](bool checked) {
@@ -3999,6 +4193,7 @@ YourClassName::~YourClassName() {
     }
     stopPlayback();
     stopRecording(false);
+    stopSpectrumFrameRecording();
 
     if (stopPollTimer) {
         stopPollTimer->stop();
@@ -4115,6 +4310,14 @@ bool YourClassName::eventFilter(QObject *watched, QEvent *event) {
                 startRecording(true);
             } else {
                 stopRecording(true);
+            }
+            return true;
+        }
+        if (keyEvent && keyEvent->key() == Qt::Key_F8 && event->type() == QEvent::KeyPress && !keyEvent->isAutoRepeat()) {
+            if (spectrumFrameRecorder.isRecording()) {
+                stopSpectrumFrameRecording();
+            } else {
+                startSpectrumFrameRecording();
             }
             return true;
         }
@@ -4376,6 +4579,9 @@ bool YourClassName::restartStreamForHardwareChange() {
     const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
     const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
     const bool channelIqRecording = isChannelIqRecordingActive();
+    const bool eventIq = spectrumEventIqProducerNeeded();
+    const bool eventFullIq = eventIq && spectrumEventCaptureMode == 2;
+    const bool eventChannelIq = eventIq && spectrumEventIqChannelized();
     const bool suppressServerLocalOutput =
         networkMode == NetworkMode::Server &&
         serverDisableLocalVisualAudio &&
@@ -4395,10 +4601,12 @@ bool YourClassName::restartStreamForHardwareChange() {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
 
-    if ((serverIqStreaming || channelIqRecording) && processor) {
+    if ((serverIqStreaming || channelIqRecording || eventIq) && processor) {
         processor->configureNetworkIqStreaming(pendingSettings,
                                                true,
-                                               serverChannelIqStreaming || channelIqRecording);
+                                               !serverFullIqStreaming &&
+                                                   !eventFullIq &&
+                                                   (serverChannelIqStreaming || channelIqRecording || eventChannelIq));
     }
 
     processor->startProcessing(makeFobosStreamDescriptor(activeFobosDevice(),
@@ -4843,6 +5051,7 @@ void YourClassName::publishSettingsToGlobals() {
     }
     const bool iqFrameProducerActive =
         isChannelIqRecordingActive() ||
+        spectrumEventIqProducerNeeded() ||
         (networkMode == NetworkMode::Server && isClientIqProcessingMode());
     if (runState == RadioRunState::Running && iqFrameProducerActive) {
         updateIqFrameProducerSettings();
@@ -4964,6 +5173,12 @@ void YourClassName::connectDataProcessorSignals() {
                     recordingManager->mode() == RecordingManager::Mode::ChannelIqWav) {
                     recordingManager->appendIqFrame(iqData, sampleRate, sampleCount);
                 }
+                const bool channelizedFrame =
+                    !isFullIqProcessingMode() &&
+                    (isChannelIqRecordingActive() ||
+                     (networkMode == NetworkMode::Server && isChannelIqProcessingMode()) ||
+                     spectrumEventIqChannelized());
+                handleSpectrumEventIqFrame(iqData, sampleRate, sampleCount, channelizedFrame);
                 processVideoIqFrame(iqData, sampleRate, sampleCount);
                 sendNetworkIqFrame(iqData, sampleRate, sampleCount);
             },
@@ -6333,6 +6548,9 @@ void YourClassName::startFobosProcessing() {
     const bool serverFullIqStreaming = networkMode == NetworkMode::Server && isFullIqProcessingMode();
     const bool serverChannelIqStreaming = networkMode == NetworkMode::Server && isChannelIqProcessingMode();
     const bool channelIqRecording = isChannelIqRecordingActive();
+    const bool eventIq = spectrumEventIqProducerNeeded();
+    const bool eventFullIq = eventIq && spectrumEventCaptureMode == 2;
+    const bool eventChannelIq = eventIq && spectrumEventIqChannelized();
     const bool suppressServerLocalOutput =
         networkMode == NetworkMode::Server &&
         serverDisableLocalVisualAudio &&
@@ -6351,10 +6569,12 @@ void YourClassName::startFobosProcessing() {
     if (audioProcessor) {
         audioProcessor->setLocalPlaybackEnabled(!suppressServerLocalOutput);
     }
-    if ((serverIqStreaming || channelIqRecording) && processor) {
+    if ((serverIqStreaming || channelIqRecording || eventIq) && processor) {
         processor->configureNetworkIqStreaming(pendingSettings,
                                                true,
-                                               serverChannelIqStreaming || channelIqRecording);
+                                               !serverFullIqStreaming &&
+                                                   !eventFullIq &&
+                                                   (serverChannelIqStreaming || channelIqRecording || eventChannelIq));
     }
     qDebug() << "[FobosLifecycle] starting DataProcessor"
              << "backend" << (bladeRfNativeSelected ? "bladerf-native" :
@@ -6368,23 +6588,25 @@ void YourClassName::startFobosProcessing() {
              << "publishIqSnapshot" << publishIqSnapshot
              << "serverIqStreaming" << serverIqStreaming
              << "serverChannelIqStreaming" << serverChannelIqStreaming
-             << "channelIqRecording" << channelIqRecording;
+             << "channelIqRecording" << channelIqRecording
+             << "eventIq" << eventIq
+             << "eventMode" << spectrumEventCaptureMode;
     if (rtlSdrNativeSelected) {
         processor->startProcessing(makeRtlSdrNativeStreamDescriptor(queueAudioBlocks,
                                                                     publishIqSnapshot,
-                                                                    serverIqStreaming || channelIqRecording));
+                                                                    serverIqStreaming || channelIqRecording || eventIq));
     } else if (rtlTcpSelected) {
         processor->startProcessing(makeRtlTcpStreamDescriptor(queueAudioBlocks,
                                                               publishIqSnapshot,
-                                                              serverIqStreaming || channelIqRecording));
+                                                              serverIqStreaming || channelIqRecording || eventIq));
     } else if (soapySdrSelected) {
         processor->startProcessing(makeSoapySdrStreamDescriptor(queueAudioBlocks,
                                                                 publishIqSnapshot,
-                                                                serverIqStreaming || channelIqRecording));
+                                                                serverIqStreaming || channelIqRecording || eventIq));
     } else if (bladeRfNativeSelected) {
         processor->startProcessing(makeBladeRfNativeStreamDescriptor(queueAudioBlocks,
                                                                      publishIqSnapshot,
-                                                                     serverIqStreaming || channelIqRecording));
+                                                                     serverIqStreaming || channelIqRecording || eventIq));
     } else {
         processor->startProcessing(makeFobosStreamDescriptor(activeFobosDevice(),
                                                              activeFobosApiKind,
@@ -6393,7 +6615,7 @@ void YourClassName::startFobosProcessing() {
                                                              pendingSettings.centerFrequency,
                                                              queueAudioBlocks,
                                                              publishIqSnapshot,
-                                                             serverIqStreaming || channelIqRecording,
+                                                             serverIqStreaming || channelIqRecording || eventIq,
                                                              agileScanEnabled &&
                                                                  !standardScanEnabled &&
                                                                  activeFobosApiKind == FobosApiKind::Agile,

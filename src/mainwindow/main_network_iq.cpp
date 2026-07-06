@@ -137,6 +137,7 @@ void YourClassName::handleNetworkIqPayload(const QJsonObject &frame, QByteArray 
         return;
     }
     const int frameSampleCount = frame.value("sampleCount").toInt(iqBytes.size() / bytesPerIqSample);
+    handleSpectrumEventIqFrame(iqBytes, frameSampleRate, frameSampleCount, channelizedFrame);
     processVideoIqFrame(iqBytes, frameSampleRate, frameSampleCount);
     if (channelizedFrame &&
         recordingManager &&
