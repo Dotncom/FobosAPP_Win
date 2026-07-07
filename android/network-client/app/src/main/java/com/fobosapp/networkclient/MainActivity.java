@@ -21,6 +21,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -117,11 +118,15 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private TextView statusText;
     private TextView levelMinLabel;
     private TextView levelMaxLabel;
+    private TextView zoomBottomLabel;
+    private TextView zoomSideLabel;
     private TextView fineTuneLabel;
     private View fineTuneModeButton;
     private TextView logText;
     private SeekBar levelMinSeek;
     private SeekBar levelMaxSeek;
+    private SeekBar zoomBottomSeek;
+    private SeekBar zoomSideSeek;
     private FineTuneDialView fineTuneDial;
     private SpectrumView spectrumView;
     private ScrollView controlsScroll;
@@ -130,6 +135,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private LinearLayout commandPanel;
     private LinearLayout contentPanel;
     private LinearLayout levelPanel;
+    private LinearLayout zoomBottomPanel;
+    private LinearLayout zoomSidePanel;
     private LinearLayout usbToolsRow;
     private LinearLayout usbSessionRow;
     private LinearLayout usbSampleRow;
@@ -141,9 +148,11 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
     private int pendingReliableSettingsRepeats = 0;
     private boolean suppressUiCallbacks = false;
     private boolean suppressLevelCallbacks = false;
+    private boolean suppressZoomCallbacks = false;
     private long localSettingsGuardUntilMs = 0L;
     private float displayLevelMin = -130.0f;
     private float displayLevelMax = -50.0f;
+    private int spectrumZoomProgress = 0;
     private boolean fineTuneHoldMode = false;
     private boolean showGeneralBandMarkers = false;
     private boolean showAmateurBandMarkers = false;
@@ -312,6 +321,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                     settings.listeningFrequency,
                     settings.bandwidth,
                     settings.modulationType);
+            applyStoredZoomToSpectrum();
             updateFineTuneControl();
         });
     }
@@ -594,6 +604,13 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             centerToFrequency(frequencyHz, true);
         });
         spectrumView.setPanTuneRequestListener(deltaHz -> applySpectrumPanDelta(deltaHz));
+        spectrumView.setZoomProgressListener(progress -> {
+            spectrumZoomProgress = Math.max(0, Math.min(100, progress));
+            updateZoomControls();
+            updateFineTuneControl();
+        });
+        zoomBottomPanel = buildBottomZoomPanel();
+        zoomSidePanel = buildSideZoomPanel();
 
         contentPanel.addView(levelPanel, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(52)));
@@ -603,6 +620,8 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(230)));
         contentPanel.addView(spectrumView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
+        contentPanel.addView(zoomBottomPanel, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
 
         setContentView(rootLayout);
         applyResponsiveLayout();
@@ -1172,10 +1191,13 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             displayLevelMin = -130.0f;
             displayLevelMax = -50.0f;
         }
+        spectrumZoomProgress = Math.max(0, Math.min(100,
+                prefs.getInt("spectrumZoomProgress", spectrumZoomProgress)));
         normalizeSettingsForCurrentInput();
 
         updateControlsFromSettings(true);
         updateLevelControls();
+        applyStoredZoomToSpectrum();
         suppressUiCallbacks = true;
         audioCheck.setChecked(settings.audioEnabled);
         audioPlaybackEnabled = settings.audioEnabled;
@@ -1225,6 +1247,7 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
                 .putBoolean("suppressServer", suppressServerCheck.isChecked())
                 .putFloat("levelMin", displayLevelMin)
                 .putFloat("levelMax", displayLevelMax)
+                .putInt("spectrumZoomProgress", spectrumZoomProgress)
                 .apply();
     }
 
@@ -1383,12 +1406,17 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             ((LinearLayout.LayoutParams) levelParams).height = dp(landscape ? 44 : 52);
             levelPanel.setLayoutParams(levelParams);
         }
+        if (zoomBottomPanel != null) {
+            zoomBottomPanel.setVisibility(landscape ? View.GONE : View.VISIBLE);
+        }
 
         if (landscape) {
             rootLayout.addView(commandPanel, new LinearLayout.LayoutParams(
                     dp(92), LinearLayout.LayoutParams.MATCH_PARENT));
             rootLayout.addView(contentPanel, new LinearLayout.LayoutParams(
                     0, LinearLayout.LayoutParams.MATCH_PARENT, 1.0f));
+            rootLayout.addView(zoomSidePanel, new LinearLayout.LayoutParams(
+                    dp(48), LinearLayout.LayoutParams.MATCH_PARENT));
         } else {
             rootLayout.addView(commandPanel, new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
@@ -1464,6 +1492,84 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
         return panel;
     }
 
+    private LinearLayout buildBottomZoomPanel() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.HORIZONTAL);
+        panel.setGravity(Gravity.CENTER_VERTICAL);
+        panel.setPadding(dp(6), dp(2), dp(6), dp(2));
+        panel.setBackgroundColor(0xff101418);
+
+        zoomBottomLabel = label("");
+        zoomBottomLabel.setTextSize(11.0f);
+        zoomBottomLabel.setGravity(Gravity.CENTER);
+        zoomBottomSeek = zoomSeekBar();
+        zoomBottomSeek.setOnSeekBarChangeListener(zoomChangeListener());
+
+        panel.addView(zoomBottomLabel, new LinearLayout.LayoutParams(dp(62), dp(38)));
+        panel.addView(zoomBottomSeek, new LinearLayout.LayoutParams(0, dp(38), 1.0f));
+        updateZoomControls();
+        return panel;
+    }
+
+    private LinearLayout buildSideZoomPanel() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setGravity(Gravity.CENTER);
+        panel.setPadding(dp(2), dp(6), dp(2), dp(6));
+        panel.setBackgroundColor(0xff101418);
+
+        zoomSideLabel = label("");
+        zoomSideLabel.setTextSize(10.0f);
+        zoomSideLabel.setGravity(Gravity.CENTER);
+        zoomSideSeek = zoomSeekBar();
+        zoomSideSeek.setRotation(-90.0f);
+        zoomSideSeek.setOnSeekBarChangeListener(zoomChangeListener());
+
+        FrameLayout sliderFrame = new FrameLayout(this);
+        sliderFrame.addView(zoomSideSeek, new FrameLayout.LayoutParams(
+                dp(190), dp(42), Gravity.CENTER));
+
+        panel.addView(zoomSideLabel, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
+        panel.addView(sliderFrame, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
+        updateZoomControls();
+        return panel;
+    }
+
+    private SeekBar zoomSeekBar() {
+        SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(100);
+        seekBar.setProgress(spectrumZoomProgress);
+        return seekBar;
+    }
+
+    private SeekBar.OnSeekBarChangeListener zoomChangeListener() {
+        return new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (suppressZoomCallbacks || !fromUser) {
+                    return;
+                }
+                spectrumZoomProgress = Math.max(0, Math.min(100, progress));
+                if (spectrumView != null) {
+                    spectrumView.setZoomProgress(spectrumZoomProgress);
+                }
+                updateZoomControls();
+                updateFineTuneControl();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                savePrefs();
+            }
+        };
+    }
+
     private SeekBar levelSeekBar() {
         SeekBar seekBar = new SeekBar(this);
         seekBar.setMax(LEVEL_DB_MAX - LEVEL_DB_MIN);
@@ -1527,6 +1633,35 @@ public final class MainActivity extends Activity implements FobosNetworkClient.L
             spectrumView.setLevelRange(displayLevelMin, displayLevelMax);
         }
         suppressLevelCallbacks = false;
+    }
+
+    private void applyStoredZoomToSpectrum() {
+        if (spectrumView == null) {
+            return;
+        }
+        spectrumView.setZoomProgress(spectrumZoomProgress);
+        updateZoomControls();
+    }
+
+    private void updateZoomControls() {
+        suppressZoomCallbacks = true;
+        int progress = Math.max(0, Math.min(100, spectrumZoomProgress));
+        spectrumZoomProgress = progress;
+        if (zoomBottomSeek != null) {
+            zoomBottomSeek.setProgress(progress);
+        }
+        if (zoomSideSeek != null) {
+            zoomSideSeek.setProgress(progress);
+        }
+        String label = String.format(Locale.US, "Zoom\nx%.1f",
+                Math.pow(100.0, progress / 100.0));
+        if (zoomBottomLabel != null) {
+            zoomBottomLabel.setText(label);
+        }
+        if (zoomSideLabel != null) {
+            zoomSideLabel.setText(label);
+        }
+        suppressZoomCallbacks = false;
     }
 
     private void updateFineTuneControl() {

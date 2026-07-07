@@ -26,6 +26,10 @@ public final class SpectrumView extends View {
         void onPanTuneRequested(double deltaHz);
     }
 
+    public interface ZoomProgressListener {
+        void onZoomProgressChanged(int progress);
+    }
+
     private static final int[] WATERFALL_COLORS = new int[] {
             Color.rgb(0, 0, 32),
             Color.rgb(0, 0, 80),
@@ -117,6 +121,7 @@ public final class SpectrumView extends View {
     private TuneRequestListener tuneRequestListener;
     private CenterTuneRequestListener centerTuneRequestListener;
     private PanTuneRequestListener panTuneRequestListener;
+    private ZoomProgressListener zoomProgressListener;
     private float downX = 0.0f;
     private float downY = 0.0f;
     private float lastTapX = Float.NaN;
@@ -153,6 +158,10 @@ public final class SpectrumView extends View {
         panTuneRequestListener = listener;
     }
 
+    public synchronized void setZoomProgressListener(ZoomProgressListener listener) {
+        zoomProgressListener = listener;
+    }
+
     public SpectrumView(Context context, AttributeSet attrs) {
         super(context, attrs);
         init();
@@ -186,6 +195,31 @@ public final class SpectrumView extends View {
 
     public synchronized double visibleSpanHz() {
         return Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+    }
+
+    public synchronized int zoomProgress() {
+        double lowerLimit = rangeLowerLimit();
+        double upperLimit = rangeUpperLimit();
+        double fullSpan = Math.max(1.0, upperLimit - lowerLimit);
+        double visibleSpan = Math.max(1.0, visibleMaxFrequency - visibleMinFrequency);
+        double zoom = Math.max(1.0, Math.min(100.0, fullSpan / visibleSpan));
+        return (int) Math.round(Math.log(zoom) / Math.log(100.0) * 100.0);
+    }
+
+    public synchronized void setZoomProgress(int progress) {
+        int clampedProgress = Math.max(0, Math.min(100, progress));
+        double lowerLimit = rangeLowerLimit();
+        double upperLimit = rangeUpperLimit();
+        double fullSpan = Math.max(1.0, upperLimit - lowerLimit);
+        double zoom = Math.pow(100.0, clampedProgress / 100.0);
+        double span = fullSpan / Math.max(1.0, zoom);
+        double center = (visibleMinFrequency + visibleMaxFrequency) * 0.5;
+        if (!Double.isFinite(center) || center <= 0.0) {
+            center = (lowerLimit + upperLimit) * 0.5;
+        }
+        setVisibleRange(center, span);
+        invalidate();
+        notifyZoomProgressChanged();
     }
 
     public synchronized void shiftFrequencyDisplay(double deltaHz) {
@@ -814,6 +848,13 @@ public final class SpectrumView extends View {
         setVisibleRange(nextCenter, nextSpan);
         if (Math.abs(oldVisibleSpan - (visibleMaxFrequency - visibleMinFrequency)) > 0.5) {
             invalidate();
+            notifyZoomProgressChanged();
+        }
+    }
+
+    private void notifyZoomProgressChanged() {
+        if (zoomProgressListener != null) {
+            zoomProgressListener.onZoomProgressChanged(zoomProgress());
         }
     }
 
