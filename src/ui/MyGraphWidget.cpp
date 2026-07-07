@@ -308,6 +308,16 @@ void MyGraphWidget::wheelEvent(QWheelEvent *event) {
 void MyGraphWidget::mouseMoveEvent(QMouseEvent *event) {
     hoverCursorVisible = true;
     hoverCursorPos = event->pos();
+    if (spectrumPanActive) {
+        const int deltaPixels = event->pos().x() - spectrumPanLastPos.x();
+        if (deltaPixels != 0) {
+            spectrumPanMoved = true;
+            spectrumPanLastPos = event->pos();
+            emit panRequested(deltaPixels, width());
+        }
+        event->accept();
+        return;
+    }
     if (bandwidthMeasurementActive) {
         bandwidthMeasurementVisible = true;
         bandwidthMeasureEndPos = event->pos();
@@ -337,7 +347,9 @@ void MyGraphWidget::mousePressEvent(QMouseEvent *event) {
         return;
     }
     if (event->button() == Qt::MiddleButton) {
-        emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
+        spectrumPanActive = true;
+        spectrumPanMoved = false;
+        spectrumPanLastPos = event->pos();
         event->accept();
         return;
     }
@@ -352,6 +364,14 @@ void MyGraphWidget::mouseReleaseEvent(QMouseEvent *event) {
             bandwidthMeasurementVisible = false;
         }
         update();
+        event->accept();
+        return;
+    }
+    if (event->button() == Qt::MiddleButton && spectrumPanActive) {
+        spectrumPanActive = false;
+        if (!spectrumPanMoved) {
+            emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
+        }
         event->accept();
         return;
     }

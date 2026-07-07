@@ -311,6 +311,84 @@ void YourClassName::clearHfInterferenceBaseline() {
     qDebug() << "[HF interference] baseline cleared";
 }
 
+void YourClassName::resetHfInterferenceDefaults() {
+    hfInterferenceBaselineFrequencies.clear();
+    hfInterferenceBaselineMagnitudes.clear();
+    hfInterferenceVisualMagnitudes.clear();
+    hfInterferenceBaselineEnabled = false;
+    hfInterferenceRawOverlayEnabled = false;
+    hfInterferenceBaselineDepth = 1.0;
+    hfInterferenceBaselineSmoothBins = 121;
+
+    pendingSettings.hfNoiseCancelDepth = 1.0;
+    pendingSettings.hfNoiseCancelRefGainDb = 0.0;
+    pendingSettings.hfNoiseCancelRefDelayNs = 0.0;
+    pendingSettings.hfNoiseCancelRefTiltDb = 0.0;
+    pendingSettings.hfNoiseCancelFreeze = false;
+    pendingSettings.hfAudioBlankerEnabled = false;
+    pendingSettings.hfAudioBlankerThreshold = 8.0;
+
+    if (hfInterferenceBaselineCheckbox) {
+        QSignalBlocker blocker(hfInterferenceBaselineCheckbox);
+        hfInterferenceBaselineCheckbox->setChecked(false);
+    }
+    if (hfInterferenceRawOverlayCheckbox) {
+        QSignalBlocker blocker(hfInterferenceRawOverlayCheckbox);
+        hfInterferenceRawOverlayCheckbox->setChecked(false);
+    }
+    if (hfInterferenceBaselineDepthSlider) {
+        QSignalBlocker blocker(hfInterferenceBaselineDepthSlider);
+        hfInterferenceBaselineDepthSlider->setValue(static_cast<int>(std::lround(hfInterferenceBaselineDepth * 100.0)));
+    }
+    if (hfInterferenceBaselineSmoothSlider) {
+        QSignalBlocker blocker(hfInterferenceBaselineSmoothSlider);
+        hfInterferenceBaselineSmoothSlider->setValue(hfInterferenceBaselineSmoothBins);
+    }
+    if (hfNoiseCancelDepthSlider) {
+        QSignalBlocker blocker(hfNoiseCancelDepthSlider);
+        hfNoiseCancelDepthSlider->setValue(hfNoiseCancelDepthToSliderValue(pendingSettings.hfNoiseCancelDepth));
+    }
+    if (hfNoiseCancelRefGainSlider) {
+        QSignalBlocker blocker(hfNoiseCancelRefGainSlider);
+        hfNoiseCancelRefGainSlider->setValue(hfNoiseCancelRefGainToSliderValue(pendingSettings.hfNoiseCancelRefGainDb));
+    }
+    if (hfNoiseCancelRefDelaySlider) {
+        QSignalBlocker blocker(hfNoiseCancelRefDelaySlider);
+        hfNoiseCancelRefDelaySlider->setValue(hfNoiseCancelRefDelayToSliderValue(pendingSettings.hfNoiseCancelRefDelayNs));
+    }
+    if (hfNoiseCancelRefTiltSlider) {
+        QSignalBlocker blocker(hfNoiseCancelRefTiltSlider);
+        hfNoiseCancelRefTiltSlider->setValue(hfNoiseCancelRefTiltToSliderValue(pendingSettings.hfNoiseCancelRefTiltDb));
+    }
+    if (hfNoiseCancelFreezeCheckbox) {
+        QSignalBlocker blocker(hfNoiseCancelFreezeCheckbox);
+        hfNoiseCancelFreezeCheckbox->setChecked(false);
+    }
+    if (hfAudioBlankerCheckbox) {
+        QSignalBlocker blocker(hfAudioBlankerCheckbox);
+        hfAudioBlankerCheckbox->setChecked(false);
+    }
+    if (hfAudioBlankerThresholdSlider) {
+        QSignalBlocker blocker(hfAudioBlankerThresholdSlider);
+        hfAudioBlankerThresholdSlider->setValue(static_cast<int>(std::lround(pendingSettings.hfAudioBlankerThreshold * 10.0)));
+    }
+
+    if (fftResult) {
+        fftResult->resetHfNoiseCancelState();
+    }
+    if (spectrumFftWorker) {
+        spectrumFftWorker->resetHfNoiseCancelState();
+    }
+    if (audioProcessor) {
+        audioProcessor->resetHfNoiseCancelState();
+        audioProcessor->configure(audioProcessorSettings());
+    }
+
+    updateHfNoiseCancelControls();
+    savePersistentSettings();
+    qDebug() << "[HF interference] defaults restored";
+}
+
 bool YourClassName::buildHfInterferenceBaselineVisual(const std::vector<float> &frequencies,
                                                       const std::vector<float> &magnitudes,
                                                       std::vector<float> &outputMagnitudes) {
@@ -512,13 +590,13 @@ void YourClassName::updateSpectrum() {
     }
 
     const double fullSpan = (std::max)(1.0, fullMaxFrequency - fullMinFrequency);
-    double visibleSpan = spectrumSettings.sampleRate * (currentScale / 100.0);
+    double visibleSpan = fullSpan * (currentScale / 100.0);
     if (!std::isfinite(visibleSpan) || visibleSpan <= 0.0) {
         visibleSpan = fullSpan;
     }
     visibleSpan = (std::clamp)(visibleSpan, 1.0, fullSpan);
 
-    double visibleCenter = pendingSettings.listeningFrequency;
+    double visibleCenter = spectrumDisplayCenterHz;
     if (!std::isfinite(visibleCenter) ||
         visibleCenter < fullMinFrequency ||
         visibleCenter > fullMaxFrequency) {
@@ -527,6 +605,7 @@ void YourClassName::updateSpectrum() {
                             : (fullMinFrequency + fullMaxFrequency) * 0.5;
     }
     visibleCenter = (std::clamp)(visibleCenter, fullMinFrequency, fullMaxFrequency);
+    spectrumDisplayCenterHz = visibleCenter;
 
     double frameMinFrequency = visibleCenter - visibleSpan * 0.5;
     frameMinFrequency = (std::clamp)(frameMinFrequency,
@@ -707,7 +786,7 @@ void YourClassName::updateSpectrum() {
                         ? scanFullSpanHz * (currentScale / 100.0)
                         : scanFullSpanHz;
                 const double scanVisibleCenterHz =
-                    displayFrequencyForScanActual(pendingSettings.listeningFrequency,
+                    displayFrequencyForScanActual(spectrumDisplayCenterHz,
                                                   scanFrame.segments,
                                                   scanFrame.centerFrequency);
                 const ScanVisualFrame *displayScanFrame = &scanFrame;
@@ -831,11 +910,16 @@ void YourClassName::updateSpectrum() {
     updateDigitalVideoHunter(digitalVideoHunterFrequencies, digitalVideoHunterMagnitudes);
 
     const std::vector<float> *visualMagnitudesPtr = &displayMagnitudes;
+    std::vector<float> baselineRawOverlay;
     if (isDirectInputMode(spectrumSettings.inputMode) &&
         buildHfInterferenceBaselineVisual(displayFrequencies,
                                           displayMagnitudes,
                                           hfInterferenceVisualMagnitudes)) {
         visualMagnitudesPtr = &hfInterferenceVisualMagnitudes;
+        if (hfInterferenceRawOverlayEnabled &&
+            displayMagnitudes.size() == hfInterferenceVisualMagnitudes.size()) {
+            baselineRawOverlay = displayMagnitudes;
+        }
     }
     const std::vector<float> &visualMagnitudes = *visualMagnitudesPtr;
     if ((spectrumFrameBufferEnabled || spectrumFrameRecorder.isRecording()) &&
@@ -966,9 +1050,6 @@ void YourClassName::updateSpectrum() {
                     scaleListening =
                         fallbackActualFrequencyForScanSegments(displayScanSegments, displayCenterFrequency);
                 }
-            } else if (scaleListening < displayMinFrequency ||
-                       scaleListening > displayMaxFrequency) {
-                scaleListening = displayCenterFrequency;
             }
             scaleWidget->setScanSegments(displayScanSegments);
             scaleWidget->setScanSegmentMarkersVisible(displayScanSegmentMarkers);
@@ -993,10 +1074,14 @@ void YourClassName::updateSpectrum() {
                 : displayFrequencies;
         const std::vector<float> measurementOverlay =
             scanMeasurementOverlay(measurementFrequencies, static_cast<int>(displayMagnitudes.size()));
-        graphWidget->setOverlayData(!measurementOverlay.empty() ? measurementOverlay : displayReferenceMagnitudes,
-                                    !measurementOverlay.empty() ||
-                                        (pendingSettings.inputMode == INPUT_HF_NOISE_CANCEL &&
-                                         !displayReferenceMagnitudes.empty()));
+        if (!baselineRawOverlay.empty()) {
+            graphWidget->setOverlayData(baselineRawOverlay, true);
+        } else {
+            graphWidget->setOverlayData(!measurementOverlay.empty() ? measurementOverlay : displayReferenceMagnitudes,
+                                        !measurementOverlay.empty() ||
+                                            (pendingSettings.inputMode == INPUT_HF_NOISE_CANCEL &&
+                                             !displayReferenceMagnitudes.empty()));
+        }
         if (traceFrame) {
             qDebug() << "[Spectrum] before waterfall" << "elapsedMs" << traceTimer.elapsed();
         }
@@ -1018,7 +1103,7 @@ void YourClassName::updateSpectrum() {
         qDebug() << "[Spectrum] local server visual update skipped" << "elapsedMs" << traceTimer.elapsed();
     }
     sendNetworkSpectrumFrame(displayFrequencies,
-                             displayMagnitudes,
+                             visualMagnitudes,
                              displayReferenceMagnitudes,
                              displayCenterFrequency,
                              displayMinFrequency,

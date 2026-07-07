@@ -76,13 +76,14 @@ void YourClassName::onDirectSamplingChanged(int index) {
         return;
     }
 
-    qDebug() << "Input mode will be applied on the next start.";
+    if (!restartStreamForHardwareChange()) {
+        qDebug() << "Input mode will be applied on the next start.";
+    }
 }
 void YourClassName::settingRange() {
     if (!scaleWidget || globalSampleRate <= 0.0) {
         return;
     }
-    double newRange = globalSampleRate * (currentScale / 100.0);
     double overallMin = directMinFrequencyForMode(globalMode, globalSampleRate);
     double overallMax = directMaxFrequency(globalSampleRate);
 
@@ -105,10 +106,24 @@ void YourClassName::settingRange() {
     }
 
     const double availableRange = (std::max)(1.0, overallMax - overallMin);
+    double newRange = availableRange * (currentScale / 100.0);
     newRange = (std::clamp)(newRange, 1.0, availableRange);
 
-    const double displayAnchorListening = (std::clamp)(pendingSettings.listeningFrequency, overallMin, overallMax);
-	double newMin = displayAnchorListening - newRange / 2.0;
+    if (!std::isfinite(spectrumDisplayCenterHz) ||
+        spectrumDisplayCenterHz < overallMin ||
+        spectrumDisplayCenterHz > overallMax) {
+        spectrumDisplayCenterHz = (std::clamp)(pendingSettings.listeningFrequency, overallMin, overallMax);
+    }
+
+    const double minCenter = overallMin + newRange / 2.0;
+    const double maxCenter = overallMax - newRange / 2.0;
+    if (maxCenter >= minCenter) {
+        spectrumDisplayCenterHz = (std::clamp)(spectrumDisplayCenterHz, minCenter, maxCenter);
+    } else {
+        spectrumDisplayCenterHz = overallMin + availableRange / 2.0;
+    }
+
+	double newMin = spectrumDisplayCenterHz - newRange / 2.0;
     newMin = (std::clamp)(newMin, overallMin, overallMax - newRange);
     double newMax = newMin + newRange;
     minFrequency = newMin;

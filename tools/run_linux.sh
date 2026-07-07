@@ -13,5 +13,10 @@ if [ ! -x "${APP}" ]; then
     exit 2
 fi
 
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ -d "${RUNTIME_DIR}" ]; then
+    chmod 700 "${RUNTIME_DIR}" 2>/dev/null || true
+fi
+
 export LD_LIBRARY_PATH="${LOCAL_FOBOS_PREFIX}/lib:${FOBOS_STANDARD_ROOT:-/usr/local}/lib:${FOBOS_AGILE_ROOT:-/usr/local}/lib:${LD_LIBRARY_PATH:-}"
 exec "${APP}" "$@"

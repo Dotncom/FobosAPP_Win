@@ -2,6 +2,7 @@
 #define SPECTRUMFRAMEREPLAYDIALOG_H
 
 #include <QDialog>
+#include <QByteArray>
 #include <QColor>
 #include <QCheckBox>
 #include <QComboBox>
@@ -28,11 +29,16 @@ class QShowEvent;
 class ScaleWidget;
 
 class SpectrumFrameReplayDialog : public QDialog {
+    Q_OBJECT
+
 public:
     explicit SpectrumFrameReplayDialog(QWidget *parent = nullptr);
     ~SpectrumFrameReplayDialog() override;
 
     bool loadRecording(const QString &path, QString *errorMessage = nullptr);
+
+signals:
+    void replayAudioFrameReady(const QByteArray &pcmData);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;

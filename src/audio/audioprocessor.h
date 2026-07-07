@@ -58,6 +58,8 @@ signals:
     void dmrBasebandFrameReady(const QByteArray &pcmData, int sampleRate);
 
 private:
+    static constexpr int HF_NOISE_CANCEL_TAP_COUNT = 9;
+
     void SDRThread();
     bool openAudioDevice(int deviceID);
     void closeAudioDevice();
@@ -154,6 +156,12 @@ private:
     double dmrLastLoggedChannelRate = 0.0;
     std::complex<float> hfNoiseCancelCoeff = {0.0f, 0.0f};
     std::complex<float> hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+    std::array<std::complex<float>, HF_NOISE_CANCEL_TAP_COUNT> hfNoiseCancelTapCoeffs = {};
+    std::array<std::complex<float>, HF_NOISE_CANCEL_TAP_COUNT> hfNoiseCancelRefHistory = {};
+    int hfNoiseCancelRefHistoryIndex = 0;
+    float hfAudioBlankerEnvelope = 0.0f;
+    int hfAudioBlankerHoldSamples = 0;
+    std::complex<float> hfAudioBlankerLastCleanSample = {0.0f, 0.0f};
 
 	QByteArray byteArray;
     QString audioDeviceName;

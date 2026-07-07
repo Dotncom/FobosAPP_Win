@@ -12,6 +12,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
+#include <QGuiApplication>
 #include <QInputDialog>
 #include <QMenu>
 #include <QNetworkAccessManager>
@@ -510,7 +511,9 @@ void YourClassName::openQthMapWindow() {
     updateQthControls();
     qthMapDialog->show();
     qthMapDialog->raise();
-    qthMapDialog->activateWindow();
+    if (!QGuiApplication::platformName().contains(QStringLiteral("wayland"), Qt::CaseInsensitive)) {
+        qthMapDialog->activateWindow();
+    }
 }
 
 void YourClassName::applyQthMapSearch() {

@@ -180,6 +180,7 @@ private slots:
     void updateFrequency();
     void updateCentralFrequency();
     void updateTuningFromScale(double tunedListeningFrequency, double tunedCenterFrequency);
+    void panSpectrumView(int deltaPixels, int widthPixels);
     void doubleGraphEnable(bool checked);
     void colorGraphEnable(bool checked);
     void pollStopCompletion();
@@ -470,6 +471,9 @@ private:
     void updateHfNoiseCancelControls();
     void learnHfInterferenceBaseline();
     void clearHfInterferenceBaseline();
+    void resetHfInterferenceDefaults();
+    void loadHfInterferenceBaselineCurve();
+    void saveHfInterferenceBaselineCurve() const;
     bool buildHfInterferenceBaselineVisual(const std::vector<float> &frequencies,
                                            const std::vector<float> &magnitudes,
                                            std::vector<float> &outputMagnitudes);
@@ -629,6 +633,7 @@ private:
     QPushButton *gnssMonitorResetButton = nullptr;
     QPushButton *hfInterferenceBaselineLearnButton = nullptr;
     QPushButton *hfInterferenceBaselineClearButton = nullptr;
+    QPushButton *hfInterferenceDefaultsButton = nullptr;
     
     QCheckBox *spectrumCheckbox = nullptr;
     QCheckBox *audioCheckbox = nullptr;
@@ -643,7 +648,9 @@ private:
     QCheckBox *videoVSyncCheckbox = nullptr;
     QCheckBox *videoTestPatternCheckbox = nullptr;
     QCheckBox *hfNoiseCancelFreezeCheckbox = nullptr;
+    QCheckBox *hfAudioBlankerCheckbox = nullptr;
     QCheckBox *hfInterferenceBaselineCheckbox = nullptr;
+    QCheckBox *hfInterferenceRawOverlayCheckbox = nullptr;
     QCheckBox *spectrumFrameBufferCheckbox = nullptr;
     QCheckBox *agileScanCheckbox = nullptr;
     QCheckBox *standardScanCheckbox = nullptr;
@@ -681,6 +688,7 @@ private:
     QSlider *hfNoiseCancelRefGainSlider = nullptr;
     QSlider *hfNoiseCancelRefDelaySlider = nullptr;
     QSlider *hfNoiseCancelRefTiltSlider = nullptr;
+    QSlider *hfAudioBlankerThresholdSlider = nullptr;
     QSlider *hfInterferenceBaselineDepthSlider = nullptr;
     QSlider *hfInterferenceBaselineSmoothSlider = nullptr;
     SpectrumHunterControls *dmrHunterControls = nullptr;
@@ -694,6 +702,7 @@ private:
     QLabel *hfNoiseCancelRefGainLabel = nullptr;
     QLabel *hfNoiseCancelRefDelayLabel = nullptr;
     QLabel *hfNoiseCancelRefTiltLabel = nullptr;
+    QLabel *hfAudioBlankerThresholdLabel = nullptr;
     QLabel *hfInterferenceBaselineDepthLabel = nullptr;
     QLabel *hfInterferenceBaselineSmoothLabel = nullptr;
     QLabel *hfInterferenceBaselineStatusLabel = nullptr;
@@ -878,6 +887,7 @@ private:
     bool remoteReceiverDeviceListValid = false;
     RadioSettings pendingSettings;
     RadioSettings appliedHardwareSettings;
+    double spectrumDisplayCenterHz = std::numeric_limits<double>::quiet_NaN();
     bool hardwareSettingsApplied = false;
     int spectrumDebugFramesRemaining = 0;
     int spectrumTuningDebugFramesRemaining = 0;
@@ -944,6 +954,7 @@ private:
     std::deque<SpectrumEventIqFrame> spectrumIqPrebuffer;
     QString spectrumEventBasePath;
     bool hfInterferenceBaselineEnabled = false;
+    bool hfInterferenceRawOverlayEnabled = false;
     double hfInterferenceBaselineDepth = 1.0;
     int hfInterferenceBaselineSmoothBins = 121;
     std::vector<float> spectrumFrequencyScratch;
@@ -1063,6 +1074,8 @@ private:
     int spurCalibrationFramesDone = 0;
     int spurCalibrationTargetFrames = 32;
     double spurCalibrationBinHz = 0.0;
+    double spurCombStepHz = 0.0;
+    int spurCombSpacingHits = 0;
     QMap<QString, double> centerFrequencyPresets;
     QMap<QString, double> listeningFrequencyPresets;
     QMap<QString, double> bandwidthValuePresets;

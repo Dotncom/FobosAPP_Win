@@ -146,7 +146,72 @@ void YourClassName::tuneSidebandEdgeAt(double frequency, int modulationType) {
 }
 
 void YourClassName::centerReceiverAt(double frequency) {
+    spectrumDisplayCenterHz = frequency;
     updateTuningFromScale(pendingSettings.listeningFrequency, frequency);
+}
+
+void YourClassName::panSpectrumView(int deltaPixels, int widthPixels) {
+    if (deltaPixels == 0 || widthPixels <= 0 || !std::isfinite(minFrequency) || !std::isfinite(maxFrequency)) {
+        return;
+    }
+
+    double overallMin = directMinFrequencyForMode(globalMode, globalSampleRate);
+    double overallMax = directMaxFrequency(globalSampleRate);
+    if (offlineIqPlaybackActive && !offlineIqPlaybackHasMetadata) {
+        overallMin = globalFrequency - globalSampleRate / 2.0;
+        overallMax = globalFrequency + globalSampleRate / 2.0;
+    } else if (globalMode == INPUT_RF) {
+        overallMin = (std::max)(RF_MIN_LISTENING_FREQUENCY,
+                                globalFrequency - globalSampleRate / 2.0);
+        overallMax = (std::max)(overallMin,
+                                globalFrequency + globalSampleRate / 2.0);
+    }
+
+    const double visibleSpan = maxFrequency - minFrequency;
+    const double overallSpan = overallMax - overallMin;
+    if (!std::isfinite(visibleSpan) || visibleSpan <= 0.0 ||
+        !std::isfinite(overallSpan) || overallSpan <= 0.0) {
+        return;
+    }
+
+    const double shiftHz = -static_cast<double>(deltaPixels) * visibleSpan /
+                           static_cast<double>((std::max)(1, widthPixels));
+    const double desiredMin = minFrequency + shiftHz;
+    const double desiredMax = maxFrequency + shiftHz;
+    double retuneDeltaHz = 0.0;
+    if (desiredMin < overallMin) {
+        retuneDeltaHz = desiredMin - overallMin;
+    } else if (desiredMax > overallMax) {
+        retuneDeltaHz = desiredMax - overallMax;
+    }
+
+    const double previousDisplayCenter = std::isfinite(spectrumDisplayCenterHz)
+                                             ? spectrumDisplayCenterHz
+                                             : (minFrequency + maxFrequency) * 0.5;
+    spectrumDisplayCenterHz = previousDisplayCenter + shiftHz;
+
+    if (std::abs(retuneDeltaHz) > 0.5 && pendingSettings.inputMode == INPUT_RF && !offlineIqPlaybackActive) {
+        const RadioSettings previousSettings = pendingSettings;
+        pendingSettings.centerFrequency += retuneDeltaHz;
+        normalizeTuning(pendingSettings, true);
+        applyCenterFrequencyToHardwareIfNeeded(previousSettings, "spectrum pan");
+        publishSettingsToGlobals();
+        if (frequencyControl) {
+            QSignalBlocker blocker(frequencyControl);
+            frequencyControl->setValueHz(pendingSettings.centerFrequency);
+        }
+        if (listeningFrequencyControl) {
+            QSignalBlocker blocker(listeningFrequencyControl);
+            listeningFrequencyControl->setValueHz(pendingSettings.listeningFrequency);
+        }
+        if (isNetworkClientMode()) {
+            scheduleRemoteSettingsCommand(0);
+        } else if (networkMode == NetworkMode::Server) {
+            sendServerStateToClients();
+        }
+    }
+
+    settingRange();
 }
 
 void YourClassName::onModulationChanged(int id) {
@@ -591,6 +656,12 @@ void YourClassName::updateHfNoiseCancelControls() {
             uiText(QStringLiteral("hf_baseline_tooltip"),
                    QStringLiteral("Subtract a learned HF noise-floor curve from the visual spectrum and waterfall only.")));
     }
+    if (hfInterferenceRawOverlayCheckbox) {
+        hfInterferenceRawOverlayCheckbox->setEnabled(hfVisualEnabled && !hfInterferenceBaselineFrequencies.empty());
+        hfInterferenceRawOverlayCheckbox->setToolTip(
+            uiText(QStringLiteral("hf_raw_overlay_tooltip"),
+                   QStringLiteral("Draw the original raw spectrum over the cleaned HF baseline graph.")));
+    }
     if (hfInterferenceBaselineLearnButton) {
         hfInterferenceBaselineLearnButton->setEnabled(hfVisualEnabled && !spectrumFrequencyScratch.empty());
         hfInterferenceBaselineLearnButton->setToolTip(
@@ -602,6 +673,12 @@ void YourClassName::updateHfNoiseCancelControls() {
         hfInterferenceBaselineClearButton->setToolTip(
             uiText(QStringLiteral("hf_baseline_clear_tooltip"),
                    QStringLiteral("Clear the learned HF interference baseline.")));
+    }
+    if (hfInterferenceDefaultsButton) {
+        hfInterferenceDefaultsButton->setEnabled(hfVisualEnabled);
+        hfInterferenceDefaultsButton->setToolTip(
+            uiText(QStringLiteral("hf_interference_default_tooltip"),
+                   QStringLiteral("Reset HF interference lab controls and clear the learned baseline.")));
     }
     if (hfInterferenceBaselineDepthLabel) {
         hfInterferenceBaselineDepthLabel->setText(
@@ -684,6 +761,25 @@ void YourClassName::updateHfNoiseCancelControls() {
         hfNoiseCancelFreezeCheckbox->setEnabled(enabled);
         hfNoiseCancelFreezeCheckbox->setToolTip(
             QStringLiteral("Hold the small adaptive trim added on top of the manual HF2 reference"));
+    }
+    if (hfAudioBlankerCheckbox) {
+        hfAudioBlankerCheckbox->setEnabled(hfVisualEnabled);
+        hfAudioBlankerCheckbox->setToolTip(
+            uiText(QStringLiteral("hf_audio_blanker_tooltip"),
+                   QStringLiteral("Blank short impulse spikes in the selected HF audio channel.")));
+    }
+    if (hfAudioBlankerThresholdLabel) {
+        hfAudioBlankerThresholdLabel->setText(
+            QStringLiteral("%1: %2x")
+                .arg(uiText(QStringLiteral("hf_audio_blanker_threshold"), QStringLiteral("Blanker threshold")))
+                .arg((std::clamp)(pendingSettings.hfAudioBlankerThreshold, 2.0, 20.0), 0, 'f', 1));
+        hfAudioBlankerThresholdLabel->setEnabled(hfVisualEnabled && pendingSettings.hfAudioBlankerEnabled);
+    }
+    if (hfAudioBlankerThresholdSlider) {
+        hfAudioBlankerThresholdSlider->setEnabled(hfVisualEnabled && pendingSettings.hfAudioBlankerEnabled);
+        hfAudioBlankerThresholdSlider->setToolTip(
+            uiText(QStringLiteral("hf_audio_blanker_threshold_tooltip"),
+                   QStringLiteral("Higher values blank only stronger impulse spikes; lower values are more aggressive.")));
     }
 }
 

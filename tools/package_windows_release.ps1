@@ -44,6 +44,7 @@ New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 $excludedNames = @(
     "FobosAPP.ini",
     "FobosAPP_diagnostic.log",
+    "FobosAPP-backup.exe",
     "dmr_lab_replay.exe",
     "dmr_lab_replay.md"
 )

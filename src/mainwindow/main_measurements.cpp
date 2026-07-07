@@ -18,6 +18,8 @@ void YourClassName::startSpurCalibration() {
     spurCalibrationFramesDone = 0;
     spurCalibrationTargetFrames = SPUR_CALIBRATION_TARGET_FRAMES;
     spurCalibrationBinHz = 0.0;
+    spurCombStepHz = 0.0;
+    spurCombSpacingHits = 0;
     spurCalibrationActive = true;
     updateSpurSuppressionStatus();
     qDebug() << "[Spur] calibration started"
@@ -31,6 +33,8 @@ void YourClassName::clearSpurMask() {
     spurCalibrationActive = false;
     spurCalibrationBins.clear();
     spurMaskEntries.clear();
+    spurCombStepHz = 0.0;
+    spurCombSpacingHits = 0;
     spurSuppressionEnabled = false;
     if (spurSuppressionCheckbox) {
         QSignalBlocker blocker(spurSuppressionCheckbox);
@@ -193,6 +197,45 @@ void YourClassName::finishSpurCalibration() {
         }
     }
 
+    spurCombStepHz = 0.0;
+    spurCombSpacingHits = 0;
+    if (candidates.size() >= 5) {
+        constexpr double kMinCombStepHz = 1000.0;
+        constexpr double kMaxCombStepHz = 2000000.0;
+        constexpr double kCombStepBinHz = 250.0;
+        QMap<qint64, int> spacingBins;
+        QVector<double> offsets;
+        offsets.reserve(candidates.size());
+        for (const SpurMaskEntry &candidate : std::as_const(candidates)) {
+            offsets.append(candidate.offsetHz);
+        }
+        std::sort(offsets.begin(), offsets.end());
+        const int offsetCount = offsets.size();
+        for (int i = 0; i < offsetCount; ++i) {
+            for (int j = i + 1; j < offsetCount; ++j) {
+                const double spacingHz = std::abs(offsets.at(j) - offsets.at(i));
+                if (spacingHz < kMinCombStepHz) {
+                    continue;
+                }
+                if (spacingHz > kMaxCombStepHz) {
+                    break;
+                }
+                const qint64 bin = static_cast<qint64>(std::llround(spacingHz / kCombStepBinHz));
+                ++spacingBins[bin];
+            }
+        }
+        for (auto it = spacingBins.constBegin(); it != spacingBins.constEnd(); ++it) {
+            if (it.value() > spurCombSpacingHits) {
+                spurCombSpacingHits = it.value();
+                spurCombStepHz = static_cast<double>(it.key()) * kCombStepBinHz;
+            }
+        }
+        if (spurCombSpacingHits < 6) {
+            spurCombStepHz = 0.0;
+            spurCombSpacingHits = 0;
+        }
+    }
+
     std::sort(candidates.begin(), candidates.end(), [](const SpurMaskEntry &a, const SpurMaskEntry &b) {
         if (a.hits != b.hits) {
             return a.hits > b.hits;
@@ -244,6 +287,8 @@ void YourClassName::finishSpurCalibration() {
     }
     qDebug() << "[Spur] calibration finished"
              << "entries" << spurMaskEntries.size()
+             << "combStepHz" << spurCombStepHz
+             << "combHits" << spurCombSpacingHits
              << "offsets" << offsets.join(QStringLiteral(", "));
 }
 
@@ -350,6 +395,12 @@ void YourClassName::updateSpurSuppressionStatus() {
         offsets << QStringLiteral("%1k").arg(spurMaskEntries.at(i).offsetHz / 1000.0, 0, 'f', 1);
     }
     const QString suffix = spurMaskEntries.size() > 6 ? QStringLiteral(", ...") : QString();
+    const QString combSuffix =
+        spurCombStepHz > 0.0
+            ? QStringLiteral(", comb %1k/h%2")
+                  .arg(spurCombStepHz / 1000.0, 0, 'f', 2)
+                  .arg(spurCombSpacingHits)
+            : QString();
     setSpurStatus(
         uiText(QStringLiteral("spur_mask_status"),
                QStringLiteral("Spur mask: %1, %2 offsets [%3%4]"))
@@ -358,7 +409,8 @@ void YourClassName::updateSpurSuppressionStatus() {
                      : uiText(QStringLiteral("off"), QStringLiteral("off")))
             .arg(spurMaskEntries.size())
             .arg(offsets.join(QStringLiteral(", ")))
-            .arg(suffix));
+            .arg(suffix) +
+        combSuffix);
 }
 
 void YourClassName::updateGnssSpurWatch(const std::vector<float> &frequencies,

@@ -42,12 +42,15 @@ signals:
     void scaleChanged(int delta);
     void tuneContextRequested(double frequency, const QPoint &globalPos);
     void autoTuneRequested(double frequency);
+    void panRequested(int deltaPixels, int widthPixels);
 protected:
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
 	void wheelEvent(QWheelEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
 private:
     void ensureLineBuffer();
@@ -87,6 +90,10 @@ private:
     bool waterfallProgramTried = false;
     bool secondGraph;
     bool changebit;
+    bool spectrumPanActive = false;
+    bool spectrumPanMoved = false;
+    Qt::MouseButton spectrumPanButton = Qt::NoButton;
+    QPoint spectrumPanLastPos;
     bool pendingTextureLine = false;
     bool textureClearRequested = false;
     bool updateQueued = false;

@@ -361,6 +361,11 @@ SpectrumFrameReplayDialog::SpectrumFrameReplayDialog(QWidget *parent)
 
     localAudioProcessor = new AudioProcessor(this);
     localAudioProcessor->setLocalPlaybackEnabled(true);
+    connect(localAudioProcessor,
+            &AudioProcessor::audioFrameReady,
+            this,
+            &SpectrumFrameReplayDialog::replayAudioFrameReady,
+            Qt::QueuedConnection);
 
     saveSettingsTimer.setSingleShot(true);
     saveSettingsTimer.setInterval(750);

@@ -35,6 +35,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
+#include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -588,14 +589,31 @@ YourClassName::YourClassName(QWidget *parent)
     hfNoiseCancelRefTiltSlider->setPageStep(30);
     hfNoiseCancelRefTiltSlider->setValue(hfNoiseCancelRefTiltToSliderValue(pendingSettings.hfNoiseCancelRefTiltDb));
 
+    hfAudioBlankerThresholdSlider = new QSlider(Qt::Horizontal, this);
+    hfAudioBlankerThresholdSlider->setRange(HF_AUDIO_BLANKER_THRESHOLD_MIN, HF_AUDIO_BLANKER_THRESHOLD_MAX);
+    hfAudioBlankerThresholdSlider->setSingleStep(5);
+    hfAudioBlankerThresholdSlider->setPageStep(20);
+    hfAudioBlankerThresholdSlider->setValue(static_cast<int>(std::lround(
+        (std::clamp)(pendingSettings.hfAudioBlankerThreshold, 2.0, 20.0) * 10.0)));
+
     hfNoiseCancelFreezeCheckbox = new QCheckBox("Freeze", this);
     markTranslatable(hfNoiseCancelFreezeCheckbox, QStringLiteral("freeze"), QStringLiteral("Freeze"));
     hfNoiseCancelFreezeCheckbox->setToolTip("Hold the small adaptive trim added on top of the manual HF2 reference");
+
+    hfAudioBlankerCheckbox = new QCheckBox("Audio blanker", this);
+    markTranslatable(hfAudioBlankerCheckbox, QStringLiteral("hf_audio_blanker"), QStringLiteral("Audio blanker"));
+    hfAudioBlankerCheckbox->setChecked(pendingSettings.hfAudioBlankerEnabled);
+    hfAudioBlankerCheckbox->setToolTip("Blank short impulse spikes in the selected HF audio channel.");
 
     hfInterferenceBaselineCheckbox = new QCheckBox("Baseline", this);
     markTranslatable(hfInterferenceBaselineCheckbox, QStringLiteral("hf_baseline"), QStringLiteral("Baseline"));
     hfInterferenceBaselineCheckbox->setChecked(hfInterferenceBaselineEnabled);
     hfInterferenceBaselineCheckbox->setToolTip("Apply a learned HF noise-floor curve to the visual spectrum/waterfall only.");
+
+    hfInterferenceRawOverlayCheckbox = new QCheckBox("Raw overlay", this);
+    markTranslatable(hfInterferenceRawOverlayCheckbox, QStringLiteral("hf_raw_overlay"), QStringLiteral("Raw overlay"));
+    hfInterferenceRawOverlayCheckbox->setChecked(hfInterferenceRawOverlayEnabled);
+    hfInterferenceRawOverlayCheckbox->setToolTip("Draw the original raw spectrum over the cleaned HF baseline view.");
 
     hfInterferenceBaselineLearnButton = new QPushButton("Learn", this);
     markTranslatable(hfInterferenceBaselineLearnButton, QStringLiteral("hf_baseline_learn"), QStringLiteral("Learn"));
@@ -604,6 +622,12 @@ YourClassName::YourClassName(QWidget *parent)
     hfInterferenceBaselineClearButton = new QPushButton("Clear", this);
     markTranslatable(hfInterferenceBaselineClearButton, QStringLiteral("clear"), QStringLiteral("Clear"));
     hfInterferenceBaselineClearButton->setToolTip("Remove the learned HF interference baseline.");
+
+    hfInterferenceDefaultsButton = new QPushButton("Default", this);
+    markTranslatable(hfInterferenceDefaultsButton, QStringLiteral("hf_interference_defaults"), QStringLiteral("Default"));
+    hfInterferenceDefaultsButton->setToolTip(uiText(
+        QStringLiteral("hf_interference_default_tooltip"),
+        QStringLiteral("Reset HF interference lab controls and clear the learned baseline.")));
 
     hfInterferenceBaselineDepthSlider = new QSlider(Qt::Horizontal, this);
     hfInterferenceBaselineDepthSlider->setRange(0, 200);
@@ -624,6 +648,7 @@ YourClassName::YourClassName(QWidget *parent)
     hfNoiseCancelRefGainLabel = new QLabel(hfNoiseCancelRefGainLabelText(pendingSettings.hfNoiseCancelRefGainDb), this);
     hfNoiseCancelRefDelayLabel = new QLabel(hfNoiseCancelRefDelayLabelText(pendingSettings.hfNoiseCancelRefDelayNs), this);
     hfNoiseCancelRefTiltLabel = new QLabel(hfNoiseCancelRefTiltLabelText(pendingSettings.hfNoiseCancelRefTiltDb), this);
+    hfAudioBlankerThresholdLabel = new QLabel("Blanker: 8.0x", this);
     hfInterferenceBaselineDepthLabel = new QLabel("Baseline depth: 100%", this);
     hfInterferenceBaselineSmoothLabel = new QLabel("Smooth: 121 bins", this);
     hfInterferenceBaselineStatusLabel = new QLabel("Baseline: empty", this);
@@ -2140,22 +2165,27 @@ YourClassName::YourClassName(QWidget *parent)
     QGridLayout *hfNoiseCancelLayout = new QGridLayout();
     hfNoiseCancelLayout->setColumnStretch(1, 1);
     hfNoiseCancelLayout->addWidget(hfInterferenceBaselineCheckbox, 0, 0);
-    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineLearnButton, 0, 1);
-    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineClearButton, 0, 2);
-    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineStatusLabel, 1, 0, 1, 3);
+    hfNoiseCancelLayout->addWidget(hfInterferenceRawOverlayCheckbox, 0, 1);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineLearnButton, 0, 2);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineClearButton, 0, 3);
+    hfNoiseCancelLayout->addWidget(hfInterferenceDefaultsButton, 0, 4);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineStatusLabel, 1, 0, 1, 5);
     hfNoiseCancelLayout->addWidget(hfInterferenceBaselineDepthLabel, 2, 0);
-    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineDepthSlider, 2, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineDepthSlider, 2, 1, 1, 4);
     hfNoiseCancelLayout->addWidget(hfInterferenceBaselineSmoothLabel, 3, 0);
-    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineSmoothSlider, 3, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfInterferenceBaselineSmoothSlider, 3, 1, 1, 4);
     hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthLabel, 4, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthSlider, 4, 1);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelFreezeCheckbox, 4, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelDepthSlider, 4, 1, 1, 3);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelFreezeCheckbox, 4, 4);
     hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainLabel, 5, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainSlider, 5, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefGainSlider, 5, 1, 1, 4);
     hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelayLabel, 6, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelaySlider, 6, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefDelaySlider, 6, 1, 1, 4);
     hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltLabel, 7, 0);
-    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltSlider, 7, 1, 1, 2);
+    hfNoiseCancelLayout->addWidget(hfNoiseCancelRefTiltSlider, 7, 1, 1, 4);
+    hfNoiseCancelLayout->addWidget(hfAudioBlankerCheckbox, 8, 0);
+    hfNoiseCancelLayout->addWidget(hfAudioBlankerThresholdLabel, 8, 1);
+    hfNoiseCancelLayout->addWidget(hfAudioBlankerThresholdSlider, 8, 2, 1, 3);
 
     QHBoxLayout *recordingLayout = new QHBoxLayout();
     recordingLayout->addWidget(recordingModeCombo);
@@ -2526,6 +2556,13 @@ YourClassName::YourClassName(QWidget *parent)
         if (hfNoiseCancelFreezeCheckbox) {
             pendingSettings.hfNoiseCancelFreeze = hfNoiseCancelFreezeCheckbox->isChecked();
         }
+        if (hfAudioBlankerCheckbox) {
+            pendingSettings.hfAudioBlankerEnabled = hfAudioBlankerCheckbox->isChecked();
+        }
+        if (hfAudioBlankerThresholdSlider) {
+            pendingSettings.hfAudioBlankerThreshold =
+                (std::clamp)(hfAudioBlankerThresholdSlider->value() / 10.0, 2.0, 20.0);
+        }
         updateHfNoiseCancelControls();
         if (fftResult) {
             fftResult->resetHfNoiseCancelState();
@@ -2552,8 +2589,15 @@ YourClassName::YourClassName(QWidget *parent)
     connect(hfNoiseCancelRefDelaySlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfNoiseCancelRefTiltSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfNoiseCancelFreezeCheckbox, &QCheckBox::toggled, this, applyHfNoiseCancelControls);
+    connect(hfAudioBlankerCheckbox, &QCheckBox::toggled, this, applyHfNoiseCancelControls);
+    connect(hfAudioBlankerThresholdSlider, &QSlider::valueChanged, this, applyHfNoiseCancelControls);
     connect(hfInterferenceBaselineCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
         hfInterferenceBaselineEnabled = checked;
+        updateHfNoiseCancelControls();
+        savePersistentSettings();
+    });
+    connect(hfInterferenceRawOverlayCheckbox, &QCheckBox::toggled, this, [this](bool checked) {
+        hfInterferenceRawOverlayEnabled = checked;
         updateHfNoiseCancelControls();
         savePersistentSettings();
     });
@@ -2576,6 +2620,9 @@ YourClassName::YourClassName(QWidget *parent)
     });
     connect(hfInterferenceBaselineClearButton, &QPushButton::clicked, this, [this]() {
         clearHfInterferenceBaseline();
+    });
+    connect(hfInterferenceDefaultsButton, &QPushButton::clicked, this, [this]() {
+        resetHfInterferenceDefaults();
     });
     connect(qthSourceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         qthSource = qthSourceCombo ? qthSourceCombo->currentData().toString() : QStringLiteral("manual");
@@ -2638,7 +2685,9 @@ YourClassName::YourClassName(QWidget *parent)
                 updateGnssSatelliteView(true);
                 gnssSatelliteTableDialog->show();
                 gnssSatelliteTableDialog->raise();
-                gnssSatelliteTableDialog->activateWindow();
+                if (!QGuiApplication::platformName().contains(QStringLiteral("wayland"), Qt::CaseInsensitive)) {
+                    gnssSatelliteTableDialog->activateWindow();
+                }
             } else {
                 gnssSatelliteTableDialog->hide();
             }
@@ -2761,7 +2810,9 @@ YourClassName::YourClassName(QWidget *parent)
         }
         gnssAcquisitionPlotDialog->show();
         gnssAcquisitionPlotDialog->raise();
-        gnssAcquisitionPlotDialog->activateWindow();
+        if (!QGuiApplication::platformName().contains(QStringLiteral("wayland"), Qt::CaseInsensitive)) {
+            gnssAcquisitionPlotDialog->activateWindow();
+        }
     });
     connect(gnssSatellitesButton, &QPushButton::clicked, this, [this]() {
         if (!gnssSatelliteDialog) {
@@ -2770,7 +2821,9 @@ YourClassName::YourClassName(QWidget *parent)
         updateGnssSatelliteView(true);
         gnssSatelliteDialog->show();
         gnssSatelliteDialog->raise();
-        gnssSatelliteDialog->activateWindow();
+        if (!QGuiApplication::platformName().contains(QStringLiteral("wayland"), Qt::CaseInsensitive)) {
+            gnssSatelliteDialog->activateWindow();
+        }
         if (gnssSatelliteTableVisible && gnssSatelliteTableDialog) {
             gnssSatelliteTableDialog->show();
             gnssSatelliteTableDialog->raise();
@@ -3401,6 +3454,8 @@ YourClassName::YourClassName(QWidget *parent)
             [this](const QByteArray &pcmData) {
                 if (pendingSettings.modulationType != MOD_DMR) {
                     processDigitalAudioFrame(pcmData);
+                    sendAudioRelayFrame(pcmData);
+                    sendAudioHttpFrame(pcmData);
                 }
                 processSstvAudioFrame(pcmData);
                 processAptAudioFrame(pcmData);
@@ -3429,8 +3484,10 @@ YourClassName::YourClassName(QWidget *parent)
                     recordingManager->appendAudioFrame(pcmData);
                 }
                 sendNetworkAudioFrame(pcmData);
-                sendAudioRelayFrame(pcmData);
-                sendAudioHttpFrame(pcmData);
+                if (pendingSettings.modulationType == MOD_DMR) {
+                    sendAudioRelayFrame(pcmData);
+                    sendAudioHttpFrame(pcmData);
+                }
 #if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
                 const bool suppressServerLocalOutput =
                     networkMode == NetworkMode::Server &&
@@ -4150,6 +4207,8 @@ YourClassName::YourClassName(QWidget *parent)
     connect(scaleWidget, &ScaleWidget::tuningChanged, this, &YourClassName::updateTuningFromScale);
     connect(waterfallWidget, &MyWaterfallWidget::scaleChanged, this, &YourClassName::onWaterfallScaleChanged);
     connect(graphWidget, &MyGraphWidget::scaleChanged, this, &YourClassName::onWaterfallScaleChanged);
+    connect(waterfallWidget, &MyWaterfallWidget::panRequested, this, &YourClassName::panSpectrumView);
+    connect(graphWidget, &MyGraphWidget::panRequested, this, &YourClassName::panSpectrumView);
     connect(graphWidget, &MyGraphWidget::tuneContextRequested, this, &YourClassName::showTuneContextMenu);
     connect(waterfallWidget, &MyWaterfallWidget::tuneContextRequested, this, &YourClassName::showTuneContextMenu);
     connect(graphWidget, &MyGraphWidget::autoTuneRequested, this, &YourClassName::tuneSignalCenterAt);
@@ -4774,6 +4833,13 @@ void YourClassName::refreshSettingsFromUi() {
     }
     if (hfNoiseCancelFreezeCheckbox) {
         pendingSettings.hfNoiseCancelFreeze = hfNoiseCancelFreezeCheckbox->isChecked();
+    }
+    if (hfAudioBlankerCheckbox) {
+        pendingSettings.hfAudioBlankerEnabled = hfAudioBlankerCheckbox->isChecked();
+    }
+    if (hfAudioBlankerThresholdSlider) {
+        pendingSettings.hfAudioBlankerThreshold =
+            (std::clamp)(hfAudioBlankerThresholdSlider->value() / 10.0, 2.0, 20.0);
     }
     if (audioCheckbox) {
         pendingSettings.audioEnabled = audioCheckbox->isChecked();
@@ -6492,7 +6558,7 @@ void YourClassName::startFobosProcessing() {
             return;
         }
     } else {
-        const bool fobosSessionAlreadyPrepared =
+        bool fobosSessionAlreadyPrepared =
             hasActiveFobosDevice() &&
             hardwareSettingsApplied &&
             appliedHardwareSettings.inputMode == pendingSettings.inputMode &&
@@ -6502,6 +6568,33 @@ void YourClassName::startFobosProcessing() {
             appliedHardwareSettings.gpoValue == pendingSettings.gpoValue &&
             std::abs(appliedHardwareSettings.centerFrequency - pendingSettings.centerFrequency) <= 0.5 &&
             std::abs(appliedHardwareSettings.sampleRate - pendingSettings.sampleRate) <= 0.5;
+
+        if (!fobosSessionAlreadyPrepared && hasActiveFobosDevice()) {
+            qDebug() << "[FobosLifecycle] prepared Fobos session is stale; applying pending hardware settings before reader start"
+                     << "appliedInputMode" << appliedHardwareSettings.inputMode
+                     << "pendingInputMode" << pendingSettings.inputMode
+                     << "appliedSampleRate" << appliedSampleRate
+                     << "pendingSampleRate" << pendingSettings.sampleRate
+                     << "appliedCenter" << appliedHardwareSettings.centerFrequency
+                     << "pendingCenter" << pendingSettings.centerFrequency;
+            const bool forceFrequencyApply = pendingSettings.inputMode == INPUT_RF;
+            if (!applyFobosSettings(forceFrequencyApply)) {
+                qDebug() << "[FobosLifecycle] Start failed while applying stale prepared Fobos settings";
+                clearLiveSpectrumSnapshot();
+                runState = RadioRunState::Idle;
+                updateUiForRunState();
+                return;
+            }
+            fobosSessionAlreadyPrepared =
+                hardwareSettingsApplied &&
+                appliedHardwareSettings.inputMode == pendingSettings.inputMode &&
+                appliedHardwareSettings.clockSource == pendingSettings.clockSource &&
+                appliedHardwareSettings.lnaGain == pendingSettings.lnaGain &&
+                appliedHardwareSettings.vgaGain == pendingSettings.vgaGain &&
+                appliedHardwareSettings.gpoValue == pendingSettings.gpoValue &&
+                std::abs(appliedHardwareSettings.centerFrequency - pendingSettings.centerFrequency) <= 0.5 &&
+                std::abs(appliedHardwareSettings.sampleRate - pendingSettings.sampleRate) <= 0.5;
+        }
 
         if (fobosSessionAlreadyPrepared) {
             qDebug() << "[FobosLifecycle] prepared Fobos session reused; Start will only launch reader"

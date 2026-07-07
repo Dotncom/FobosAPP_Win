@@ -42,6 +42,7 @@ signals:
     void scaleChanged(int direction);
     void tuneContextRequested(double frequency, const QPoint &globalPos);
     void autoTuneRequested(double frequency);
+    void panRequested(int deltaPixels, int widthPixels);
 
 protected:
     void initializeGL() override;
@@ -101,6 +102,9 @@ private:
     bool bandwidthMeasurementVisible = false;
     QPoint bandwidthMeasureStartPos;
     QPoint bandwidthMeasureEndPos;
+    bool spectrumPanActive = false;
+    bool spectrumPanMoved = false;
+    QPoint spectrumPanLastPos;
     QVector<GraphBandMarker> bandMarkers;
     QVector<ScanVisualSegment> scanSegments;
     bool scanSegmentMarkersVisible = true;

@@ -94,6 +94,14 @@ void MyWaterfallWidget::wheelEvent(QWheelEvent *event) {
 }
 
 void MyWaterfallWidget::mousePressEvent(QMouseEvent *event) {
+    if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton) {
+        spectrumPanActive = true;
+        spectrumPanMoved = false;
+        spectrumPanButton = event->button();
+        spectrumPanLastPos = event->pos();
+        event->accept();
+        return;
+    }
     if (event->button() == Qt::RightButton) {
         emit tuneContextRequested(frequencyAtX(event->x()), event->globalPos());
         event->accept();
@@ -107,8 +115,38 @@ void MyWaterfallWidget::mousePressEvent(QMouseEvent *event) {
     QOpenGLWidget::mousePressEvent(event);
 }
 
+void MyWaterfallWidget::mouseMoveEvent(QMouseEvent *event) {
+    if (spectrumPanActive) {
+        const int deltaPixels = event->pos().x() - spectrumPanLastPos.x();
+        if (deltaPixels != 0) {
+            spectrumPanMoved = true;
+            spectrumPanLastPos = event->pos();
+            emit panRequested(deltaPixels, width());
+        }
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::mouseMoveEvent(event);
+}
+
+void MyWaterfallWidget::mouseReleaseEvent(QMouseEvent *event) {
+    if (spectrumPanActive && event->button() == spectrumPanButton) {
+        const bool middleClickAutoTune = spectrumPanButton == Qt::MiddleButton && !spectrumPanMoved;
+        spectrumPanActive = false;
+        spectrumPanButton = Qt::NoButton;
+        if (middleClickAutoTune) {
+            emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
+        }
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::mouseReleaseEvent(event);
+}
+
 void MyWaterfallWidget::mouseDoubleClickEvent(QMouseEvent *event) {
     if (event->button() == Qt::LeftButton) {
+        spectrumPanActive = false;
+        spectrumPanButton = Qt::NoButton;
         emit autoTuneRequested(signalCenterNearFrequency(frequencyAtX(event->x())));
         event->accept();
         return;

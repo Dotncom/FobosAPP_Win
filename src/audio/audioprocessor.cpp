@@ -639,6 +639,12 @@ void AudioProcessor::resetDemodulatorState() {
     dmrLastLoggedChannelRate = 0.0;
     hfNoiseCancelCoeff = {0.0f, 0.0f};
     hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+    hfNoiseCancelTapCoeffs.fill(std::complex<float>(0.0f, 0.0f));
+    hfNoiseCancelRefHistory.fill(std::complex<float>(0.0f, 0.0f));
+    hfNoiseCancelRefHistoryIndex = 0;
+    hfAudioBlankerEnvelope = 0.0f;
+    hfAudioBlankerHoldSamples = 0;
+    hfAudioBlankerLastCleanSample = {0.0f, 0.0f};
 }
 
 size_t AudioProcessor::queuedAudioSamples() const {
@@ -1041,23 +1047,50 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock,
         1.0 - std::exp(-1.0 / ((std::max)(1.0, rfChannelRate) * fmDeemphasisSeconds))
         );
     const bool adaptiveNoiseCancel = inputMode == INPUT_HF_NOISE_CANCEL;
+    const bool hfAudioBlankerEnabled =
+        settings.hfAudioBlankerEnabled &&
+        isDirectInputMode(inputMode) &&
+        !digitalAudioMode;
+    const float hfAudioBlankerThreshold = static_cast<float>(
+        (std::clamp)(settings.hfAudioBlankerThreshold, 2.0, 20.0));
+    float hfBlankerEnvelope = hfAudioBlankerEnvelope;
+    int hfBlankerHoldSamples = hfAudioBlankerHoldSamples;
+    std::complex<float> hfBlankerLastClean = hfAudioBlankerLastCleanSample;
+    const int hfBlankerHoldTarget =
+        (std::max)(1, static_cast<int>(std::lround(rfChannelRate * 0.00008)));
+    const float hfBlankerEnvAlpha = static_cast<float>((std::clamp)(
+        1.0 - std::exp(-TWO_PI * 80.0 / rfChannelRate),
+        0.000001,
+        1.0));
     std::complex<float> refChannelSum = hfNoiseCancelRefDecimationSum;
     std::complex<float> adaptiveCoeff = hfNoiseCancelCoeff;
+    auto adaptiveTaps = hfNoiseCancelTapCoeffs;
+    auto refHistory = hfNoiseCancelRefHistory;
+    int refHistoryIndex = hfNoiseCancelRefHistoryIndex;
     if (hfNoiseCancelResetRequested.exchange(false)) {
         refChannelSum = {0.0f, 0.0f};
         adaptiveCoeff = {0.0f, 0.0f};
+        adaptiveTaps.fill(std::complex<float>(0.0f, 0.0f));
+        refHistory.fill(std::complex<float>(0.0f, 0.0f));
+        refHistoryIndex = 0;
         hfNoiseCancelCoeff = {0.0f, 0.0f};
         hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+        hfNoiseCancelTapCoeffs.fill(std::complex<float>(0.0f, 0.0f));
+        hfNoiseCancelRefHistory.fill(std::complex<float>(0.0f, 0.0f));
+        hfNoiseCancelRefHistoryIndex = 0;
     }
     if (!adaptiveNoiseCancel) {
         hfNoiseCancelCoeff = {0.0f, 0.0f};
         hfNoiseCancelRefDecimationSum = {0.0f, 0.0f};
+        hfNoiseCancelTapCoeffs.fill(std::complex<float>(0.0f, 0.0f));
+        hfNoiseCancelRefHistory.fill(std::complex<float>(0.0f, 0.0f));
+        hfNoiseCancelRefHistoryIndex = 0;
     }
     const float noiseCancelDepth =
         static_cast<float>((std::clamp)(settings.hfNoiseCancelDepth, 0.0, 2.0));
     const std::complex<float> manualRefCoeff =
         hfNoiseCancelReferenceCoefficient(settings, settings.listeningFrequency);
-    constexpr float adaptiveMu = 0.035f;
+    constexpr float adaptiveMu = 0.075f;
     constexpr float adaptiveEpsilon = 1.0e-8f;
 
     for (size_t n = 0; n < iqSamples; ++n) {
@@ -1118,21 +1151,78 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock,
         std::complex<float> channelSample(channelSumI * invDecimationCount,
                                           channelSumQ * invDecimationCount);
         if (adaptiveNoiseCancel) {
-            const std::complex<float> refSample = manualRefCoeff * refChannelSum * invDecimationCount;
-            if (!settings.hfNoiseCancelFreeze) {
-                const float refPower = std::norm(refSample);
-                if (std::isfinite(refPower) && refPower > adaptiveEpsilon) {
-                    const std::complex<float> prediction = adaptiveCoeff * refSample;
-                    const std::complex<float> error = channelSample - prediction;
-                    adaptiveCoeff += adaptiveMu * error * std::conj(refSample) /
-                                     (refPower + adaptiveEpsilon);
-                    adaptiveCoeff = clampComplexMagnitude(adaptiveCoeff, HF_NOISE_CANCEL_MAX_COEFF);
-                    hfNoiseCancelCoeff = adaptiveCoeff;
+            std::complex<float> refSample = manualRefCoeff * refChannelSum * invDecimationCount;
+            if (!std::isfinite(std::real(refSample)) || !std::isfinite(std::imag(refSample))) {
+                refSample = std::complex<float>(0.0f, 0.0f);
+            }
+            refHistory[static_cast<std::size_t>(refHistoryIndex)] = refSample;
+
+            std::complex<float> prediction(0.0f, 0.0f);
+            float refPower = adaptiveEpsilon;
+            for (int tap = 0; tap < HF_NOISE_CANCEL_TAP_COUNT; ++tap) {
+                int historyIndex = refHistoryIndex - tap;
+                if (historyIndex < 0) {
+                    historyIndex += HF_NOISE_CANCEL_TAP_COUNT;
+                }
+                const std::complex<float> historySample =
+                    refHistory[static_cast<std::size_t>(historyIndex)];
+                prediction += adaptiveTaps[static_cast<std::size_t>(tap)] * historySample;
+                refPower += std::norm(historySample);
+            }
+
+            if (!settings.hfNoiseCancelFreeze &&
+                std::isfinite(refPower) &&
+                refPower > adaptiveEpsilon * 2.0f) {
+                const std::complex<float> error = channelSample - prediction;
+                const float step = adaptiveMu / refPower;
+                if (std::isfinite(std::real(error)) && std::isfinite(std::imag(error))) {
+                    for (int tap = 0; tap < HF_NOISE_CANCEL_TAP_COUNT; ++tap) {
+                        int historyIndex = refHistoryIndex - tap;
+                        if (historyIndex < 0) {
+                            historyIndex += HF_NOISE_CANCEL_TAP_COUNT;
+                        }
+                        const std::complex<float> historySample =
+                            refHistory[static_cast<std::size_t>(historyIndex)];
+                        adaptiveTaps[static_cast<std::size_t>(tap)] +=
+                            step * error * std::conj(historySample);
+                        adaptiveTaps[static_cast<std::size_t>(tap)] =
+                            clampComplexMagnitude(adaptiveTaps[static_cast<std::size_t>(tap)],
+                                                  HF_NOISE_CANCEL_MAX_COEFF);
+                    }
                 }
             }
-            channelSample -= noiseCancelDepth * adaptiveCoeff * refSample;
+            adaptiveCoeff = adaptiveTaps.front();
+            channelSample -= noiseCancelDepth * prediction;
+            refHistoryIndex = (refHistoryIndex + 1) % HF_NOISE_CANCEL_TAP_COUNT;
             refChannelSum = {0.0f, 0.0f};
         }
+        if (hfAudioBlankerEnabled) {
+            const float magnitude = std::abs(channelSample);
+            if (std::isfinite(magnitude)) {
+                if (hfBlankerEnvelope <= 0.0f) {
+                    hfBlankerEnvelope = magnitude;
+                } else {
+                    hfBlankerEnvelope += hfBlankerEnvAlpha * (magnitude - hfBlankerEnvelope);
+                }
+            }
+
+            const float triggerLevel =
+                (std::max)(hfBlankerEnvelope * hfAudioBlankerThreshold, 0.00001f);
+            if (magnitude > triggerLevel) {
+                hfBlankerHoldSamples = hfBlankerHoldTarget;
+                channelSample = hfBlankerLastClean;
+            } else if (hfBlankerHoldSamples > 0) {
+                --hfBlankerHoldSamples;
+                channelSample = hfBlankerLastClean;
+            } else {
+                hfBlankerLastClean = channelSample;
+            }
+        } else {
+            hfBlankerEnvelope = 0.0f;
+            hfBlankerHoldSamples = 0;
+            hfBlankerLastClean = channelSample;
+        }
+
         const float channelI = std::real(channelSample);
         const float channelQ = std::imag(channelSample);
         channelSumI = 0.0f;
@@ -1272,7 +1362,20 @@ void AudioProcessor::processDemodulatorBlock(const std::vector<float>& iqBlock,
 
     channelDecimationSum = std::complex<float>(channelSumI, channelSumQ);
     channelDecimationCount = decimationCount;
+    hfNoiseCancelCoeff = adaptiveNoiseCancel ? adaptiveCoeff : std::complex<float>(0.0f, 0.0f);
     hfNoiseCancelRefDecimationSum = adaptiveNoiseCancel ? refChannelSum : std::complex<float>(0.0f, 0.0f);
+    if (adaptiveNoiseCancel) {
+        hfNoiseCancelTapCoeffs = adaptiveTaps;
+        hfNoiseCancelRefHistory = refHistory;
+        hfNoiseCancelRefHistoryIndex = refHistoryIndex;
+    } else {
+        hfNoiseCancelTapCoeffs.fill(std::complex<float>(0.0f, 0.0f));
+        hfNoiseCancelRefHistory.fill(std::complex<float>(0.0f, 0.0f));
+        hfNoiseCancelRefHistoryIndex = 0;
+    }
+    hfAudioBlankerEnvelope = hfAudioBlankerEnabled ? hfBlankerEnvelope : 0.0f;
+    hfAudioBlankerHoldSamples = hfAudioBlankerEnabled ? hfBlankerHoldSamples : 0;
+    hfAudioBlankerLastCleanSample = hfAudioBlankerEnabled ? hfBlankerLastClean : std::complex<float>(0.0f, 0.0f);
     amLowPassState = std::complex<float>(lowPassI, lowPassQ);
     sidebandLowPassStates = sidebandStates;
     fmPreviousSample = std::complex<float>(fmPrevI, fmPrevQ);
@@ -1307,6 +1410,8 @@ void AudioProcessor::SDRThread() {
     double activeBandwidth = activeSettings.bandwidth;
     double activeAudioLowPassHz = activeSettings.audioLowPassHz;
     double activeAudioHighPassHz = activeSettings.audioHighPassHz;
+    bool activeHfAudioBlankerEnabled = activeSettings.hfAudioBlankerEnabled;
+    double activeHfAudioBlankerThreshold = activeSettings.hfAudioBlankerThreshold;
     int activeDmrBasebandSampleRate =
         normalizedDmrBasebandSampleRate(activeSettings.dmrBasebandSampleRate);
     int activeDmrChannelSampleRate = activeSettings.dmrChannelSampleRate;
@@ -1322,6 +1427,8 @@ void AudioProcessor::SDRThread() {
             std::abs(activeBandwidth - settings.bandwidth) > 1.0 ||
             std::abs(activeAudioLowPassHz - settings.audioLowPassHz) > 1.0 ||
             std::abs(activeAudioHighPassHz - settings.audioHighPassHz) > 1.0 ||
+            activeHfAudioBlankerEnabled != settings.hfAudioBlankerEnabled ||
+            std::abs(activeHfAudioBlankerThreshold - settings.hfAudioBlankerThreshold) > 0.01 ||
             activeDmrChannelSampleRate != settings.dmrChannelSampleRate ||
             activeDmrBasebandSampleRate !=
                 normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate)) {
@@ -1333,6 +1440,8 @@ void AudioProcessor::SDRThread() {
             activeBandwidth = settings.bandwidth;
             activeAudioLowPassHz = settings.audioLowPassHz;
             activeAudioHighPassHz = settings.audioHighPassHz;
+            activeHfAudioBlankerEnabled = settings.hfAudioBlankerEnabled;
+            activeHfAudioBlankerThreshold = settings.hfAudioBlankerThreshold;
             activeDmrChannelSampleRate = settings.dmrChannelSampleRate;
             activeDmrBasebandSampleRate =
                 normalizedDmrBasebandSampleRate(settings.dmrBasebandSampleRate);

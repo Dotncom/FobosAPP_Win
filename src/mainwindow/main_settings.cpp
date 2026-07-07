@@ -17,6 +17,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QByteArray>
+#include <QDataStream>
+#include <QIODevice>
 #include <QSettings>
 #include <QSignalBlocker>
 
@@ -29,6 +32,105 @@ extern bool syncWariable;
 extern float sensitivity;
 extern float contrast;
 extern bool colorf;
+
+namespace {
+constexpr quint32 HF_INTERFERENCE_BASELINE_MAGIC = 0x4648424Cu; // FHBL
+constexpr quint32 HF_INTERFERENCE_BASELINE_VERSION = 1u;
+constexpr quint32 HF_INTERFERENCE_BASELINE_MAX_POINTS = 2000000u;
+
+QByteArray encodeHfInterferenceBaselineCurve(const std::vector<float> &frequencies,
+                                             const std::vector<float> &magnitudes) {
+    if (frequencies.empty() || frequencies.size() != magnitudes.size()) {
+        return QByteArray();
+    }
+
+    QByteArray payload;
+    QDataStream out(&payload, QIODevice::WriteOnly);
+    out.setByteOrder(QDataStream::LittleEndian);
+    out.setVersion(QDataStream::Qt_5_12);
+    out << HF_INTERFERENCE_BASELINE_MAGIC
+        << HF_INTERFERENCE_BASELINE_VERSION
+        << static_cast<quint32>(frequencies.size());
+    for (std::size_t i = 0; i < frequencies.size(); ++i) {
+        out << frequencies[i] << magnitudes[i];
+    }
+    return qCompress(payload, 1);
+}
+
+bool decodeHfInterferenceBaselineCurve(const QByteArray &encoded,
+                                       std::vector<float> &frequencies,
+                                       std::vector<float> &magnitudes) {
+    frequencies.clear();
+    magnitudes.clear();
+    if (encoded.isEmpty()) {
+        return false;
+    }
+
+    const QByteArray payload = qUncompress(encoded);
+    if (payload.isEmpty()) {
+        return false;
+    }
+
+    QDataStream in(payload);
+    in.setByteOrder(QDataStream::LittleEndian);
+    in.setVersion(QDataStream::Qt_5_12);
+
+    quint32 magic = 0;
+    quint32 version = 0;
+    quint32 count = 0;
+    in >> magic >> version >> count;
+    if (in.status() != QDataStream::Ok ||
+        magic != HF_INTERFERENCE_BASELINE_MAGIC ||
+        version != HF_INTERFERENCE_BASELINE_VERSION ||
+        count < 2 ||
+        count > HF_INTERFERENCE_BASELINE_MAX_POINTS) {
+        frequencies.clear();
+        magnitudes.clear();
+        return false;
+    }
+
+    frequencies.resize(count);
+    magnitudes.resize(count);
+    for (quint32 i = 0; i < count; ++i) {
+        in >> frequencies[i] >> magnitudes[i];
+    }
+    if (in.status() != QDataStream::Ok) {
+        frequencies.clear();
+        magnitudes.clear();
+        return false;
+    }
+    return true;
+}
+}
+
+void YourClassName::loadHfInterferenceBaselineCurve() {
+    QSettings settings(persistentSettingsFilePath(), QSettings::IniFormat);
+    const QByteArray encoded = settings.value(QStringLiteral("hfInterference/baselineCurve")).toByteArray();
+    if (encoded.isEmpty()) {
+        hfInterferenceBaselineFrequencies.clear();
+        hfInterferenceBaselineMagnitudes.clear();
+        hfInterferenceBaselineEnabled = false;
+        return;
+    }
+    if (!decodeHfInterferenceBaselineCurve(encoded,
+                                           hfInterferenceBaselineFrequencies,
+                                           hfInterferenceBaselineMagnitudes)) {
+        qDebug() << "[HF interference] stored baseline curve could not be loaded";
+        hfInterferenceBaselineFrequencies.clear();
+        hfInterferenceBaselineMagnitudes.clear();
+        hfInterferenceBaselineEnabled = false;
+        return;
+    }
+    qDebug() << "[HF interference] stored baseline loaded"
+             << "bins" << hfInterferenceBaselineFrequencies.size();
+}
+
+void YourClassName::saveHfInterferenceBaselineCurve() const {
+    QSettings settings(persistentSettingsFilePath(), QSettings::IniFormat);
+    settings.setValue(QStringLiteral("hfInterference/baselineCurve"),
+                      encodeHfInterferenceBaselineCurve(hfInterferenceBaselineFrequencies,
+                                                        hfInterferenceBaselineMagnitudes));
+}
 
 void YourClassName::loadPersistentSettings() {
     const QString settingsPath = persistentSettingsFilePath();
@@ -71,11 +173,20 @@ void YourClassName::loadPersistentSettings() {
     pendingSettings.hfNoiseCancelRefTiltDb =
         clampHfNoiseCancelRefTiltDb(settings.value("hfNoiseCancel/refTiltDb", pendingSettings.hfNoiseCancelRefTiltDb).toDouble());
     pendingSettings.hfNoiseCancelFreeze = settings.value("hfNoiseCancel/freeze", pendingSettings.hfNoiseCancelFreeze).toBool();
+    pendingSettings.hfAudioBlankerEnabled =
+        settings.value("hfNoiseCancel/audioBlankerEnabled", pendingSettings.hfAudioBlankerEnabled).toBool();
+    pendingSettings.hfAudioBlankerThreshold =
+        (std::clamp)(settings.value("hfNoiseCancel/audioBlankerThreshold", pendingSettings.hfAudioBlankerThreshold).toDouble(),
+                     2.0,
+                     20.0);
     hfInterferenceBaselineEnabled = settings.value("hfInterference/baselineEnabled", hfInterferenceBaselineEnabled).toBool();
+    hfInterferenceRawOverlayEnabled =
+        settings.value("hfInterference/rawOverlayEnabled", hfInterferenceRawOverlayEnabled).toBool();
     hfInterferenceBaselineDepth =
         (std::clamp)(settings.value("hfInterference/baselineDepth", hfInterferenceBaselineDepth).toDouble(), 0.0, 2.0);
     hfInterferenceBaselineSmoothBins =
         (std::clamp)(settings.value("hfInterference/baselineSmoothBins", hfInterferenceBaselineSmoothBins).toInt(), 1, 301) | 1;
+    loadHfInterferenceBaselineCurve();
     pendingSettings.audioEnabled = settings.value("receiver/audioEnabled", pendingSettings.audioEnabled).toBool();
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>((std::clamp)(settings.value("receiver/gpoValue", static_cast<int>(pendingSettings.gpoValue)).toInt(), 0, 255));
@@ -1216,9 +1327,15 @@ void YourClassName::savePersistentSettings() {
     settings.setValue("hfNoiseCancel/refDelayNs", pendingSettings.hfNoiseCancelRefDelayNs);
     settings.setValue("hfNoiseCancel/refTiltDb", pendingSettings.hfNoiseCancelRefTiltDb);
     settings.setValue("hfNoiseCancel/freeze", pendingSettings.hfNoiseCancelFreeze);
+    settings.setValue("hfNoiseCancel/audioBlankerEnabled", pendingSettings.hfAudioBlankerEnabled);
+    settings.setValue("hfNoiseCancel/audioBlankerThreshold", pendingSettings.hfAudioBlankerThreshold);
     settings.setValue("hfInterference/baselineEnabled", hfInterferenceBaselineEnabled);
+    settings.setValue("hfInterference/rawOverlayEnabled", hfInterferenceRawOverlayEnabled);
     settings.setValue("hfInterference/baselineDepth", hfInterferenceBaselineDepth);
     settings.setValue("hfInterference/baselineSmoothBins", hfInterferenceBaselineSmoothBins);
+    settings.setValue("hfInterference/baselineCurve",
+                      encodeHfInterferenceBaselineCurve(hfInterferenceBaselineFrequencies,
+                                                        hfInterferenceBaselineMagnitudes));
 
     settings.setValue("network/serverAddress", networkServerAddress);
     settings.setValue("network/bindAddress", networkBindAddress);

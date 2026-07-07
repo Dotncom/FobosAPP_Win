@@ -72,6 +72,8 @@ inline constexpr int HF_NOISE_CANCEL_REF_DELAY_MIN_NS = -2000;
 inline constexpr int HF_NOISE_CANCEL_REF_DELAY_MAX_NS = 2000;
 inline constexpr int HF_NOISE_CANCEL_REF_TILT_MIN = -300;
 inline constexpr int HF_NOISE_CANCEL_REF_TILT_MAX = 300;
+inline constexpr int HF_AUDIO_BLANKER_THRESHOLD_MIN = 20;
+inline constexpr int HF_AUDIO_BLANKER_THRESHOLD_MAX = 200;
 
 inline constexpr int VIDEO_SNAPSHOT_INTERVAL_MS = 90;
 inline constexpr std::size_t VIDEO_SNAPSHOT_MAX_FLOATS = 262144 * 2;
@@ -130,7 +132,7 @@ inline constexpr float SPUR_CALIBRATION_MIN_PROMINENCE_DB = 8.0f;
 inline constexpr float SPUR_CALIBRATION_MIN_NARROW_DB = 2.0f;
 inline constexpr int SPUR_CALIBRATION_INNER_BINS = 4;
 inline constexpr int SPUR_CALIBRATION_OUTER_BINS = 36;
-inline constexpr int SPUR_MAX_MASK_ENTRIES = 16;
+inline constexpr int SPUR_MAX_MASK_ENTRIES = 64;
 inline constexpr double SPUR_MIN_MASK_WIDTH_HZ = 50.0;
 inline constexpr double SPUR_MAX_MASK_WIDTH_HZ = 20000.0;
 

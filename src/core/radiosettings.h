@@ -157,6 +157,8 @@ struct RadioSettings {
     double hfNoiseCancelRefDelayNs = 0.0;
     double hfNoiseCancelRefTiltDb = 0.0;
     bool hfNoiseCancelFreeze = false;
+    bool hfAudioBlankerEnabled = false;
+    double hfAudioBlankerThreshold = 8.0;
     bool audioEnabled = true;
     bool syncEnabled = false;
     std::uint8_t gpoValue = 0;

@@ -1,5 +1,6 @@
 param(
-    [string]$OutputPath = ""
+    [string]$OutputPath = "",
+    [switch]$NoArchive
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,5 +89,9 @@ foreach ($file in $files) {
     Copy-Item -LiteralPath $source -Destination $dest -Force
 }
 
-Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $OutputFullPath -Force
-Get-Item -LiteralPath $OutputFullPath | Select-Object FullName, Length, LastWriteTime
+if ($NoArchive) {
+    Get-Item -LiteralPath $Stage | Select-Object FullName, LastWriteTime
+} else {
+    Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $OutputFullPath -Force
+    Get-Item -LiteralPath $OutputFullPath | Select-Object FullName, Length, LastWriteTime
+}

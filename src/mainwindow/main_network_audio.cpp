@@ -148,10 +148,20 @@ void YourClassName::sendAudioRelayFrame(const QByteArray &pcmData) {
     datagram.append(pcmData);
 
     audioRelaySocket->writeDatagram(datagram, targetAddress, audioRelayPort);
+    static quint64 sentRelayFrames = 0;
+    ++sentRelayFrames;
+    if (fobosVerboseLoggingEnabled() &&
+        (sentRelayFrames <= 8 || (sentRelayFrames % 200) == 0)) {
+        qDebug() << "[AudioRelay] sent PCM frame"
+                 << "frames" << static_cast<qulonglong>(sentRelayFrames)
+                 << "bytes" << pcmData.size()
+                 << "target" << audioRelayHost
+                 << "port" << audioRelayPort;
+    }
 }
 
 void YourClassName::receiveAudioRelayDatagrams() {
-    if (!audioRelayReceiveEnabled || !audioRelaySocket || !remoteAudioPlayer) {
+    if (!audioRelayReceiveEnabled || !audioRelaySocket) {
         return;
     }
 
@@ -179,7 +189,24 @@ void YourClassName::receiveAudioRelayDatagrams() {
         }
 
         const QByteArray pcmData = datagram.mid(AUDIO_RELAY_HEADER_BYTES, static_cast<int>(payloadBytes));
-        remoteAudioPlayer->playPcmFrame(pcmData);
+        static quint64 receivedRelayFrames = 0;
+        ++receivedRelayFrames;
+        if (fobosVerboseLoggingEnabled() &&
+            (receivedRelayFrames <= 8 || (receivedRelayFrames % 200) == 0)) {
+            qDebug() << "[AudioRelay] received PCM frame"
+                     << "frames" << static_cast<qulonglong>(receivedRelayFrames)
+                     << "bytes" << pcmData.size()
+                     << "port" << audioRelayListenPort;
+        }
+        if (remoteAudioPlayer) {
+            remoteAudioPlayer->playPcmFrame(pcmData);
+        } else if (fobosVerboseLoggingEnabled()) {
+            static bool loggedMissingPlayer = false;
+            if (!loggedMissingPlayer) {
+                loggedMissingPlayer = true;
+                qDebug() << "[AudioRelay] received PCM but no remote audio player is available";
+            }
+        }
     }
 }
 

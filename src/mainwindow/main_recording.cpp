@@ -337,6 +337,29 @@ void YourClassName::openSpectrumFrameReplay() {
                              QStringLiteral("Could not open spectrum recording:\n%1").arg(errorMessage));
         return;
     }
+    connect(dialog,
+            &SpectrumFrameReplayDialog::replayAudioFrameReady,
+            this,
+            [this](const QByteArray &pcmData) {
+                processDigitalAudioFrame(pcmData);
+                processSstvAudioFrame(pcmData);
+                processAptAudioFrame(pcmData);
+                processWefaxAudioFrame(pcmData);
+                sendNetworkAudioFrame(pcmData);
+                sendAudioRelayFrame(pcmData);
+                sendAudioHttpFrame(pcmData);
+#if !defined(_WIN32) && defined(FOBOSAPP_HAS_QT_AUDIO)
+                const bool suppressServerLocalOutput =
+                    networkMode == NetworkMode::Server &&
+                    serverDisableLocalVisualAudio &&
+                    networkController &&
+                    networkController->isControlReady();
+                if (remoteAudioPlayer && !suppressServerLocalOutput) {
+                    remoteAudioPlayer->playPcmFrame(pcmData);
+                }
+#endif
+            },
+            Qt::QueuedConnection);
     dialog->setAttribute(Qt::WA_DeleteOnClose, true);
     dialog->show();
 }

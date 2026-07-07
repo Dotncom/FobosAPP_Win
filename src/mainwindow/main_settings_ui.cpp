@@ -274,6 +274,15 @@ void YourClassName::updateUiFromPendingSettings() {
         hfNoiseCancelFreezeCheckbox->setChecked(pendingSettings.hfNoiseCancelFreeze);
         hfNoiseCancelFreezeCheckbox->blockSignals(false);
     }
+    if (hfAudioBlankerCheckbox) {
+        QSignalBlocker blocker(hfAudioBlankerCheckbox);
+        hfAudioBlankerCheckbox->setChecked(pendingSettings.hfAudioBlankerEnabled);
+    }
+    if (hfAudioBlankerThresholdSlider) {
+        QSignalBlocker blocker(hfAudioBlankerThresholdSlider);
+        hfAudioBlankerThresholdSlider->setValue(static_cast<int>(std::lround(
+            (std::clamp)(pendingSettings.hfAudioBlankerThreshold, 2.0, 20.0) * 10.0)));
+    }
     if (spectrumFrameBufferCheckbox) {
         QSignalBlocker blocker(spectrumFrameBufferCheckbox);
         spectrumFrameBufferCheckbox->setChecked(spectrumFrameBufferEnabled);
@@ -292,6 +301,10 @@ void YourClassName::updateUiFromPendingSettings() {
     if (hfInterferenceBaselineCheckbox) {
         QSignalBlocker blocker(hfInterferenceBaselineCheckbox);
         hfInterferenceBaselineCheckbox->setChecked(hfInterferenceBaselineEnabled);
+    }
+    if (hfInterferenceRawOverlayCheckbox) {
+        QSignalBlocker blocker(hfInterferenceRawOverlayCheckbox);
+        hfInterferenceRawOverlayCheckbox->setChecked(hfInterferenceRawOverlayEnabled);
     }
     if (hfInterferenceBaselineDepthSlider) {
         QSignalBlocker blocker(hfInterferenceBaselineDepthSlider);

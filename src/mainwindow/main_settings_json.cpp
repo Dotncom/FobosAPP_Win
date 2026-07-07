@@ -49,6 +49,8 @@ QJsonObject YourClassName::settingsToJson() const {
     settings["hfNoiseCancelRefDelayNs"] = pendingSettings.hfNoiseCancelRefDelayNs;
     settings["hfNoiseCancelRefTiltDb"] = pendingSettings.hfNoiseCancelRefTiltDb;
     settings["hfNoiseCancelFreeze"] = pendingSettings.hfNoiseCancelFreeze;
+    settings["hfAudioBlankerEnabled"] = pendingSettings.hfAudioBlankerEnabled;
+    settings["hfAudioBlankerThreshold"] = pendingSettings.hfAudioBlankerThreshold;
     settings["audioEnabled"] = pendingSettings.audioEnabled;
     settings["syncEnabled"] = false;
     settings["gpoValue"] = static_cast<int>(pendingSettings.gpoValue);
@@ -203,6 +205,12 @@ void YourClassName::applySettingsFromJson(const QJsonObject &settingsJson, bool 
     pendingSettings.hfNoiseCancelRefTiltDb =
         clampHfNoiseCancelRefTiltDb(readDouble("hfNoiseCancelRefTiltDb", pendingSettings.hfNoiseCancelRefTiltDb));
     pendingSettings.hfNoiseCancelFreeze = readBool("hfNoiseCancelFreeze", pendingSettings.hfNoiseCancelFreeze);
+    pendingSettings.hfAudioBlankerEnabled =
+        readBool("hfAudioBlankerEnabled", pendingSettings.hfAudioBlankerEnabled);
+    pendingSettings.hfAudioBlankerThreshold =
+        (std::clamp)(readDouble("hfAudioBlankerThreshold", pendingSettings.hfAudioBlankerThreshold),
+                     2.0,
+                     20.0);
     pendingSettings.audioEnabled = readBool("audioEnabled", pendingSettings.audioEnabled);
     pendingSettings.syncEnabled = false;
     pendingSettings.gpoValue = static_cast<std::uint8_t>(readInt("gpoValue", pendingSettings.gpoValue));
